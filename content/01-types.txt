@@ -1,0 +1,875 @@
+=== chapter types
+title: Types and conversions
+blurb: Integer sizes, signed vs unsigned, fixed-width types, floating point, the conversion rules that bite, overflow, const, literals and sizeof.
+--- body
+## Types are about bytes, not objects
+
+In C# an `int` is always 32 bits and a `long` always 64, by specification. In JavaScript every number is a double (plus `BigInt`). C only promises *minimum* ranges and an ordering:
+
+```text
+sizeof(char) == 1  <=  short  <=  int  <=  long  <=  long long
+```
+
+with `short` and `int` at least 16 bits, `long` at least 32, `long long` at least 64. What you actually get depends on the platform's *data model*. This site (and practically all 64-bit Linux and macOS) uses **LP64**:
+
+| Type | Bytes | Range on LP64 | Closest C# |
+|---|---|---|---|
+| `char` | 1 | -128..127 or 0..255 (see below) | `sbyte` / `byte` |
+| `short` | 2 | -32768..32767 | `short` |
+| `int` | 4 | about ±2.1 billion | `int` |
+| `long` | 8 | about ±9.2e18 | `long` |
+| `long long` | 8 | about ±9.2e18 | `long` |
+| `float` | 4 | ~7 significant digits | `float` |
+| `double` | 8 | ~15-16 significant digits | `double` |
+| any pointer | 8 | | `IntPtr` / `nint` |
+
+> Windows uses **LLP64**: `long` is only 4 bytes there. Code that stores a pointer or a file size in a `long` breaks on Windows. This is why fixed-width types exist.
+
+Every integer type has an `unsigned` twin with the same size: `unsigned int` (or just `unsigned`), `unsigned long`, and so on. Plain `int`, `short`, `long` are signed.
+
+## sizeof
+
+`sizeof` is an operator, not a function. It gives a size in bytes as a `size_t`, computed at compile time (except for variable-length arrays). Parentheses are required for a type name and optional for an expression. The expression is **not evaluated**.
+
+```c
+#include <stdio.h>
+
+int main(void) {
+    int x = 5;
+    double values[10];
+    printf("%zu %zu %zu\n", sizeof(int), sizeof x, sizeof(void *));
+    printf("%zu\n", sizeof values);                     // 80: the whole array
+    printf("%zu\n", sizeof values / sizeof values[0]);  // 10: the element count idiom
+    printf("%zu\n", sizeof x++);                        // 4, and x is NOT incremented
+    printf("%d\n", x);                                  // 5
+    return 0;
+}
+```
+
+## Fixed-width types: stdint.h
+
+When the size matters (file formats, network protocols, hashing, bit manipulation), use `<stdint.h>`:
+
+| Type | Meaning |
+|---|---|
+| `int8_t`, `int16_t`, `int32_t`, `int64_t` | exactly that many bits, signed |
+| `uint8_t` ... `uint64_t` | exactly that many bits, unsigned |
+| `int_least32_t`, `int_fast32_t` | at least 32 bits / the fastest such type (rarely needed) |
+| `intptr_t`, `uintptr_t` | an integer big enough to hold a pointer |
+| `intmax_t`, `uintmax_t` | the widest integer type |
+
+Their limits are `INT32_MAX`, `INT32_MIN`, `UINT8_MAX`, `UINT64_MAX`, etc. Printing them portably needs `<inttypes.h>`, whose macros expand to the right `printf` letters for the platform. They are string literals, glued to the rest of the format by adjacent-literal concatenation:
+
+```c
+#include <stdio.h>
+#include <stdint.h>
+#include <inttypes.h>
+
+int main(void) {
+    int64_t big = INT64_MAX;
+    uint8_t byte = 255;
+    printf("%" PRId64 "\n", big);       // "%" "ld" "\n" on LP64
+    printf("%" PRIu8 " %d\n", byte, byte);
+    return 0;
+}
+```
+
+## size_t and ptrdiff_t
+
+`size_t` (from `<stddef.h>`, also pulled in by `<stdio.h>`, `<string.h>`, `<stdlib.h>`) is the unsigned type that `sizeof` yields and that `strlen`, `malloc` and `memcpy` use for sizes. On LP64 it is 64 bits. Print it with `%zu`. `ptrdiff_t` is the signed type you get by subtracting two pointers; print it with `%td`.
+
+The classic `size_t` bug is counting down:
+
+```c
+#include <stdio.h>
+
+int main(void) {
+    const char *s = "abc";
+    // for (size_t i = 2; i >= 0; i--)   // infinite: a size_t is always >= 0
+    for (size_t i = 3; i-- > 0; )       // the idiom: test, then decrement
+        putchar(s[i]);
+    putchar('\n');
+    return 0;
+}
+```
+
+## char is a small integer
+
+`char` is just a 1-byte integer type. A character literal like `'A'` is an `int` with value 65 (yes, `int`, not `char`: `sizeof('A')` is 4 in C, unlike C++). There is no separate character type, no UTF-16, no `string` class.
+
+```c
+#include <stdio.h>
+
+int main(void) {
+    char c = 'A';
+    printf("%c %d\n", c, c);          // A 65
+    printf("%c\n", c + 2);            // C
+    printf("%d\n", '7' - '0');        // 7: digit characters are contiguous
+    printf("%c\n", 'a' - 'a' + 'A');  // A: so are letters in ASCII
+    return 0;
+}
+```
+
+Whether plain `char` is signed is *implementation-defined*: signed on x86, unsigned on ARM. `char`, `signed char` and `unsigned char` are three distinct types. Use `unsigned char` (or `uint8_t`) for raw bytes, and plain `char` only for text.
+
+## Floating point
+
+`float` and `double` are IEEE 754, exactly like C#'s `float`/`double` and JS's `number` (which is a `double`). Same rounding surprises:
+
+```c
+#include <stdio.h>
+#include <math.h>
+
+int main(void) {
+    double a = 0.1 + 0.2;
+    printf("%.17f\n", a);                 // 0.30000000000000004
+    printf("%d\n", a == 0.3);             // 0
+    printf("%d\n", fabs(a - 0.3) < 1e-9); // 1: compare with a tolerance
+    float f = 16777217;                   // 2^24 + 1: not representable in float
+    printf("%.1f\n", f);                  // 16777216.0
+    printf("%f %f\n", 1.0 / 0.0, -1.0 / 0.0);  // inf -inf (integer / 0 is UB!)
+    return 0;
+}
+```
+
+Use `double` unless you have a reason (memory, SIMD, GPU) to use `float`. `printf` takes `%f` for both (a `float` argument is promoted to `double`), but `scanf` needs `%f` for `float *` and `%lf` for `double *`.
+
+## Literals and suffixes
+
+| Literal | Type |
+|---|---|
+| `42` | `int` (or the first of `long`, `long long` that fits) |
+| `42u`, `42U` | `unsigned int` |
+| `42L`, `42UL`, `42LL`, `42ULL` | `long`, `unsigned long`, `long long`, `unsigned long long` |
+| `0x2A` | hexadecimal |
+| `052` | **octal**: a leading zero means base 8, so `010 == 8` |
+| `0b101010` | binary: a gcc extension, standard only in C23 |
+| `3.0`, `3.`, `1e3` | `double` |
+| `3.0f` | `float` |
+| `'A'`, `'\n'`, `'\0'`, `'\x41'` | `int` |
+
+There are no digit separators like C#'s `1_000_000` (C23 adds `1'000'000`).
+
+## Integer promotion
+
+Arithmetic never happens in a type narrower than `int`. Before any arithmetic, `char`, `short`, `uint8_t`, `uint16_t` and `_Bool` values are **promoted** to `int`. So two `uint8_t` values add up as `int`s:
+
+```c
+#include <stdio.h>
+#include <stdint.h>
+
+int main(void) {
+    uint8_t a = 200, b = 100;
+    int sum = a + b;            // 300: computed as int
+    uint8_t wrapped = a + b;    // 44: 300 converted back to 8 bits (300 - 256)
+    printf("%d %d\n", sum, wrapped);
+    uint8_t x = 0xF0;
+    printf("%d\n", ~x);         // -241, not 15: ~ applied to the int 0x000000F0
+    printf("%d\n", (uint8_t)~x);  // 15
+    return 0;
+}
+```
+
+C# does the same promotion (which is why `byte + byte` is an `int` there and needs a cast back), but C# refuses the implicit narrowing; C silently truncates.
+
+## The usual arithmetic conversions
+
+When a binary operator gets two different types, C converts both to a common type:
+
+1. If either is floating, convert to the widest floating type involved (`long double` > `double` > `float`).
+2. Otherwise promote both (see above), then if they still differ, the one with lower *rank* (roughly: size) converts to the other's type...
+3. ...**except** that if the unsigned one has rank greater or equal, the signed one converts to **unsigned**. If the signed type is bigger and can hold every value of the unsigned one, the unsigned converts to signed.
+
+Rule 3 is the trap. Mix an `int` and an `unsigned int` and the `int` becomes unsigned, so `-1` turns into `4294967295`:
+
+```c
+#include <stdio.h>
+#include <string.h>
+
+int main(void) {
+    int i = -1;
+    unsigned u = 1;
+    printf("%d\n", i < u);           // 0: -1 became 4294967295
+    printf("%d\n", i < (int)u);      // 1
+    printf("%d\n", -1L < 1u);        // 1: long can hold every unsigned int, so 1u -> long
+
+    const char *s = "hi";
+    if (strlen(s) - 3 > 0)           // size_t arithmetic: 2 - 3 wraps to 18446744073709551615
+        puts("oops: unsigned subtraction never goes negative");
+    if ((long)strlen(s) - 3 < 0)
+        puts("correct");
+    return 0;
+}
+```
+
+`-Wall -Wextra` turns on `-Wsign-compare`, which warns about the comparison case. Read those warnings. Two habits help: use signed types (`int`, `long`, `ptrdiff_t`) for anything you subtract or count down, and compare sizes as `a < b` rather than `a - b < 0`.
+
+## Overflow: unsigned wraps, signed is undefined
+
+Unsigned arithmetic is **defined** to wrap modulo 2^N: `UINT_MAX + 1u == 0` and `0u - 1 == UINT_MAX`, always. That makes unsigned types right for hashes, checksums and bit twiddling.
+
+Signed overflow is **undefined behavior**. Not "it wraps", not "it throws": the compiler is allowed to assume it never happens, and optimizes on that assumption. With `-O2`, gcc compiles this function to `return 1;`:
+
+```c
+int always_bigger(int x) {
+    return x + 1 > x;   // "can't overflow, so always true"
+}
+```
+
+C# wraps silently by default (and throws inside `checked`). In C you must prevent overflow *before* it happens, by checking against the limits:
+
+```c
+#include <stdio.h>
+#include <limits.h>
+
+int main(void) {
+    int a = INT_MAX, b = 1;
+    if (b > 0 && a > INT_MAX - b)
+        puts("would overflow");
+    else
+        printf("%d\n", a + b);
+    printf("%d %d\n", INT_MIN, INT_MAX);
+    printf("%u %ld\n", UINT_MAX, LONG_MAX);
+    printf("%d %d %d\n", CHAR_BIT, SCHAR_MIN, UCHAR_MAX);
+    return 0;
+}
+```
+
+`<limits.h>` has `CHAR_BIT` (8), `SCHAR_MIN/MAX`, `UCHAR_MAX`, `CHAR_MIN/MAX`, `SHRT_MIN/MAX`, `INT_MIN/MAX`, `UINT_MAX`, `LONG_MIN/MAX`, `ULONG_MAX`, `LLONG_MIN/MAX`, `ULLONG_MAX`. `<float.h>` has `DBL_MAX`, `DBL_EPSILON` and friends. gcc also offers `__builtin_add_overflow(a, b, &result)`, which does the check for you.
+
+A few more things that are undefined: `INT_MIN / -1`, `INT_MIN % -1`, `-INT_MIN`, any integer division by zero, shifting by a negative amount or by the type's width or more, and converting a `double` to an integer type that cannot hold it.
+
+## Conversions on assignment and casts
+
+Assignment, argument passing and `return` silently convert to the target type:
+
+| From | To | Result |
+|---|---|---|
+| any integer | wider integer | the same value |
+| any integer | unsigned type | value modulo 2^N (well defined) |
+| any integer | narrower signed type that can't hold it | implementation-defined (gcc wraps) |
+| floating | integer | truncates toward zero; UB if out of range |
+| integer | floating | nearest representable value (big `long long`s lose precision) |
+| `double` | `float` | rounded |
+
+A cast `(type)expr` performs the same conversion explicitly. It is mostly there to say "I mean it", and to force a type *before* an operation happens:
+
+```c
+#include <stdio.h>
+
+int main(void) {
+    int total = 7, count = 2;
+    printf("%.2f\n", (double)total / count);  // 3.50: total converted first
+    printf("%.2f\n", (double)(total / count)); // 3.00: too late
+    printf("%d %d\n", (int)2.9, (int)-2.9);   // 2 -2: truncation toward zero
+    printf("%u\n", (unsigned)-1);             // 4294967295
+    printf("%d\n", (signed char)200);         // -56 on gcc
+    return 0;
+}
+```
+
+There is no `Convert.ToInt32`, no `Math.Round` behind the scenes, no exception. If you want rounding, use `round`, `floor`, `ceil` or `lround` from `<math.h>`.
+
+## const
+
+`const` makes an object read-only through that name. Writing to it is a compile error:
+
+```c
+#include <stdio.h>
+
+int main(void) {
+    const int max_users = 100;
+    // max_users = 200;     // error: assignment of read-only variable
+    const double rate = 0.2;
+    printf("%d %.1f\n", max_users, max_users * rate);
+    return 0;
+}
+```
+
+Unlike C#'s `const`, a C `const` variable is **not** a compile-time constant. Prior to C23 it cannot be a `case` label, and `int arr[max_users];` makes a variable-length array rather than a normal one. For true named constants, C programmers use `#define MAX_USERS 100` or an `enum { MAX_USERS = 100 };`. `const` really earns its keep with pointers, in the pointers chapter.
+
+## Summary of the traps
+
+- Sizes vary by platform; use `<stdint.h>` when they matter and `sizeof` instead of hard-coded numbers.
+- Everything narrower than `int` becomes `int` before arithmetic.
+- Signed meets unsigned of the same size: signed loses. `-1 < 0u` is false.
+- `size_t` arithmetic never goes negative.
+- Unsigned overflow wraps; signed overflow is UB. Check before you add.
+- Integer division truncates; `int / int` is never a fraction no matter where you store it.
+- A leading `0` makes a literal octal.
+
+=== exercise sizes
+title: Know your sizes
+--- prompt
+Print the size in bytes of each of these types, one per line, in this format, using `sizeof` (with `%zu`) rather than typing the numbers:
+
+```text
+char 1
+short 2
+int 4
+long 8
+long long 8
+float 4
+double 8
+pointer 8
+```
+
+For `pointer` use `sizeof(void *)`. The expected output is for 64-bit Linux; your code should print the right thing on any platform.
+--- starter
+#include <stdio.h>
+
+int main(void) {
+    printf("char %zu\n", sizeof(char));
+    // the rest
+    return 0;
+}
+--- solution
+#include <stdio.h>
+
+int main(void) {
+    printf("char %zu\n", sizeof(char));
+    printf("short %zu\n", sizeof(short));
+    printf("int %zu\n", sizeof(int));
+    printf("long %zu\n", sizeof(long));
+    printf("long long %zu\n", sizeof(long long));
+    printf("float %zu\n", sizeof(float));
+    printf("double %zu\n", sizeof(double));
+    printf("pointer %zu\n", sizeof(void *));
+    return 0;
+}
+--- hint
+`sizeof` yields a `size_t`, and `%zu` is its `printf` specifier. Using `%d` is a type mismatch that `-Wall` warns about.
+--- test
+--- out
+char 1
+short 2
+int 4
+long 8
+long long 8
+float 4
+double 8
+pointer 8
+
+=== exercise hexval
+title: Characters are numbers
+--- prompt
+Write `int hex_value(char c)` that returns the value of a hexadecimal digit: `'0'`..`'9'` give 0..9, `'a'`..`'f'` and `'A'`..`'F'` give 10..15. Anything else returns `-1`.
+
+Use character arithmetic (`c - '0'`), not a lookup table or a 22-case `switch`.
+--- starter
+int hex_value(char c) {
+    return 0;
+}
+--- solution
+int hex_value(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+--- harness
+int main(void) {
+    CHECK_INT(hex_value('0'), 0);
+    CHECK_INT(hex_value('7'), 7);
+    CHECK_INT(hex_value('9'), 9);
+    CHECK_INT(hex_value('a'), 10);
+    CHECK_INT(hex_value('c'), 12);
+    CHECK_INT(hex_value('f'), 15);
+    CHECK_INT(hex_value('A'), 10);
+    CHECK_INT(hex_value('F'), 15);
+    CHECK_INT(hex_value('g'), -1);
+    CHECK_INT(hex_value('G'), -1);
+    CHECK_INT(hex_value('/'), -1);
+    CHECK_INT(hex_value(':'), -1);
+    CHECK_INT(hex_value('@'), -1);
+    CHECK_INT(hex_value('`'), -1);
+    CHECK_INT(hex_value(' '), -1);
+    CHECK_INT(hex_value('\0'), -1);
+    CHECK_INT(hex_value((char)200), -1);
+    return TEST_END();
+}
+--- hint
+`'0'` through `'9'` are consecutive codes (48..57), so `c - '0'` is the digit's value. Letters are consecutive too.
+--- hint
+Check the range first: `c >= 'a' && c <= 'f'`. Note that `':'` and `'@'` sit right after `'9'` and right before `'A'`.
+
+=== exercise celsius
+title: Fix the conversion
+--- prompt
+This program reads Fahrenheit temperatures (integers, one or more, until end of input) and should print each as Celsius with one decimal, using C = (F - 32) * 5 / 9:
+
+```text
+212 F = 100.0 C
+```
+
+It compiles and runs, but prints `0.0` for every temperature. Find out why and fix it.
+--- starter
+#include <stdio.h>
+
+int main(void) {
+    int f;
+    while (scanf("%d", &f) == 1) {
+        double c = (f - 32) * (5 / 9);
+        printf("%d F = %.1f C\n", f, c);
+    }
+    return 0;
+}
+--- solution
+#include <stdio.h>
+
+int main(void) {
+    int f;
+    while (scanf("%d", &f) == 1) {
+        double c = (f - 32) * 5.0 / 9.0;
+        printf("%d F = %.1f C\n", f, c);
+    }
+    return 0;
+}
+--- hint
+What is `5 / 9` when both operands are `int`?
+--- hint
+Make one operand of the division a `double` (`5.0`), and the usual arithmetic conversions do the rest.
+--- test
+212
+--- out
+212 F = 100.0 C
+--- test
+32 -40 0 98 451 -459
+--- out
+32 F = 0.0 C
+-40 F = -40.0 C
+0 F = -17.8 C
+98 F = 36.7 C
+451 F = 232.8 C
+-459 F = -272.8 C
+
+=== exercise lesssu
+title: Comparing signed with unsigned
+--- prompt
+Write `int less_su(int a, unsigned b)` that returns 1 if `a` is *mathematically* less than `b`, and 0 otherwise.
+
+The starter does the obvious `a < b`, which is wrong: `less_su(-1, 0)` returns 0 because `-1` is converted to `4294967295` first. Fix it without using a wider type like `long long` (pretend you are writing the 64-bit version, where no wider type exists).
+--- starter
+int less_su(int a, unsigned b) {
+    return a < b;
+}
+--- solution
+int less_su(int a, unsigned b) {
+    if (a < 0) return 1;
+    return (unsigned)a < b;
+}
+--- harness
+#include <limits.h>
+int main(void) {
+    CHECK_INT(less_su(-1, 0u), 1);
+    CHECK_INT(less_su(-1, 1u), 1);
+    CHECK_INT(less_su(INT_MIN, 0u), 1);
+    CHECK_INT(less_su(INT_MIN, UINT_MAX), 1);
+    CHECK_INT(less_su(0, 0u), 0);
+    CHECK_INT(less_su(0, 1u), 1);
+    CHECK_INT(less_su(3, 4u), 1);
+    CHECK_INT(less_su(5, 3u), 0);
+    CHECK_INT(less_su(7, 7u), 0);
+    CHECK_INT(less_su(INT_MAX, (unsigned)INT_MAX), 0);
+    CHECK_INT(less_su(INT_MAX, (unsigned)INT_MAX + 1u), 1);
+    CHECK_INT(less_su(INT_MAX, UINT_MAX), 1);
+    CHECK_INT(less_su(INT_MAX, 0u), 0);
+    return TEST_END();
+}
+--- hint
+A negative `a` is less than every unsigned value. Handle that case first.
+--- hint
+Once you know `a >= 0`, converting it to `unsigned` cannot change its value, so the comparison is safe.
+
+=== exercise fits
+title: Which types can hold it?
+--- prompt
+Read `long long` values from stdin until end of input. For each, print on one line, separated by single spaces, every type from this list that can hold the value exactly, in this order:
+
+`int8_t int16_t int32_t int64_t uint8_t uint16_t uint32_t uint64_t`
+
+Every `long long` fits in `int64_t`, so no line is empty. For example `200` gives:
+
+```text
+int16_t int32_t int64_t uint8_t uint16_t uint32_t uint64_t
+```
+
+Use the limit macros from `<stdint.h>` (`INT8_MIN`, `UINT16_MAX`, ...), not hand-typed numbers. There is a trap in the `uint64_t` check.
+--- starter
+#include <stdio.h>
+#include <stdint.h>
+
+int main(void) {
+    long long n;
+    while (scanf("%lld", &n) == 1) {
+        // print the matching type names
+    }
+    return 0;
+}
+--- solution
+#include <stdio.h>
+#include <stdint.h>
+
+int main(void) {
+    long long n;
+    while (scanf("%lld", &n) == 1) {
+        if (n >= INT8_MIN && n <= INT8_MAX) printf("int8_t ");
+        if (n >= INT16_MIN && n <= INT16_MAX) printf("int16_t ");
+        if (n >= INT32_MIN && n <= INT32_MAX) printf("int32_t ");
+        printf("int64_t");
+        if (n >= 0) {
+            if (n <= UINT8_MAX) printf(" uint8_t");
+            if (n <= UINT16_MAX) printf(" uint16_t");
+            if (n <= UINT32_MAX) printf(" uint32_t");
+            printf(" uint64_t");
+        }
+        printf("\n");
+    }
+    return 0;
+}
+--- hint
+`n <= UINT64_MAX` compares a `long long` with an `unsigned long long`. By the usual arithmetic conversions, `n` becomes unsigned, so `-1` passes the test. Check `n >= 0` first.
+--- hint
+`n <= UINT32_MAX` is fine as written: `UINT32_MAX` is an `unsigned int`, and `long long` can hold every `unsigned int`, so it converts to `long long`.
+--- hint
+Getting the spaces right is easier if you notice that `int64_t` is always printed and always in the middle.
+--- test
+0
+200
+-1
+--- out
+int8_t int16_t int32_t int64_t uint8_t uint16_t uint32_t uint64_t
+int16_t int32_t int64_t uint8_t uint16_t uint32_t uint64_t
+int8_t int16_t int32_t int64_t
+--- test
+127
+128
+-128
+-129
+255
+256
+--- out
+int8_t int16_t int32_t int64_t uint8_t uint16_t uint32_t uint64_t
+int16_t int32_t int64_t uint8_t uint16_t uint32_t uint64_t
+int8_t int16_t int32_t int64_t
+int16_t int32_t int64_t
+int16_t int32_t int64_t uint8_t uint16_t uint32_t uint64_t
+int16_t int32_t int64_t uint16_t uint32_t uint64_t
+--- test
+32767
+32768
+-32768
+-32769
+65535
+65536
+--- out
+int16_t int32_t int64_t uint16_t uint32_t uint64_t
+int32_t int64_t uint16_t uint32_t uint64_t
+int16_t int32_t int64_t
+int32_t int64_t
+int32_t int64_t uint16_t uint32_t uint64_t
+int32_t int64_t uint32_t uint64_t
+--- test
+2147483647
+2147483648
+-2147483648
+-2147483649
+4294967295
+4294967296
+9223372036854775807
+-9223372036854775808
+--- out
+int32_t int64_t uint32_t uint64_t
+int64_t uint32_t uint64_t
+int32_t int64_t
+int64_t
+int64_t uint32_t uint64_t
+int64_t uint64_t
+int64_t uint64_t
+int64_t
+
+=== exercise midpoint
+title: Midpoint without overflow
+--- prompt
+Write `int32_t midpoint(int32_t a, int32_t b)` that returns `(a + b) / 2`, truncated toward zero like normal integer division, with the exact mathematical result even when `a + b` would overflow 32 bits.
+
+The starter's `(a + b) / 2` is undefined behavior for `midpoint(INT32_MAX, INT32_MAX)`; the sanitizer will tell you so. (This exact bug sat in Java's binary search for nine years.)
+--- starter
+#include <stdint.h>
+
+int32_t midpoint(int32_t a, int32_t b) {
+    return (a + b) / 2;
+}
+--- solution
+#include <stdint.h>
+
+int32_t midpoint(int32_t a, int32_t b) {
+    return (int32_t)(((int64_t)a + b) / 2);
+}
+--- harness
+#include <stdint.h>
+int main(void) {
+    CHECK_INT(midpoint(2, 4), 3);
+    CHECK_INT(midpoint(3, 4), 3);
+    CHECK_INT(midpoint(0, 0), 0);
+    CHECK_INT(midpoint(-3, -4), -3);
+    CHECK_INT(midpoint(-3, 4), 0);
+    CHECK_INT(midpoint(-1, 0), 0);
+    CHECK_INT(midpoint(INT32_MAX, INT32_MAX), INT32_MAX);
+    CHECK_INT(midpoint(INT32_MIN, INT32_MIN), INT32_MIN);
+    CHECK_INT(midpoint(INT32_MAX, INT32_MIN), 0);
+    CHECK_INT(midpoint(INT32_MAX, INT32_MAX - 1), INT32_MAX - 1);
+    CHECK_INT(midpoint(INT32_MIN, INT32_MIN + 1), INT32_MIN + 1);
+    CHECK_INT(midpoint(2000000000, 2000000002), 2000000001);
+    CHECK_INT(midpoint(-2000000000, -2000000001), -2000000000);
+    return TEST_END();
+}
+--- hint
+Do the addition in a type that cannot overflow: `int64_t` holds the sum of any two `int32_t`s.
+--- hint
+Cast one operand *before* adding: `(int64_t)a + b`. Casting the sum, `(int64_t)(a + b)`, is too late.
+
+=== exercise saturate
+title: Saturating addition
+--- prompt
+Saturating arithmetic clamps at the limits instead of overflowing: audio and image code use it everywhere. Write both:
+
+- `uint32_t sat_addu(uint32_t a, uint32_t b)`: `a + b`, or `UINT32_MAX` if the true sum is larger.
+- `int32_t sat_add(int32_t a, int32_t b)`: `a + b`, or `INT32_MAX` / `INT32_MIN` if the true sum is above / below the range.
+
+Do it **without** a wider type: no `int64_t`, no `long long`. A signed overflow must never actually happen (the sanitizer is watching).
+--- starter
+#include <stdint.h>
+
+uint32_t sat_addu(uint32_t a, uint32_t b) {
+    return a + b;
+}
+
+int32_t sat_add(int32_t a, int32_t b) {
+    return a + b;
+}
+--- solution
+#include <stdint.h>
+
+uint32_t sat_addu(uint32_t a, uint32_t b) {
+    uint32_t s = a + b;          // wraps, which is defined for unsigned
+    return s < a ? UINT32_MAX : s;
+}
+
+int32_t sat_add(int32_t a, int32_t b) {
+    if (b > 0 && a > INT32_MAX - b) return INT32_MAX;
+    if (b < 0 && a < INT32_MIN - b) return INT32_MIN;
+    return a + b;
+}
+--- harness
+#include <stdint.h>
+int main(void) {
+    CHECK_UINT(sat_addu(1, 2), 3);
+    CHECK_UINT(sat_addu(0, 0), 0);
+    CHECK_UINT(sat_addu(UINT32_MAX, 0), UINT32_MAX);
+    CHECK_UINT(sat_addu(0, UINT32_MAX), UINT32_MAX);
+    CHECK_UINT(sat_addu(UINT32_MAX, 1), UINT32_MAX);
+    CHECK_UINT(sat_addu(UINT32_MAX, UINT32_MAX), UINT32_MAX);
+    CHECK_UINT(sat_addu(4000000000u, 294967295u), UINT32_MAX);
+    CHECK_UINT(sat_addu(4000000000u, 294967296u), UINT32_MAX);
+    CHECK_UINT(sat_addu(4000000000u, 294967294u), 4294967294u);
+
+    CHECK_INT(sat_add(1, 2), 3);
+    CHECK_INT(sat_add(-5, 3), -2);
+    CHECK_INT(sat_add(0, 0), 0);
+    CHECK_INT(sat_add(INT32_MAX, 0), INT32_MAX);
+    CHECK_INT(sat_add(INT32_MAX, 1), INT32_MAX);
+    CHECK_INT(sat_add(INT32_MAX, INT32_MAX), INT32_MAX);
+    CHECK_INT(sat_add(INT32_MAX - 1, 1), INT32_MAX);
+    CHECK_INT(sat_add(INT32_MIN, 0), INT32_MIN);
+    CHECK_INT(sat_add(INT32_MIN, -1), INT32_MIN);
+    CHECK_INT(sat_add(INT32_MIN, INT32_MIN), INT32_MIN);
+    CHECK_INT(sat_add(INT32_MIN + 1, -1), INT32_MIN);
+    CHECK_INT(sat_add(INT32_MAX, INT32_MIN), -1);
+    CHECK_INT(sat_add(-1, INT32_MIN + 1), INT32_MIN);
+    CHECK_INT(sat_add(1500000000, 1500000000), INT32_MAX);
+    CHECK_INT(sat_add(-1500000000, -1500000000), INT32_MIN);
+    return TEST_END();
+}
+--- hint
+Unsigned: the sum wraps (legally) exactly when the result comes out smaller than either operand.
+--- hint
+Signed: overflow is only possible when both operands have the same sign. If `b > 0`, the sum is too big exactly when `a > INT32_MAX - b`, and that subtraction itself cannot overflow.
+--- hint
+The negative case mirrors it: if `b < 0`, check `a < INT32_MIN - b`.
+
+=== quiz
+run: yes
+--- q
+What does this print?
+--- code
+#include <stdio.h>
+
+int main(void) {
+    int i = -1;
+    unsigned u = 1;
+    if (i < u)
+        puts("less");
+    else
+        puts("not less");
+    return 0;
+}
+--- choice
+less
+--- answer
+not less
+--- explain
+`int` and `unsigned int` have the same rank, so the usual arithmetic conversions turn `i` into `unsigned`: `-1` becomes `4294967295`, which is not less than 1. gcc warns about this with `-Wextra` (`-Wsign-compare`).
+
+=== quiz
+run: yes
+--- q
+What does this print?
+--- code
+#include <stdio.h>
+#include <stdint.h>
+
+int main(void) {
+    uint8_t a = 200, b = 100;
+    uint8_t c = a + b;
+    printf("%d %d\n", a + b, c);
+    return 0;
+}
+--- choice
+44 44
+--- answer
+300 44
+--- choice
+300 300
+--- choice
+255 255
+--- explain
+Integer promotion: `a + b` is computed as `int`, giving 300. Storing it into a `uint8_t` reduces it modulo 256, giving 44. Nothing saturates in C unless you write the code for it.
+
+=== quiz
+run: yes
+--- q
+What does this print on 64-bit Linux?
+--- code
+#include <stdio.h>
+
+int main(void) {
+    printf("%zu %zu %zu\n", sizeof(char), sizeof('a'), sizeof(1.0f));
+    return 0;
+}
+--- choice
+1 1 4
+--- answer
+1 4 4
+--- choice
+1 1 8
+--- choice
+2 2 4
+--- explain
+`sizeof(char)` is 1 by definition. A character literal like `'a'` has type `int` in C (it is `char` in C++). `1.0f` is a `float`, 4 bytes.
+
+=== quiz
+run: yes
+--- q
+What does this print?
+--- code
+#include <stdio.h>
+
+int main(void) {
+    unsigned int x = 0;
+    x--;
+    printf("%u\n", x);
+    return 0;
+}
+--- choice
+-1
+--- choice
+0
+--- answer
+4294967295
+--- choice
+It is undefined behavior
+--- explain
+Unsigned arithmetic wraps modulo 2^32 by definition, so `0 - 1` is `UINT_MAX`. Only *signed* overflow is undefined.
+
+=== quiz
+run: yes
+--- q
+What does this print?
+--- code
+#include <stdio.h>
+
+int main(void) {
+    printf("%d %d %d\n", (int)3.99, (int)-3.99, 7 / 2 * 2);
+    return 0;
+}
+--- choice
+4 -4 7
+--- choice
+3 -4 6
+--- answer
+3 -3 6
+--- choice
+3 -3 7
+--- explain
+Converting a floating value to an integer truncates toward zero, so 3 and -3. `7 / 2` is integer division (3), times 2 is 6.
+
+=== quiz
+run: yes
+--- q
+What does this print?
+--- code
+#include <stdio.h>
+
+int main(void) {
+    printf("%d\n", 010 + 0x10 + 10);
+    return 0;
+}
+--- choice
+30
+--- answer
+34
+--- choice
+36
+--- choice
+It does not compile
+--- explain
+A leading `0` makes a literal octal: `010` is 8. `0x10` is 16. 8 + 16 + 10 = 34. Never pad decimal constants with zeros in C.
+
+=== quiz
+--- q
+Which of these has undefined behavior? (Assume 32-bit `int`.)
+--- choice
+`unsigned u = UINT_MAX; u = u + 1;`
+--- answer
+`int i = INT_MAX; i = i + 1;`
+--- choice
+`unsigned char c = 300;`
+--- choice
+`int n = (int)3.5;`
+--- explain
+Signed overflow is UB. Unsigned overflow wraps to 0. Converting 300 to `unsigned char` is defined as modulo 256 (44). Converting 3.5 to `int` truncates to 3; it would only be UB if the value were out of `int`'s range.
+
+=== quiz
+run: yes
+--- q
+What does this print?
+--- code
+#include <stdio.h>
+
+int main(void) {
+    double a = 0.1 + 0.2;
+    float f = 0.1f;
+    printf("%d %d\n", a == 0.3, f == 0.1);
+    return 0;
+}
+--- choice
+1 1
+--- choice
+1 0
+--- choice
+0 1
+--- answer
+0 0
+--- explain
+`0.1 + 0.2` is `0.30000000000000004` in binary floating point, exactly as in C# and JS. And `f == 0.1` compares the `float` approximation of 0.1 (converted to `double`) with the more precise `double` approximation of 0.1: they differ.

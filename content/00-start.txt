@@ -1,0 +1,426 @@
+=== chapter start
+title: Getting started
+blurb: How C differs from C# and JavaScript, the compile model, printf, and how this site runs your code.
+--- body
+## What you are walking into
+
+You know C# and JavaScript. Most of C's *syntax* will feel familiar: braces, `if`, `for`, `while`, `switch`, the same operators. Its *model* is very different:
+
+| | C# / JavaScript | C |
+|---|---|---|
+| Runtime | CLR / JS engine, GC, JIT | none: compiled to native machine code |
+| Memory | managed, garbage collected | you `malloc` and `free` it yourself |
+| Objects | classes, methods, interfaces | `struct`s and functions that take pointers to them |
+| Strings | immutable string objects | arrays of `char` ending in a `0` byte |
+| Errors | exceptions | return codes, `errno`, or crashing |
+| Bounds checks | always | never |
+| Generics | yes | `void *`, macros, or copy-paste |
+| Bugs | usually an exception | often *undefined behavior*: anything can happen, including "seems to work" |
+
+That last row is the important one. In C# reading past the end of an array throws. In C it reads whatever memory happens to be there, and the program carries on. Half of learning C is learning which things are your job now.
+
+## The build pipeline
+
+A C program goes through four stages. `gcc` runs them all for you:
+
+1. **Preprocess**: handle `#include` and `#define` (pure text substitution). `gcc -E main.c` shows the result.
+2. **Compile**: C to assembly, one `.c` file at a time. Each file is a *translation unit* and is compiled knowing nothing about the others.
+3. **Assemble**: assembly to an object file (`.o`).
+4. **Link**: glue the object files and libraries into an executable. "undefined reference to `foo`" is a linker error: something was declared but never defined.
+
+On your own machine:
+
+```text
+gcc -std=c17 -Wall -Wextra -g main.c -o main
+./main
+```
+
+Always use `-Wall -Wextra`. C compilers accept a lot of dubious code silently unless you ask for warnings.
+
+## Hello, world, dissected
+
+```c
+#include <stdio.h>   // declarations for printf, puts, scanf, FILE...
+
+int main(void) {     // (void) means "no parameters"; () means "unspecified" in older C
+    printf("Hello, %s! %d + %d = %d\n", "C", 2, 3, 2 + 3);
+    return 0;        // exit code: 0 means success
+}
+```
+
+- `#include <stdio.h>` pastes in the header text. Headers mostly contain *declarations*: they tell the compiler that `printf` exists and what its signature is. The code itself lives in the C library, which the linker adds.
+- `main` returns an `int` that becomes the process's exit code. Reaching the end of `main` without `return` returns 0 (only `main` gets that special case).
+- There is no namespace, no class wrapping it. Functions are top level.
+
+## printf in five minutes
+
+`printf` takes a format string and a variable number of arguments. The compiler cannot fully check that they match (gcc warns with `-Wall`), and a mismatch is undefined behavior.
+
+| Specifier | Type | Example output |
+|---|---|---|
+| `%d` / `%i` | `int` | `-42` |
+| `%u` | `unsigned int` | `42` |
+| `%ld`, `%lld` | `long`, `long long` | `123456789012` |
+| `%zu` | `size_t` (result of `sizeof`) | `8` |
+| `%f`, `%.2f` | `double` (and `float`, which is promoted) | `3.141593`, `3.14` |
+| `%e`, `%g` | `double`, scientific / shortest | `3.141593e+00`, `3.14159` |
+| `%c` | `char` (passed as `int`) | `A` |
+| `%s` | `char *` string | `hello` |
+| `%p` | `void *` pointer | `0x7ffd5c3e1a2c` |
+| `%x`, `%X`, `%o` | `unsigned`, hex / octal | `ff`, `FF`, `377` |
+| `%%` | a literal percent sign | `%` |
+
+Width and flags go between the `%` and the letter: `%5d` pads to 5 columns on the left, `%-5d` pads on the right, `%05d` pads with zeros, `%8.3f` is 8 wide with 3 decimals, `%+d` always shows the sign.
+
+```c
+#include <stdio.h>
+
+int main(void) {
+    printf("[%5d] [%-5d] [%05d] [%+d]\n", 42, 42, 42, 42);
+    printf("[%8.3f] [%-8.2f] [%.0f]\n", 3.14159, 2.5, 2.5);
+    printf("[%x] [%X] [%#x] [%o]\n", 255, 255, 255, 8);
+    printf("[%10s] [%-10s] [%.3s]\n", "right", "left", "truncate");
+    printf("[%c%c%c] [%%]\n", 'C', 'a', 't');
+    return 0;
+}
+```
+
+`puts("text")` prints a string plus a newline. `putchar('x')` prints one character.
+
+## Reading input
+
+`scanf` is the mirror of `printf`, but it needs *addresses* of the variables to fill in, hence the `&`. It returns how many items it successfully read, which is how you detect bad input or end of file.
+
+```c
+#include <stdio.h>
+
+int main(void) {
+    int a, b;
+    if (scanf("%d %d", &a, &b) != 2) {
+        printf("expected two numbers\n");
+        return 1;
+    }
+    printf("%d\n", a + b);
+    return 0;
+}
+```
+
+In the playground, type input into the **stdin** box. We will cover `scanf`'s many traps and safer alternatives (`fgets` + `sscanf`/`strtol`) in the I/O chapter.
+
+## Declare before use
+
+The compiler reads top to bottom. A function must be *declared* before it is called. Either define it above `main`, or write a *prototype* first:
+
+```c
+#include <stdio.h>
+
+int square(int x);           // prototype (declaration)
+
+int main(void) {
+    printf("%d\n", square(7));
+    return 0;
+}
+
+int square(int x) {          // definition
+    return x * x;
+}
+```
+
+## How this site runs your code
+
+Your code is sent to the [Compiler Explorer](https://godbolt.org) API (with [Wandbox](https://wandbox.org) as a fallback) and compiled with gcc as:
+
+```text
+gcc -std=c17 -Wall -Wextra -g -O0 -fsanitize=address,undefined
+```
+
+The `-fsanitize` part turns on **AddressSanitizer** and **UndefinedBehaviorSanitizer**. They add runtime checks so that many silent C bugs (buffer overruns, use after free, signed overflow, leaks) crash loudly with a report instead. Real C programmers use them constantly during development; so will you. You can switch them off in the settings to see what "normal" C does with your bug.
+
+There are two kinds of exercise:
+
+- **Program** exercises: write a whole program. It is run with the given stdin and its output must match exactly (trailing spaces ignored).
+- **Function** exercises: write one or more functions. Hidden test code (you can view it) calls them and checks the results. You may keep a `main` of your own for experimenting; it is renamed out of the way when the tests run.
+
+Shortcuts: **Ctrl+Enter** runs, **Ctrl+Shift+Enter** checks against the tests.
+
+=== exercise hello
+title: Hello, C
+--- prompt
+Print exactly `Hello, C!` followed by a newline.
+--- starter
+#include <stdio.h>
+
+int main(void) {
+    // your code here
+    return 0;
+}
+--- solution
+#include <stdio.h>
+
+int main(void) {
+    printf("Hello, C!\n");
+    return 0;
+}
+--- test
+--- out
+Hello, C!
+
+=== exercise table
+title: Formatted table
+--- prompt
+Print this table exactly, using `printf` width and precision specifiers rather than typing the spaces by hand. Names are left aligned in 8 columns, quantities right aligned in 4, prices right aligned in 8 with 2 decimals.
+
+```text
+apple   |   3|    0.50
+banana  |  12|    0.25
+cherry  | 100|   12.00
+```
+
+The data is already in the starter as arrays.
+--- starter
+#include <stdio.h>
+
+int main(void) {
+    const char *names[] = {"apple", "banana", "cherry"};
+    int qty[] = {3, 12, 100};
+    double price[] = {0.5, 0.25, 12.0};
+
+    for (int i = 0; i < 3; i++) {
+        // print one row
+    }
+    return 0;
+}
+--- solution
+#include <stdio.h>
+
+int main(void) {
+    const char *names[] = {"apple", "banana", "cherry"};
+    int qty[] = {3, 12, 100};
+    double price[] = {0.5, 0.25, 12.0};
+
+    for (int i = 0; i < 3; i++) {
+        printf("%-8s|%4d|%8.2f\n", names[i], qty[i], price[i]);
+    }
+    return 0;
+}
+--- hint
+`%-8s` left aligns a string in 8 columns.
+--- hint
+`%8.2f` is 8 columns wide with 2 digits after the decimal point.
+--- test
+--- out
+apple   |   3|    0.50
+banana  |  12|    0.25
+cherry  | 100|   12.00
+
+=== exercise arith
+title: Integer arithmetic
+--- prompt
+Read two integers `a` and `b` from stdin (`b` is never 0). Print four lines: `a + b`, `a - b`, `a * b`, then `a / b` and `a % b` separated by a space.
+
+For input `17 5`:
+
+```text
+22
+12
+85
+3 2
+```
+
+Note what C does with negative numbers: integer division truncates toward zero, and `%` takes the sign of the left operand. That matches C#, not Python.
+--- starter
+#include <stdio.h>
+
+int main(void) {
+    int a, b;
+    // read a and b, then print
+    return 0;
+}
+--- solution
+#include <stdio.h>
+
+int main(void) {
+    int a, b;
+    if (scanf("%d %d", &a, &b) != 2) return 1;
+    printf("%d\n%d\n%d\n%d %d\n", a + b, a - b, a * b, a / b, a % b);
+    return 0;
+}
+--- test
+17 5
+--- out
+22
+12
+85
+3 2
+--- test
+-17 5
+--- out
+-12
+-22
+-85
+-3 -2
+--- test
+7 -2
+--- out
+5
+9
+-14
+-3 1
+
+=== exercise exitcode
+title: Exit codes
+--- prompt
+Read an integer `n` from stdin. If it is even, print `even` and exit with code 0. If it is odd, print `odd` and exit with code 1.
+
+The exit code is what `main` returns. Shells use it: `./prog && echo ok` only prints `ok` on 0.
+--- starter
+#include <stdio.h>
+
+int main(void) {
+    int n;
+    scanf("%d", &n);
+    return 0;
+}
+--- solution
+#include <stdio.h>
+
+int main(void) {
+    int n;
+    if (scanf("%d", &n) != 1) return 2;
+    if (n % 2 == 0) {
+        puts("even");
+        return 0;
+    }
+    puts("odd");
+    return 1;
+}
+--- test
+10
+--- out
+even
+--- test
+7
+--- out
+odd
+--- exit
+1
+
+=== exercise funcs
+title: Your first function exercise
+--- prompt
+This one is a **function** exercise: there is no `main` to write. Hidden tests call your functions; click **Tests** to see them.
+
+Write:
+
+- `int add(int a, int b)` returning the sum.
+- `double average(int a, int b)` returning the exact average, so `average(1, 2)` is `1.5`.
+
+Watch out: `(a + b) / 2` with two `int`s is integer division. Convert to `double` first.
+--- starter
+int add(int a, int b) {
+    return 0;
+}
+
+double average(int a, int b) {
+    return 0;
+}
+--- solution
+int add(int a, int b) {
+    return a + b;
+}
+
+double average(int a, int b) {
+    return ((double)a + b) / 2;
+}
+--- harness
+int main(void) {
+    CHECK_INT(add(2, 3), 5);
+    CHECK_INT(add(-4, 4), 0);
+    CHECK_DBL(average(1, 2), 1.5);
+    CHECK_DBL(average(-3, 0), -1.5);
+    CHECK_DBL(average(2000000000, 2000000000), 2000000000.0);
+    return TEST_END();
+}
+--- hint
+`(double)a` converts before the addition, so the addition and division happen in floating point. That also avoids `int` overflow in the last test.
+
+=== quiz
+run: yes
+--- q
+What does this print?
+--- code
+#include <stdio.h>
+
+int main(void) {
+    printf("%d %d\n", 7 / 2, -7 / 2);
+    return 0;
+}
+--- choice
+3 -4
+--- answer
+3 -3
+--- choice
+3.5 -3.5
+--- choice
+4 -4
+--- explain
+Integer division truncates toward zero in C (since C99), so `-7 / 2` is `-3`. Python would give `-4`.
+
+=== quiz
+run: yes
+--- q
+What does this print?
+--- code
+#include <stdio.h>
+
+int main(void) {
+    printf("[%5.1f][%-4d][%03d]\n", 3.14159, 7, 7);
+    return 0;
+}
+--- answer
+[  3.1][7   ][007]
+--- choice
+[3.1  ][   7][007]
+--- choice
+[3.14159][7][7]
+--- choice
+[ 3.1][7   ][700]
+--- explain
+`%5.1f`: 5 wide, 1 decimal, right aligned. `%-4d`: left aligned in 4. `%03d`: zero padded to 3.
+
+=== quiz
+--- q
+You get `undefined reference to 'parse_config'` when building. Which stage failed?
+--- choice
+Preprocessing
+--- choice
+Compiling
+--- answer
+Linking
+--- choice
+Running
+--- explain
+The compiler was happy because a declaration (prototype) existed. The linker could not find any object file or library that actually *defines* `parse_config`.
+
+=== quiz
+run: yes
+--- q
+What does this print?
+--- code
+#include <stdio.h>
+
+int main(void) {
+    double d = 10 / 4;
+    printf("%.2f\n", d);
+    return 0;
+}
+--- choice
+2.50
+--- answer
+2.00
+--- choice
+2
+--- choice
+3.00
+--- explain
+`10 / 4` is evaluated as `int` division first (giving `2`), then converted to `double`. The type of the variable you assign to does not affect how the right-hand side is computed. Write `10.0 / 4`.
