@@ -1108,7 +1108,7 @@ typedef struct {
 } Pool;
 ```
 
-- `size_t pool_init(Pool *p, void *mem, size_t mem_size, size_t block_size)`: round `block_size` up to a multiple of `alignof(max_align_t)` (16 here); a `block_size` smaller than that becomes 16. The first block starts at the first suitably aligned address at or after `mem`. Make as many whole blocks as fit in the buffer and return that number (possibly 0).
+- `size_t pool_init(Pool *p, void *mem, size_t mem_size, size_t block_size)`: round `block_size` up to a multiple of 16; a `block_size` smaller than that becomes 16. (16 is `alignof(max_align_t)` on x86-64 Linux, enough for any type. Apple arm64 reports 8, so the pool fixes 16 to get the same layout everywhere.) The first block starts at the first suitably aligned address at or after `mem`. Make as many whole blocks as fit in the buffer and return that number (possibly 0).
 - `void *pool_alloc(Pool *p)`: a free block, or `NULL` if none. Initially blocks come out in increasing address order.
 - `bool pool_free(Pool *p, void *block)`: return `block` to the pool. Return `false` and do nothing for `NULL` or for a pointer that is not the start of one of this pool's blocks. The most recently freed block is the next one allocated (LIFO).
 - `size_t pool_available(const Pool *p)`.
@@ -1181,7 +1181,7 @@ static void set_next(void *block, void *next) {
 }
 
 size_t pool_init(Pool *p, void *mem, size_t mem_size, size_t block_size) {
-    const size_t a = alignof(max_align_t);
+    const size_t a = 16;  /* alignof(max_align_t) on x86-64 Linux; fixed so every platform gets the same layout */
     if (block_size < a) block_size = a;
     block_size = (block_size + a - 1) & ~(a - 1);
     uintptr_t m = (uintptr_t)mem;

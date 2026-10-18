@@ -1,14 +1,14 @@
 # The Procedural World engine (C, native WebGPU)
 
-The `world` course (`content/world/`) is one continuous project: a procedural, high-detail open world in C on native WebGPU (Dawn by default, wgpu-native optional; both implement `webgpu.h`), with SDL3 for windows and input. The project lives in [world/](world/) (see its README). Lessons are on the course site. Each chapter has:
+The `world` course (`content/world/`) is one continuous project: a procedural, high-detail open world in C on native WebGPU (Dawn by default, wgpu-native optional; both implement `webgpu.h`), with SDL3 for windows and input. The project lives in [world/](world/) (see its README). The lesson text (`content/world/`) is not in this repo yet. Each chapter has:
 
-- **online exercises**: CPU-side C (math, noise, terrain functions, meshing, placement, culling math, controller physics, ...) compiled on the site with gcc + sanitizers and checked by tests. A chapter's `lib:` header names the engine headers it introduces (e.g. `lib: wmath.h noise.h`); every later chapter's exercises get them prepended, so exercises build on the engine. These headers are the same files the native engine uses.
-- **local steps** (`--- local` field, "Mark as done" on the site): GPU and integration work in `world/`: write WGSL, wire pipelines, run the chapter demo (`apps/NN-name.c`) and the headless tests (`./build/world_tests NAME`). Starters with TODOs go in `world/exercises/NN-name/`; the finished reference is in `engine/`, `shaders/` and `apps/`.
+- **exercises**: CPU-side C (math, noise, terrain functions, meshing, placement, culling math, controller physics, ...) compiled with gcc + sanitizers and checked by tests. A chapter's `lib:` header names the engine headers it introduces (e.g. `lib: wmath.h noise.h`); every later chapter's exercises get them prepended, so exercises build on the engine. These headers are the same files the native engine uses.
+- **local steps** (`--- local` field): GPU and integration work in `world/`: write WGSL, wire pipelines, run the chapter demo (`apps/NN-name.c`) and the headless tests (`./build/world_tests NAME`). Starters with TODOs go in `world/exercises/NN-name/`; the finished reference is in `engine/`, `shaders/` and `apps/`.
 
 ## Conventions
 
 - C17, `-Wall -Wextra` clean, ASan/UBSan clean (`-DWORLD_SANITIZE=ON`).
-- **CPU modules** are single headers in `world/engine/` with only `static inline` functions and types (no `static` non-inline functions: unused ones warn), no GPU dependency, including only standard headers and other CPU module headers via `#include "x.h"`. They must compile when concatenated in chapter order into one file (the site does that). Each starts with a comment listing its API.
+- **CPU modules** are single headers in `world/engine/` with only `static inline` functions and types (no `static` non-inline functions: unused ones warn), no GPU dependency, including only standard headers and other CPU module headers via `#include "x.h"`. They must compile when concatenated in chapter order into one file (exercise checking does that). Each starts with a comment listing its API.
 - **GPU modules** are `name.h` + `name.c` using `gpu.h`; added to the `engine` library in `world/CMakeLists.txt`.
 - Shaders in `world/shaders/*.wgsl`; shared WGSL snippets are included by `gpu_shader_file` (`//#include "noise.wgsl"` lines, added in chapter 01).
 - Coordinates: meters, right-handed, **Y up**, camera looks down **-Z** in view space. Matrices column-major `float[16]` matching WGSL `mat4x4f`. WebGPU clip depth 0..1, **reversed-Z** (depth32float, clear 0, `Greater`) from chapter 03.

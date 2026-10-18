@@ -19,11 +19,13 @@ if(WORLD_WEBGPU STREQUAL "DAWN" AND WORLD_DAWN_BUILD)
 
 elseif(WORLD_WEBGPU STREQUAL "DAWN")
   set(WORLD_WEBGPU_DEFINE WORLD_WEBGPU_DAWN)
-  # Pinned Dawn release. Dependencies are fetched by Dawn's own script on first configure.
+  # Pinned Dawn release. Dependencies are fetched by Dawn's own script on first configure, so skip git
+  # submodules: FetchContent would otherwise clone all of them recursively (tens of GB, some need git-lfs).
   FetchContent_Declare(dawn
     GIT_REPOSITORY https://github.com/google/dawn
     GIT_TAG v20261016.190333
-    GIT_SHALLOW TRUE)
+    GIT_SHALLOW TRUE
+    GIT_SUBMODULES "")
   set(DAWN_FETCH_DEPENDENCIES ON CACHE BOOL "" FORCE)
   set(DAWN_BUILD_MONOLITHIC_LIBRARY SHARED CACHE STRING "" FORCE)
   set(DAWN_BUILD_SAMPLES OFF CACHE BOOL "" FORCE)

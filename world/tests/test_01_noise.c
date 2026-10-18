@@ -167,8 +167,11 @@ TEST(noise_gpu_parity) {
     }
     CHECK(hash_mismatch == 0);
     for (int k = 1; k < PARITY_OUT; k++) {
-        if (getenv("NOISE_VERBOSE") || worst[k] > 1e-3) printf("  output %d differs by %g\n", k, worst[k]);
-        CHECK(worst[k] <= 1e-3);
+        // Noise outputs are unit-scale. Terrain height (k = 9) is in meters, sampled at tens of km where a
+        // float32 step is already ~4 mm, and GPUs fuse multiply-adds differently from the CPU: scale its tolerance.
+        double tol = k == 9 ? 1e-4 * tp.height : 1e-3;
+        if (getenv("NOISE_VERBOSE") || worst[k] > tol) printf("  output %d differs by %g\n", k, worst[k]);
+        CHECK(worst[k] <= tol);
     }
     free(o);
     wgpuCommandBufferRelease(cb);

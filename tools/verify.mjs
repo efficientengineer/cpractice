@@ -3,10 +3,9 @@
 import fs from 'fs'; import vm from 'vm'; import { execFileSync, spawnSync } from 'child_process'; import os from 'os'; import path from 'path';
 const root = path.dirname(path.dirname(new URL(import.meta.url).pathname));
 const ctx = { window: {}, COURSE: [] }; ctx.globalThis = ctx; vm.createContext(ctx);
-vm.runInContext(fs.readFileSync(root + '/js/manifest.js', 'utf8'), ctx);
-vm.runInContext(fs.readFileSync(root + '/js/assemble.js', 'utf8'), ctx);
-vm.runInContext(fs.readFileSync(root + '/js/format.js', 'utf8'), ctx);
-vm.runInContext(fs.readFileSync(root + '/js/format.js', 'utf8'), ctx);
+vm.runInContext(fs.readFileSync(root + '/tools/lib/manifest.js', 'utf8'), ctx);
+vm.runInContext(fs.readFileSync(root + '/tools/lib/assemble.js', 'utf8'), ctx);
+vm.runInContext(fs.readFileSync(root + '/tools/lib/format.js', 'utf8'), ctx);
 const A = ctx.window.Assemble;
 // Usage: node tools/verify.mjs [prefix]  (C course)  |  node tools/verify.mjs world [prefix]
 const worldMode = process.argv[2] === 'world';
@@ -29,14 +28,18 @@ for (const f of course.files) {
 const withLibs = (ch, code) => ch.libs.length
   ? A.cLibs(ch.libs, ch.libs.map(n => fs.readFileSync(`${root}/${course.libDir}${n}`, 'utf8'))) + code : code;
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'cv-'));
-const FLAGS = ['-std=c17', '-Wall', '-Wextra', '-g', '-O0', '-fsanitize=address,undefined', '-fno-omit-frame-pointer'];
+// On macOS "gcc" is clang, which warns about unused static inline functions in the main file and about
+// sprintf being deprecated (Apple's SDK); gcc does neither.
+const isClang = /clang/.test(spawnSync('gcc', ['--version'], { encoding: 'utf8' }).stdout || '');
+const FLAGS = ['-std=c17', '-Wall', '-Wextra', '-g', '-O0', '-fsanitize=address,undefined', '-fno-omit-frame-pointer',
+  ...(isClang ? ['-Wno-unused-function', '-Wno-deprecated-declarations'] : [])];
 let n = 0;
 function run(src, stdin = '', extra = []) {
   const c = `${tmp}/t${n++}.c`, exe = c.replace(/\.c$/, '');
   fs.writeFileSync(c, src);
   const b = spawnSync('gcc', [...FLAGS, ...extra, c, '-o', exe, '-lm'], { encoding: 'utf8' });
   if (b.status !== 0) return { didExecute: false, build: b.stderr, exit: -1, stdout: '', stderr: '' };
-  const r = spawnSync(exe, [], { input: stdin, encoding: 'utf8', timeout: 10000, env: { ...process.env, ASAN_OPTIONS: 'detect_leaks=1' } });
+  const r = spawnSync(exe, [], { input: stdin, encoding: 'utf8', timeout: 10000, env: { ...process.env, ASAN_OPTIONS: `detect_leaks=${process.platform === 'darwin' ? 0 : 1}` } });
   return { didExecute: true, build: b.stderr, exit: r.status, stdout: r.stdout, stderr: r.stderr };
 }
 let fails = 0, exs = 0, qs = 0; const ids = new Set();
