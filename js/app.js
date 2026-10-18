@@ -33,16 +33,35 @@
   }
 
   // ---------- output ----------
+  // A C program that prints an ASCII PNM image (P2 grayscale / P3 color) gets it drawn as a picture.
+  function pnm(text) {
+    const m = text.match(/^\s*(P[23])\s/);
+    if (!m) return null;
+    const t = text.replace(/#[^\n]*/g, '').trim().split(/\s+/);
+    const w = +t[1], h = +t[2], max = +t[3] || 255, ch = m[1] === 'P3' ? 3 : 1;
+    if (!(w > 0 && h > 0) || t.length < 4 + w * h * ch) return null;
+    const c = document.createElement('canvas'); c.width = w; c.height = h; c.className = 'pnm';
+    const ctx = c.getContext('2d'), img = ctx.createImageData(w, h);
+    for (let i = 0, k = 4; i < w * h; i++) {
+      for (let j = 0; j < 3; j++) img.data[i * 4 + j] = 255 * +t[ch === 3 ? k + j : k] / max;
+      img.data[i * 4 + 3] = 255; k += ch;
+    }
+    ctx.putImageData(img, 0, 0);
+    return c;
+  }
   function showResult(out, res, extraHtml = '') {
     let h = '';
+    const image = res.didExecute && pnm(res.stdout);
     if (res.build.trim()) h += `<div class="label">compiler</div><pre class="build">${esc(res.build)}</pre>`;
     if (!res.didExecute) h += `<div class="status bad">Build failed</div>`;
     else {
-      h += `<div class="label">stdout</div><pre class="stdout">${esc(res.stdout) || '<span class="muted">(empty)</span>'}</pre>`;
+      if (image) h += `<div class="label">image (${image.width}×${image.height})</div><div class="pnmhost"></div><details><summary class="muted small">raw stdout</summary><pre class="stdout">${esc(res.stdout.slice(0, 20000))}</pre></details>`;
+      else h += `<div class="label">stdout</div><pre class="stdout">${esc(res.stdout) || '<span class="muted">(empty)</span>'}</pre>`;
       if (res.stderr.trim()) h += `<div class="label">stderr</div><pre class="stderr">${esc(res.stderr)}</pre>`;
       h += `<div class="status ${res.exit === 0 ? '' : 'bad'}">exit code ${res.exit}${res.timedOut ? ' (timed out)' : ''}</div>`;
     }
     out.innerHTML = extraHtml + h + `<div class="backend muted">${esc(res.backend)}</div>`;
+    if (image) out.querySelector('.pnmhost').appendChild(image);
   }
   // Runs code for the current course. For WebGPU a fresh canvas is created in canvasHost.
   // Runs code for the current course. JS/WebGPU code that mentions `canvas` gets a fresh canvas

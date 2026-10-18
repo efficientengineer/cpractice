@@ -1,0 +1,977 @@
+=== chapter collections
+title: Collections, iterators and generators
+blurb: Map versus object, Set and set operations, WeakMap and WeakRef, the iteration protocol, writing iterables, generators for lazy and infinite sequences, and generators as game coroutines.
+--- body
+## Map: the real dictionary
+
+Plain objects work as string-keyed dictionaries, but `Map` is the purpose-built one, the `Dictionary<TKey, TValue>` of JavaScript:
+
+| | plain object | `Map` |
+|---|---|---|
+| Key types | strings and symbols (numbers become strings) | **any value**: numbers, objects, functions, `NaN` |
+| Inherited keys | yes (`'toString' in {}` is true) | none |
+| Order | integer keys first, then insertion | insertion order, always |
+| Size | `Object.keys(o).length` (O(n)) | `map.size` |
+| Iteration | via `Object.entries` | directly iterable: `for (const [k, v] of map)` |
+| Frequent add/delete | slow (shape changes, dictionary mode) | designed for it |
+| JSON | native | needs conversion (`Object.fromEntries(map)`) |
+
+```js
+const entities = new Map();
+entities.set(101, { name: 'player', hp: 10 })
+        .set(102, { name: 'slime', hp: 3 });           // set returns the map: chainable
+const player = entities.get(101);
+console.log(entities.size, entities.has(102), entities.get(999), player.name);
+entities.delete(102);
+
+const sprite = { file: 'hero.png' };
+const meta = new Map([[sprite, { frames: 8 }], [NaN, 'not a number'], ['1', 'string one'], [1, 'number one']]);
+console.log(meta.get(sprite).frames, meta.get(NaN), meta.get(1), meta.get('1'));
+
+for (const [id, e] of entities) console.log(id, e.name);
+console.log([...meta.keys()].length, Object.fromEntries(entities), new Map(Object.entries({ a: 1 })));
+```
+
+Use a plain object for records with a fixed set of known fields (an entity, a config). Use a `Map` for lookups keyed by data: id to entity, tile to state, object to metadata.
+
+> **Performance:** a Map keyed by numbers is fast. A Map (or object) keyed by strings you build per lookup, like `` grid.get(`${x},${y}`) ``, allocates a string and hashes it on every access: in a pathfinding inner loop that dominates the run time. Pack coordinates into a number instead (`y * width + x`, or `x * 65536 + y` for unbounded maps with small coordinates), or, for a bounded grid, skip the Map entirely and use a flat array.
+
+Object keys in a Map are compared by **identity**. Two different `{ x: 1, y: 2 }` objects are two different keys, unlike C# records or tuples with value equality. That's another reason to use numeric or string keys for coordinates.
+
+## Set
+
+`Set` is `HashSet<T>`: unique values, SameValueZero equality, insertion order.
+
+```js
+const visited = new Set();
+visited.add(5).add(7).add(5);
+console.log(visited.size, visited.has(7), [...visited]);
+
+// de-duplicate preserving order
+console.log([...new Set(['fire', 'ice', 'fire', 'poison', 'ice'])]);
+
+const a = new Set(['fire', 'ice', 'poison']), b = new Set(['ice', 'stun']);
+// ES2025 set methods: return new sets, don't mutate
+console.log(a.union(b), a.intersection(b), a.difference(b), a.symmetricDifference(b));
+console.log(new Set(['ice']).isSubsetOf(a), a.isDisjointFrom(new Set(['holy'])));
+```
+
+On older engines without the set methods, `new Set([...a].filter(x => b.has(x)))` is the intersection idiom.
+
+The `keys` global on this site, the keys currently held down, is a `Set` of key codes, so `keys.has('ArrowLeft')` is how a game's update reads input. One of the exercises builds "just pressed this frame" on top of it.
+
+## WeakMap, WeakSet, WeakRef (briefly)
+
+A `WeakMap` holds its keys (which must be objects) **weakly**: if nothing else references a key object, it can be garbage collected and its entry vanishes. That makes it the right tool for attaching data to objects you don't own without leaking them, like C#'s `ConditionalWeakTable`.
+
+```js
+const bounds = new WeakMap();      // cache computed per entity, dies with the entity
+function getBounds(e) {
+  let b = bounds.get(e);
+  if (!b) { b = { w: e.sprite.length * 8, h: 8 }; bounds.set(e, b); }
+  return b;
+}
+const orc = { sprite: 'orc' };
+console.log(getBounds(orc), getBounds(orc) === getBounds(orc));
+```
+
+WeakMaps aren't iterable and have no `size` (their contents depend on when GC runs). `WeakSet` is the set version ("have I processed this object?"). `WeakRef` holds a single object weakly (`ref.deref()` returns it or `undefined`), and `FinalizationRegistry` runs a callback after an object is collected. Both are for caches and resource cleanup at the edges, and GC timing is unpredictable, so don't put game logic on them.
+
+## The iteration protocol
+
+`for...of`, spread, destructuring, `Array.from`, `new Map(iterable)`, `Promise.all` and more all work on **iterables**. The protocol is two small interfaces, like C#'s `IEnumerable<T>`/`IEnumerator<T>`:
+
+- An **iterable** has a method under the key `Symbol.iterator` that returns an iterator.
+- An **iterator** has `next()` returning `{ value, done }`. Optionally `return()`, called when the consumer stops early (`break`, `throw`, destructuring that doesn't read everything).
+
+```js
+const countdown = {
+  from: 3,
+  [Symbol.iterator]() {
+    let n = this.from;
+    return {
+      next: () => (n > 0 ? { value: n--, done: false } : { value: undefined, done: true }),
+      return: () => { console.log('(cleanup)'); return { done: true }; },
+    };
+  },
+};
+console.log([...countdown]);
+for (const n of countdown) { if (n === 2) break; console.log('tick', n); }
+const [first] = countdown;
+console.log(first);
+```
+
+Arrays, strings, Maps, Sets, typed arrays, `arguments`, and the `keys()`/`values()`/`entries()` results are all iterable. Plain objects are **not** (`for (const x of {})` throws); use `Object.entries`.
+
+A Map or Set iterator is *live*: entries added during iteration are visited, deleted ones aren't. Deleting the current entry while iterating a Map is safe (unlike C#'s "collection was modified" exception).
+
+## Generators
+
+Writing iterators by hand is tedious. A **generator function** (`function*`) returns an iterator whose body runs lazily: each `next()` resumes execution until the next `yield`. This is exactly C#'s `yield return`.
+
+```js
+function* range(start, end, step = 1) {
+  for (let i = start; step > 0 ? i < end : i > end; i += step) yield i;
+}
+console.log([...range(0, 5)], [...range(10, 0, -4)]);
+
+function* naturals() { let n = 0; while (true) yield n++; }    // infinite: fine, it's lazy
+
+function* take(iterable, n) {
+  if (n <= 0) return;
+  for (const x of iterable) { yield x; if (--n <= 0) return; }
+}
+function* mapIt(iterable, f) { for (const x of iterable) yield f(x); }
+function* filterIt(iterable, p) { for (const x of iterable) if (p(x)) yield x; }
+
+const squaresOfOdds = mapIt(filterIt(naturals(), n => n % 2), n => n * n);
+console.log([...take(squaresOfOdds, 5)]);
+```
+
+Nothing runs until something pulls. `take` stops pulling after `n` items, so the infinite `naturals()` only ever produces what's needed. When `take` returns, `for...of` calls `return()` on the inner generator, which finishes it.
+
+### yield*, return values, and two-way communication
+
+```js
+function* waves() {
+  yield* ['slime', 'slime'];          // delegate to another iterable
+  yield* bossWave();                  // or another generator
+  return 'victory';                   // becomes { value: 'victory', done: true }, ignored by for...of
+}
+function* bossWave() { yield 'troll'; yield 'dragon'; }
+console.log([...waves()]);
+
+const it = waves();
+let r;
+while (!(r = it.next()).done) {}
+console.log(r);
+
+function* accumulator() {
+  let total = 0;
+  while (true) {
+    const x = yield total;            // next(x) sends a value in; yield returns it
+    total += x;
+  }
+}
+const acc = accumulator();
+acc.next();                           // run to the first yield
+console.log(acc.next(5).value, acc.next(10).value);
+```
+
+### Iterator helpers (ES2025)
+
+Modern engines put `map`, `filter`, `take`, `drop`, `flatMap`, `reduce`, `toArray`, `some`, `every`, `find`, `forEach` directly on iterators: LINQ-style lazy chaining without writing the generators yourself.
+
+```js
+function* naturals() { let n = 1; while (true) yield n++; }
+console.log(naturals().filter(n => n % 3 === 0).map(n => n * 10).take(4).toArray());
+const m = new Map([['a', 1], ['b', 2], ['c', 3]]);
+console.log(m.values().map(v => v * 2).toArray(), m.keys().find(k => k > 'a'));
+```
+
+### Generators as coroutines
+
+The killer game use: a generator can **pause in the middle of a function** and resume later, which makes scripted sequences (cutscenes, enemy patterns, tutorials) read top to bottom instead of as a state machine. Unity's coroutines (`IEnumerator` plus `yield return new WaitForSeconds(1)`) are exactly this, built on C#'s iterators.
+
+```js
+function* guardPatrol(guard) {
+  while (true) {
+    guard.say = 'walking right';
+    for (let i = 0; i < 3; i++) { guard.x++; yield; }      // one step per frame
+    guard.say = 'looking around';
+    yield 2;                                                 // convention here: yield n = wait n frames
+    guard.x -= 3;
+  }
+}
+const guard = { x: 0, say: '' };
+const co = guardPatrol(guard);
+let wait = 0;
+for (let frame = 0; frame < 8; frame++) {                    // the game loop
+  if (wait > 0) { wait--; } else { wait = co.next().value ?? 0; }
+  console.log(frame, guard.x, guard.say);
+}
+```
+
+The scheduler is the four lines in the loop; the behaviour reads like a script. One exercise builds a proper scheduler with time-based waits.
+
+> **Performance:** iterators are an abstraction with a cost: each `next()` returns a result object and each generator resumption saves and restores a frame. Engines optimize `for...of` over plain arrays to roughly an indexed loop, but generator pipelines and iterator helpers are slower than a hand-written loop. Use them for readable setup code, AI scripts and sequences (a few per frame), not for the inner loop over 10,000 particles. Likewise `[...map.values()]` allocates an array: iterate the map directly when you only need to read.
+
+## Spread and for...of over anything iterable
+
+Because everything speaks one protocol, conversions are one-liners:
+
+```js
+const tiles = new Set([3, 1, 2]);
+const best = new Map([['ada', 30], ['bob', 50]]);
+function* gen() { yield 'x'; yield 'y'; }
+
+console.log([...tiles], Math.max(...tiles), [...best.keys()], [...'hey'], [...gen()]);
+console.log(Array.from(best, ([name, s]) => `${name}:${s}`), new Set(gen()), Object.fromEntries(best));
+const [[topName]] = [...best].sort((p, q) => q[1] - p[1]);
+console.log(topName);
+for (const [i, ch] of [...'ab'].entries()) console.log(i, ch);
+```
+
+=== exercise inventory
+title: Inventory with a Map
+--- prompt
+Write `class Inventory` backed by a `Map` from item name to quantity:
+
+- `add(item, qty = 1)`: adds; returns the new quantity. `qty` must be a positive integer, otherwise throw a `RangeError`.
+- `remove(item, qty = 1)`: removes if there are at least `qty`; returns `true`, or returns `false` and changes nothing if there aren't enough. When a count reaches 0, the item is deleted entirely.
+- `count(item)`: quantity, `0` if absent.
+- `get size()`: number of distinct items.
+- `get total()`: sum of all quantities.
+- Iterable: `for (const [item, qty] of inv)` yields entries in the order items were first added (an item removed completely and added again goes to the end).
+- `static from(entries)`: builds an inventory from any iterable of `[item, qty]` pairs (repeated items accumulate).
+
+Item names can be any value, including ones like `'constructor'` and `'__proto__'` that would break a plain-object implementation.
+--- starter
+class Inventory {
+  items = {};
+  add(item, qty = 1) { this.items[item] = (this.items[item] || 0) + qty; return this.items[item]; }
+  count(item) { return this.items[item] || 0; }
+}
+--- solution
+class Inventory {
+  #items = new Map();
+
+  add(item, qty = 1) {
+    if (!Number.isInteger(qty) || qty <= 0) throw new RangeError('qty must be a positive integer');
+    const n = (this.#items.get(item) ?? 0) + qty;
+    this.#items.set(item, n);
+    return n;
+  }
+
+  remove(item, qty = 1) {
+    const have = this.#items.get(item) ?? 0;
+    if (have < qty) return false;
+    if (have === qty) this.#items.delete(item);
+    else this.#items.set(item, have - qty);
+    return true;
+  }
+
+  count(item) { return this.#items.get(item) ?? 0; }
+  get size() { return this.#items.size; }
+  get total() {
+    let t = 0;
+    for (const q of this.#items.values()) t += q;
+    return t;
+  }
+  [Symbol.iterator]() { return this.#items.entries(); }
+
+  static from(entries) {
+    const inv = new Inventory();
+    for (const [item, qty] of entries) inv.add(item, qty);
+    return inv;
+  }
+}
+--- hint
+`[Symbol.iterator]() { return this.#map.entries(); }` makes the class iterable by delegating to the Map.
+--- hint
+Map preserves insertion order, and a deleted-then-re-added key goes to the end, which is exactly the required order.
+--- harness
+{
+  const inv = new Inventory();
+  eq(inv.add('potion', 3), 3);
+  eq(inv.add('sword'), 1);
+  eq(inv.add('potion', 2), 5);
+  eq([inv.count('potion'), inv.count('nothing'), inv.size, inv.total], [5, 0, 2, 6]);
+  eq(inv.remove('potion', 6), false, 'not enough');
+  eq(inv.count('potion'), 5, 'unchanged');
+  eq(inv.remove('potion', 5), true);
+  eq([inv.count('potion'), inv.size], [0, 1], 'deleted at 0');
+  eq(inv.remove('ghost'), false);
+  inv.add('potion');
+  eq([...inv], [['sword', 1], ['potion', 1]], 'readded item goes last');
+  throws(() => inv.add('x', 0), 'zero qty');
+  throws(() => inv.add('x', -2), 'negative qty');
+  throws(() => inv.add('x', 1.5), 'fractional qty');
+  eq(inv.count('x'), 0);
+  const odd = new Inventory();
+  odd.add('constructor'); odd.add('__proto__', 2); odd.add('toString');
+  eq([odd.count('constructor'), odd.count('__proto__'), odd.count('toString'), odd.count('hasOwnProperty')], [1, 2, 1, 0], 'tricky names');
+  const key = { id: 1 };
+  odd.add(key, 4);
+  eq(odd.count(key), 4, 'object keys');
+  eq(odd.count({ id: 1 }), 0, 'by identity');
+  const f = Inventory.from([['a', 1], ['b', 2], ['a', 3]]);
+  check(f instanceof Inventory, 'from returns an Inventory');
+  eq([...f], [['a', 4], ['b', 2]]);
+  function* gen() { yield ['g', 1]; yield ['g', 1]; }
+  eq(Inventory.from(gen()).count('g'), 2, 'from takes any iterable');
+  eq(new Inventory().total, 0);
+  const fromMap = new Map(f);
+  eq(fromMap.get('a'), 4, 'spreadable into a Map');
+}
+
+=== exercise input
+title: Just pressed, just released
+--- prompt
+Game input needs edges, not just state: jump when Space *goes down*, not every frame it's held. Write `class InputTracker`:
+
+- `update(held)`: called once per frame with the set of currently held key codes (an iterable; on this site you'd pass the global `keys`). It must **copy** what it needs, because the caller's Set keeps changing.
+- `pressed(code)`: true if `code` is held this frame but wasn't last frame.
+- `released(code)`: true if it was held last frame but isn't now.
+- `held(code)`: held this frame.
+- `get pressedKeys()`: an array of all codes pressed this frame, sorted.
+
+Before the first `update`, nothing is held. Each `update` should make the "current" state from the previous call become "previous".
+--- starter
+class InputTracker {
+  update(held) { this.now = held; }
+  held(code) { return this.now.has(code); }
+  pressed(code) { return this.held(code); }
+  released(code) { return false; }
+  get pressedKeys() { return []; }
+}
+--- solution
+class InputTracker {
+  #prev = new Set();
+  #cur = new Set();
+
+  update(held) {
+    const t = this.#prev;
+    this.#prev = this.#cur;
+    t.clear();                       // reuse the old set: no allocation per frame
+    for (const k of held) t.add(k);
+    this.#cur = t;
+  }
+  held(code) { return this.#cur.has(code); }
+  pressed(code) { return this.#cur.has(code) && !this.#prev.has(code); }
+  released(code) { return !this.#cur.has(code) && this.#prev.has(code); }
+  get pressedKeys() { return [...this.#cur].filter(k => !this.#prev.has(k)).sort(); }
+}
+--- hint
+Keep two Sets, previous and current. On `update`, current becomes previous, and the new current is filled from `held`.
+--- hint
+To avoid allocating a Set every frame, swap the two and `clear()` the old one before filling it.
+--- harness
+{
+  const t = new InputTracker();
+  check(!t.held('Space') && !t.pressed('Space') && !t.released('Space'), 'nothing before first update');
+  const keysNow = new Set(['Space']);
+  t.update(keysNow);
+  check(t.pressed('Space') && t.held('Space') && !t.released('Space'), 'frame 1: pressed');
+  keysNow.add('ArrowLeft');
+  check(!t.held('ArrowLeft'), 'copied, not referenced');
+  t.update(keysNow);
+  check(!t.pressed('Space') && t.held('Space'), 'frame 2: held, not pressed again');
+  check(t.pressed('ArrowLeft'), 'frame 2: left pressed');
+  keysNow.delete('Space');
+  t.update(keysNow);
+  check(t.released('Space') && !t.held('Space'), 'frame 3: released');
+  check(!t.pressed('ArrowLeft') && !t.released('ArrowLeft'), 'left still held');
+  t.update(keysNow);
+  check(!t.released('Space'), 'released only for one frame');
+  t.update(['KeyW', 'KeyA', 'ArrowLeft']);
+  eq(t.pressedKeys, ['KeyA', 'KeyW'], 'pressedKeys sorted, from an array');
+  t.update(new Set());
+  eq(t.pressedKeys, []);
+  check(t.released('KeyW') && t.released('ArrowLeft'), 'all released');
+  t.update(['KeyW']); t.update([]); t.update(['KeyW']);
+  check(t.pressed('KeyW'), 'tap, release, tap again');
+}
+
+=== exercise spatialHash
+title: Collisions with a spatial hash
+--- prompt
+Checking every pair of `n` objects for collisions is O(n²): 40,000 bullets means 800 million checks per frame. A **spatial hash** buckets objects by grid cell so each object is only tested against its neighbours.
+
+Write `findCollisions(circles, cellSize)` where `circles` is an array of `{ x, y, r }` (radius at most `cellSize / 2`). Return all pairs `[i, j]` (indexes into `circles`, `i < j`) whose circles overlap, meaning the distance between centres is **less than** `ri + rj`. Sort the pairs by `i`, then `j`.
+
+Approach: put each circle's index into the bucket for its cell, `Math.floor(x / cellSize)`, `Math.floor(y / cellSize)` (coordinates can be negative). Then for each circle, only test circles in the same and the 8 neighbouring cells. Use **numeric** bucket keys (for example `cx * 1e6 + cy` with a `Map`), not strings, and compare squared distances to avoid `Math.sqrt`.
+
+The tests include 40,000 circles that must be processed in under a second, which the O(n²) starter can't do.
+--- starter
+function findCollisions(circles, cellSize) {
+  const out = [];
+  for (let i = 0; i < circles.length; i++) {
+    for (let j = i + 1; j < circles.length; j++) {
+      const a = circles[i], b = circles[j];
+      if (Math.hypot(a.x - b.x, a.y - b.y) < a.r + b.r) out.push([i, j]);
+    }
+  }
+  return out;
+}
+--- solution
+function findCollisions(circles, cellSize) {
+  const grid = new Map();
+  const key = (cx, cy) => cx * 1e6 + cy;
+  for (let i = 0; i < circles.length; i++) {
+    const c = circles[i];
+    const k = key(Math.floor(c.x / cellSize), Math.floor(c.y / cellSize));
+    let bucket = grid.get(k);
+    if (!bucket) grid.set(k, (bucket = []));
+    bucket.push(i);
+  }
+  const out = [];
+  for (let i = 0; i < circles.length; i++) {
+    const a = circles[i];
+    const cx = Math.floor(a.x / cellSize), cy = Math.floor(a.y / cellSize);
+    const found = [];
+    for (let dx = -1; dx <= 1; dx++) {
+      for (let dy = -1; dy <= 1; dy++) {
+        const bucket = grid.get(key(cx + dx, cy + dy));
+        if (!bucket) continue;
+        for (const j of bucket) {
+          if (j <= i) continue;
+          const b = circles[j], ddx = a.x - b.x, ddy = a.y - b.y, rr = a.r + b.r;
+          if (ddx * ddx + ddy * ddy < rr * rr) found.push(j);
+        }
+      }
+    }
+    found.sort((p, q) => p - q);
+    for (const j of found) out.push([i, j]);
+  }
+  return out;
+}
+--- hint
+Two passes: first fill the buckets (`Map` from numeric cell key to an array of indexes), then for each circle scan the 3x3 block of cells around its own.
+--- hint
+Only report `j > i` to avoid duplicates and self-pairs. Collect each `i`'s matches, sort them, then push the pairs, and the overall result comes out sorted.
+--- hint
+`cx * 1e6 + cy` is unique as long as `|cy| < 500000`, and negative cells work because it's plain arithmetic, not bit packing.
+--- harness
+{
+  const brute = (cs) => {
+    const out = [];
+    for (let i = 0; i < cs.length; i++) for (let j = i + 1; j < cs.length; j++) {
+      const a = cs[i], b = cs[j];
+      if ((a.x - b.x) ** 2 + (a.y - b.y) ** 2 < (a.r + b.r) ** 2) out.push([i, j]);
+    }
+    return out;
+  };
+  eq(findCollisions([], 10), []);
+  eq(findCollisions([{ x: 0, y: 0, r: 1 }], 10), []);
+  eq(findCollisions([{ x: 0, y: 0, r: 1 }, { x: 1.5, y: 0, r: 1 }], 10), [[0, 1]]);
+  eq(findCollisions([{ x: 0, y: 0, r: 1 }, { x: 2, y: 0, r: 1 }], 10), [], 'touching is not overlapping');
+  eq(findCollisions([{ x: -0.5, y: -0.5, r: 2 }, { x: 0.5, y: 0.5, r: 2 }], 4), [[0, 1]], 'across a cell boundary at 0');
+  eq(findCollisions([{ x: 9.9, y: 5, r: 1 }, { x: 10.1, y: 5, r: 1 }, { x: 30, y: 30, r: 1 }], 10), [[0, 1]], 'neighbouring cells');
+  let seed = 12345;
+  const rnd = () => ((seed = (seed * 1103515245 + 12345) % 2147483648) / 2147483648);
+  const cs = Array.from({ length: 600 }, () => ({ x: rnd() * 300 - 150, y: rnd() * 300 - 150, r: 1 + rnd() * 4 }));
+  eq(findCollisions(cs, 10), brute(cs), 'random small set matches brute force');
+
+  const big = [];
+  for (let gy = 0; gy < 100; gy++) for (let gx = 0; gx < 200; gx++) {
+    const x = gx * 20 - 2000, y = gy * 20 - 1000;
+    big.push({ x, y, r: 2 }, { x: x + 1, y: y + 1, r: 2 });
+  }
+  const t = performance.now();
+  const res = findCollisions(big, 8);
+  const ms = performance.now() - t;
+  eq(res.length, 20000);
+  check(res.every(([i, j], k) => i === 2 * k && j === 2 * k + 1), 'big result pairs');
+  check(ms < 1000, `40,000 circles took ${ms.toFixed(0)} ms (want < 1000)`);
+}
+
+=== exercise lazy
+title: Lazy sequence toolkit
+--- prompt
+Write these as **generator functions** that work on any iterable, including infinite ones, and pull no more items than necessary:
+
+- `naturals(start = 0)`: `start, start + 1, ...` forever.
+- `take(iter, n)`: the first `n` items (none if `n <= 0`). After yielding the `n`th item it must stop *without* pulling another item from `iter`.
+- `filter(iter, pred)` and `map(iter, f)`.
+- `zip(...iters)`: tuples until the **shortest** runs out.
+- `chunks(iter, size)`: arrays of `size` items; the last may be shorter; no empty chunk at the end.
+- `cycle(iter)`: repeats the items of a finite iterable forever (it may need to remember them on the first pass). An empty input yields nothing.
+
+Game use: `take(cycle(['idle1', 'idle2', 'idle3']), 7)` is a looping animation; `zip(naturals(), waves)` numbers waves.
+--- starter
+function* naturals(start = 0) {}
+function* take(iter, n) { yield* iter; }
+function* filter(iter, pred) {}
+function* map(iter, f) {}
+function* zip(...iters) {}
+function* chunks(iter, size) {}
+function* cycle(iter) {}
+--- solution
+function* naturals(start = 0) {
+  for (let n = start; ; n++) yield n;
+}
+
+function* take(iter, n) {
+  if (n <= 0) return;
+  for (const x of iter) {
+    yield x;
+    if (--n <= 0) return;
+  }
+}
+
+function* filter(iter, pred) {
+  for (const x of iter) if (pred(x)) yield x;
+}
+
+function* map(iter, f) {
+  for (const x of iter) yield f(x);
+}
+
+function* zip(...iters) {
+  if (!iters.length) return;
+  const its = iters.map(i => i[Symbol.iterator]());
+  try {
+    while (true) {
+      const tuple = [];
+      for (const it of its) {
+        const r = it.next();
+        if (r.done) return;
+        tuple.push(r.value);
+      }
+      yield tuple;
+    }
+  } finally {
+    for (const it of its) it.return?.();
+  }
+}
+
+function* chunks(iter, size) {
+  let buf = [];
+  for (const x of iter) {
+    buf.push(x);
+    if (buf.length === size) { yield buf; buf = []; }
+  }
+  if (buf.length) yield buf;
+}
+
+function* cycle(iter) {
+  const seen = [];
+  for (const x of iter) { seen.push(x); yield x; }
+  if (!seen.length) return;
+  while (true) yield* seen;
+}
+--- hint
+For `take`, check the counter *after* yielding and `return` right away: a `for...of` that loops back around would call `next()` once more on the source.
+--- hint
+`zip` must drive several iterators by hand: get each with `iter[Symbol.iterator]()` and call `next()` on each per tuple.
+--- hint
+`cycle` records items during the first pass, then loops `yield* seen` forever.
+--- harness
+{
+  eq([...take(naturals(), 5)], [0, 1, 2, 3, 4]);
+  eq([...take(naturals(10), 3)], [10, 11, 12]);
+  eq([...take([1, 2], 5)], [1, 2]);
+  eq([...take(naturals(), 0)], []);
+  let pulled = 0;
+  function* counting() { while (true) { pulled++; yield pulled; } }
+  eq([...take(counting(), 3)], [1, 2, 3]);
+  eq(pulled, 3, 'take must not pull extra items');
+  pulled = 0;
+  eq([...take(map(filter(counting(), x => x % 2 === 0), x => x * 10), 2)], [20, 40]);
+  eq(pulled, 4, 'pipeline is lazy');
+  eq([...zip([1, 2, 3], 'ab')], [[1, 'a'], [2, 'b']]);
+  eq([...zip(naturals(), ['x', 'y'])], [[0, 'x'], [1, 'y']], 'zip with infinite');
+  eq([...zip()], []);
+  eq([...zip([], naturals())], []);
+  eq([...chunks([1, 2, 3, 4, 5], 2)], [[1, 2], [3, 4], [5]]);
+  eq([...chunks([1, 2, 3, 4], 2)], [[1, 2], [3, 4]], 'no empty last chunk');
+  eq([...chunks([], 3)], []);
+  eq([...take(chunks(naturals(), 3), 2)], [[0, 1, 2], [3, 4, 5]], 'chunks of infinite');
+  eq([...take(cycle(['idle1', 'idle2', 'idle3']), 7)], ['idle1', 'idle2', 'idle3', 'idle1', 'idle2', 'idle3', 'idle1']);
+  eq([...cycle([])], [], 'empty cycle ends');
+  let made = 0;
+  function* once3() { made++; yield 'a'; yield 'b'; }
+  eq([...take(cycle(once3()), 5)], ['a', 'b', 'a', 'b', 'a']);
+  eq(made, 1, 'cycle iterates its source once');
+  const s = new Set([1, 2]);
+  eq([...map(s, x => x + 1)], [2, 3], 'works on Sets');
+  check(typeof take([], 1).next === 'function', 'returns an iterator');
+}
+
+=== exercise coroutines
+title: A coroutine scheduler
+--- prompt
+Write `class Scheduler` that runs generator-based scripts, the way Unity runs coroutines:
+
+- `start(gen)`: adds a generator object (already created, e.g. `sched.start(cutscene())`) and **immediately runs it to its first `yield`**.
+- What a script yields decides when it resumes:
+  - `yield` (undefined): resume on the next `update`.
+  - `yield seconds` (a number): resume on the first `update` at which at least that much time has passed since the yield. Time is the sum of `dt` values passed to `update`.
+- `update(dt)`: advance the clock by `dt`, then resume every script that's due, in the order they were started. A script resumed in this update doesn't run again until a later update. Scripts that finish are removed.
+- `get count()`: number of running scripts.
+- `stopAll()`: stops all scripts and calls `return()` on each so their `finally` blocks run.
+
+A script may `start` another script while running; the new one runs to its first yield immediately but isn't resumed again in the same update.
+
+Floating point: compare with a tiny tolerance, e.g. resume when `elapsed >= wait - 1e-9`.
+--- starter
+class Scheduler {
+  scripts = [];
+  start(gen) { this.scripts.push(gen); }
+  update(dt) { for (const g of this.scripts) g.next(); }
+  get count() { return this.scripts.length; }
+  stopAll() { this.scripts = []; }
+}
+--- solution
+class Scheduler {
+  #scripts = [];
+  #time = 0;
+
+  start(gen) {
+    const s = { gen, wakeAt: 0 };
+    if (this.#step(s)) this.#scripts.push(s);
+  }
+
+  #step(s) {
+    const r = s.gen.next();
+    if (r.done) return false;
+    s.wakeAt = typeof r.value === 'number' ? this.#time + r.value : -Infinity;
+    return true;
+  }
+
+  update(dt) {
+    this.#time += dt;
+    const due = this.#scripts.slice();
+    for (const s of due) {
+      if (this.#time >= s.wakeAt - 1e-9 && !this.#step(s)) {
+        this.#scripts.splice(this.#scripts.indexOf(s), 1);
+      }
+    }
+  }
+
+  get count() { return this.#scripts.length; }
+
+  stopAll() {
+    const all = this.#scripts;
+    this.#scripts = [];
+    for (const s of all) s.gen.return();
+  }
+}
+--- hint
+Store `{ gen, wakeAt }` per script. After each `next()`, set `wakeAt` from the yielded value: `time + seconds`, or `-Infinity` (due on any later update) for a bare `yield`.
+--- hint
+Iterate over a copy of the script list in `update`, so scripts started during the update aren't resumed in it, and removals don't skip anything.
+--- harness
+{
+  const sch = new Scheduler(), log = [];
+  function* cutscene() {
+    log.push('fade in');
+    yield 1;
+    log.push('hero speaks');
+    yield;
+    log.push('next frame');
+    yield 0.5;
+    log.push('end');
+  }
+  sch.start(cutscene());
+  eq(log, ['fade in'], 'runs to first yield immediately');
+  eq(sch.count, 1);
+  sch.update(0.4); eq(log.length, 1);
+  sch.update(0.4); eq(log.length, 1);
+  sch.update(0.2); eq(log.at(-1), 'hero speaks', 'after 1.0s (with float error)');
+  sch.update(0.016); eq(log.at(-1), 'next frame');
+  sch.update(0.3); eq(log.length, 3);
+  sch.update(0.3); eq(log.at(-1), 'end');
+  eq(sch.count, 0, 'finished scripts removed');
+
+  const s2 = new Scheduler(), order = [];
+  function* ticker(name, n) { for (let i = 0; i < n; i++) { order.push(name + i); yield; } }
+  s2.start(ticker('a', 3));
+  s2.start(ticker('b', 2));
+  eq(order, ['a0', 'b0']);
+  s2.update(0.1);
+  eq(order, ['a0', 'b0', 'a1', 'b1'], 'order of start');
+  s2.update(0.1);
+  eq(order.slice(4), ['a2'], 'b finished on this resume');
+  eq(s2.count, 1);
+  s2.update(0.1);
+  eq(s2.count, 0);
+
+  const s3 = new Scheduler(), ev = [];
+  function* child() { ev.push('child start'); yield; ev.push('child resumed'); }
+  function* parent() { ev.push('parent'); yield; s3.start(child()); ev.push('parent after start'); yield; ev.push('parent end'); }
+  s3.start(parent());
+  s3.update(1);
+  eq(ev, ['parent', 'child start', 'parent after start'], 'child runs to first yield at once');
+  s3.update(1);
+  eq(ev.slice(3), ['parent end', 'child resumed']);
+
+  const s4 = new Scheduler();
+  let cleaned = 0;
+  function* guarded() { try { while (true) yield 1; } finally { cleaned++; } }
+  s4.start(guarded()); s4.start(guarded());
+  s4.update(5);
+  s4.stopAll();
+  eq([cleaned, s4.count], [2, 0], 'stopAll runs finally blocks');
+
+  const s5 = new Scheduler();
+  let ran = 0;
+  s5.start((function* () { ran++; })());
+  eq([ran, s5.count], [1, 0], 'script that never yields finishes at start');
+}
+
+=== exercise ring
+title: Ring buffer event queue
+--- prompt
+An event queue with `push` + `shift` on an array is O(n) per dequeue. Write `class RingBuffer` with a fixed `capacity` backed by a preallocated array:
+
+- `push(x)`: adds at the back; returns `true`, or `false` (and does nothing) when full.
+- `shift()`: removes and returns the front item, or `undefined` if empty.
+- `peek()`: the front item without removing it.
+- `get size()`, `get capacity()`.
+- `clear()`.
+- Iterable from front to back, without removing items.
+
+All operations except iteration and `clear` must be O(1) and must not allocate (no array growth, no `shift`/`splice`/`slice` on the storage). The tests run 2,000,000 operations against a time limit.
+--- starter
+class RingBuffer {
+  constructor(capacity) { this.items = []; this.cap = capacity; }
+  push(x) { this.items.push(x); return true; }
+  shift() { return this.items.shift(); }
+  peek() { return this.items[0]; }
+  get size() { return this.items.length; }
+  get capacity() { return this.cap; }
+  clear() { this.items = []; }
+  *[Symbol.iterator]() { yield* this.items; }
+}
+--- solution
+class RingBuffer {
+  #buf; #head = 0; #size = 0;
+
+  constructor(capacity) { this.#buf = new Array(capacity).fill(undefined); }
+
+  push(x) {
+    if (this.#size === this.#buf.length) return false;
+    this.#buf[(this.#head + this.#size) % this.#buf.length] = x;
+    this.#size++;
+    return true;
+  }
+
+  shift() {
+    if (this.#size === 0) return undefined;
+    const x = this.#buf[this.#head];
+    this.#buf[this.#head] = undefined;       // don't keep the object alive
+    this.#head = (this.#head + 1) % this.#buf.length;
+    this.#size--;
+    return x;
+  }
+
+  peek() { return this.#size ? this.#buf[this.#head] : undefined; }
+  get size() { return this.#size; }
+  get capacity() { return this.#buf.length; }
+  clear() { this.#buf.fill(undefined); this.#head = 0; this.#size = 0; }
+
+  *[Symbol.iterator]() {
+    for (let i = 0; i < this.#size; i++) yield this.#buf[(this.#head + i) % this.#buf.length];
+  }
+}
+--- hint
+Keep `head` (index of the front item) and `size`. The back slot is `(head + size) % capacity`.
+--- hint
+After `shift`, overwrite the vacated slot with `undefined` so the buffer doesn't keep old events alive for the GC.
+--- harness
+{
+  const q = new RingBuffer(3);
+  eq([q.size, q.capacity, q.shift(), q.peek()], [0, 3, undefined, undefined]);
+  eq([q.push('a'), q.push('b'), q.push('c'), q.push('d')], [true, true, true, false], 'full');
+  eq([...q], ['a', 'b', 'c']);
+  eq(q.shift(), 'a');
+  eq(q.push('d'), true, 'wraps around');
+  eq([...q], ['b', 'c', 'd']);
+  eq([q.peek(), q.size], ['b', 3]);
+  eq([q.shift(), q.shift(), q.shift(), q.shift()], ['b', 'c', 'd', undefined]);
+  q.push(1); q.push(2);
+  q.clear();
+  eq([q.size, [...q]], [0, []]);
+  q.push('x');
+  eq([...q], ['x'], 'usable after clear');
+  const z = new RingBuffer(1);
+  eq([z.push(0), z.push(1), z.shift(), z.push(2), z.peek()], [true, false, 0, true, 2]);
+  const u = new RingBuffer(2);
+  u.push(undefined);
+  eq(u.size, 1, 'can hold undefined');
+
+  const big = new RingBuffer(1000);
+  const t = performance.now();
+  let sum = 0;
+  for (let i = 0; i < 1000000; i++) {
+    big.push(i);
+    if (big.size > 500) sum += big.shift();
+  }
+  const ms = performance.now() - t;
+  eq(big.size, 500);
+  eq(sum, 999499 * 999500 / 2, 'sum of shifted items');
+  eq(big.peek(), 999500);
+  check(ms < 800, `2M operations took ${ms.toFixed(0)} ms (want < 800)`);
+}
+
+=== quiz
+run: yes
+--- q
+What does this print?
+--- code
+const obj = {}, map = new Map();
+obj[1] = 'a'; obj['1'] = 'b';
+map.set(1, 'a'); map.set('1', 'b');
+const k1 = { id: 1 }, k2 = { id: 1 };
+map.set(k1, 'x'); map.set(k2, 'y');
+console.log(Object.keys(obj).length, map.size, map.get({ id: 1 }), map.get(k1));
+--- choice
+2 4 x x
+--- answer
+1 4 undefined x
+--- choice
+1 3 y x
+--- choice
+2 3 undefined x
+--- explain
+Object keys are strings, so `1` and `'1'` are the same key. Map keys keep their type, and objects are compared by identity: `k1` and `k2` are different keys, and a fresh `{ id: 1 }` matches neither.
+
+=== quiz
+run: yes
+--- q
+What does this print?
+--- code
+function* g() {
+  console.log('start');
+  const x = yield 1;
+  console.log('got', x);
+  yield x * 2;
+  return 'done';
+}
+const it = g();
+console.log('created');
+console.log(it.next('ignored').value);
+console.log(it.next(21).value);
+console.log(it.next().value, it.next().done);
+--- choice
+start
+created
+1
+got 21
+42
+done true
+--- answer
+created
+start
+1
+got 21
+42
+done true
+--- choice
+created
+start
+1
+got undefined
+NaN
+undefined true
+--- choice
+created
+start
+1
+got 21
+42
+undefined true
+--- explain
+Calling a generator function runs nothing. The first `next()` runs to the first `yield` (its argument is discarded: no `yield` is waiting for it). `next(21)` makes the paused `yield` evaluate to `21`. The `return` value arrives with `done: true`; after that, `next()` keeps returning `{ value: undefined, done: true }`.
+
+=== quiz
+run: yes
+--- q
+What does this print?
+--- code
+function* nums() {
+  try { yield 1; yield 2; yield 3; }
+  finally { console.log('cleanup'); }
+}
+for (const n of nums()) { if (n === 2) break; console.log(n); }
+const [a] = nums();
+console.log(a, [...nums()].length);
+--- choice
+1
+2
+1 3
+cleanup
+--- answer
+1
+cleanup
+cleanup
+cleanup
+1 3
+--- choice
+1
+1 3
+--- choice
+1
+cleanup
+1 3
+cleanup
+--- explain
+`break` calls the iterator's `return()`, which runs the generator's `finally`. Destructuring one element also stops early, so it cleans up too. Spreading runs the generator to completion, and `finally` runs then. All three happen before `console.log(a, ...)` is called.
+
+=== quiz
+run: yes
+--- q
+What does this print?
+--- code
+const s = new Set([1, 2, 3]);
+for (const x of s) {
+  if (x < 5) s.add(x + 3);
+}
+console.log([...s]);
+--- choice
+[ 1, 2, 3, 4, 5, 6 ]
+--- answer
+[ 1, 2, 3, 4, 5, 6, 7 ]
+--- choice
+[ 1, 2, 3 ]
+--- choice
+It throws: collection was modified during iteration
+--- explain
+Set (and Map) iteration is live: items added during the loop are visited too. So `4` is visited and adds `7`; `5`, `6` and `7` add nothing. There's no "modified during enumeration" exception as in C#.
+
+=== quiz
+run: yes
+--- q
+What does this print?
+--- code
+const m = new Map([['b', 2], ['a', 1]]);
+m.set('b', 20);
+m.delete('a');
+m.set('a', 10);
+console.log([...m], Object.fromEntries(m), [...new Set('hello')].join(''));
+--- choice
+[ [ 'a', 10 ], [ 'b', 20 ] ] { a: 10, b: 20 } helo
+--- answer
+[ [ 'b', 20 ], [ 'a', 10 ] ] { b: 20, a: 10 } helo
+--- choice
+[ [ 'b', 20 ], [ 'a', 10 ] ] { b: 20, a: 10 } hello
+--- choice
+[ [ 'b', 2 ], [ 'a', 10 ], [ 'b', 20 ] ] { b: 20, a: 10 } helo
+--- explain
+Updating an existing key keeps its position; deleting and re-adding moves it to the end. A Set of a string's characters drops the repeated `l`.
+
+=== quiz
+run: yes
+--- q
+What does this print?
+--- code
+const iterable = { *[Symbol.iterator]() { yield 'a'; yield 'b'; } };
+const it = iterable[Symbol.iterator]();
+it.next();
+console.log([...iterable], [...it], [...it]);
+--- choice
+[ 'a', 'b' ] [ 'a', 'b' ] [ 'a', 'b' ]
+--- answer
+[ 'a', 'b' ] [ 'b' ] []
+--- choice
+[ 'b' ] [ 'b' ] []
+--- choice
+[ 'a', 'b' ] [ 'b' ] [ 'b' ]
+--- explain
+Spreading the *iterable* asks it for a fresh iterator each time. A generator object is an iterator that is also iterable, but it returns *itself*: once consumed, it's empty. Like C#'s `IEnumerator`, a used-up iterator can't be rewound.
+
+=== quiz
+--- q
+An A* pathfinder stores costs in `costs.get(`${x},${y}`)` and runs slowly. What's the most effective fix?
+--- choice
+Switch from a `Map` to a plain object with the same string keys.
+--- answer
+Use numeric keys like `y * width + x` (or a flat typed array indexed that way), so no string is built and hashed per lookup.
+--- choice
+Use a `WeakMap`, which is faster for temporary data.
+--- choice
+Wrap the lookups in a generator so they're lazy.
+--- explain
+The template literal allocates a string per lookup and hashing strings is slower than numbers. Numeric keys avoid both; for a bounded grid a flat array avoids hashing altogether. A `WeakMap` can't even have string or number keys.

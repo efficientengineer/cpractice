@@ -72,6 +72,8 @@ int main(void) {
 
 The pattern "return a status, deliver the results through pointers" is everywhere in C APIs, because there are no exceptions and only one return value. Unlike C#, nothing at the call site marks the argument as `ref`; the `&` is the only clue that the callee may change the variable.
 
+> **Performance:** once a function has two pointers, the compiler has to consider that they might point at the same memory (*aliasing*). In `void scale_all(float *v, int n, const float *k)`, writing `v[i]` could change `*k`, so the compiler reloads `*k` from memory on every iteration and cannot vectorize the loop. Read such values into a local before the loop (`float kk = *k;`): it is both faster and states what you mean. Better still, pass small inputs by value (`float k`), so the question never comes up.
+
 ## NULL
 
 `NULL` is a null pointer constant, a pointer that points at nothing. A null pointer is false in a condition, so `if (p)` means "if p is not null". Dereferencing `NULL` is undefined behavior; on Linux it usually crashes with a segmentation fault, but there is no `NullReferenceException` to catch.
@@ -83,21 +85,21 @@ A common idiom is the *optional out-parameter*: the caller passes `NULL` for res
 ```c
 #include <stdio.h>
 
-void stats(const int *v, int n, int *sum, int *count_negative) {
-    int s = 0, neg = 0;
+void hp_stats(const int *hp, int n, int *total, int *alive) {
+    int t = 0, a = 0;
     for (int i = 0; i < n; i++) {
-        s += v[i];
-        if (v[i] < 0) neg++;
+        t += hp[i];
+        if (hp[i] > 0) a++;
     }
-    if (sum) *sum = s;                        // only if the caller asked
-    if (count_negative) *count_negative = neg;
+    if (total) *total = t;                    // only if the caller asked
+    if (alive) *alive = a;
 }
 
 int main(void) {
-    int data[] = {3, -1, 4, -1, 5};
+    int hp[] = {30, 0, 45, 0, 25};
     int total;
-    stats(data, 5, &total, NULL);
-    printf("%d\n", total);   // 10
+    hp_stats(hp, 5, &total, NULL);
+    printf("%d\n", total);   // 100
     return 0;
 }
 ```
@@ -150,6 +152,8 @@ int main(void) {
 The rules: arithmetic is only valid within one array, and you may form (but not dereference) the address one past its last element. Anything else, like `a - 1` or `a + 6`, is undefined even if you never dereference it. Comparing pointers with `<` is only meaningful within the same array; `==` and `!=` work for any two pointers.
 
 `*p++` is the most famous C idiom. Postfix `++` binds tighter than `*`, so it means `*(p++)`: read the element, then advance the pointer. `(*p)++` increments the element instead.
+
+> **Performance:** a bad habit from old C books is rewriting `a[i]` loops as pointer walks "because pointers are faster". With optimization on, both compile to the same instructions. Write whichever is clearer (usually the index) and spend your effort on what actually costs: how much memory the loop touches, and in what order.
 
 ```c
 #include <stdio.h>
@@ -297,6 +301,8 @@ gcc warns, and even replaces the returned address with `NULL` so that the bug cr
 | Type check | at runtime on every cast | none after a cast |
 
 C#'s `unsafe` code with `int*` and `fixed` *is* C pointers, borrowed wholesale. A JavaScript object variable is closest to a C# reference. In C, the address is just a number, and every guarantee you had is now a rule you have to keep.
+
+> **Performance:** in C# and JavaScript, a `List<Enemy>` of class objects is really a list of references, each pointing to an object somewhere on the heap. Walking it means jumping to a different address for each enemy, and every jump to memory that is not in the cache costs on the order of 100 ns, hundreds of instructions' worth. C lets you choose: store the enemies themselves, back to back, in one array, and a loop over them reads memory in order, which the CPU prefetches ahead of you. Use pointers to *reach* data (out-parameters, a cursor into an array), not as the way to *organize* thousands of objects; when one object must refer to another, an index into an array is often better than a pointer (it stays valid when the array is copied or saved, and it is smaller).
 
 === exercise swap
 title: Swap through pointers
@@ -789,6 +795,231 @@ After printing `*p`, you need a space only if there are more elements to come, w
 -1 0 -2147483648 2147483647
 --- out
 2147483647 -2147483648 0 -1
+
+=== exercise integrate
+title: Move every entity
+--- prompt
+The core of a game's physics step: every entity's position moves by its velocity times the frame time. Store each property in its own array (all the `x`s together, all the `vx`s together), and write:
+
+- `void integrate(float *x, float *y, const float *vx, const float *vy, int n, float dt)`: for each of the `n` entities, `x += vx * dt` and `y += vy * dt`.
+- `void apply_gravity(float *vy, int n, float g, float dt)`: `vy += g * dt` for every entity.
+
+The `const` on the velocity parameters is the contract "I only read these". Write plain index loops; pointer-walking versions (`*x++ += *vx++ * dt`) compile to the same machine code, so pick whichever reads better.
+
+The next exercise keeps the entities inside the arena.
+--- starter
+void integrate(float *x, float *y, const float *vx, const float *vy, int n, float dt) {
+}
+
+void apply_gravity(float *vy, int n, float g, float dt) {
+}
+--- solution
+void integrate(float *x, float *y, const float *vx, const float *vy, int n, float dt) {
+    for (int i = 0; i < n; i++) {
+        x[i] += vx[i] * dt;
+        y[i] += vy[i] * dt;
+    }
+}
+
+void apply_gravity(float *vy, int n, float g, float dt) {
+    float dv = g * dt;          // the same for everyone: compute once
+    for (int i = 0; i < n; i++)
+        vy[i] += dv;
+}
+--- hint
+`g * dt` does not depend on `i`. Compute it once before the loop.
+--- harness
+int main(void) {
+    float x[3] = {0, 10, -5}, y[3] = {0, 0, 1};
+    float vx[3] = {1, -2, 0}, vy[3] = {0, 4, -1};
+    integrate(x, y, vx, vy, 3, 0.5f);
+    CHECK_DBL(x[0], 0.5); CHECK_DBL(x[1], 9); CHECK_DBL(x[2], -5);
+    CHECK_DBL(y[0], 0); CHECK_DBL(y[1], 2); CHECK_DBL(y[2], 0.5);
+    CHECK_DBL(vx[1], -2);
+    integrate(x, y, vx, vy, 0, 1.0f);
+    CHECK_DBL(x[0], 0.5);
+    integrate(x + 1, y + 1, vx + 1, vy + 1, 1, 1.0f);   // a slice: only entity 1
+    CHECK_DBL(x[0], 0.5); CHECK_DBL(x[1], 7); CHECK_DBL(x[2], -5);
+    apply_gravity(vy, 3, -10.0f, 0.25f);
+    CHECK_DBL(vy[0], -2.5); CHECK_DBL(vy[1], 1.5); CHECK_DBL(vy[2], -3.5);
+    // a falling body over 60 frames
+    float px = 0, py = 100, pvx = 3, pvy = 0;
+    for (int f = 0; f < 60; f++) {
+        apply_gravity(&pvy, 1, -9.8f, 1.0f / 60);
+        integrate(&px, &py, &pvx, &pvy, 1, 1.0f / 60);
+    }
+    CHECK(fabs(px - 3.0) < 1e-4);
+    CHECK(fabs(pvy + 9.8) < 1e-4);
+    CHECK(fabs(py - (100 - 9.8 * 61 / 120.0)) < 1e-3);
+    return TEST_END();
+}
+
+=== exercise arena
+title: Bounce off the walls
+continues: integrate
+--- prompt
+Keep your functions and add `int keep_in_arena(float *x, float *y, float *vx, float *vy, int n, float w, float h)`. The arena spans `0..w` horizontally and `0..h` vertically. For each entity, on each axis:
+
+- if `x < 0`: mirror it back inside (`x = -x`) and flip the velocity (`vx = -vx`);
+- if `x > w`: `x = 2 * w - x` and flip `vx`;
+- the same for `y` with `h` and `vy`.
+
+(Entities never move more than one arena width in a frame, so one mirror is enough.) Return how many entities bounced on at least one axis this frame. An entity exactly on the edge (`x == 0` or `x == w`) is still inside.
+--- stubs
+int keep_in_arena(float *x, float *y, float *vx, float *vy, int n, float w, float h) {
+    return -1;
+}
+--- solution
+void integrate(float *x, float *y, const float *vx, const float *vy, int n, float dt) {
+    for (int i = 0; i < n; i++) {
+        x[i] += vx[i] * dt;
+        y[i] += vy[i] * dt;
+    }
+}
+
+void apply_gravity(float *vy, int n, float g, float dt) {
+    float dv = g * dt;
+    for (int i = 0; i < n; i++)
+        vy[i] += dv;
+}
+
+// Mirror one coordinate back into [0, limit]. Returns 1 if it bounced.
+static int bounce_axis(float *p, float *v, float limit) {
+    if (*p < 0) { *p = -*p; *v = -*v; return 1; }
+    if (*p > limit) { *p = 2 * limit - *p; *v = -*v; return 1; }
+    return 0;
+}
+
+int keep_in_arena(float *x, float *y, float *vx, float *vy, int n, float w, float h) {
+    int bounced = 0;
+    for (int i = 0; i < n; i++) {
+        int b = bounce_axis(&x[i], &vx[i], w);
+        b |= bounce_axis(&y[i], &vy[i], h);
+        bounced += b;
+    }
+    return bounced;
+}
+--- hint
+A helper `static int bounce_axis(float *p, float *v, float limit)` that handles one coordinate keeps the loop short. Call it with `&x[i], &vx[i]`.
+--- hint
+Combine the two axis results with `|` (not `||`, which would skip the second call when the first bounced).
+--- harness
+int main(void) {
+    float x[4] = {-1, 11, 5, 0}, y[4] = {5, 5, 12, 10};
+    float vx[4] = {-2, 3, 1, -1}, vy[4] = {0, 0, 4, 1};
+    CHECK_INT(keep_in_arena(x, y, vx, vy, 4, 10, 10), 3);
+    CHECK_DBL(x[0], 1); CHECK_DBL(vx[0], 2);
+    CHECK_DBL(x[1], 9); CHECK_DBL(vx[1], -3);
+    CHECK_DBL(y[2], 8); CHECK_DBL(vy[2], -4); CHECK_DBL(x[2], 5); CHECK_DBL(vx[2], 1);
+    CHECK_DBL(x[3], 0); CHECK_DBL(vx[3], -1); CHECK_DBL(y[3], 10); CHECK_DBL(vy[3], 1);
+    float cx[1] = {-0.5f}, cy[1] = {-0.25f}, cvx[1] = {-1}, cvy[1] = {-1};
+    CHECK_INT(keep_in_arena(cx, cy, cvx, cvy, 1, 10, 10), 1);
+    CHECK_DBL(cx[0], 0.5); CHECK_DBL(cy[0], 0.25); CHECK_DBL(cvx[0], 1); CHECK_DBL(cvy[0], 1);
+    // a ball bouncing for 1000 frames never leaves the box
+    float bx = 1, by = 1, bvx = 37, bvy = -23;
+    int bounces = 0, outside = 0;
+    for (int f = 0; f < 1000; f++) {
+        integrate(&bx, &by, &bvx, &bvy, 1, 1.0f / 60);
+        bounces += keep_in_arena(&bx, &by, &bvx, &bvy, 1, 8, 6);
+        if (bx < 0 || bx > 8 || by < 0 || by > 6) outside++;
+    }
+    CHECK_INT(outside, 0);
+    CHECK(bounces > 10);
+    return TEST_END();
+}
+
+=== exercise splash
+title: Splash damage and aliasing
+--- prompt
+Write `void splash_damage(int *hp, int n, const int *amount)`: every one of the `n` entities takes `*amount` damage, and hit points stop at 0.
+
+The catch: `amount` may point *into* `hp`. A "thorns" effect deals damage equal to the attacker's current hit points, and the caller passes `&hp[k]`. The damage is the value `*amount` had **when the function was called**. If you read `*amount` inside the loop, then as soon as the loop writes `hp[k]`, every later entity takes a different amount.
+
+This is **aliasing**: two pointers that reach the same memory. The fix is to copy `*amount` into a local before the loop.
+
+> **Performance:** the same local copy is also what makes the loop fast. If the loop reads `*amount` on every iteration, the compiler must assume that writing `hp[i]` might change it (they might alias), so it reloads it from memory every time and cannot vectorize the loop. A local in a register has no such problem. C99's `restrict` keyword (`int *restrict hp`) is the other way to tell the compiler "these don't overlap"; it is a promise you must keep, and breaking it is undefined behavior.
+--- starter
+void splash_damage(int *hp, int n, const int *amount) {
+    for (int i = 0; i < n; i++) {
+        hp[i] -= *amount;
+        if (hp[i] < 0) hp[i] = 0;
+    }
+}
+--- solution
+void splash_damage(int *hp, int n, const int *amount) {
+    int dmg = *amount;              // snapshot: hp[] writes can't change it now
+    for (int i = 0; i < n; i++)
+        hp[i] = hp[i] > dmg ? hp[i] - dmg : 0;
+}
+--- hint
+`int dmg = *amount;` as the first line, then use only `dmg`.
+--- harness
+int main(void) {
+    int a[4] = {10, 3, 8, 20};
+    int d = 5;
+    splash_damage(a, 4, &d);
+    CHECK_INT(a[0], 5); CHECK_INT(a[1], 0); CHECK_INT(a[2], 3); CHECK_INT(a[3], 15);
+    CHECK_INT(d, 5);
+    int b[4] = {6, 9, 12, 30};
+    splash_damage(b, 4, &b[0]);          // aliased: damage is 6 for everyone
+    CHECK_INT(b[0], 0); CHECK_INT(b[1], 3); CHECK_INT(b[2], 6); CHECK_INT(b[3], 24);
+    int c[3] = {50, 7, 50};
+    splash_damage(c, 3, &c[1]);          // 7 for everyone
+    CHECK_INT(c[0], 43); CHECK_INT(c[1], 0); CHECK_INT(c[2], 43);
+    int e[2] = {4, 4};
+    int zero = 0;
+    splash_damage(e, 2, &zero);
+    CHECK_INT(e[0], 4); CHECK_INT(e[1], 4);
+    splash_damage(e, 0, &d);
+    CHECK_INT(e[0], 4);
+    return TEST_END();
+}
+
+=== exercise weakest
+title: Target the weakest
+--- prompt
+Enemy AI often picks the weakest target. Write `int *weakest_alive(int *hp, int n)`: return a pointer to the element of `hp` with the smallest **positive** value (the first one if several tie), or `NULL` if no entity is alive (or `n` is 0).
+
+Returning a pointer lets the caller act on the element directly: `int *t = weakest_alive(hp, n); if (t) *t -= 10;`, and `t - hp` is its index.
+
+Return `NULL`, never `&hp[-1]` or `hp + n` as a "not found" marker; the caller can test `NULL` and nothing else.
+--- starter
+#include <stddef.h>
+
+int *weakest_alive(int *hp, int n) {
+    return hp;
+}
+--- solution
+#include <stddef.h>
+
+int *weakest_alive(int *hp, int n) {
+    int *best = NULL;
+    for (int i = 0; i < n; i++)
+        if (hp[i] > 0 && (best == NULL || hp[i] < *best))
+            best = &hp[i];
+    return best;
+}
+--- hint
+Keep `int *best = NULL;`. An element replaces it when it is alive and either `best` is still `NULL` or the element is smaller. Strictly smaller keeps the first of a tie.
+--- harness
+int main(void) {
+    int a[5] = {30, 0, 12, -4, 12};
+    int *t = weakest_alive(a, 5);
+    CHECK(t != NULL);
+    if (t) { CHECK_INT(t - a, 2); *t -= 10; }
+    CHECK_INT(a[2], 2);
+    t = weakest_alive(a, 5);
+    CHECK(t == &a[2]);
+    int dead[3] = {0, -1, 0};
+    CHECK(weakest_alive(dead, 3) == NULL);
+    CHECK(weakest_alive(a, 0) == NULL);
+    int one[1] = {7};
+    CHECK(weakest_alive(one, 1) == &one[0]);
+    int b[4] = {1, 1, 1, 1};
+    CHECK(weakest_alive(b, 4) == &b[0]);
+    CHECK(weakest_alive(b + 1, 3) == &b[1]);
+    return TEST_END();
+}
 
 === quiz
 run: yes

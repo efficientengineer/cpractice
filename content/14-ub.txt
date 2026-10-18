@@ -38,6 +38,8 @@ int main(void) {
 
 The programmer reasons with two's complement wrapping. The compiler reasons: `x + 1` cannot overflow (that would be UB), so `x + 1 < x` is always false, so the function is `return 0;`. At `-O0` you may see `1`; at `-O2` you see `0`. The check has to be written *before* the operation, in terms that cannot overflow: `x == INT_MAX`, or more generally `b > 0 && a > INT_MAX - b`.
 
+> **Performance:** this is not the compiler being spiteful; the same assumption pays for itself everywhere else. In `for (int i = 0; i < n; i++) sum += a[i];` the compiler may assume `i` never wraps, so it can widen `i` to a 64-bit pointer offset and vectorize the loop to process 8 elements at a time. Flags like `-fwrapv` (make signed overflow wrap) are legitimate but block some of these optimizations in hot loops.
+
 ### Example 2: a null check after the dereference
 
 ```c
@@ -174,6 +176,8 @@ int main(void) {
 }
 ```
 
+> **Performance:** never profile or benchmark a sanitizer build; it measures the instrumentation, not your code. The usual setup is a *debug* build (`-O0` or `-Og`, `-g`, ASan and UBSan) that you develop and run tests with, and a *release* build (`-O2 -g`, no sanitizers) that you profile and ship. Run the test suite against both: some bugs only appear once the optimizer starts exploiting UB.
+
 **valgrind** (`valgrind ./prog`) finds many of the same memory errors and uninitialized reads without recompiling, by running the program on a simulated CPU. It is 20-50x slower and misses stack overflows, but needs no special build, which is handy for third-party binaries.
 
 ## Warnings are free bug reports
@@ -225,6 +229,8 @@ int main(void) {
 }
 ```
 
+> **Performance:** safety checks are cheap when placed well. `__builtin_add_overflow` is one add plus one branch on the overflow flag. For bounds checks in a hot loop, validate the *range* once before the loop (`if (first + count > len) return error;`) and then index without per-element checks.
+
 The `__builtin_*_overflow` functions work for any integer types, compute the result as if with infinite precision, store the wrapped result, and return `true` if it did not fit. They compile to a single instruction plus a flag check.
 
 ## How to think about it
@@ -234,7 +240,7 @@ C is a contract: you promise not to do the things on the list, and the compiler 
 === exercise dupupper
 title: Find the bug: dup_upper
 --- prompt
-`dup_upper` should return a newly allocated uppercase copy of `s` (ASCII letters only change; the caller frees it). It produces the right text when you print it, yet the tests crash under AddressSanitizer. Find and fix the bug.
+Chat messages typed in caps lock get "shouted" by `dup_upper`, which should return a newly allocated uppercase copy of `s` (ASCII letters only change; the caller frees it). It produces the right text when you print it, yet the tests crash under AddressSanitizer. Find and fix the bug.
 
 Then also make it return `NULL` if `s` is `NULL` or if `malloc` fails.
 --- starter
@@ -287,9 +293,11 @@ int main(void) {
 === exercise removeall
 title: Find the bug: remove from a list
 --- prompt
-`remove_all` deletes every node whose `value` equals `value` from a singly linked list, frees those nodes, and returns the new head. The list-building helpers are in the tests.
+An old part of the engine keeps entities in a linked list, where `value` is the entity's team. When a team is eliminated, `remove_all` deletes every node whose `value` equals `value` from the singly linked list, frees those nodes, and returns the new head. The list-building helpers are in the tests.
 
 It "works" without sanitizers on most machines. Under ASan it fails with `heap-use-after-free`. Find and fix it without changing the function's interface.
+
+> **Performance:** after fixing it, notice the design: one `malloc` per entity and a pointer chase per step, so every node visited is likely a cache miss. New code keeps entities in a contiguous array and removes with swap-remove (see the culling exercise below).
 --- starter
 #include <stdlib.h>
 
@@ -388,7 +396,7 @@ int main(void) {
 === exercise histogram
 title: Find the bugs: histogram
 --- prompt
-`histogram` counts how many of the `n` values fall in each bucket `0 .. buckets-1` and returns a newly allocated array of `buckets` counts. Values outside that range are ignored. The caller frees the result.
+The analytics screen shows how many hits fell in each damage bracket. `histogram` counts how many of the `n` values fall in each bucket `0 .. buckets-1` and returns a newly allocated array of `buckets` counts. Values outside that range are ignored. The caller frees the result.
 
 There are **two** bugs. One makes the counts come out as huge negative numbers like `-1094795586` under ASan (on another machine they might look right by luck); the other writes out of bounds. Fix both.
 --- starter
@@ -444,10 +452,104 @@ int main(void) {
     return TEST_END();
 }
 
+=== exercise cull
+title: Find the bug: culling dead entities
+--- prompt
+Entities live in a contiguous array. Once per frame `remove_dead` removes every entity with `hp <= 0` and returns the new count. Order does not matter, so it uses **swap-remove**: overwrite the dead entity with the last one and shrink the array, which is O(1) per removal.
+
+It walks backwards so that the element swapped in (from the end) has already been checked. The idea is right, but the loop is broken: gcc even warns about it with `-Wextra`. Under ASan it crashes with a heap-buffer-overflow. Find and fix the bug. It must also work for `n == 0`.
+
+The tests cull 400000 entities, half of them dead. Removing by shifting everything after the dead entity down one place (`memmove`, like `List.RemoveAt` in C#) is O(n) per removal and times out.
+
+> **Performance:** swap-remove is the standard way to delete from an unordered array in a frame loop: no allocation, no shifting, and the survivors stay packed together so the next system that iterates them streams through memory. If order matters (draw order, say), mark entities dead and compact once per frame with a single read-index / write-index pass instead.
+--- starter
+#include <stddef.h>
+
+typedef struct {
+    int id;
+    int hp;
+    float x, y;
+} Entity;
+
+size_t remove_dead(Entity *e, size_t n) {
+    for (size_t i = n - 1; i >= 0; i--) {
+        if (e[i].hp <= 0) {
+            e[i] = e[n - 1];
+            n--;
+        }
+    }
+    return n;
+}
+--- solution
+#include <stddef.h>
+
+typedef struct {
+    int id;
+    int hp;
+    float x, y;
+} Entity;
+
+size_t remove_dead(Entity *e, size_t n) {
+    for (size_t i = n; i-- > 0;) {
+        if (e[i].hp <= 0) {
+            e[i] = e[n - 1];
+            n--;
+        }
+    }
+    return n;
+}
+--- hint
+`size_t` is unsigned. What is `i >= 0` when `i` is unsigned, and what does `i--` do when `i` is 0?
+--- hint
+The idiom for counting down with an unsigned index is `for (size_t i = n; i-- > 0;)`: the test sees the old value, the body sees the decremented one, and it handles `n == 0` too.
+--- harness
+static int all_alive_and_unique(const Entity *e, size_t n, size_t total) {
+    unsigned char *seen = calloc(total, 1);
+    int ok = 1;
+    for (size_t i = 0; i < n; i++) {
+        ok &= e[i].hp > 0 && e[i].id >= 0 && (size_t)e[i].id < total;
+        if (ok) { ok &= !seen[e[i].id]; seen[e[i].id] = 1; }
+    }
+    free(seen);
+    return ok;
+}
+
+int main(void) {
+    CHECK_INT(remove_dead(NULL, 0), 0);
+    Entity one = {7, 0, 0, 0};
+    CHECK_INT(remove_dead(&one, 1), 0);
+    Entity small[] = {{0, 10, 0, 0}, {1, 0, 0, 0}, {2, -5, 0, 0}, {3, 1, 0, 0}, {4, 0, 0, 0}};
+    size_t n = remove_dead(small, 5);
+    CHECK_INT(n, 2);
+    CHECK(all_alive_and_unique(small, n, 5));
+    CHECK_INT(small[0].id + small[1].id, 3);
+    Entity none_dead[] = {{0, 1, 0, 0}, {1, 2, 0, 0}};
+    CHECK_INT(remove_dead(none_dead, 2), 2);
+    CHECK_INT(none_dead[1].id, 1);
+
+    enum { N = 400000 };
+    Entity *world = malloc(N * sizeof *world);
+    long long expected_ids = 0;
+    size_t expected = 0;
+    for (int i = 0; i < N; i++) {
+        int hp = (i * 7919) % 3 == 0 || i % 2 ? 0 : 50;
+        world[i] = (Entity){i, hp, (float)i, 0};
+        if (hp > 0) { expected++; expected_ids += i; }
+    }
+    n = remove_dead(world, N);
+    CHECK_INT(n, expected);
+    long long ids = 0;
+    for (size_t i = 0; i < n; i++) ids += world[i].id;
+    CHECK_INT(ids, expected_ids);
+    CHECK(all_alive_and_unique(world, n, N));
+    free(world);
+    return TEST_END();
+}
+
 === exercise longest
 title: Find the bug: longest word
 --- prompt
-This program reads whitespace-separated words from stdin and prints the longest one and its length (the first one wins ties). Words are at most 63 characters long. With short words it works; with a long word it crashes with `stack-buffer-overflow`.
+The lobby screen sizes its name column from the longest player name. This program reads whitespace-separated names from stdin and prints the longest one and its length (the first one wins ties). Words are at most 63 characters long. With short words it works; with a long word it crashes with `stack-buffer-overflow`.
 
 Fix it so that it handles any word up to 63 characters, and so that it **cannot** overflow its buffers even if the input breaks that promise. If there are no words, print `none`.
 
@@ -637,7 +739,7 @@ Write checked arithmetic helpers. Each returns `true` and stores the result in `
 - `bool checked_mul(int a, int b, int *out)`: do this one with comparisons against `INT_MAX`/`INT_MIN` (no builtins, no wider type), as practice. Mind `INT_MIN * -1`.
 - `void *alloc_array(size_t count, size_t size)`: like `malloc(count * size)` but returns `NULL` if the multiplication would wrap. Use `__builtin_mul_overflow` here. (`calloc` does this check internally; this is how.)
 
-The classic bug `malloc(count * size)` with an attacker-chosen `count` wraps to a small number and then the code writes `count` elements into it.
+The classic bug `malloc(count * size)` with an attacker-chosen `count` (say, an entity count read from a modded save file) wraps to a small number and then the code writes `count` elements into it.
 --- starter
 #include <stdbool.h>
 #include <stdlib.h>
@@ -744,7 +846,7 @@ int main(void) {
 === exercise safesum
 title: A sum that knows when it overflowed
 --- prompt
-Read whitespace-separated integers from stdin until end of input. Each one fits in a `long long`. Print their sum, or print `overflow` if the sum (at any point, adding left to right) does not fit in a `long long`. Also print the count of numbers read on a second line.
+Read whitespace-separated per-level scores from stdin until end of input. Each one fits in a `long long` (bonuses can be negative). Print their sum, or print `overflow` if the sum (at any point, adding left to right) does not fit in a `long long`. Also print the count of numbers read on a second line.
 
 For input `1 2 3`:
 

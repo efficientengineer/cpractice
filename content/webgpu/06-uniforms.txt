@@ -116,20 +116,25 @@ console.log(new Uint8Array(data).slice(0, 20));
 
 ## Animating: requestAnimationFrame in a worker
 
-Code here runs in a Web Worker that owns `canvas` (an `OffscreenCanvas`). Dedicated workers have `requestAnimationFrame` too, so the loop looks the same as on a page:
+Code here runs in a Web Worker that owns `canvas` (an `OffscreenCanvas`). Dedicated workers have `requestAnimationFrame` too, so a game loop looks the same as on a page:
 
 ```text
+setup (once):  pipelines, buffers, bind groups, one Float32Array for uniforms
 frame(timestamp):
-  write this frame's uniforms with writeBuffer
-  encode a pass into ctx.getCurrentTexture()
-  submit
+  dt = time since last frame
+  update(state, dt, keys)          plain JS, no GPU
+  fill the Float32Array, writeBuffer it once
+  encode a pass into ctx.getCurrentTexture(), submit
   requestAnimationFrame(frame)
 ```
 
-Two rules:
+Rules:
 
 - **Call `getCurrentTexture()` every frame.** The canvas hands out a fresh texture per frame and presents it when your callback returns. Holding on to last frame's texture is an error.
-- **Animate by time, not by frame count.** The callback receives a timestamp in milliseconds. Screens run at 60, 120 or 144 Hz; `angle += 0.02` per frame spins twice as fast on a 120 Hz monitor. Use `t / 1000` seconds, or a `dt` between frames.
+- **Animate by time, not by frame count.** The callback receives a timestamp in milliseconds. Screens run at 60, 120 or 144 Hz; `angle += 0.02` per frame spins twice as fast on a 120 Hz monitor. Multiply speeds by `dt` in seconds, and clamp `dt` (a background tab can deliver a 5-second frame).
+- **Keep game logic out of the GPU code.** `update(state, dt, keys)` is plain JS you can test with a fake `keys` set; rendering just copies `state` into uniforms.
+
+Input: `keys` is a `Set` of the `KeyboardEvent.code` values currently held (`'ArrowLeft'`, `'KeyW'`, `'Space'`), and `mouse` is `{ x, y, down }` in canvas pixels. Click the canvas and steer this ship with the arrow keys:
 
 ```js
 const device = await getDevice();
@@ -137,19 +142,22 @@ const ctx = canvas.getContext('webgpu');
 const format = navigator.gpu.getPreferredCanvasFormat();
 ctx.configure({ device, format });
 
+// ---- setup: everything created once ----
 const module = device.createShaderModule({ code: `
-  struct Frame { time: f32, aspect: f32 }
-  @group(0) @binding(0) var<uniform> frame: Frame;
+  struct Frame { pos: vec2f, angle: f32, aspect: f32, thrust: f32 }
+  @group(0) @binding(0) var<uniform> ship: Frame;
 
   struct VOut { @builtin(position) pos: vec4f, @location(0) color: vec3f }
 
   @vertex fn vs(@builtin(vertex_index) i: u32) -> VOut {
-    let p = array(vec2f(0, 0.6), vec2f(-0.52, -0.3), vec2f(0.52, -0.3));
-    let c = array(vec3f(1, 0.3, 0.3), vec3f(0.3, 1, 0.3), vec3f(0.3, 0.4, 1));
-    let a = frame.time;                       // radians: one turn every 6.28 s
-    let r = vec2f(p[i].x * cos(a) - p[i].y * sin(a), p[i].x * sin(a) + p[i].y * cos(a));
-    let s = 0.8 + 0.2 * sin(frame.time * 3.0); // pulse
-    return VOut(vec4f(r.x * s / frame.aspect, r.y * s, 0, 1), c[i]);
+    // hull (3 vertices) + flame (3 vertices), in ship space, nose along +x
+    let p = array(vec2f(0.08, 0), vec2f(-0.05, 0.045), vec2f(-0.05, -0.045),
+                  vec2f(-0.05, 0.02), vec2f(-0.05, -0.02), vec2f(-0.05 - 0.08 * ship.thrust, 0));
+    let c = array(vec3f(0.8, 0.9, 1), vec3f(0.4, 0.5, 0.9), vec3f(0.4, 0.5, 0.9),
+                  vec3f(1, 0.8, 0.2), vec3f(1, 0.8, 0.2), vec3f(1, 0.3, 0.1));
+    let s = sin(ship.angle); let co = cos(ship.angle);
+    let r = vec2f(p[i].x * co - p[i].y * s, p[i].x * s + p[i].y * co) + ship.pos;
+    return VOut(vec4f(r.x / ship.aspect, r.y, 0, 1), c[i]);
   }
   @fragment fn fs(v: VOut) -> @location(0) vec4f { return vec4f(v.color, 1); }
 `});
@@ -158,22 +166,43 @@ const pipeline = device.createRenderPipeline({
   vertex: { module, entryPoint: 'vs' },
   fragment: { module, entryPoint: 'fs', targets: [{ format }] },
 });
-const uniforms = device.createBuffer({ size: 8, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+const uniforms = device.createBuffer({ size: 32, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
 const bindGroup = device.createBindGroup({ layout: pipeline.getBindGroupLayout(0),
   entries: [{ binding: 0, resource: { buffer: uniforms } }] });
-const frameData = new Float32Array(2);   // reused every frame
+const shipData = new Float32Array(8);   // reused every frame: no garbage
 
-function frame(ms) {
-  frameData[0] = ms / 1000;
-  frameData[1] = canvas.width / canvas.height;
-  device.queue.writeBuffer(uniforms, 0, frameData);
+// ---- game logic: plain JS, testable without a GPU ----
+const state = { x: 0, y: 0, vx: 0, vy: 0, angle: Math.PI / 2, thrust: 0 };
+function update(s, dt, keys) {
+  if (keys.has('ArrowLeft')) s.angle += 3 * dt;     // radians per second
+  if (keys.has('ArrowRight')) s.angle -= 3 * dt;
+  s.thrust = keys.has('ArrowUp') ? 1 : 0;
+  s.vx += Math.cos(s.angle) * s.thrust * 1.5 * dt;  // units per second squared
+  s.vy += Math.sin(s.angle) * s.thrust * 1.5 * dt;
+  s.vx *= Math.pow(0.5, dt); s.vy *= Math.pow(0.5, dt);  // frame-rate independent drag
+  s.x += s.vx * dt; s.y += s.vy * dt;
+  const w = canvas.width / canvas.height;            // wrap around the screen
+  if (s.x > w) s.x -= 2 * w; if (s.x < -w) s.x += 2 * w;
+  if (s.y > 1) s.y -= 2; if (s.y < -1) s.y += 2;
+}
+
+// ---- the loop ----
+let last = performance.now();
+function frame(now) {
+  const dt = Math.min((now - last) / 1000, 0.1);  // seconds, clamped
+  last = now;
+  update(state, dt, keys);
+
+  shipData[0] = state.x; shipData[1] = state.y; shipData[2] = state.angle;
+  shipData[3] = canvas.width / canvas.height; shipData[4] = state.thrust * (0.7 + 0.3 * Math.sin(now / 30));
+  device.queue.writeBuffer(uniforms, 0, shipData);   // one upload per frame
 
   const enc = device.createCommandEncoder();
   const pass = enc.beginRenderPass({ colorAttachments: [{
-    view: ctx.getCurrentTexture().createView(), clearValue: [0.08, 0.08, 0.1, 1], loadOp: 'clear', storeOp: 'store' }] });
+    view: ctx.getCurrentTexture().createView(), clearValue: [0.02, 0.02, 0.05, 1], loadOp: 'clear', storeOp: 'store' }] });
   pass.setPipeline(pipeline);
   pass.setBindGroup(0, bindGroup);
-  pass.draw(3);
+  pass.draw(6);
   pass.end();
   device.queue.submit([enc.finish()]);
   requestAnimationFrame(frame);
@@ -181,9 +210,11 @@ function frame(ms) {
 requestAnimationFrame(frame);
 ```
 
-Your function returns immediately; the loop keeps running in the worker until you click Run again (which terminates the worker).
+Your code returns immediately; the loop keeps running in the worker until you click Run again (which terminates the worker).
 
-`writeBuffer` copies your data **when you call it**, into a staging area, and the copy into the GPU buffer is ordered before any later `submit`. So reusing one `Float32Array` every frame is safe and avoids garbage.
+`writeBuffer` copies your data **when you call it**, into a staging area, and the copy into the GPU buffer is ordered before any later `submit`. So reusing one `Float32Array` every frame is safe.
+
+> **Performance:** everything above `frame` runs once. Don't create pipelines, shader modules, buffers or bind groups inside the frame loop: pipeline creation compiles shaders (milliseconds each), and every `createBuffer` is a driver allocation that the garbage collector must later clean up. Also avoid `new Float32Array([...])` per frame: it allocates two objects every frame, and the GC pauses that follow show up as stutter. Allocate once, overwrite the contents.
 
 ## The one-buffer-many-draws trap
 
@@ -204,6 +235,8 @@ Fixes, from simplest to most scalable:
 2. One big buffer holding every object's data at different offsets, a bind group per offset.
 3. One big buffer and **dynamic offsets**: one bind group, offset chosen at `setBindGroup` time.
 4. Put per-object data in a storage buffer array and index it with `instance_index` (the instancing chapter, and the next ones).
+
+> **Performance:** fix 1 is fine for a handful of objects (a player, a boss, the HUD). For a level with hundreds of enemies it means hundreds of buffers, hundreds of bind groups and hundreds of `writeBuffer` calls per frame, each with fixed overhead. Fixes 3 and 4 pack every object into one `Float32Array` on the CPU and upload it with **one** `writeBuffer` per frame; fix 4 also turns hundreds of draw calls into one.
 
 ## Grouping by update frequency
 
@@ -229,10 +262,13 @@ const bgl = device.createBindGroupLayout({ entries: [{
 const layout = device.createPipelineLayout({ bindGroupLayouts: [bgl] });
 
 const STRIDE = device.limits.minUniformBufferOffsetAlignment; // 256 almost everywhere
-const objects = 3;
-const buf = device.createBuffer({ size: STRIDE * objects, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+const enemies = 3;
+const buf = device.createBuffer({ size: STRIDE * enemies, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
 const bg = device.createBindGroup({ layout: bgl, entries: [{ binding: 0, resource: { buffer: buf, size: 16 } }] });
-// later: pass.setBindGroup(0, bg, [i * STRIDE]); pass.draw(...);
+const cpu = new Float32Array(buf.size / 4);  // CPU mirror, allocated once
+// each frame: write enemy i's 16 bytes at float index i * STRIDE / 4, then ONE upload:
+//   device.queue.writeBuffer(buf, 0, cpu);
+//   for each enemy: pass.setBindGroup(0, bg, [i * STRIDE]); pass.draw(...);
 console.log('stride', STRIDE, 'bytes per object, buffer', buf.size);
 ```
 
@@ -302,6 +338,7 @@ const pipeline = device.createRenderPipeline({
   fragment: { module, entryPoint: 'fs', targets: [{ format }] },
 });
 const frameBuf = device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+const frameData = new Float32Array(4);
 const frameGroup = device.createBindGroup({ layout: pipeline.getBindGroupLayout(0),
   entries: [{ binding: 0, resource: { buffer: frameBuf } }] });
 
@@ -316,7 +353,8 @@ const objects = [[1, 0.8, 0.2, 1], [0.2, 0.5, 1, 1], [0.8, 0.8, 0.8, 1]].map(col
 
 function frame(ms) {
   const t = ms / 1000;
-  device.queue.writeBuffer(frameBuf, 0, new Float32Array([canvas.width / canvas.height]));
+  frameData[0] = canvas.width / canvas.height;
+  device.queue.writeBuffer(frameBuf, 0, frameData);
   const sun = S(0.25);
   const earthOrbit = mul(R(t * 0.8), T(0.6, 0));        // rotate the offset: an orbit
   const earth = mul(earthOrbit, S(0.1));
@@ -343,14 +381,14 @@ function frame(ms) {
 requestAnimationFrame(frame);
 ```
 
-Note that each object has its *own* buffer, so writing all three before the submit is correct, unlike the trap above.
+Note that each object has its *own* buffer, so writing all three before the submit is correct, unlike the trap above. With three objects, three small uploads are fine; with three hundred, switch to one buffer and one upload.
 
 > Try it: change `S(0.1)` for the earth to `mul(S(0.1), R(t))`. A circle does not show rotation, but swap the wedge shape for a triangle and it will.
 
 === exercise saxpy
-title: A uniform in a compute shader
+title: Difficulty scaling in a compute shader
 --- prompt
-Uniforms work the same in compute shaders. Write `async function affine(device, data, a, b)` that returns a new `Float32Array` where each element is `a * x + b`, computed on the GPU.
+Uniforms work the same in compute shaders. A game keeps every enemy's health in one `Float32Array`; when the player picks a difficulty, all of them become `a * health + b`. Write `async function affine(device, data, a, b)` that returns a new `Float32Array` with that applied to each element, computed on the GPU.
 
 The starter has the shader, buffers and dispatch. The shader reads `a` and `b` from a uniform struct `Params` at `@group(0) @binding(1)`. Create that uniform buffer, fill it, and add it to the bind group.
 --- starter
@@ -420,6 +458,76 @@ async function affine(device, data, a, b) {
   const big = new Float32Array(1000).map((_, i) => i);
   const r = await affine(device, big, -1, 1000);
   check(r.every((v, i) => v === 1000 - i), 'all 1000 elements should be 1000 - i');
+}
+
+=== exercise ship
+title: Frame-rate independent ship
+--- prompt
+Game logic that feeds the uniforms should be plain, testable JS. Write two functions for the ship from the chapter:
+
+`updateShip(s, dt, keys)` mutates `s = { x, y, vx, vy, angle }` for a frame of `dt` seconds, where `keys` is a `Set` of held key codes:
+
+1. `'ArrowLeft'` turns counter-clockwise at 3 radians per second; `'ArrowRight'` turns clockwise at the same rate.
+2. `'ArrowUp'` accelerates along the (new) heading `(cos angle, sin angle)` at 2 units per second².
+3. If the speed `hypot(vx, vy)` is above 1, scale the velocity down to length 1.
+4. Move: `x += vx * dt`, `y += vy * dt`.
+
+`packShip(s, out)` writes the uniform `struct Ship { pos: vec2f, angle: f32, speed: f32 }` into the `Float32Array(4)` `out` and returns `out`. It must not allocate: the tests check that you return the same array you were given.
+--- starter
+function updateShip(s, dt, keys) {
+  if (keys.has('ArrowLeft')) s.angle += 0.05;   // per frame: wrong on fast monitors
+  if (keys.has('ArrowRight')) s.angle -= 0.05;
+  s.x += s.vx; s.y += s.vy;
+}
+
+function packShip(s, out) {
+  return new Float32Array([s.x, s.y, s.angle, Math.hypot(s.vx, s.vy)]);
+}
+--- solution
+function updateShip(s, dt, keys) {
+  if (keys.has('ArrowLeft')) s.angle += 3 * dt;
+  if (keys.has('ArrowRight')) s.angle -= 3 * dt;
+  if (keys.has('ArrowUp')) {
+    s.vx += Math.cos(s.angle) * 2 * dt;
+    s.vy += Math.sin(s.angle) * 2 * dt;
+  }
+  const speed = Math.hypot(s.vx, s.vy);
+  if (speed > 1) { s.vx /= speed; s.vy /= speed; }
+  s.x += s.vx * dt;
+  s.y += s.vy * dt;
+}
+
+function packShip(s, out) {
+  out[0] = s.x; out[1] = s.y; out[2] = s.angle; out[3] = Math.hypot(s.vx, s.vy);
+  return out;
+}
+--- hint
+Every rate gets multiplied by `dt`: radians per second times seconds is radians.
+--- hint
+`packShip` should assign `out[0]` to `out[3]` and `return out`, never `new Float32Array(...)`.
+--- harness
+{
+  const fresh = () => ({ x: 0, y: 0, vx: 0, vy: 0, angle: 0 });
+  const run = (fps, seconds, keys) => { const s = fresh(); for (let i = 0; i < fps * seconds; i++) updateShip(s, 1 / fps, keys); return s; };
+  near(run(60, 1, new Set(['ArrowLeft'])).angle, 3, 1e-9, 'turn left for 1 s at 60 fps');
+  near(run(144, 1, new Set(['ArrowLeft'])).angle, 3, 1e-9, 'turn left for 1 s at 144 fps');
+  near(run(60, 0.5, new Set(['ArrowRight'])).angle, -1.5, 1e-9, 'turn right for 0.5 s');
+  const a = run(60, 0.25, new Set(['ArrowUp']));
+  near(a.vx, 0.5, 1e-9, 'thrust 0.25 s: vx'); near(a.vy, 0, 1e-9, 'thrust: vy');
+  near(a.x, 0.25 * 0.25 * (1 + 1 / 15), 1e-9, 'thrust 0.25 s at 60 fps: x (semi-implicit Euler)');
+  const b = run(60, 3, new Set(['ArrowUp']));
+  near(b.vx, 1, 1e-9, 'speed is capped at 1');
+  const c = fresh(); c.angle = Math.PI / 2; c.vx = 0.3;
+  updateShip(c, 0.1, new Set(['ArrowUp']));
+  near(c.vx, 0.3, 1e-9, 'thrust along +y keeps vx'); near(c.vy, 0.2, 1e-9, 'thrust along +y: vy');
+  near(c.y, 0.02, 1e-9, 'moved after the velocity update');
+  const d = fresh(); d.vx = 0.4; d.vy = -0.3;
+  for (let i = 0; i < 30; i++) updateShip(d, 1 / 30, new Set());
+  near(d.x, 0.4, 1e-9, 'coasting: x after 1 s'); near(d.y, -0.3, 1e-9, 'coasting: y after 1 s');
+  const out = new Float32Array(4);
+  const r = packShip({ x: 1, y: 2, vx: 0.3, vy: 0.4, angle: 0.5 }, out);
+  check(r === out, 'packShip must fill and return the array it was given');
+  eq([...out].map(v => +v.toFixed(5)), [1, 2, 0.5, 0.5], 'packed values');
 }
 
 === exercise pack

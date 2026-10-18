@@ -102,6 +102,8 @@ static inline int max_int(int a, int b) { return a > b ? a : b; }
 
 `static` gives it internal linkage, so putting it in a header that several `.c` files include causes no duplicate-symbol errors; `inline` is a hint and silences "unused function" warnings. Reach for a macro only when a function genuinely cannot do the job: you need the argument's *text* (`#`), you need to build names (`##`), you need the caller's `__FILE__`/`__LINE__`, or it must work for any type.
 
+> **Performance:** old C code used function-like macros "for speed" because compilers once could not inline. That reason is gone: a `static inline` function in a header is inlined at `-O2` and costs exactly what the macro did, without the double evaluation. Write small hot helpers (vector add, clamp, lerp) as `static inline` functions in headers so every file that calls them can inline them.
+
 ### Multi-statement macros: do { } while (0)
 
 A macro that expands to several statements breaks under an unbraced `if`:
@@ -202,6 +204,8 @@ int main(void) {
 
 `<assert.h>` gives you `assert(cond)`: if `cond` is false it prints the expression, file and line and calls `abort()`. Use it for *programmer errors* ("this pointer is never NULL here"), never for user input or I/O failures, because release builds compile with `-DNDEBUG` and every `assert` vanishes, side effects included. `assert(fclose(f) == 0)` is a bug.
 
+> **Performance:** that vanishing is the point. Games assert generously (`assert(entity_index < entity_count)` inside every accessor) because the checks cost nothing in release builds. Expensive validation, like walking a whole data structure to verify it, goes behind its own `#ifdef DEBUG_VALIDATE` so even debug builds stay playable.
+
 C11 also has `static_assert(cond, "message")` (from `<assert.h>`; the keyword is `_Static_assert`), checked at compile time:
 
 ```c
@@ -258,28 +262,33 @@ When one list of things drives several pieces of code (an enum, a name table, a 
 ```c
 #include <stdio.h>
 
-#define TOKENS(X) \
-    X(PLUS,  '+') \
-    X(MINUS, '-') \
-    X(STAR,  '*') \
-    X(SLASH, '/')
+/*      name          display name     damage  weight */
+#define ITEMS(X)                                    \
+    X(SWORD,         "Sword",           12,     3.5) \
+    X(BOW,           "Bow",              8,     1.2) \
+    X(FIRE_STAFF,    "Staff of Fire",   20,     2.0) \
+    X(HEALTH_POTION, "Health Potion",    0,     0.3)
 
-#define AS_ENUM(name, ch) TOK_##name,
-#define AS_NAME(name, ch) #name,
-#define AS_CHAR(name, ch) ch,
+#define AS_ENUM(id, name, dmg, wt) ITEM_##id,
+#define AS_NAME(id, name, dmg, wt) name,
+#define AS_DAMAGE(id, name, dmg, wt) dmg,
+#define AS_WEIGHT(id, name, dmg, wt) wt,
 
-enum token { TOKENS(AS_ENUM) TOK_COUNT };
-static const char *const token_names[] = { TOKENS(AS_NAME) };
-static const char token_chars[] = { TOKENS(AS_CHAR) };
+enum item { ITEMS(AS_ENUM) ITEM_COUNT };
+static const char *const item_names[] = { ITEMS(AS_NAME) };
+static const int item_damage[] = { ITEMS(AS_DAMAGE) };
+static const float item_weight[] = { ITEMS(AS_WEIGHT) };
 
 int main(void) {
-    for (int t = 0; t < TOK_COUNT; t++)
-        printf("%d %-5s %c\n", t, token_names[t], token_chars[t]);
+    for (int i = 0; i < ITEM_COUNT; i++)
+        printf("%d %-14s dmg %2d  %.1f kg\n", i, item_names[i], item_damage[i], item_weight[i]);
     return 0;
 }
 ```
 
-Adding a token is now a one-line change and the tables can never get out of step. You will see this pattern in interpreters, opcode tables and error-code lists.
+Adding an item is now a one-line change and the tables can never get out of step. You will see this pattern for item and component types, interpreter opcodes, error-code lists and asset manifests.
+
+> **Performance:** note the shape of the result: one small array per property (`item_damage[]`, `item_weight[]`) rather than an array of item structs. A loop that sums the weight of an inventory reads only `item_weight`, so every byte the CPU pulls into cache is a weight. This *struct-of-arrays* layout comes back in the advanced chapter. And everything is a compile-time constant table in read-only memory: no initialization code, no lookups by name at run time.
 
 ## _Generic, briefly
 
@@ -394,6 +403,8 @@ clean:
 ```
 
 A rule is `target: prerequisites` followed by tab-indented commands (a tab, not spaces). `make` rebuilds a target when any prerequisite is newer. `$@` is the target, `$<` the first prerequisite. The header dependencies matter: change `counter.h` and both `main.o` and `counter.o` must rebuild. Larger projects let gcc write those lines for them with `-MMD -MP`, or use CMake or Meson.
+
+> **Performance:** the compiler optimizes one translation unit at a time, so a tiny function *defined* in `vec2.c` and called from `physics.c` cannot be inlined there: every call is a real call. Fixes, in order of preference: put small hot functions in the header as `static inline`; build release with link-time optimization (`-O2 -flto`), which lets the linker inline across files; or use a "unity build" (one `.c` that `#include`s all the others), which many game studios do for both speed and build time.
 
 The exercise runner here compiles one file, so multi-file exercises put each "file" in a commented section of the same source. The rules about what goes where still apply.
 
@@ -604,7 +615,7 @@ counter = 1
 === exercise xcolors
 title: X-macro color table
 --- prompt
-The starter defines a color list once with an X-macro and generates `enum color` from it (`COLOR_BLACK` ... `COLOR_WHITE`, then `COLOR_COUNT`). Use the same list to implement:
+The game's palette is a color list defined once with an X-macro. The starter generates `enum color` from it (`COLOR_BLACK` ... `COLOR_WHITE`, then `COLOR_COUNT`). Use the same list to implement:
 
 - `const char *color_name(enum color c)`: `"BLACK"`, `"RED"`, ... and `"?"` for anything out of range.
 - `unsigned color_rgb(enum color c)`: the hex value from the list, `0` when out of range.
@@ -782,7 +793,7 @@ int main(void) {
 === exercise module
 title: A module in sections
 --- prompt
-This exercise simulates three files in one: `ring.h` (the public interface), `ring.c` (the implementation) and your tests standing in for `main.c`. Implement a FIFO **ring buffer** of `int`s holding at most `RING_CAP` (8) values, as a module with private state:
+Games buffer input: the platform layer delivers key events whenever they arrive, and the game loop drains them once per frame. This exercise simulates three files in one: `ring.h` (the public interface), `ring.c` (the implementation) and the tests standing in for `main.c`. Implement a FIFO **ring buffer** of `int` key codes holding at most `RING_CAP` (8) values, as a module with private state:
 
 - The storage, head and count live in `ring.c` as file-scope `static` variables. Nothing outside `ring.c` can touch them.
 - `bool ring_push(int v)`: append; if the ring is full, do nothing, increment `ring_overflows` and return `false`.
@@ -791,6 +802,8 @@ This exercise simulates three files in one: `ring.h` (the public interface), `ri
 - `ring_overflows` is a public global: declared `extern` in the header, defined exactly once in `ring.c`.
 
 The tests push and pop past the end of the array many times, so the indices must wrap.
+
+> **Performance:** a fixed-capacity ring never allocates, so it is safe to use from any frame. Dropping (and counting) events when full is a deliberate policy: a game must never stall waiting for room. With a power-of-two capacity, `i % RING_CAP` compiles to the single instruction `i & (RING_CAP - 1)`.
 --- starter
 #include <stdbool.h>
 #include <stddef.h>

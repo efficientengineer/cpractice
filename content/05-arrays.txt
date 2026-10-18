@@ -32,6 +32,8 @@ int main(void) {
 
 A local array without an initializer contains whatever was on the stack. Reading it before writing is undefined behavior, not "zero" like C#. Arrays at file scope or marked `static` *are* zeroed.
 
+> **Performance:** "back to back in memory" is the single most important property for speed. The CPU never fetches one `int` from RAM; it fetches a whole 64-byte **cache line** (16 `int`s, 16 `float`s, 64 bytes of pixels), and when it sees you walking forward it starts fetching the next lines before you ask. A loop over a contiguous array therefore runs at close to the speed of arithmetic. Jumping around memory (following pointers, striding across rows) pays a cache miss of roughly 100 ns each time, the cost of hundreds of additions. For vertices, pixels, particles and tiles, a flat array walked in order is the default you should need a reason to leave.
+
 ## Initialization
 
 ```c
@@ -199,9 +201,33 @@ void print_grid(int rows, int m[][4]);     // OK: columns fixed at 4
 void print_grid(int rows, int (*m)[4]);    // the same thing, written honestly
 ```
 
-For grids whose width varies at runtime, the usual C approach is a flat `int *` plus a width, indexing `grid[r * width + c]`. It is what you will see in real code (image buffers, tile maps, matrices).
+For grids whose width varies at runtime, the usual C approach is a flat `int *` plus a width, indexing `grid[r * width + c]`. It is what you will see in real code (image buffers, tile maps, height fields, matrices).
 
-Iterate rows in the outer loop and columns in the inner loop. Walking memory in order is cache friendly; walking column-first on a big grid can be several times slower.
+Here is a procedural texture, a radial gradient, written into a flat pixel buffer and printed as a PGM image (`P2`: a header with the width, height and maximum value, then one number per pixel). The output panel draws it as a picture:
+
+```c
+#include <stdio.h>
+#include <math.h>
+
+#define W 64
+#define H 64
+
+int main(void) {
+    static unsigned char img[W * H];         // one flat block, row-major
+    for (int y = 0; y < H; y++)              // rows outside...
+        for (int x = 0; x < W; x++) {        // ...columns inside: memory order
+            float dx = x - W / 2.0f, dy = y - H / 2.0f;
+            float d = sqrtf(dx * dx + dy * dy) / (W / 2.0f);
+            img[y * W + x] = (unsigned char)(d >= 1 ? 0 : 255 * (1 - d));
+        }
+    printf("P2\n%d %d\n255\n", W, H);
+    for (int i = 0; i < W * H; i++)
+        printf("%d%c", img[i], (i % W == W - 1) ? '\n' : ' ');
+    return 0;
+}
+```
+
+> **Performance:** iterate rows in the outer loop and columns in the inner loop, so the inner loop walks consecutive addresses. Swap them (`x` outside, `y` inside) and each step jumps a whole row ahead: on a 4096x4096 texture every access lands on a different cache line, and the same loop runs several times slower for no other reason. The same goes for any flat buffer: make the innermost loop move along the last index.
 
 ## Variable-length arrays (and why to avoid them)
 
@@ -219,7 +245,7 @@ It looks convenient. Avoid it:
 - `sizeof buf` becomes a runtime computation, and `goto` and `switch` have special restrictions around VLAs.
 - C11 made VLAs optional, MSVC never supported them, and many style guides (including the Linux kernel's) ban them.
 
-If the size is bounded and small, use a fixed array with the maximum size. Otherwise use `malloc`. (VLA *types* in parameters, like `void f(int rows, int cols, int m[rows][cols])`, are a different and more defensible feature, but you will rarely see them.)
+If the size is bounded and small, use a fixed array with the maximum size. Otherwise use `malloc`.In real-time code, "a fixed array with the maximum size" is often the right design anyway: `Particle particles[MAX_PARTICLES]` plus a count never allocates, never fails halfway through a frame, and its cost is visible at a glance. (VLA *types* in parameters, like `void f(int rows, int cols, int m[rows][cols])`, are a different and more defensible feature, but you will rarely see them.)
 
 ## Algorithms by hand
 
@@ -296,6 +322,8 @@ int main(void) {
     return 0;
 }
 ```
+
+> **Performance:** insertion sort is O(n²) in general but close to O(n) on data that is already nearly sorted, and that describes a lot of per-frame sorting: sprites or transparent triangles sorted back to front by depth barely change order between frames. Re-sorting last frame's order with insertion sort is often faster than a general O(n log n) sort from scratch. For a linear search, a plain loop over a few dozen contiguous elements beats any clever structure; reach for hashing or binary search when n is in the hundreds or more.
 
 **Rotate** by `k`: the elegant in-place trick is three reversals. To rotate left by `k`, reverse the first `k`, reverse the rest, then reverse the whole thing. `[1 2 3 4 5]` by 2: `[2 1 | 5 4 3]` then `[3 4 5 1 2]`.
 
@@ -779,6 +807,463 @@ int main(void) {
     k = dedupe(f, 7);
     CHECK_UINT(k, 4);
     CHECK(memcmp(f, (int[]){1, 2, 3, 4}, 4 * sizeof(int)) == 0);
+    return TEST_END();
+}
+
+=== exercise tilemap
+title: A tile map in a flat array
+--- prompt
+A 2D tile map is almost always one flat array of `w * h` small integers, indexed `y * w + x` (row-major, the same layout as `uint8_t map[h][w]`, but with a width chosen at runtime). Each tile is a `uint8_t`, so a 256x256 map is just 64 KB.
+
+Write:
+
+- `int tile_index(int x, int y, int w)`: the flat index of tile `(x, y)`.
+- `int tile_at(const uint8_t *map, int w, int h, int x, int y)`: the tile at `(x, y)`, or `TILE_WALL` if `(x, y)` is outside the map.
+- `void tile_set(uint8_t *map, int w, int h, int x, int y, int tile)`: set a tile; do nothing if `(x, y)` is outside.
+
+Treating everything outside the map as solid wall is a standard trick: movement, line of sight and neighbor counting then need no special cases at the edges, because the edge *is* a wall.
+
+The next two exercises build a cave generator on top of these.
+--- starter
+#include <stdint.h>
+
+enum { TILE_FLOOR = 0, TILE_WALL = 1, TILE_WATER = 2 };
+
+int tile_index(int x, int y, int w) {
+    return 0;
+}
+
+int tile_at(const uint8_t *map, int w, int h, int x, int y) {
+    return map[tile_index(x, y, w)];
+}
+
+void tile_set(uint8_t *map, int w, int h, int x, int y, int tile) {
+}
+--- solution
+#include <stdint.h>
+
+enum { TILE_FLOOR = 0, TILE_WALL = 1, TILE_WATER = 2 };
+
+int tile_index(int x, int y, int w) {
+    return y * w + x;
+}
+
+int tile_at(const uint8_t *map, int w, int h, int x, int y) {
+    if (x < 0 || y < 0 || x >= w || y >= h) return TILE_WALL;
+    return map[tile_index(x, y, w)];
+}
+
+void tile_set(uint8_t *map, int w, int h, int x, int y, int tile) {
+    if (x < 0 || y < 0 || x >= w || y >= h) return;
+    map[tile_index(x, y, w)] = (uint8_t)tile;
+}
+--- hint
+Check all four bounds before indexing. `x >= w` matters: `(w, 0)` would otherwise read `(0, 1)`, a silent wrong answer rather than a crash.
+--- harness
+#include <stdint.h>
+int main(void) {
+    uint8_t map[4 * 3] = {0};
+    CHECK_INT(tile_index(0, 0, 4), 0);
+    CHECK_INT(tile_index(3, 0, 4), 3);
+    CHECK_INT(tile_index(0, 1, 4), 4);
+    CHECK_INT(tile_index(2, 2, 4), 10);
+    tile_set(map, 4, 3, 2, 1, TILE_WATER);
+    CHECK_INT(map[6], TILE_WATER);
+    CHECK_INT(tile_at(map, 4, 3, 2, 1), TILE_WATER);
+    CHECK_INT(tile_at(map, 4, 3, 0, 0), TILE_FLOOR);
+    CHECK_INT(tile_at(map, 4, 3, -1, 0), TILE_WALL);
+    CHECK_INT(tile_at(map, 4, 3, 4, 0), TILE_WALL);
+    CHECK_INT(tile_at(map, 4, 3, 0, 3), TILE_WALL);
+    CHECK_INT(tile_at(map, 4, 3, 0, -1), TILE_WALL);
+    tile_set(map, 4, 3, 4, 0, TILE_WATER);     // outside: ignored
+    tile_set(map, 4, 3, -1, 2, TILE_WATER);
+    tile_set(map, 4, 3, 0, 3, TILE_WATER);
+    int waters = 0;
+    for (int i = 0; i < 12; i++) waters += map[i] == TILE_WATER;
+    CHECK_INT(waters, 1);
+    tile_set(map, 4, 3, 3, 2, TILE_WALL);
+    CHECK_INT(map[11], TILE_WALL);
+    return TEST_END();
+}
+
+=== exercise neighbors
+title: Counting neighbors
+continues: tilemap
+--- prompt
+Add `int count_around(const uint8_t *map, int w, int h, int x, int y, int tile)`: how many of the 8 tiles around `(x, y)` (not counting `(x, y)` itself) are `tile`. Use `tile_at`, so tiles outside the map count as walls.
+
+A corner tile of an all-floor map therefore has 5 wall neighbors (the outside), an edge tile 3, and an interior tile 0.
+
+Loop `dy` from -1 to 1 in the outer loop and `dx` in the inner loop: rows outside, columns inside, the order the tiles sit in memory.
+--- stubs
+int count_around(const uint8_t *map, int w, int h, int x, int y, int tile) {
+    return -1;
+}
+--- solution
+#include <stdint.h>
+
+enum { TILE_FLOOR = 0, TILE_WALL = 1, TILE_WATER = 2 };
+
+int tile_index(int x, int y, int w) {
+    return y * w + x;
+}
+
+int tile_at(const uint8_t *map, int w, int h, int x, int y) {
+    if (x < 0 || y < 0 || x >= w || y >= h) return TILE_WALL;
+    return map[tile_index(x, y, w)];
+}
+
+void tile_set(uint8_t *map, int w, int h, int x, int y, int tile) {
+    if (x < 0 || y < 0 || x >= w || y >= h) return;
+    map[tile_index(x, y, w)] = (uint8_t)tile;
+}
+
+int count_around(const uint8_t *map, int w, int h, int x, int y, int tile) {
+    int count = 0;
+    for (int dy = -1; dy <= 1; dy++)
+        for (int dx = -1; dx <= 1; dx++) {
+            if (dx == 0 && dy == 0) continue;
+            if (tile_at(map, w, h, x + dx, y + dy) == tile) count++;
+        }
+    return count;
+}
+--- harness
+#include <stdint.h>
+int main(void) {
+    uint8_t map[5 * 4] = {0};
+    CHECK_INT(count_around(map, 5, 4, 0, 0, TILE_WALL), 5);
+    CHECK_INT(count_around(map, 5, 4, 2, 0, TILE_WALL), 3);
+    CHECK_INT(count_around(map, 5, 4, 2, 2, TILE_WALL), 0);
+    CHECK_INT(count_around(map, 5, 4, 2, 2, TILE_FLOOR), 8);
+    CHECK_INT(count_around(map, 5, 4, 4, 3, TILE_FLOOR), 3);
+    tile_set(map, 5, 4, 2, 2, TILE_WALL);      // the center itself is not counted
+    CHECK_INT(count_around(map, 5, 4, 2, 2, TILE_WALL), 0);
+    CHECK_INT(count_around(map, 5, 4, 1, 1, TILE_WALL), 1);
+    tile_set(map, 5, 4, 1, 1, TILE_WATER);
+    tile_set(map, 5, 4, 3, 3, TILE_WATER);
+    CHECK_INT(count_around(map, 5, 4, 2, 2, TILE_WATER), 2);
+    CHECK_INT(count_around(map, 5, 4, 0, 0, TILE_WATER), 1);
+    uint8_t one[1] = {TILE_FLOOR};
+    CHECK_INT(count_around(one, 1, 1, 0, 0, TILE_WALL), 8);
+    return TEST_END();
+}
+
+=== exercise cave
+title: Cave generation with a double buffer
+continues: neighbors
+--- prompt
+Random noise smoothed by a *cellular automaton* makes convincing caves. Add `void smooth_cave(const uint8_t *src, uint8_t *dst, int w, int h)`: for every tile, count the walls among its 8 neighbors **in `src`** (outside counts as wall):
+
+- 5 or more wall neighbors: the tile becomes `TILE_WALL` in `dst`,
+- 3 or fewer: it becomes `TILE_FLOOR`,
+- exactly 4: it keeps its `src` value.
+
+All the counting reads `src` and all the writing goes to `dst`: a **double buffer**. Updating one array in place is the bad habit here: tiles you already changed would feed into their neighbors' counts in the same step, so the result depends on loop order and the cave smears toward one corner. The caller swaps the two buffers between steps; nothing is allocated.
+
+The tests compare against a reference on random maps, including a 1500x1500 map smoothed three times.
+--- stubs
+void smooth_cave(const uint8_t *src, uint8_t *dst, int w, int h) {
+}
+--- solution
+#include <stdint.h>
+
+enum { TILE_FLOOR = 0, TILE_WALL = 1, TILE_WATER = 2 };
+
+int tile_index(int x, int y, int w) {
+    return y * w + x;
+}
+
+int tile_at(const uint8_t *map, int w, int h, int x, int y) {
+    if (x < 0 || y < 0 || x >= w || y >= h) return TILE_WALL;
+    return map[tile_index(x, y, w)];
+}
+
+void tile_set(uint8_t *map, int w, int h, int x, int y, int tile) {
+    if (x < 0 || y < 0 || x >= w || y >= h) return;
+    map[tile_index(x, y, w)] = (uint8_t)tile;
+}
+
+int count_around(const uint8_t *map, int w, int h, int x, int y, int tile) {
+    int count = 0;
+    for (int dy = -1; dy <= 1; dy++)
+        for (int dx = -1; dx <= 1; dx++) {
+            if (dx == 0 && dy == 0) continue;
+            if (tile_at(map, w, h, x + dx, y + dy) == tile) count++;
+        }
+    return count;
+}
+
+void smooth_cave(const uint8_t *src, uint8_t *dst, int w, int h) {
+    for (int y = 0; y < h; y++)
+        for (int x = 0; x < w; x++) {
+            int walls = count_around(src, w, h, x, y, TILE_WALL);
+            int i = tile_index(x, y, w);
+            dst[i] = walls >= 5 ? TILE_WALL : walls <= 3 ? TILE_FLOOR : src[i];
+        }
+}
+--- hint
+Loop `y` outside and `x` inside, call `count_around` on `src`, and write the decision into `dst[tile_index(x, y, w)]`.
+--- harness
+#include <stdint.h>
+static int ref_walls(const uint8_t *m, int w, int h, int x, int y) {
+    int c = 0;
+    for (int dy = -1; dy <= 1; dy++)
+        for (int dx = -1; dx <= 1; dx++) {
+            if (!dx && !dy) continue;
+            int xx = x + dx, yy = y + dy;
+            if (xx < 0 || yy < 0 || xx >= w || yy >= h || m[yy * w + xx] == 1) c++;
+        }
+    return c;
+}
+static void ref_smooth(const uint8_t *s, uint8_t *d, int w, int h) {
+    for (int y = 0; y < h; y++)
+        for (int x = 0; x < w; x++) {
+            int c = ref_walls(s, w, h, x, y);
+            d[y * w + x] = c >= 5 ? 1 : c <= 3 ? 0 : s[y * w + x];
+        }
+}
+static void noise(uint8_t *m, int n, unsigned seed) {
+    for (int i = 0; i < n; i++) {
+        seed = seed * 1103515245u + 12345u;
+        m[i] = ((seed >> 16) % 100) < 45;
+    }
+}
+int main(void) {
+    // tiny cases by hand
+    uint8_t a[9] = {0, 0, 0, 0, 1, 0, 0, 0, 0}, b[9];
+    smooth_cave(a, b, 3, 3);
+    // corners see 5 outside walls + center = 6, edges 3 + 1 = 4 (keep 0), center sees 0
+    CHECK_INT(b[0], 1); CHECK_INT(b[1], 0); CHECK_INT(b[4], 0); CHECK_INT(b[8], 1);
+    CHECK_INT(a[4], 1);                      // src untouched
+    // random maps against the reference
+    int bad = 0;
+    for (unsigned seed = 1; seed <= 20; seed++) {
+        int w = 7 + (int)seed, h = 5 + (int)(seed % 7);
+        uint8_t s[40 * 20], d[40 * 20], r[40 * 20];
+        noise(s, w * h, seed);
+        smooth_cave(s, d, w, h);
+        ref_smooth(s, r, w, h);
+        if (memcmp(d, r, (size_t)(w * h)) != 0) bad++;
+    }
+    CHECK_INT(bad, 0);
+    // a big map, three steps, swapping buffers
+    int W = 1500, H = 1500;
+    uint8_t *m1 = malloc((size_t)W * H), *m2 = malloc((size_t)W * H);
+    uint8_t *r1 = malloc((size_t)W * H), *r2 = malloc((size_t)W * H);
+    noise(m1, W * H, 99);
+    memcpy(r1, m1, (size_t)W * H);
+    for (int step = 0; step < 3; step++) {
+        smooth_cave(m1, m2, W, H);
+        uint8_t *t = m1; m1 = m2; m2 = t;
+        ref_smooth(r1, r2, W, H);
+        t = r1; r1 = r2; r2 = t;
+    }
+    CHECK(memcmp(m1, r1, (size_t)W * H) == 0);
+    free(m1); free(m2); free(r1); free(r2);
+    return TEST_END();
+}
+
+=== exercise boxblur
+title: Box blur with a summed-area table
+--- prompt
+Blurring is everywhere in procedural textures: softening noise, smoothing a height map, making a glow. A **box blur** of radius `r` replaces each pixel by the average of the `(2r+1) x (2r+1)` square around it. Write
+
+```c
+void box_blur(const uint8_t *src, uint8_t *dst, int w, int h, int r, uint32_t *sat);
+```
+
+for a grayscale image stored row-major (`src[y * w + x]`). Near the edges the square is clipped to the image, and the average is over the pixels actually inside: `dst = sum / count`, with integer division (truncation). `sat` is a buffer of `(w + 1) * (h + 1)` elements the caller lends you.
+
+Summing each square directly costs `(2r+1)^2` reads per pixel. The tests blur a 1024x1024 image with radius 40: 6,561 reads for each of a million pixels, about 7e9, which times out. Use a **summed-area table**: `sat[(y + 1) * (w + 1) + (x + 1)]` holds the sum of all pixels in the rectangle from `(0, 0)` to `(x, y)` inclusive, with a zero row and column in front. Build it in one pass:
+
+```text
+S(x+1, y+1) = src(x, y) + S(x, y+1) + S(x+1, y) - S(x, y)
+```
+
+Then the sum of any rectangle `[x0, x1) x [y0, y1)` is four lookups: `S(x1, y1) - S(x0, y1) - S(x1, y0) + S(x0, y0)`. The blur becomes O(1) per pixel, whatever the radius.
+
+> **Performance:** precompute once so every later question is O(1): summed-area tables for rectangles (blurs, "how much rock under this footprint"), prefix sums for 1D ranges, lookup tables for curves. Note the signature too: the caller lends the scratch buffer, so a function that runs every frame never allocates. A `uint32_t` holds the sum of up to 16 million bytes of 255, plenty for a 4096x4096 image.
+--- starter
+#include <stdint.h>
+
+void box_blur(const uint8_t *src, uint8_t *dst, int w, int h, int r, uint32_t *sat) {
+    for (int y = 0; y < h; y++)
+        for (int x = 0; x < w; x++) {
+            uint32_t sum = 0, count = 0;
+            for (int yy = y - r; yy <= y + r; yy++)
+                for (int xx = x - r; xx <= x + r; xx++)
+                    if (xx >= 0 && yy >= 0 && xx < w && yy < h) {
+                        sum += src[yy * w + xx];
+                        count++;
+                    }
+            dst[y * w + x] = (uint8_t)(sum / count);
+        }
+}
+--- solution
+#include <stdint.h>
+
+void box_blur(const uint8_t *src, uint8_t *dst, int w, int h, int r, uint32_t *sat) {
+    int sw = w + 1;                                  // row stride of the table
+    for (int x = 0; x <= w; x++) sat[x] = 0;         // zero top row
+    for (int y = 0; y < h; y++) {
+        sat[(y + 1) * sw] = 0;                       // zero left column
+        for (int x = 0; x < w; x++)
+            sat[(y + 1) * sw + x + 1] = src[y * w + x] + sat[(y + 1) * sw + x]
+                                      + sat[y * sw + x + 1] - sat[y * sw + x];
+    }
+    for (int y = 0; y < h; y++) {
+        int y0 = y - r < 0 ? 0 : y - r, y1 = y + r + 1 > h ? h : y + r + 1;
+        for (int x = 0; x < w; x++) {
+            int x0 = x - r < 0 ? 0 : x - r, x1 = x + r + 1 > w ? w : x + r + 1;
+            uint32_t sum = sat[y1 * sw + x1] - sat[y0 * sw + x1] - sat[y1 * sw + x0] + sat[y0 * sw + x0];
+            uint32_t count = (uint32_t)((x1 - x0) * (y1 - y0));
+            dst[y * w + x] = (uint8_t)(sum / count);
+        }
+    }
+}
+--- hint
+Clip the window first: `x0 = max(x - r, 0)`, `x1 = min(x + r + 1, w)` (half-open), the same for `y`. The pixel count is `(x1 - x0) * (y1 - y0)`.
+--- hint
+The table is `(w + 1)` wide. Write a zero top row and a zero left column so the recurrence needs no special cases. Unsigned subtraction in the four-lookup formula may wrap in the middle, but the final result is exact, because unsigned arithmetic is modulo 2^32.
+--- harness
+#include <stdint.h>
+static void ref_blur(const uint8_t *s, uint8_t *d, int w, int h, int r) {
+    for (int y = 0; y < h; y++)
+        for (int x = 0; x < w; x++) {
+            uint32_t sum = 0, c = 0;
+            for (int yy = y - r; yy <= y + r; yy++)
+                for (int xx = x - r; xx <= x + r; xx++)
+                    if (xx >= 0 && yy >= 0 && xx < w && yy < h) { sum += s[yy * w + xx]; c++; }
+            d[y * w + x] = (uint8_t)(sum / c);
+        }
+}
+static void noise(uint8_t *m, int n, unsigned seed) {
+    for (int i = 0; i < n; i++) { seed = seed * 1664525u + 1013904223u; m[i] = (uint8_t)(seed >> 24); }
+}
+int main(void) {
+    uint8_t a[3] = {0, 30, 90}, b[3];
+    uint32_t sat[64];
+    box_blur(a, b, 3, 1, 1, sat);
+    CHECK_INT(b[0], 15); CHECK_INT(b[1], 40); CHECK_INT(b[2], 60);
+    box_blur(a, b, 3, 1, 0, sat);                 // radius 0 copies
+    CHECK_INT(b[0], 0); CHECK_INT(b[1], 30); CHECK_INT(b[2], 90);
+    uint8_t one[1] = {200}, o[1];
+    box_blur(one, o, 1, 1, 5, sat);
+    CHECK_INT(o[0], 200);
+    int bad = 0;
+    for (unsigned seed = 1; seed <= 12; seed++) {
+        int w = 3 + (int)seed, h = 2 + (int)(seed % 5), r = (int)(seed % 4);
+        uint8_t s[16 * 8], d[16 * 8], e[16 * 8];
+        uint32_t t[17 * 9];
+        noise(s, w * h, seed);
+        box_blur(s, d, w, h, r, t);
+        ref_blur(s, e, w, h, r);
+        if (memcmp(d, e, (size_t)(w * h)) != 0) bad++;
+    }
+    CHECK_INT(bad, 0);
+    // a 1024x1024 texture, radius 40
+    int W = 1024, H = 1024, R = 40;
+    uint8_t *src = malloc((size_t)W * H), *dst = malloc((size_t)W * H);
+    uint32_t *tab = malloc((size_t)(W + 1) * (H + 1) * sizeof *tab);
+    for (int y = 0; y < H; y++)
+        for (int x = 0; x < W; x++) src[y * W + x] = (uint8_t)(((x / 64 + y / 64) % 2) * 255);
+    box_blur(src, dst, W, H, R, tab);
+    CHECK_INT(dst[0], 0);                         // top-left window is all black
+    int samples_bad = 0;
+    for (int k = 0; k < 200; k++) {
+        int x = (k * 379) % W, y = (k * 613) % H;
+        uint32_t sum = 0, c = 0;
+        for (int yy = y - R; yy <= y + R; yy++)
+            for (int xx = x - R; xx <= x + R; xx++)
+                if (xx >= 0 && yy >= 0 && xx < W && yy < H) { sum += src[yy * W + xx]; c++; }
+        if (dst[y * W + x] != sum / c) samples_bad++;
+    }
+    CHECK_INT(samples_bad, 0);
+    free(src); free(dst); free(tab);
+    return TEST_END();
+}
+
+=== exercise cull
+title: Removing dead entities
+--- prompt
+Entities live in parallel arrays (`id[i]`, `hp[i]`). Each frame some die and must be removed. Write both of the standard ways:
+
+- `int swap_remove(int *id, int *hp, int n, int i)`: remove entity `i` in O(1) by moving the **last** entity into slot `i`. Order is not preserved. Returns the new count `n - 1`.
+- `int remove_dead(int *id, int *hp, int n)`: remove every entity with `hp <= 0`, **keeping the order** of the survivors, and return the new count. Do it in one pass with a *write index*: walk `i` over all entities, and copy each survivor to position `w`, then `w++`.
+
+The tempting version of `remove_dead` shifts the whole tail left each time it finds a dead entity. That is O(n) per removal and O(n²) per frame when many die at once (an explosion in a crowd). The tests remove 150,000 of 300,000 entities, which that version cannot finish in time.
+
+> **Performance:** use `swap_remove` when order doesn't matter (most entity lists: bullets, particles), and the write-index compaction when it does (draw order, a turn queue). Both keep the array dense, so every later loop still runs over contiguous live data with no "is it dead?" checks.
+--- starter
+int swap_remove(int *id, int *hp, int n, int i) {
+    return n;
+}
+
+int remove_dead(int *id, int *hp, int n) {
+    for (int i = 0; i < n; ) {
+        if (hp[i] <= 0) {
+            for (int j = i; j + 1 < n; j++) {   // shift the tail left: O(n) per removal
+                id[j] = id[j + 1];
+                hp[j] = hp[j + 1];
+            }
+            n--;
+        } else {
+            i++;
+        }
+    }
+    return n;
+}
+--- solution
+int swap_remove(int *id, int *hp, int n, int i) {
+    id[i] = id[n - 1];
+    hp[i] = hp[n - 1];
+    return n - 1;
+}
+
+int remove_dead(int *id, int *hp, int n) {
+    int w = 0;
+    for (int i = 0; i < n; i++) {
+        if (hp[i] > 0) {
+            id[w] = id[i];
+            hp[w] = hp[i];
+            w++;
+        }
+    }
+    return w;
+}
+--- hint
+`swap_remove`: copy element `n - 1` over element `i` (when `i == n - 1` that is a harmless self-copy) and return `n - 1`.
+--- hint
+`remove_dead`: `w` never gets ahead of `i`, so copying `id[i]` to `id[w]` never overwrites an entity you have not looked at yet.
+--- harness
+int main(void) {
+    int id[5] = {10, 11, 12, 13, 14}, hp[5] = {5, 6, 7, 8, 9};
+    int n = swap_remove(id, hp, 5, 1);
+    CHECK_INT(n, 4);
+    CHECK_INT(id[1], 14); CHECK_INT(hp[1], 9);
+    CHECK_INT(id[0], 10); CHECK_INT(id[3], 13);
+    n = swap_remove(id, hp, n, 3);               // removing the last one
+    CHECK_INT(n, 3);
+    CHECK_INT(id[0], 10); CHECK_INT(id[1], 14); CHECK_INT(id[2], 12);
+
+    int id2[6] = {1, 2, 3, 4, 5, 6}, hp2[6] = {0, 4, -3, 2, 0, 9};
+    n = remove_dead(id2, hp2, 6);
+    CHECK_INT(n, 3);
+    CHECK_INT(id2[0], 2); CHECK_INT(id2[1], 4); CHECK_INT(id2[2], 6);
+    CHECK_INT(hp2[0], 4); CHECK_INT(hp2[1], 2); CHECK_INT(hp2[2], 9);
+    int id3[2] = {1, 2}, hp3[2] = {0, 0};
+    CHECK_INT(remove_dead(id3, hp3, 2), 0);
+    CHECK_INT(remove_dead(id3, hp3, 0), 0);
+
+    int N = 300000;
+    int *bid = malloc(N * sizeof *bid), *bhp = malloc(N * sizeof *bhp);
+    for (int i = 0; i < N; i++) { bid[i] = i; bhp[i] = (i % 2) ? 10 : 0; }
+    n = remove_dead(bid, bhp, N);
+    CHECK_INT(n, 150000);
+    int bad = 0;
+    for (int i = 0; i < n; i++) if (bid[i] != 2 * i + 1 || bhp[i] != 10) bad++;
+    CHECK_INT(bad, 0);
+    free(bid); free(bhp);
     return TEST_END();
 }
 

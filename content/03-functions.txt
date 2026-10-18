@@ -60,6 +60,8 @@ int main(void) {
 
 To let a function modify the caller's variable, you pass its *address* (a pointer) by value; that is the next chapter, and it is how C does C#'s `ref` and `out`. Arrays look like an exception: an array argument "decays" to a pointer to its first element, so the function sees the caller's elements, not a copy. More on that in the arrays chapter.
 
+> **Performance:** copying is cheap for small values and expensive for big ones. On x86-64 Linux, a struct of up to 16 bytes (a `Vec2` of two floats, a pair of ints) is passed and returned in registers, as cheaply as an `int`: pass those by value. A 200-byte `Entity` passed by value is copied onto the stack on every call; in a loop over 10,000 entities that is 2 MB of pointless copying per frame. Pass big structs by pointer (`const Entity *` when the function only reads), which you will learn next chapter.
+
 ## Return values
 
 A function returns one value (or `void`). To return several, either return a struct or write through pointer parameters. Some rules:
@@ -93,6 +95,8 @@ int main(void) {
 }
 ```
 
+> **Performance:** a function call costs a few cycles (save registers, jump, return), which only matters in the hottest loops. Recursion in game code has a bigger problem: depth. A recursive flood fill over a 1000x1000 tile map can go a million calls deep, each with its own stack frame, and overflows the 8 MB stack with a crash, not an error. When the depth depends on the data (map size, entity count), write the loop with an explicit array as the stack. Keep recursion for depths you can bound, like a tree that is a few levels deep.
+
 ## Uninitialized locals
 
 Local variables (*automatic storage*) are **not initialized**. Their starting value is whatever was on the stack, and reading it is a bug (often undefined behavior). C# refuses to compile a read of an unassigned local; C at best warns with `-Wall`, and only when it can see the problem. Initialize when you declare.
@@ -106,7 +110,7 @@ A `static` local lives for the whole program but is visible only inside its func
 ```c
 #include <stdio.h>
 
-int next_ticket(void) {
+int next_entity_id(void) {
     static int counter = 0;   // initialized once, keeps its value between calls
     counter++;
     return counter;
@@ -114,12 +118,14 @@ int next_ticket(void) {
 
 int main(void) {
     for (int i = 0; i < 3; i++)
-        printf("ticket %d\n", next_ticket());
+        printf("spawned entity %d\n", next_entity_id());
     return 0;
 }
 ```
 
 Typical uses: counters, caches, memo tables, and "first call" flags. The downside is shared hidden state: such functions are not thread-safe and not reentrant (the C library's `strtok` is the infamous example).
+
+Games add one more reason to be careful: a random number generator kept in a hidden `static` (like the C library's `rand`) means anything that calls it changes the sequence for everyone else, so a replay or a networked game drifts out of sync the moment one extra call happens. Keep such state in an explicit struct that you pass around (one RNG for gameplay, another for cosmetic effects), which the pointers chapter makes possible.
 
 ## Global variables, linkage, extern and static
 
@@ -215,6 +221,8 @@ int main(void) {
 
 `inline` is a hint that the function is small and calls to it may be replaced by its body. Modern compilers inline on their own at `-O2` and mostly ignore the hint. Its real effect is on linkage, and plain `inline` in C has confusing rules. The pattern to remember: a small helper in a header is `static inline int max_int(int a, int b) { return a > b ? a : b; }`. Each file that includes it gets its own private copy, so there is no "multiple definition" error.
 
+> **Performance:** the call overhead itself is small. The real cost of *not* inlining is that the optimizer cannot see through the call: it has to assume the function might change any memory, so it reloads values and cannot vectorize the loop around it. The compiler can only inline what it can see, which means a definition in the same `.c` file (or a header), not one in another file (unless you enable link-time optimization with `-flto`). So tiny hot helpers like `vec2_add`, `clamp` or `lerp` go in headers as `static inline`, and anything bigger stays in a `.c` file, where inlining would only bloat the code.
+
 ## Variadic functions
 
 `printf` takes a variable number of arguments, and you can write such functions with `<stdarg.h>`. Unlike C#'s `params int[]`, the callee gets no count and no types: it must be told, by a count argument, a sentinel value, or a format string. Arguments undergo the *default argument promotions*: `char` and `short` arrive as `int`, `float` as `double`.
@@ -241,6 +249,8 @@ int main(void) {
 ```
 
 Variadic functions throw away type safety. Use them sparingly, mostly for printf-style wrappers (with `vprintf` and friends).
+
+> **Performance:** printf-style formatting is slow compared with the work around it: parsing the format, converting each number to digits, then writing. A debug log call inside a per-entity loop can cost more than the update it describes. Log events (spawned, died, level loaded), not every frame, and guard verbose logging so the formatting does not even run when it is switched off: `if (log_level >= LOG_DEBUG) log_printf(...)`.
 
 ## No overloading, no default arguments
 
@@ -646,6 +656,295 @@ int main(void) {
 Base cases: amount exactly 0 is one way; a negative amount or no coin kinds left is zero ways.
 --- hint
 `static long long ways(int amount, int kinds)` with `coins[kinds - 1]` as the kind being decided. Then `change_ways(a)` is `ways(a, 5)`.
+
+=== exercise vec2
+title: A tiny vector library
+--- prompt
+Every game has a 2D (or 3D) vector type and a handful of functions on it. The starter defines the type:
+
+```c
+typedef struct { float x, y; } Vec2;
+```
+
+Write these, each taking and returning `Vec2` **by value**:
+
+- `Vec2 v2(float x, float y)`: build one.
+- `Vec2 v2_add(Vec2 a, Vec2 b)`, `Vec2 v2_sub(Vec2 a, Vec2 b)`: component-wise.
+- `Vec2 v2_scale(Vec2 a, float k)`: multiply both components by `k`.
+- `float v2_dot(Vec2 a, Vec2 b)`: `a.x * b.x + a.y * b.y`.
+- `float v2_len(Vec2 a)`: the length. Use `sqrtf`, the `float` version of `sqrt`.
+
+Passing an 8-byte struct by value is not wasteful: on x86-64 two floats travel in a single register, and returning one is just as cheap. That is why small math types are value types in every engine (and `struct` rather than `class` in C#'s Unity). The next two exercises add to this library.
+--- starter
+#include <math.h>
+
+typedef struct { float x, y; } Vec2;
+
+Vec2 v2(float x, float y) {
+    Vec2 r = {0, 0};
+    return r;
+}
+
+Vec2 v2_add(Vec2 a, Vec2 b) { return a; }
+Vec2 v2_sub(Vec2 a, Vec2 b) { return a; }
+Vec2 v2_scale(Vec2 a, float k) { return a; }
+float v2_dot(Vec2 a, Vec2 b) { return 0; }
+float v2_len(Vec2 a) { return 0; }
+--- solution
+#include <math.h>
+
+typedef struct { float x, y; } Vec2;
+
+Vec2 v2(float x, float y) {
+    Vec2 r = {x, y};
+    return r;
+}
+
+Vec2 v2_add(Vec2 a, Vec2 b) { return v2(a.x + b.x, a.y + b.y); }
+Vec2 v2_sub(Vec2 a, Vec2 b) { return v2(a.x - b.x, a.y - b.y); }
+Vec2 v2_scale(Vec2 a, float k) { return v2(a.x * k, a.y * k); }
+float v2_dot(Vec2 a, Vec2 b) { return a.x * b.x + a.y * b.y; }
+float v2_len(Vec2 a) { return sqrtf(v2_dot(a, a)); }
+--- hint
+Write `v2` first and build every other result with it. `v2_len(a)` is `sqrtf(v2_dot(a, a))`.
+--- harness
+int main(void) {
+    Vec2 a = v2(3, 4), b = v2(-1, 2);
+    CHECK_DBL(a.x, 3); CHECK_DBL(a.y, 4);
+    Vec2 s = v2_add(a, b);
+    CHECK_DBL(s.x, 2); CHECK_DBL(s.y, 6);
+    Vec2 d = v2_sub(a, b);
+    CHECK_DBL(d.x, 4); CHECK_DBL(d.y, 2);
+    Vec2 k = v2_scale(a, 0.5f);
+    CHECK_DBL(k.x, 1.5); CHECK_DBL(k.y, 2);
+    CHECK_DBL(v2_dot(a, b), 5);
+    CHECK_DBL(v2_dot(v2(1, 0), v2(0, 1)), 0);
+    CHECK_DBL(v2_len(a), 5);
+    CHECK_DBL(v2_len(v2(0, 0)), 0);
+    CHECK_DBL(v2_len(v2(-6, 8)), 10);
+    return TEST_END();
+}
+
+=== exercise vec2move
+title: Normalize and move towards
+continues: vec2
+--- prompt
+Add two functions that every movement system needs:
+
+- `Vec2 v2_normalize(Vec2 a)`: the vector with the same direction and length 1. The zero vector has no direction: return `(0, 0)` instead of dividing by zero (which would give NaN, and NaN spreads into every position it touches).
+- `Vec2 move_towards(Vec2 pos, Vec2 target, float max_step)`: move `pos` toward `target` by at most `max_step`. If the target is within `max_step`, return exactly `target` (so the mover arrives instead of jittering around it).
+
+`max_step` is `speed * dt` in a real game. Reuse your functions from the previous step.
+--- stubs
+Vec2 v2_normalize(Vec2 a) {
+    return a;
+}
+
+Vec2 move_towards(Vec2 pos, Vec2 target, float max_step) {
+    return pos;
+}
+--- solution
+#include <math.h>
+
+typedef struct { float x, y; } Vec2;
+
+Vec2 v2(float x, float y) {
+    Vec2 r = {x, y};
+    return r;
+}
+
+Vec2 v2_add(Vec2 a, Vec2 b) { return v2(a.x + b.x, a.y + b.y); }
+Vec2 v2_sub(Vec2 a, Vec2 b) { return v2(a.x - b.x, a.y - b.y); }
+Vec2 v2_scale(Vec2 a, float k) { return v2(a.x * k, a.y * k); }
+float v2_dot(Vec2 a, Vec2 b) { return a.x * b.x + a.y * b.y; }
+float v2_len(Vec2 a) { return sqrtf(v2_dot(a, a)); }
+
+Vec2 v2_normalize(Vec2 a) {
+    float len = v2_len(a);
+    if (len == 0.0f) return v2(0, 0);
+    return v2_scale(a, 1.0f / len);
+}
+
+Vec2 move_towards(Vec2 pos, Vec2 target, float max_step) {
+    Vec2 d = v2_sub(target, pos);
+    float dist = v2_len(d);
+    if (dist <= max_step || dist == 0.0f) return target;
+    return v2_add(pos, v2_scale(d, max_step / dist));
+}
+--- hint
+`move_towards`: compute the difference and its length once. If the length is `<= max_step`, return `target`; otherwise scale the difference by `max_step / dist` and add it to `pos`.
+--- hint
+Multiplying by `1.0f / len` once is cheaper than two divisions; divisions are several times slower than multiplications.
+--- harness
+int main(void) {
+    Vec2 n = v2_normalize(v2(3, 4));
+    CHECK_DBL(n.x, 0.6); CHECK_DBL(n.y, 0.8);
+    n = v2_normalize(v2(0, -5));
+    CHECK_DBL(n.x, 0); CHECK_DBL(n.y, -1);
+    n = v2_normalize(v2(0, 0));
+    CHECK_DBL(n.x, 0); CHECK_DBL(n.y, 0);
+    CHECK(n.x == n.x && n.y == n.y);   // not NaN
+    Vec2 p = move_towards(v2(0, 0), v2(10, 0), 3);
+    CHECK_DBL(p.x, 3); CHECK_DBL(p.y, 0);
+    p = move_towards(v2(0, 0), v2(3, 4), 10);
+    CHECK_DBL(p.x, 3); CHECK_DBL(p.y, 4);
+    p = move_towards(v2(1, 1), v2(4, 5), 2.5f);
+    CHECK_DBL(p.x, 2.5); CHECK_DBL(p.y, 3);
+    p = move_towards(v2(2, 2), v2(2, 2), 1);
+    CHECK_DBL(p.x, 2); CHECK_DBL(p.y, 2);
+    p = move_towards(v2(0, 0), v2(0, 5), 5);
+    CHECK(p.x == 0.0f && p.y == 5.0f);
+    // chase for a few frames: arrives exactly
+    Vec2 q = v2(0, 0);
+    for (int i = 0; i < 20; i++) q = move_towards(q, v2(-6, 8), 0.75f);
+    CHECK(q.x == -6.0f && q.y == 8.0f);
+    return TEST_END();
+}
+
+=== exercise vec2range
+title: Range checks without square roots
+continues: vec2move
+--- prompt
+Add two more:
+
+- `int in_range(Vec2 a, Vec2 b, float radius)`: 1 if the distance between `a` and `b` is at most `radius`, else 0. **Do not call `sqrtf`** (the tests don't check, but don't): compare the *squared* distance with `radius * radius`. Both sides are non-negative, so the comparison gives the same answer.
+- `Vec2 v2_reflect(Vec2 v, Vec2 n)`: bounce velocity `v` off a surface with unit normal `n`: `v - 2 * dot(v, n) * n`. A ball moving `(3, -2)` that hits the floor (normal `(0, 1)`) leaves with `(3, 2)`.
+
+> **Performance:** "is it within range?" runs for every pair an AI or a trigger checks, every frame. A square root is roughly 10-20 times the cost of a multiply; squared distances answer the same question with no root at all. Only take the root when you need the actual distance (to display it, or to normalize).
+--- stubs
+int in_range(Vec2 a, Vec2 b, float radius) {
+    return 0;
+}
+
+Vec2 v2_reflect(Vec2 v, Vec2 n) {
+    return v;
+}
+--- solution
+#include <math.h>
+
+typedef struct { float x, y; } Vec2;
+
+Vec2 v2(float x, float y) {
+    Vec2 r = {x, y};
+    return r;
+}
+
+Vec2 v2_add(Vec2 a, Vec2 b) { return v2(a.x + b.x, a.y + b.y); }
+Vec2 v2_sub(Vec2 a, Vec2 b) { return v2(a.x - b.x, a.y - b.y); }
+Vec2 v2_scale(Vec2 a, float k) { return v2(a.x * k, a.y * k); }
+float v2_dot(Vec2 a, Vec2 b) { return a.x * b.x + a.y * b.y; }
+float v2_len(Vec2 a) { return sqrtf(v2_dot(a, a)); }
+
+Vec2 v2_normalize(Vec2 a) {
+    float len = v2_len(a);
+    if (len == 0.0f) return v2(0, 0);
+    return v2_scale(a, 1.0f / len);
+}
+
+Vec2 move_towards(Vec2 pos, Vec2 target, float max_step) {
+    Vec2 d = v2_sub(target, pos);
+    float dist = v2_len(d);
+    if (dist <= max_step || dist == 0.0f) return target;
+    return v2_add(pos, v2_scale(d, max_step / dist));
+}
+
+int in_range(Vec2 a, Vec2 b, float radius) {
+    Vec2 d = v2_sub(a, b);
+    return v2_dot(d, d) <= radius * radius;
+}
+
+Vec2 v2_reflect(Vec2 v, Vec2 n) {
+    return v2_sub(v, v2_scale(n, 2.0f * v2_dot(v, n)));
+}
+--- hint
+The squared length of `d` is `v2_dot(d, d)`.
+--- harness
+int main(void) {
+    CHECK_INT(in_range(v2(0, 0), v2(3, 4), 5), 1);
+    CHECK_INT(in_range(v2(0, 0), v2(3, 4), 4.99f), 0);
+    CHECK_INT(in_range(v2(1, 1), v2(1, 1), 0), 1);
+    CHECK_INT(in_range(v2(-10, 0), v2(10, 0), 19.5f), 0);
+    CHECK_INT(in_range(v2(-10, 0), v2(10, 0), 20), 1);
+    Vec2 r = v2_reflect(v2(3, -2), v2(0, 1));
+    CHECK_DBL(r.x, 3); CHECK_DBL(r.y, 2);
+    r = v2_reflect(v2(5, 1), v2(-1, 0));
+    CHECK_DBL(r.x, -5); CHECK_DBL(r.y, 1);
+    r = v2_reflect(v2(1, 0), v2_normalize(v2(-1, 1)));
+    CHECK_DBL(r.x, 0); CHECK_DBL(r.y, 1);
+    r = v2_reflect(v2(0, 0), v2(0, 1));
+    CHECK_DBL(r.x, 0); CHECK_DBL(r.y, 0);
+    Vec2 p = move_towards(v2(0, 0), v2(10, 0), 3);
+    CHECK_DBL(p.x, 3);
+    return TEST_END();
+}
+
+=== exercise hitparams
+title: Default arguments with an options struct
+--- prompt
+C has no default arguments. The "No overloading" section suggested an **options struct** with designated initializers instead, because any field the caller leaves out is zero. Here it is for a damage formula. The starter defines:
+
+```c
+typedef struct {
+    int base;        // weapon damage
+    int strength;    // attacker stat
+    int armor;       // target armor
+    int crit;        // nonzero: this hit is a critical
+    int crit_pct;    // critical multiplier in percent; 0 means "use the default, 150"
+} Hit;
+```
+
+Write `int hit_damage(Hit h)`:
+
+1. `dmg = base + strength / 2` (integer division).
+2. If `crit` is set, `dmg = dmg * pct / 100`, with `pct` being `crit_pct`, or 150 when `crit_pct` is 0.
+3. Subtract `armor`.
+4. If `base > 0`, the result is at least 1. If `base <= 0`, the result is at least 0.
+
+A caller writes `hit_damage((Hit){.base = 12, .strength = 6, .crit = 1})` and gets the default multiplier without mentioning it. Zero as "use the default" is the convention that makes this work, so design new fields so that 0 is the sensible default.
+--- starter
+typedef struct {
+    int base;
+    int strength;
+    int armor;
+    int crit;
+    int crit_pct;
+} Hit;
+
+int hit_damage(Hit h) {
+    return h.base;
+}
+--- solution
+typedef struct {
+    int base;
+    int strength;
+    int armor;
+    int crit;
+    int crit_pct;
+} Hit;
+
+int hit_damage(Hit h) {
+    int dmg = h.base + h.strength / 2;
+    if (h.crit) dmg = dmg * (h.crit_pct ? h.crit_pct : 150) / 100;
+    dmg -= h.armor;
+    int min_dmg = h.base > 0 ? 1 : 0;
+    return dmg < min_dmg ? min_dmg : dmg;
+}
+--- hint
+`h.crit_pct ? h.crit_pct : 150` picks the default when the field is zero.
+--- harness
+int main(void) {
+    CHECK_INT(hit_damage((Hit){.base = 10}), 10);
+    CHECK_INT(hit_damage((Hit){.base = 10, .strength = 7}), 13);
+    CHECK_INT(hit_damage((Hit){.base = 12, .strength = 6, .crit = 1}), 22);
+    CHECK_INT(hit_damage((Hit){.base = 12, .strength = 6, .crit = 1, .crit_pct = 200}), 30);
+    CHECK_INT(hit_damage((Hit){.base = 12, .strength = 6, .crit_pct = 200}), 15);
+    CHECK_INT(hit_damage((Hit){.base = 10, .armor = 4}), 6);
+    CHECK_INT(hit_damage((Hit){.base = 10, .armor = 40}), 1);
+    CHECK_INT(hit_damage((Hit){.base = 0, .strength = 4, .armor = 40}), 0);
+    CHECK_INT(hit_damage((Hit){.base = 0, .strength = 4}), 2);
+    CHECK_INT(hit_damage((Hit){.base = 7, .crit = 1, .armor = 1}), 9);
+    return TEST_END();
+}
 
 === quiz
 run: yes

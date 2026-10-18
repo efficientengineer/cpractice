@@ -117,6 +117,8 @@ int main(void) {
 
 Arenas are standard in compilers, games (a per-frame arena reset every frame) and request handlers (a per-request arena). They make lifetime management trivial: no leaks within the arena, no double frees, and allocation is a few instructions.
 
+> **Performance:** the classic game use is the **frame allocator**: one arena, sized at startup, that every system uses for temporary data during a frame (visible-entity lists, sorted draw lists, formatted text, pathfinding scratch), and that is reset with `used = 0` at the top of the next frame. That replaces hundreds of `malloc`/`free` pairs per frame with pointer bumps, and the data each system builds sits contiguously in memory. Some engines keep two and alternate, so data from the previous frame stays readable for one more frame.
+
 ## Alignment
 
 Every type has an **alignment**: its address must be a multiple of it. On x86-64, `int` is 4-aligned, `double` and pointers 8-aligned. `alignof(T)` (from `<stdalign.h>`; keyword `_Alignof`) tells you. `malloc` returns memory aligned for any standard type (`alignof(max_align_t)`, 16 here).
@@ -140,6 +142,44 @@ int main(void) {
 Order members from largest alignment to smallest to minimize padding. `offsetof(type, member)` (from `<stddef.h>`) gives a member's byte offset. Never assume a struct has no padding when writing it to a file or network: serialize field by field.
 
 To round a size or address up to a power-of-two alignment `a`: `(n + a - 1) & ~(a - 1)`. `alignas(16)` on a declaration requests stricter alignment, e.g. for SIMD.
+
+### Array of structs vs struct of arrays
+
+The CPU never reads one byte from memory: it reads a whole **cache line**, 64 bytes on current x86 and ARM chips. Fast code makes every byte of every line count. Compare two layouts for 10000 particles:
+
+```c
+#include <stdio.h>
+
+enum { N = 10000 };
+
+/* Array of structs (AoS): natural, like a C# class array */
+struct particle { float x, y, vx, vy; float r, g, b, a; int sprite, flags; float life, age; };
+static struct particle aos[N];
+
+/* Struct of arrays (SoA): one array per field */
+static struct {
+    float x[N], y[N], vx[N], vy[N];
+    float life[N], age[N];
+    /* colors, sprites, flags: in their own arrays, untouched by the update */
+} soa;
+
+int main(void) {
+    float dt = 1.0f / 60;
+    for (int i = 0; i < N; i++) { aos[i].vx = soa.vx[i] = 1; aos[i].vy = soa.vy[i] = 2; }
+    for (int i = 0; i < N; i++) {   /* uses 16 of every 48 bytes it loads */
+        aos[i].x += aos[i].vx * dt;
+        aos[i].y += aos[i].vy * dt;
+    }
+    for (int i = 0; i < N; i++) {   /* reads only bytes it uses; easy to vectorize */
+        soa.x[i] += soa.vx[i] * dt;
+        soa.y[i] += soa.vy[i] * dt;
+    }
+    printf("%zu bytes per particle; %.3f %.3f\n", sizeof(struct particle), aos[5].x, soa.x[5]);
+    return 0;
+}
+```
+
+> **Performance:** in the AoS loop, each 48-byte particle drags its color, sprite, flags, life and age through the cache, though the loop touches only position and velocity: two thirds of the memory traffic is wasted. In the SoA loop every loaded byte is used, and the four arrays are perfect input for SIMD (the compiler vectorizes it at `-O2`). Rules of thumb: lay data out by *how it is iterated*, not by what "object" it belongs to; split hot fields (touched every frame) from cold ones (touched on spawn or death); and measure with a profiler before and after, since layout wins depend on the access pattern.
 
 ## Memory layout of a process
 
@@ -307,6 +347,8 @@ int main(void) {
 
 This is template instantiation done by hand: the macro body is ordinary C with `T` substituted, and `##` builds the names. Each instantiation is fully typed and as fast as hand-written code. The downsides: errors point into a macro, debugging is awkward, and the body cannot contain `#` directives. Comments inside a multi-line macro must be `/* */`, since a `//` comment would swallow the line continuation. Libraries like `stb_ds.h` and the Linux kernel's `list.h` take this to its limit.
 
+> **Performance:** macro-generated containers store elements inline (an `IntVec` is one contiguous `int` array) and their comparisons and copies are inlined, while the `void *` style pays a function-pointer call per comparison (`qsort` cannot inline your comparator) and often a pointer per element. For containers on a hot path, the typed version is usually noticeably faster.
+
 ## volatile, briefly
 
 `volatile` tells the compiler that every read and write of the object is an observable side effect: it must not cache the value in a register or remove "redundant" accesses. Legitimate uses:
@@ -453,7 +495,7 @@ int main(void) {
 === exercise arena
 title: A bump allocator
 --- prompt
-Implement an arena allocator over one `malloc`ed block. The `Arena` struct is given.
+Implement an arena allocator over one `malloc`ed block, the kind a game uses as its per-frame scratch allocator. The `Arena` struct is given.
 
 - `bool arena_init(Arena *a, size_t cap)`: allocate `cap` bytes; `false` on failure.
 - `void *arena_alloc(Arena *a, size_t size, size_t align)`: return a pointer to `size` bytes whose **address** is a multiple of `align` (a power of two, possibly larger than 16), or `NULL` if the remaining space cannot fit it (including padding). Never write outside the block, and make sure your size arithmetic cannot wrap.
@@ -860,6 +902,10 @@ Complete `DEFINE_VEC(T, Name)`, which stamps out a growable vector type `Name` h
 - `void Name_free(Name *v)`: free the storage and reset to empty.
 
 The struct has public fields `data`, `len` and `cap`. The tests instantiate it for `int`, `double`, a struct type and `const char *`. The starter already builds the names with `##`; fill in the bodies.
+
+The tests also push three million elements. Growing by one element (or any fixed amount) per `realloc` makes that quadratic and it times out.
+
+> **Performance:** doubling makes `push` amortized O(1): each element is copied at most about twice over its lifetime. In a game, also *reserve* up front when you know the size (the entity count from the level file) and `clear` (set `len = 0`) rather than free between frames, so a vector reaches its working size once and then never allocates again.
 --- starter
 #include <stdbool.h>
 #include <stddef.h>
@@ -968,6 +1014,17 @@ int main(void) {
     CHECK_STR(*StrVec_at(&sv, 1), "beta");
     CHECK_STR(StrVec_pop(&sv), "beta");
     StrVec_free(&sv);
+
+    IntVec big;
+    IntVec_init(&big);
+    ok = 1;
+    for (int i = 0; i < 3000000; i++) ok &= IntVec_push(&big, i);
+    CHECK(ok);
+    CHECK_INT(big.len, 3000000);
+    long long sum = 0;
+    for (size_t i = 0; i < big.len; i++) sum += big.data[i];
+    CHECK_INT(sum, 4499998500000LL);
+    IntVec_free(&big);
     return TEST_END();
 }
 
@@ -1119,22 +1176,22 @@ int main(void) {
 === exercise layout
 title: Padding, alignment and static_assert
 --- prompt
-Three small tasks about memory layout.
+A particle system keeps 100000 of these structs in an array, so every wasted byte is wasted 100000 times and dilutes every cache line. Three small tasks about memory layout.
 
-1. Reorder the members of `struct Record` (keep the same names and types) so that `sizeof(struct Record)` is 16 instead of 32, and add a `static_assert` that it is 16.
+1. Reorder the members of `struct Particle` (keep the same names and types) so that `sizeof(struct Particle)` is 16 instead of 32, and add a `static_assert` that it is 16.
 2. `size_t align_up(size_t n, size_t align)`: round `n` up to a multiple of `align`, a power of two. Use bit operations, no division or loops.
-3. `size_t record_padding(void)`: the number of padding bytes in `struct Record`, computed from `sizeof` and the member sizes (so it reports `0` once the struct is tight, and would report 16 for the original order).
+3. `size_t particle_padding(void)`: the number of padding bytes in `struct Particle`, computed from `sizeof` and the member sizes (so it reports `0` once the struct is tight, and would report 16 for the original order).
 --- starter
 #include <assert.h>
 #include <stddef.h>
 #include <stdint.h>
 
-struct Record {
-    char tag;
-    double score;
-    char flag;
+struct Particle {
+    char kind;
+    double lifetime;
+    char alive;
     int32_t id;
-    int16_t year;
+    int16_t frame;
 };
 
 size_t align_up(size_t n, size_t align) {
@@ -1142,7 +1199,7 @@ size_t align_up(size_t n, size_t align) {
     return n;
 }
 
-size_t record_padding(void) {
+size_t particle_padding(void) {
     return 0;
 }
 --- solution
@@ -1150,22 +1207,22 @@ size_t record_padding(void) {
 #include <stddef.h>
 #include <stdint.h>
 
-struct Record {
-    double score;
+struct Particle {
+    double lifetime;
     int32_t id;
-    int16_t year;
-    char tag;
-    char flag;
+    int16_t frame;
+    char kind;
+    char alive;
 };
-static_assert(sizeof(struct Record) == 16, "struct Record should have no padding");
+static_assert(sizeof(struct Particle) == 16, "struct Particle should have no padding");
 
 size_t align_up(size_t n, size_t align) {
     return (n + align - 1) & ~(align - 1);
 }
 
-size_t record_padding(void) {
-    struct Record r;
-    return sizeof r - (sizeof r.tag + sizeof r.score + sizeof r.flag + sizeof r.id + sizeof r.year);
+size_t particle_padding(void) {
+    struct Particle r;
+    return sizeof r - (sizeof r.kind + sizeof r.lifetime + sizeof r.alive + sizeof r.id + sizeof r.frame);
 }
 --- hint
 Sort members by alignment, largest first: `double` (8), `int32_t` (4), `int16_t` (2), then the two `char`s.
@@ -1177,14 +1234,14 @@ Sort members by alignment, largest first: `double` (8), `int32_t` (4), `int16_t`
 #include <stddef.h>
 
 int main(void) {
-    CHECK_INT(sizeof(struct Record), 16);
-    struct Record r = {0};
-    r.tag = 'T'; r.flag = 1; r.score = 9.5; r.id = 1234567; r.year = 2024;
-    CHECK_INT(r.tag, 'T');
-    CHECK_DBL(r.score, 9.5);
-    CHECK_INT(r.id + r.year + r.flag, 1234567 + 2024 + 1);
-    CHECK_INT(offsetof(struct Record, score) % 8, 0);
-    CHECK_INT(record_padding(), 0);
+    CHECK_INT(sizeof(struct Particle), 16);
+    struct Particle r = {0};
+    r.kind = 'T'; r.alive = 1; r.lifetime = 9.5; r.id = 1234567; r.frame = 2024;
+    CHECK_INT(r.kind, 'T');
+    CHECK_DBL(r.lifetime, 9.5);
+    CHECK_INT(r.id + r.frame + r.alive, 1234567 + 2024 + 1);
+    CHECK_INT(offsetof(struct Particle, lifetime) % 8, 0);
+    CHECK_INT(particle_padding(), 0);
     CHECK_INT(align_up(0, 8), 0);
     CHECK_INT(align_up(1, 8), 8);
     CHECK_INT(align_up(8, 8), 8);

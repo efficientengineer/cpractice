@@ -142,3 +142,4 @@ blockquote { margin: 0 0 16px; padding: 8px 16px; border-left: 4px solid var(--a
   .top nav { gap: 10px; font-size: 0.9rem; }
   #side { top: 80px; height: calc(100vh - 80px); }
 }
+.pnm { width: 100%; max-width: 512px; image-rendering: pixelated; border-radius: 8px; border: 1px solid var(--line); display: block; }
