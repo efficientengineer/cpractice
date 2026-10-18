@@ -481,7 +481,7 @@ Write these as **generator functions** that work on any iterable, including infi
 Game use: `take(cycle(['idle1', 'idle2', 'idle3']), 7)` is a looping animation; `zip(naturals(), waves)` numbers waves.
 --- starter
 function* naturals(start = 0) {}
-function* take(iter, n) { yield* iter; }
+function* take(iter, n) {}
 function* filter(iter, pred) {}
 function* map(iter, f) {}
 function* zip(...iters) {}

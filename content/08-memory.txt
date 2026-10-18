@@ -45,6 +45,8 @@ The stack is fast (allocation is just moving a register) and automatically clean
 - the data must outlive the function that creates it,
 - it must grow.
 
+> **Performance:** `malloc` is not free. A call costs anywhere from tens of nanoseconds to microseconds (it searches free lists, may take a lock, occasionally asks the OS for pages), the time is unpredictable, and thousands of small blocks scatter your data across the heap, so later loops over them miss the cache. That is fine at load time and wrong in a frame loop. The rule for real-time and per-pixel code: **allocate up front, reuse forever**. Size buffers for the worst case when the scene or texture is created, reuse them every frame, and free them when the scene goes away. Never `malloc` per particle, per vertex, per pixel or per frame.
+
 ## malloc, calloc, realloc, free
 
 All four live in `<stdlib.h>`.
@@ -99,6 +101,7 @@ C has no destructors, `using`, or GC, so every heap block needs exactly one *own
 - **Paired create/destroy functions** for anything with internal allocations: `vec_init` / `vec_free`, `parser_new` / `parser_destroy`. Callers never `free` the internals by hand.
 - **Borrowing**: a function that takes a `const T *` only reads it during the call and does not keep it or free it.
 - **Caller-provided buffers** avoid the question entirely: `snprintf(buf, size, ...)` writes into memory the caller owns. Many C APIs prefer this.
+- **Arenas and pools** change the unit of ownership. An *arena* hands out pieces of one big block and frees them all at once (perfect for "everything this frame needs" or "everything while generating this chunk"); a *pool* holds fixed-size slots and recycles them through a free list (perfect for particles and other objects that come and go). Both turn thousands of `malloc`/`free` pairs into a handful, and both make leaks of individual objects impossible. You will write an arena at the end of this chapter.
 
 ```c
 #include <stdio.h>
@@ -311,6 +314,8 @@ int main(void) {
 
 The vector itself (the three fields) usually lives on the stack or inside another struct; only the elements are on the heap. Copying an `IntVec` with `=` copies the pointer, not the elements: you would get two owners of one block, and a double free when both are freed. That is the shallow copy problem, with no GC to save you.
 
+> **Performance:** doubling makes growth cheap on average, but each growth still copies the whole array, and the pause lands on whichever push happens to trigger it. When you know the size (a 256x256 terrain has 65,536 vertices), *reserve* it before the loop: one allocation, no copies. When you regenerate the same thing again (every frame, or every time a parameter changes), *clear* by setting `len = 0` and keep the capacity, instead of freeing and rebuilding. And don't shrink on every removal: a buffer that grows and shrinks by turns pays for reallocation forever.
+
 ## A heap-allocated 2D grid
 
 When both dimensions are runtime values, allocate one flat block and index it by hand. It is one allocation, one free, and cache friendly:
@@ -335,6 +340,8 @@ int main(void) {
 ```
 
 The alternative, an array of row pointers (`int **`, each row its own `malloc`), gives you `grid[r][c]` syntax and jagged rows, at the cost of `rows + 1` allocations to manage and free. It is C's version of `int[][]` versus `int[,]`.
+
+> **Performance:** for images, height fields and voxel grids, always use the flat block. The row-pointer version adds an extra memory load per access (fetch the row pointer, then the element), its rows can land anywhere in the heap so walking down a column or across rows misses the cache, and it cannot be handed to `memcpy`, `fwrite` or a GPU upload as one piece. One flat buffer of `w * h` elements, indexed `y * w + x`, is what every image format, graphics API and SIMD loop expects.
 
 > A good habit from now on: for every `malloc` you write, decide on the spot who frees it and write that `free` immediately, before filling in the code in between.
 
@@ -938,6 +945,656 @@ int main(void) {
     }
     free(one);
     free(a); free(b); free(p); free(q);
+    return TEST_END();
+}
+
+=== exercise image
+title: An image that owns its pixels
+--- prompt
+A grayscale image with its pixels in the same allocation, using the flexible array member from the structs chapter:
+
+```c
+typedef struct { int w, h; uint8_t px[]; } Image;   // px[y * w + x]
+```
+
+Write:
+
+- `Image *image_new(int w, int h)`: one allocation holding the header and `w * h` zeroed pixels. Return `NULL` if `w` or `h` is not in `1..16384`, or if the allocation fails.
+- `void image_free(Image *img)`: release it (`NULL` is allowed).
+- `Image *image_downsample(const Image *src)`: a **new** image of size `w / 2` by `h / 2` (integer division), where each pixel is the rounded average of the 2x2 block it covers: `(a + b + c + d + 2) / 4`. Return `NULL` if either new dimension would be 0. The caller owns the result and frees it with `image_free`; `src` is only borrowed.
+
+One block per image means one `malloc`, one `free`, and the pixels right next to their size. Compute the size in `size_t`: `sizeof(Image) + (size_t)w * h`.
+--- starter
+#include <stdint.h>
+#include <stdlib.h>
+
+typedef struct { int w, h; uint8_t px[]; } Image;
+
+Image *image_new(int w, int h) {
+    return NULL;
+}
+
+void image_free(Image *img) {
+}
+
+Image *image_downsample(const Image *src) {
+    return NULL;
+}
+--- solution
+#include <stdint.h>
+#include <stdlib.h>
+
+typedef struct { int w, h; uint8_t px[]; } Image;
+
+Image *image_new(int w, int h) {
+    if (w < 1 || h < 1 || w > 16384 || h > 16384) return NULL;
+    Image *img = calloc(1, sizeof *img + (size_t)w * h);   // zeroed header and pixels
+    if (!img) return NULL;
+    img->w = w;
+    img->h = h;
+    return img;
+}
+
+void image_free(Image *img) {
+    free(img);
+}
+
+Image *image_downsample(const Image *src) {
+    Image *dst = image_new(src->w / 2, src->h / 2);
+    if (!dst) return NULL;
+    for (int y = 0; y < dst->h; y++) {
+        const uint8_t *r0 = &src->px[(2 * y) * src->w], *r1 = r0 + src->w;   // two source rows
+        for (int x = 0; x < dst->w; x++)
+            dst->px[y * dst->w + x] =
+                (uint8_t)((r0[2 * x] + r0[2 * x + 1] + r1[2 * x] + r1[2 * x + 1] + 2) / 4);
+    }
+    return dst;
+}
+--- hint
+`image_new(src->w / 2, src->h / 2)` already rejects a zero dimension, so `image_downsample` gets that check for free.
+--- hint
+Destination pixel `(x, y)` averages source pixels `(2x, 2y)`, `(2x+1, 2y)`, `(2x, 2y+1)`, `(2x+1, 2y+1)`.
+--- harness
+int main(void) {
+    CHECK(image_new(0, 5) == NULL);
+    CHECK(image_new(5, -1) == NULL);
+    CHECK(image_new(16385, 1) == NULL);
+    Image *a = image_new(5, 3);
+    CHECK(a != NULL);
+    if (!a) return TEST_END();
+    CHECK_INT(a->w, 5); CHECK_INT(a->h, 3);
+    int nonzero = 0;
+    for (int i = 0; i < 15; i++) nonzero += a->px[i] != 0;
+    CHECK_INT(nonzero, 0);
+    for (int i = 0; i < 15; i++) a->px[i] = (uint8_t)(i * 10);
+    Image *b = image_downsample(a);              // 2 x 1
+    CHECK(b != NULL);
+    if (b) {
+        CHECK_INT(b->w, 2); CHECK_INT(b->h, 1);
+        CHECK_INT(b->px[0], (0 + 10 + 50 + 60 + 2) / 4);
+        CHECK_INT(b->px[1], (20 + 30 + 70 + 80 + 2) / 4);
+        CHECK(image_downsample(b) == NULL);      // 1 x 0
+        CHECK_INT(a->px[0], 0);                  // src untouched
+    }
+    image_free(b);
+    image_free(a);
+    image_free(NULL);
+    Image *c = image_new(2, 2);
+    if (c) {
+        c->px[0] = 255; c->px[1] = 255; c->px[2] = 255; c->px[3] = 254;
+        Image *d = image_downsample(c);
+        CHECK(d && d->px[0] == 255);
+        image_free(d);
+    }
+    image_free(c);
+    Image *big = image_new(4096, 4096);
+    CHECK(big != NULL);
+    if (big) {
+        for (int y = 0; y < 4096; y++)
+            for (int x = 0; x < 4096; x++) big->px[y * 4096 + x] = (uint8_t)((x ^ y) & 255);
+        Image *h = image_downsample(big);
+        CHECK(h && h->w == 2048 && h->h == 2048);
+        if (h) {
+            int x = 1000, y = 77;
+            const uint8_t *p = big->px;
+            int want = (p[(2 * y) * 4096 + 2 * x] + p[(2 * y) * 4096 + 2 * x + 1] +
+                        p[(2 * y + 1) * 4096 + 2 * x] + p[(2 * y + 1) * 4096 + 2 * x + 1] + 2) / 4;
+            CHECK_INT(h->px[y * 2048 + x], want);
+        }
+        image_free(h);
+    }
+    image_free(big);
+    return TEST_END();
+}
+
+=== exercise mipchain
+title: A mip chain, all or nothing
+continues: image
+--- prompt
+GPUs sample distant textures from **mipmaps**: the image, then half size, quarter size, and so on. Add
+
+```c
+int image_mips(const Image *src, Image **out, int max);
+```
+
+It stores up to `max` newly allocated images in `out`: `out[0]` is the first downsample of `src`, `out[1]` the downsample of `out[0]`, and so on, stopping when the next level would have a zero dimension or `max` levels exist. Return the number of levels made. `src` is not copied into `out`. The caller owns every image in `out`.
+
+**All or nothing:** if an allocation fails partway, free every level you already made, set them to `NULL`, and return -1. The caller should never have to clean up after a failed call. (The tests can't make `malloc` fail, but write the cleanup path anyway: it is the habit this chapter is about.)
+
+> **Performance:** a mip chain costs only a third more memory than the base image (1/4 + 1/16 + ... = 1/3), and it is built once, when the texture is loaded or generated, never per frame. Allocating at load time and reusing forever is the rule for every big buffer in a renderer.
+--- stubs
+int image_mips(const Image *src, Image **out, int max) {
+    return -1;
+}
+--- solution
+#include <stdint.h>
+#include <stdlib.h>
+
+typedef struct { int w, h; uint8_t px[]; } Image;
+
+Image *image_new(int w, int h) {
+    if (w < 1 || h < 1 || w > 16384 || h > 16384) return NULL;
+    Image *img = calloc(1, sizeof *img + (size_t)w * h);
+    if (!img) return NULL;
+    img->w = w;
+    img->h = h;
+    return img;
+}
+
+void image_free(Image *img) {
+    free(img);
+}
+
+Image *image_downsample(const Image *src) {
+    Image *dst = image_new(src->w / 2, src->h / 2);
+    if (!dst) return NULL;
+    for (int y = 0; y < dst->h; y++) {
+        const uint8_t *r0 = &src->px[(2 * y) * src->w], *r1 = r0 + src->w;
+        for (int x = 0; x < dst->w; x++)
+            dst->px[y * dst->w + x] =
+                (uint8_t)((r0[2 * x] + r0[2 * x + 1] + r1[2 * x] + r1[2 * x + 1] + 2) / 4);
+    }
+    return dst;
+}
+
+int image_mips(const Image *src, Image **out, int max) {
+    int n = 0;
+    const Image *cur = src;
+    while (n < max && cur->w >= 2 && cur->h >= 2) {
+        Image *next = image_downsample(cur);
+        if (!next) {                         // allocation failed: undo everything
+            for (int i = 0; i < n; i++) { image_free(out[i]); out[i] = NULL; }
+            return -1;
+        }
+        out[n++] = next;
+        cur = next;
+    }
+    return n;
+}
+--- hint
+Loop while `n < max` and the current level is at least 2x2. Downsample the *previous level*, not `src` each time (that would be both wrong and slower).
+--- harness
+int main(void) {
+    Image *base = image_new(16, 4);
+    if (!base) return 1;
+    for (int i = 0; i < 64; i++) base->px[i] = (uint8_t)(i * 4);
+    Image *mips[8] = {0};
+    int n = image_mips(base, mips, 8);
+    CHECK_INT(n, 2);                             // 8x2, 4x1
+    if (n == 2) {
+        CHECK_INT(mips[0]->w, 8); CHECK_INT(mips[0]->h, 2);
+        CHECK_INT(mips[1]->w, 4); CHECK_INT(mips[1]->h, 1);
+        Image *again = image_downsample(mips[0]);
+        CHECK(again && memcmp(again->px, mips[1]->px, 4) == 0);
+        image_free(again);
+    }
+    for (int i = 0; i < n; i++) image_free(mips[i]);
+    CHECK_INT(image_mips(base, mips, 0), 0);
+    CHECK_INT(image_mips(base, mips, 1), 1);
+    image_free(mips[0]);
+    Image *tiny = image_new(1, 9);
+    if (tiny) CHECK_INT(image_mips(tiny, mips, 8), 0);
+    image_free(tiny);
+    Image *sq = image_new(256, 256);
+    if (sq) {
+        for (int i = 0; i < 256 * 256; i++) sq->px[i] = 200;
+        Image *m[16] = {0};
+        int k = image_mips(sq, m, 16);
+        CHECK_INT(k, 8);                         // 128 down to 1
+        if (k == 8) { CHECK_INT(m[7]->w, 1); CHECK_INT(m[7]->px[0], 200); }
+        for (int i = 0; i < k; i++) image_free(m[i]);
+    }
+    image_free(sq);
+    image_free(base);
+    return TEST_END();
+}
+
+=== exercise mesh
+title: Growable vertex and index buffers
+--- prompt
+A mesh being generated (terrain, an L-system tree, marching cubes) grows as you go. Build its two growable buffers:
+
+```c
+typedef struct { float x, y, z; } Vec3;
+typedef struct {
+    Vec3 *verts;     size_t nverts, vcap;
+    uint32_t *idx;   size_t nidx, icap;
+} Mesh;
+```
+
+Write:
+
+- `void mesh_init(Mesh *m)`: empty, no allocation. `void mesh_free(Mesh *m)`: release both buffers and reset to empty.
+- `void mesh_clear(Mesh *m)`: set the counts to 0 but **keep** the buffers and capacities, so regenerating next time costs no allocation.
+- `int mesh_reserve(Mesh *m, size_t nverts, size_t nidx)`: make sure the capacities are at least these; 1 on success, 0 on failure (with the mesh unchanged).
+- `long mesh_add_vertex(Mesh *m, Vec3 v)`: append; return its index, or -1 on failure.
+- `int mesh_add_tri(Mesh *m, uint32_t a, uint32_t b, uint32_t c)`: append three indices; return 0 (adding nothing) if any index is not an existing vertex, or if allocation fails; 1 otherwise.
+
+Grow capacity by **doubling** (start at, say, 16), through a temporary pointer so a failed `realloc` loses nothing. The tests add a million vertices and count how many times your `verts` pointer changes: growing by a constant amount would move it tens of thousands of times, copying the whole buffer each time.
+
+> **Performance:** three habits for buffers in real-time code: `reserve` when you know the size (one allocation instead of twenty), `clear` instead of free-and-reallocate when you regenerate, and never shrink on every frame. A generator called each frame should reach a steady state where it allocates nothing at all.
+--- starter
+#include <stdint.h>
+#include <stdlib.h>
+
+typedef struct { float x, y, z; } Vec3;
+typedef struct {
+    Vec3 *verts;     size_t nverts, vcap;
+    uint32_t *idx;   size_t nidx, icap;
+} Mesh;
+
+void mesh_init(Mesh *m) {
+    m->verts = NULL; m->nverts = m->vcap = 0;
+    m->idx = NULL; m->nidx = m->icap = 0;
+}
+
+void mesh_free(Mesh *m) {
+}
+
+void mesh_clear(Mesh *m) {
+}
+
+int mesh_reserve(Mesh *m, size_t nverts, size_t nidx) {
+    return 0;
+}
+
+long mesh_add_vertex(Mesh *m, Vec3 v) {
+    return -1;
+}
+
+int mesh_add_tri(Mesh *m, uint32_t a, uint32_t b, uint32_t c) {
+    return 0;
+}
+--- solution
+#include <stdint.h>
+#include <stdlib.h>
+
+typedef struct { float x, y, z; } Vec3;
+typedef struct {
+    Vec3 *verts;     size_t nverts, vcap;
+    uint32_t *idx;   size_t nidx, icap;
+} Mesh;
+
+void mesh_init(Mesh *m) {
+    m->verts = NULL; m->nverts = m->vcap = 0;
+    m->idx = NULL; m->nidx = m->icap = 0;
+}
+
+void mesh_free(Mesh *m) {
+    free(m->verts);
+    free(m->idx);
+    mesh_init(m);
+}
+
+void mesh_clear(Mesh *m) {
+    m->nverts = 0;
+    m->nidx = 0;
+}
+
+int mesh_reserve(Mesh *m, size_t nverts, size_t nidx) {
+    if (nverts > m->vcap) {
+        Vec3 *t = realloc(m->verts, nverts * sizeof *t);
+        if (!t) return 0;
+        m->verts = t;
+        m->vcap = nverts;
+    }
+    if (nidx > m->icap) {
+        uint32_t *t = realloc(m->idx, nidx * sizeof *t);
+        if (!t) return 0;                    // verts may have grown: harmless, still valid
+        m->idx = t;
+        m->icap = nidx;
+    }
+    return 1;
+}
+
+static size_t grown(size_t cap, size_t need) {
+    size_t c = cap ? cap : 16;
+    while (c < need) c *= 2;
+    return c;
+}
+
+long mesh_add_vertex(Mesh *m, Vec3 v) {
+    if (m->nverts == m->vcap && !mesh_reserve(m, grown(m->vcap, m->nverts + 1), 0)) return -1;
+    m->verts[m->nverts] = v;
+    return (long)m->nverts++;
+}
+
+int mesh_add_tri(Mesh *m, uint32_t a, uint32_t b, uint32_t c) {
+    if (a >= m->nverts || b >= m->nverts || c >= m->nverts) return 0;
+    if (m->nidx + 3 > m->icap && !mesh_reserve(m, 0, grown(m->icap, m->nidx + 3))) return 0;
+    m->idx[m->nidx++] = a;
+    m->idx[m->nidx++] = b;
+    m->idx[m->nidx++] = c;
+    return 1;
+}
+--- hint
+Let `mesh_reserve` do all the reallocating. The add functions only decide the new capacity (double until it is enough) and call it.
+--- hint
+`mesh_free` can end by calling `mesh_init`, so a freed mesh is a valid empty mesh again.
+--- harness
+static Vec3 V(float x, float y, float z) { Vec3 v = {x, y, z}; return v; }
+int main(void) {
+    Mesh m;
+    mesh_init(&m);
+    CHECK_INT(mesh_add_vertex(&m, V(1, 2, 3)), 0);
+    CHECK_INT(mesh_add_vertex(&m, V(4, 5, 6)), 1);
+    CHECK_INT(mesh_add_vertex(&m, V(7, 8, 9)), 2);
+    CHECK_INT(mesh_add_tri(&m, 0, 1, 2), 1);
+    CHECK_INT(mesh_add_tri(&m, 0, 1, 3), 0);
+    CHECK_INT(m.nverts, 3); CHECK_INT(m.nidx, 3);
+    CHECK(m.verts && m.verts[1].y == 5.0f);
+    CHECK(m.idx && m.idx[2] == 2);
+    // a million vertices: the buffer may move only a few dozen times
+    int moves = 0;
+    Vec3 *last = m.verts;
+    for (int i = 0; i < 1000000; i++) {
+        if (mesh_add_vertex(&m, V((float)i, 0, 0)) < 0) break;
+        if (m.verts != last) { moves++; last = m.verts; }
+    }
+    CHECK_INT(m.nverts, 1000003);
+    CHECK(moves <= 40);
+    CHECK(m.vcap >= m.nverts && m.vcap <= 4 * m.nverts);
+    CHECK(m.verts[1000002].x == 999999.0f);
+    for (uint32_t i = 0; i + 2 < 300000; i += 3)
+        if (!mesh_add_tri(&m, i, i + 1, i + 2)) break;
+    CHECK_INT(m.nidx, 300003);
+    // clear keeps the memory
+    Vec3 *kept = m.verts;
+    size_t cap = m.vcap;
+    mesh_clear(&m);
+    CHECK_INT(m.nverts, 0); CHECK_INT(m.nidx, 0);
+    CHECK(m.verts == kept && m.vcap == cap);
+    CHECK_INT(mesh_add_tri(&m, 0, 0, 0), 0);
+    CHECK_INT(mesh_add_vertex(&m, V(0, 0, 0)), 0);
+    CHECK(m.verts == kept);
+    mesh_free(&m);
+    CHECK(m.verts == NULL && m.nverts == 0 && m.vcap == 0 && m.idx == NULL);
+    // reserve, then add without moving
+    CHECK_INT(mesh_reserve(&m, 5000, 900), 1);
+    CHECK(m.vcap >= 5000 && m.icap >= 900);
+    Vec3 *r = m.verts;
+    for (int i = 0; i < 5000; i++) mesh_add_vertex(&m, V(0, 0, 0));
+    CHECK(m.verts == r);
+    mesh_free(&m);
+    mesh_free(&m);                              // freeing an empty mesh is fine
+    return TEST_END();
+}
+
+=== exercise meshgrid
+title: Generate a grid mesh
+continues: mesh
+--- prompt
+Add the first generator: `int mesh_add_grid(Mesh *m, int nx, int nz, float cell)` appends a flat grid of `nx` by `nz` cells in the XZ plane (`nx, nz >= 1`):
+
+- Vertices: `(nx + 1) * (nz + 1)` of them, row by row: for `j` from 0 to `nz` (outer) and `i` from 0 to `nx` (inner), the vertex `(i * cell, 0, j * cell)`.
+- Triangles: two per cell. With `v00` the cell's vertex at `(i, j)`, `v10` at `(i + 1, j)`, `v01` at `(i, j + 1)` and `v11` at `(i + 1, j + 1)`, add `(v00, v01, v10)` and `(v10, v01, v11)`. That winding is counter-clockwise seen from above, so the normals point up.
+- The mesh may already contain vertices: every index you add is offset by the vertex count *before* the call.
+
+**Reserve first**: you know exactly how many vertices and indices are coming, so call `mesh_reserve` once with the final totals, and the loops never trigger a reallocation. Return 1 on success, 0 if the reservation fails (adding nothing).
+
+The tests build a 1000x1000 grid: a million vertices and six million indices.
+--- stubs
+int mesh_add_grid(Mesh *m, int nx, int nz, float cell) {
+    return 0;
+}
+--- solution
+#include <stdint.h>
+#include <stdlib.h>
+
+typedef struct { float x, y, z; } Vec3;
+typedef struct {
+    Vec3 *verts;     size_t nverts, vcap;
+    uint32_t *idx;   size_t nidx, icap;
+} Mesh;
+
+void mesh_init(Mesh *m) {
+    m->verts = NULL; m->nverts = m->vcap = 0;
+    m->idx = NULL; m->nidx = m->icap = 0;
+}
+
+void mesh_free(Mesh *m) {
+    free(m->verts);
+    free(m->idx);
+    mesh_init(m);
+}
+
+void mesh_clear(Mesh *m) {
+    m->nverts = 0;
+    m->nidx = 0;
+}
+
+int mesh_reserve(Mesh *m, size_t nverts, size_t nidx) {
+    if (nverts > m->vcap) {
+        Vec3 *t = realloc(m->verts, nverts * sizeof *t);
+        if (!t) return 0;
+        m->verts = t;
+        m->vcap = nverts;
+    }
+    if (nidx > m->icap) {
+        uint32_t *t = realloc(m->idx, nidx * sizeof *t);
+        if (!t) return 0;
+        m->idx = t;
+        m->icap = nidx;
+    }
+    return 1;
+}
+
+static size_t grown(size_t cap, size_t need) {
+    size_t c = cap ? cap : 16;
+    while (c < need) c *= 2;
+    return c;
+}
+
+long mesh_add_vertex(Mesh *m, Vec3 v) {
+    if (m->nverts == m->vcap && !mesh_reserve(m, grown(m->vcap, m->nverts + 1), 0)) return -1;
+    m->verts[m->nverts] = v;
+    return (long)m->nverts++;
+}
+
+int mesh_add_tri(Mesh *m, uint32_t a, uint32_t b, uint32_t c) {
+    if (a >= m->nverts || b >= m->nverts || c >= m->nverts) return 0;
+    if (m->nidx + 3 > m->icap && !mesh_reserve(m, 0, grown(m->icap, m->nidx + 3))) return 0;
+    m->idx[m->nidx++] = a;
+    m->idx[m->nidx++] = b;
+    m->idx[m->nidx++] = c;
+    return 1;
+}
+
+int mesh_add_grid(Mesh *m, int nx, int nz, float cell) {
+    size_t row = (size_t)nx + 1;
+    size_t nv = row * ((size_t)nz + 1), ni = (size_t)nx * nz * 6;
+    if (!mesh_reserve(m, m->nverts + nv, m->nidx + ni)) return 0;
+    uint32_t base = (uint32_t)m->nverts;
+    for (int j = 0; j <= nz; j++)
+        for (int i = 0; i <= nx; i++) {
+            Vec3 v = {i * cell, 0, j * cell};
+            m->verts[m->nverts++] = v;           // capacity is reserved: write directly
+        }
+    uint32_t *out = m->idx + m->nidx;
+    for (int j = 0; j < nz; j++)
+        for (int i = 0; i < nx; i++) {
+            uint32_t v00 = base + (uint32_t)(j * row + i), v10 = v00 + 1;
+            uint32_t v01 = v00 + (uint32_t)row, v11 = v01 + 1;
+            *out++ = v00; *out++ = v01; *out++ = v10;
+            *out++ = v10; *out++ = v01; *out++ = v11;
+        }
+    m->nidx += ni;
+    return 1;
+}
+--- hint
+Vertex `(i, j)` of this grid has index `base + j * (nx + 1) + i`, where `base` is `m->nverts` before you add anything.
+--- hint
+After the single `mesh_reserve`, write straight into `m->verts` and `m->idx` instead of calling the add functions: no per-element capacity checks in the inner loop.
+--- harness
+static Vec3 V(float x, float y, float z) { Vec3 v = {x, y, z}; return v; }
+int main(void) {
+    Mesh m;
+    mesh_init(&m);
+    CHECK_INT(mesh_add_grid(&m, 2, 1, 0.5f), 1);
+    CHECK_INT(m.nverts, 6); CHECK_INT(m.nidx, 12);
+    CHECK(m.verts[4].x == 0.5f && m.verts[4].z == 0.5f && m.verts[4].y == 0);
+    CHECK(m.verts[2].x == 1.0f && m.verts[2].z == 0);
+    unsigned want[12] = {0, 3, 1, 1, 3, 4, 1, 4, 2, 2, 4, 5};
+    int bad = 0;
+    for (int i = 0; i < 12; i++) bad += m.idx[i] != want[i];
+    CHECK_INT(bad, 0);
+    // a second grid is offset
+    mesh_add_vertex(&m, V(9, 9, 9));
+    CHECK_INT(mesh_add_grid(&m, 1, 1, 2), 1);
+    CHECK_INT(m.nverts, 11); CHECK_INT(m.nidx, 18);
+    CHECK(m.idx[12] == 7 && m.idx[13] == 9 && m.idx[14] == 8 && m.idx[17] == 10);
+    CHECK(m.verts[10].x == 2.0f && m.verts[10].z == 2.0f);
+    // every triangle faces up (+y)
+    mesh_clear(&m);
+    CHECK_INT(mesh_add_grid(&m, 1000, 1000, 1), 1);
+    CHECK_INT(m.nverts, 1002001); CHECK_INT(m.nidx, 6000000);
+    int down = 0;
+    for (size_t t = 0; t < m.nidx; t += 3001) {
+        size_t k = t - t % 3;
+        Vec3 a = m.verts[m.idx[k]], b = m.verts[m.idx[k + 1]], c = m.verts[m.idx[k + 2]];
+        float ux = b.x - a.x, uz = b.z - a.z, vx = c.x - a.x, vz = c.z - a.z;
+        float ny = uz * vx - ux * vz;              // y of cross(b - a, c - a)
+        if (ny <= 0) down++;
+    }
+    CHECK_INT(down, 0);
+    CHECK(m.verts[1002000].x == 1000.0f && m.verts[1002000].z == 1000.0f);
+    mesh_free(&m);
+    return TEST_END();
+}
+
+=== exercise arena
+title: A scratch arena
+--- prompt
+Procedural generation makes lots of short-lived buffers: a noise octave, a temporary row, a list of candidate points. Allocating and freeing each with `malloc` costs time and fragments the heap. An **arena** (bump allocator) gets one big block up front, hands out pieces by moving an offset forward, and frees *everything at once* by resetting the offset.
+
+```c
+typedef struct { unsigned char *base; size_t cap, used; } Arena;
+```
+
+Write:
+
+- `int arena_init(Arena *a, size_t cap)`: allocate the block; 1 on success, 0 on failure.
+- `void *arena_alloc(Arena *a, size_t size, size_t align)`: return a pointer to `size` bytes whose **address** is a multiple of `align` (a power of two, at most 64), or `NULL` if they don't fit in what's left. Round the current address up: `(addr + align - 1) & ~(align - 1)` with `addr` as a `uintptr_t`.
+- `void arena_reset(Arena *a)`: everything handed out is gone; the next allocation starts at the beginning again.
+- `void arena_destroy(Arena *a)`: free the block.
+
+Pieces are never freed individually. That is the whole trick: allocation is an add and a compare, and freeing a frame's worth of scratch memory is one assignment.
+
+> **Performance:** the rule "never call `malloc` in per-frame (or per-pixel) code" doesn't mean "never need temporary memory". It means: get it from an arena reset each frame, or from a pool of fixed-size slots with a free list, both allocated once at startup. You will build a pool in a later chapter.
+--- starter
+#include <stdint.h>
+#include <stdlib.h>
+
+typedef struct { unsigned char *base; size_t cap, used; } Arena;
+
+int arena_init(Arena *a, size_t cap) {
+    return 0;
+}
+
+void *arena_alloc(Arena *a, size_t size, size_t align) {
+    return malloc(size);
+}
+
+void arena_reset(Arena *a) {
+}
+
+void arena_destroy(Arena *a) {
+}
+--- solution
+#include <stdint.h>
+#include <stdlib.h>
+
+typedef struct { unsigned char *base; size_t cap, used; } Arena;
+
+int arena_init(Arena *a, size_t cap) {
+    a->base = malloc(cap);
+    a->cap = a->base ? cap : 0;
+    a->used = 0;
+    return a->base != NULL;
+}
+
+void *arena_alloc(Arena *a, size_t size, size_t align) {
+    uintptr_t start = (uintptr_t)a->base;
+    uintptr_t p = (start + a->used + align - 1) & ~(uintptr_t)(align - 1);
+    size_t offset = (size_t)(p - start);
+    if (offset > a->cap || size > a->cap - offset) return NULL;   // no overflow-prone offset + size
+    a->used = offset + size;
+    return a->base + offset;
+}
+
+void arena_reset(Arena *a) {
+    a->used = 0;
+}
+
+void arena_destroy(Arena *a) {
+    free(a->base);
+    a->base = NULL;
+    a->cap = a->used = 0;
+}
+--- hint
+Work with the address: `uintptr_t p = ((uintptr_t)a->base + a->used + align - 1) & ~(uintptr_t)(align - 1);` then the offset is `p - (uintptr_t)a->base`.
+--- hint
+Check `size > a->cap - offset` (after making sure `offset <= a->cap`) rather than `offset + size > a->cap`: a huge `size` would overflow the addition.
+--- harness
+#include <stdint.h>
+int main(void) {
+    Arena a;
+    CHECK_INT(arena_init(&a, 1024), 1);
+    char *p1 = arena_alloc(&a, 10, 1);
+    float *p2 = arena_alloc(&a, 4 * sizeof(float), 16);
+    double *p3 = arena_alloc(&a, sizeof(double), 8);
+    void *p4 = arena_alloc(&a, 1, 64);
+    CHECK(p1 && p2 && p3 && p4);
+    CHECK((uintptr_t)p2 % 16 == 0);
+    CHECK((uintptr_t)p3 % 8 == 0);
+    CHECK((uintptr_t)p4 % 64 == 0);
+    CHECK((char *)p2 >= p1 + 10);
+    CHECK((char *)p3 >= (char *)p2 + 16);
+    CHECK((char *)p1 >= (char *)a.base && (char *)p4 < (char *)a.base + 1024);
+    if (p1 && p2 && p3) {
+        memset(p1, 'x', 10); p2[3] = 1.5f; *p3 = 2.5;
+        CHECK(p2[3] == 1.5f && *p3 == 2.5 && p1[9] == 'x');
+    }
+    CHECK(arena_alloc(&a, 2000, 1) == NULL);
+    CHECK(arena_alloc(&a, SIZE_MAX, 1) == NULL);
+    arena_reset(&a);
+    char *q = arena_alloc(&a, 10, 1);
+    CHECK(q == p1);                              // the same memory again
+    CHECK(arena_alloc(&a, 1014, 1) != NULL);     // exactly fills the block
+    CHECK(arena_alloc(&a, 1, 1) == NULL);
+    // a million frames of scratch allocations: no malloc, no leaks
+    int fails = 0;
+    for (int frame = 0; frame < 1000000; frame++) {
+        arena_reset(&a);
+        float *row = arena_alloc(&a, 64 * sizeof(float), 16);
+        int *tmp = arena_alloc(&a, 32 * sizeof(int), 4);
+        if (!row || !tmp) { fails++; continue; }
+        row[63] = (float)frame;
+        tmp[0] = frame;
+    }
+    CHECK_INT(fails, 0);
+    arena_destroy(&a);
+    CHECK(a.base == NULL);
     return TEST_END();
 }
 

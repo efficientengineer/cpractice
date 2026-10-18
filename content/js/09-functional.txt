@@ -1,67 +1,86 @@
 === chapter functional
 title: Functional techniques
-blurb: Pure functions and immutability (and when not to use them), composition, currying, memoization, debounce and throttle, decorators, trampolines, reducers and state machines.
+blurb: Pure functions and immutability (and when not to use them), composing texture functions, currying, memoization, debounce and throttle, decorators, trampolines, reducers and state machines.
 --- body
 ## Functions as the unit of reuse
 
-You know LINQ and delegates, and chapter 01 covered closures. This chapter is about the techniques that grow out of treating functions as values: building behavior by wrapping and combining functions instead of subclassing. In a game codebase these show up everywhere: reducers for game state, state machines for AI, decorators for cooldowns and profiling, memoized lookups, throttled input.
+You know LINQ and delegates, and chapter 01 covered closures. This chapter is about the techniques that grow out of treating functions as values: building behavior by wrapping and combining functions instead of subclassing. Procedural graphics is full of them. A procedural texture *is* a function from coordinates to a colour, and complex textures are built by composing small ones (noise, then warp, then contrast, then a colour ramp). Editors for those textures use reducers for undoable state, debounce regeneration while you drag a slider, and memoize expensive lookups.
 
-It also covers where functional style costs too much. Functional code favours allocating new values; per-frame game code favours reusing memory. Knowing both, and where the boundary is, is the actual skill.
+It also covers where functional style costs too much. Functional code favours allocating new values; per-pixel and per-frame code favours reusing memory. Knowing both, and where the boundary is, is the actual skill.
 
 ## Pure functions and immutability
 
-A pure function's result depends only on its arguments, and it changes nothing outside itself. Pure functions are trivially testable, safe to memoize, and safe to replay, which is how deterministic replays and rollback netcode work: same inputs, same state.
+A pure function's result depends only on its arguments, and it changes nothing outside itself. Pure functions are trivially testable, safe to memoize, safe to run in parallel (in workers, or as a GPU shader, which is a pure function by construction), and deterministic: same seed and parameters in, same texture out.
 
 ```js
-// Impure: reads and writes outside state.
-let gold = 100;
-function buyImpure(price) { gold -= price; return gold >= 0; }
+// Impure: mutates shared state that other code also reads.
+const settings = { octaves: 4 };
+function addOctave() { settings.octaves++; }
 
-// Pure: returns a new state, leaves the old one alone.
-function buy(state, price) {
-  if (state.gold < price) return state;            // unchanged: return the same object
-  return { ...state, gold: state.gold - price, items: [...state.items, 'sword'] };
+// Pure: returns a new preset and leaves the old one alone.
+function setParam(preset, key, value) {
+  if (preset.params[key] === value) return preset;            // unchanged: return the same object
+  return { ...preset, params: { ...preset.params, [key]: value } };
 }
-const s0 = { gold: 100, items: ['torch'], stats: { str: 5 } };
-const s1 = buy(s0, 30);
-console.log(s0, s1);
-console.log(s0.stats === s1.stats, buy(s1, 500) === s1);
+const p0 = { name: 'marble', params: { scale: 4, octaves: 5 }, palette: ['#fff', '#888', '#222'] };
+const p1 = setParam(p0, 'scale', 8);
+console.log(p0.params, p1.params);
+console.log(p0.palette === p1.palette, setParam(p1, 'scale', 8) === p1);
 ```
 
-Copying only along the path you change and sharing everything else is **structural sharing**. It makes "did anything change?" a cheap `===` check, which is what React, Redux and undo systems rely on.
+Copying only along the path you change and sharing everything else is **structural sharing**. It makes "did anything change?" a cheap `===` check, which is what React, Redux and undo systems rely on, and it lets an editor cache the generated texture until its preset object actually changes.
 
 `Object.freeze` makes an object's own properties read-only. It is **shallow**, and writes to a frozen object fail *silently* in sloppy mode and throw in strict mode. Code on this site runs in sloppy mode unless it starts with `'use strict'` (classes and modules are always strict):
 
 ```js
 'use strict';
-const cfg = Object.freeze({ speed: 3, keys: { jump: 'Space' } });
-try { cfg.speed = 99; } catch (e) { console.log(e.constructor.name, e.message); }
-cfg.keys.jump = 'KeyW';                  // nested objects are not frozen
-console.log(cfg);
+const preset = Object.freeze({ seed: 3, colors: { low: '#203040' } });
+try { preset.seed = 99; } catch (e) { console.log(e.constructor.name, e.message); }
+preset.colors.low = '#000000';            // nested objects are not frozen
+console.log(preset);
 const deepFreeze = o => { Object.values(o).forEach(v => typeof v === 'object' && v && deepFreeze(v)); return Object.freeze(o); };
 console.log(Object.isFrozen(deepFreeze({ a: { b: 1 } }).a));
 ```
 
-> **Performance:** immutable updates allocate. `entities = entities.map(e => ({ ...e, x: e.x + e.vx }))` every frame creates thousands of objects per second, and the garbage collector eventually pauses to clean them up, which shows up as a dropped frame. That is a bad habit in a simulation loop: mutate positions in place (ideally in typed arrays, chapter 10). Use immutability where changes are rare and history matters: menus, inventory, settings, turn-based game state, undo stacks, saved snapshots.
+> **Performance:** immutable updates allocate. `vertices = vertices.map(v => ({ ...v, y: v.y + offset }))` creates an object per vertex, and doing it every frame (or every pixel with `{ r, g, b }` objects) keeps the garbage collector busy until it pauses and drops a frame. That is a bad habit in hot code: mutate typed arrays in place (chapter 10). Use immutability where changes are rare and history matters: presets, editor state, scene descriptions, undo stacks, snapshots.
 
 ## Composition and pipe
 
-`compose(f, g)(x)` is `f(g(x))` (right to left, the mathematical order). `pipe(f, g)(x)` is `g(f(x))` (left to right, reading order), which most people find clearer.
+`compose(f, g)(x)` is `f(g(x))` (right to left, the mathematical order). `pipe(f, g)(x)` is `g(f(x))` (left to right, reading order), which most people find clearer. A tone-mapping chain for a grayscale value is a natural pipeline:
 
 ```js
 const pipe = (...fns) => x => fns.reduce((acc, f) => f(acc), x);
 const compose = (...fns) => x => fns.reduceRight((acc, f) => f(acc), x);
 
-const clamp = (lo, hi) => v => Math.min(hi, Math.max(lo, v));
-const applyArmor = armor => dmg => dmg * (100 / (100 + armor));
-const crit = mult => dmg => dmg * mult;
+const clamp01 = v => Math.min(1, Math.max(0, v));
+const contrast = k => v => (v - 0.5) * k + 0.5;
+const gamma = g => v => v ** (1 / g);
+const posterize = levels => v => Math.round(v * (levels - 1)) / (levels - 1);
 
-const damage = pipe(crit(2), applyArmor(50), Math.round, clamp(1, 999));
-console.log(damage(30), damage(0), damage(10000));
+const tone = pipe(contrast(1.5), clamp01, gamma(2.2), posterize(5));
+console.log([0, 0.25, 0.5, 0.75, 1].map(tone));
 console.log(compose(x => x + 1, x => x * 2)(3), pipe(x => x + 1, x => x * 2)(3));
 ```
 
-A pipeline like `damage` is easy to read and test piece by piece. It is also a chain of closures and calls: fine for an event that happens a few times per second, worth inlining if it runs per particle per frame.
+The same idea one level up: a **texture function** maps `(u, v)` in [0, 1] to a value, and combinators build new texture functions from old ones without touching any pixels:
+
+```js
+const checker = n => (u, v) => (Math.floor(u * n) + Math.floor(v * n)) & 1;
+const circle = r => (u, v) => Math.hypot(u - 0.5, v - 0.5) < r ? 1 : 0;
+const scale = (s, f) => (u, v) => f((u * s) % 1, (v * s) % 1);
+const mix = (a, b, t) => (u, v) => a(u, v) * (1 - t) + b(u, v) * t;
+const invert = f => (u, v) => 1 - f(u, v);
+
+const tex = mix(checker(4), invert(scale(2, circle(0.3))), 0.5);
+const W = 24, H = 12, ramp = ' .:-=+*#';
+for (let y = 0; y < H; y++) {
+  let row = '';
+  for (let x = 0; x < W; x++) row += ramp[Math.round(tex((x + 0.5) / W, (y + 0.5) / H) * (ramp.length - 1))];
+  console.log(row);
+}
+```
+
+> **Performance:** a composed texture is a tree of closures, and evaluating it costs several function calls per pixel. That is fine for previews and for small textures, and modern JITs inline a lot of it, but it is not free: a 2048 by 2048 texture is four million evaluations of the whole tree. Two standard remedies: compile the tree into a single function (the projects chapter does this for formula strings) or bake intermediate layers into `Float32Array`s once and combine those. Never allocate inside a texture function (no `[r, g, b]` arrays per pixel); write into preallocated output instead.
 
 ## Currying and partial application
 
@@ -80,12 +99,12 @@ const fromOrigin = dist2(0, 0);
 console.log(fromOrigin(3, 4), dist2(1)(1)(4, 5), dist2(1, 1, 4, 5));
 
 const log = (level, system, msg) => `[${level}] ${system}: ${msg}`;
-const warnAudio = log.bind(null, 'WARN', 'audio');
-console.log(warnAudio('buffer underrun'));
+const warnShader = log.bind(null, 'WARN', 'shader');
+console.log(warnShader('uniform uTime is unused'));
 console.log(((a, b = 2, ...c) => 0).length, (function (a, b) {}).length);
 ```
 
-Note `fn.length` counts parameters before the first default or rest parameter, so `curry` does not work for those. Currying is less common in everyday JavaScript than in Haskell or F#; closures that fix a few arguments (`clamp(0, 100)` above) are the everyday form.
+Note `fn.length` counts parameters before the first default or rest parameter, so `curry` does not work for those. Currying is less common in everyday JavaScript than in Haskell or F#; closures that fix a few arguments (`contrast(1.5)` above) are the everyday form.
 
 ## Memoization
 
@@ -106,16 +125,16 @@ const fib = memoize(n => { calls++; return n < 2 ? n : fib(n - 1) + fib(n - 2); 
 console.log(fib(70), calls);
 ```
 
-The memoized `fib` calls itself through the cache, so it is linear instead of exponential. For several arguments, the tempting key `args.join(',')` or `JSON.stringify(args)` conflates `1` with `'1'` (`join`), loses object identity (two different enemies with equal fields share an entry), costs a string allocation per call, and throws on cycles and bigints. The robust structure is a **trie of Maps**, one level per argument, keyed by the arguments themselves (Maps use SameValueZero, so `NaN` works and objects are compared by identity). Use a `WeakMap` level for object keys if the cache must not keep them alive.
+The memoized `fib` calls itself through the cache, so it is linear instead of exponential. For several arguments, the tempting key `args.join(',')` or `JSON.stringify(args)` conflates `1` with `'1'` (`join`), loses object identity (two different meshes with equal fields share an entry), costs a string allocation per call, and throws on cycles and bigints. The robust structure is a **trie of Maps**, one level per argument, keyed by the arguments themselves (Maps use SameValueZero, so `NaN` works and objects are compared by identity). Use a `WeakMap` level for object keys if the cache must not keep them alive.
 
-> **Performance:** memoization trades memory for time, and both sides have costs. A `Map` lookup is a hash plus a probe: cheaper than a pathfinding query or a font layout, *more expensive* than `a * b + c`. An unbounded cache is a memory leak with a nice name. Measure first, cap the size (an LRU cache, chapter 12) or scope the cache to a level or a frame, and never memoize on keys that change every call (like a timestamp or a fresh object).
+> **Performance:** memoization trades memory for time, and both sides have costs. A `Map` lookup is a hash plus a probe: cheaper than generating a noise tile or triangulating a glyph, *far more expensive* than `a * b + c`. Memoizing a cheap per-pixel function makes it slower, and a cache keyed on float coordinates almost never hits. An unbounded cache is a memory leak with a nice name: measure first, cap the size (an LRU cache, chapter 12), or prefer a **precomputed table** indexed by an integer (a gradient table, a gamma lookup table of 256 entries), which is the procedural-generation version of memoization with no hashing at all.
 
 ## Debounce and throttle
 
 Both limit how often a function runs:
 
-- **debounce**: run once, after calls *stop* for `ms` milliseconds (search-as-you-type, saving settings after the slider stops, resizing).
-- **throttle**: run at most once per `ms`, at a steady rate while calls continue (scroll handlers, network position updates).
+- **debounce**: run once, after calls *stop* for `ms` milliseconds (regenerate a 2048 by 2048 texture after the user stops dragging the "scale" slider, save settings, re-layout on resize).
+- **throttle**: run at most once per `ms`, at a steady rate while calls continue (a cheap low-resolution preview while the slider moves, scroll handlers, network updates).
 
 ```js
 function debounce(fn, ms) {
@@ -134,17 +153,17 @@ function throttle(fn, ms) {
 }
 
 const sleep = ms => new Promise(r => setTimeout(r, ms));
-const save = debounce(v => console.log('saved volume', v), 40);
-for (const v of [10, 20, 30]) { save(v); await sleep(5); }
+const regenerate = debounce(scale => console.log('full-res texture at scale', scale), 40);
+for (const s of [2, 3, 4]) { regenerate(s); await sleep(5); }
 await sleep(80);
 
-const send = throttle(x => console.log('sent', x), 30);
-for (let i = 0; i < 10; i++) { send(i); await sleep(10); }
+const preview = throttle(s => console.log('preview at scale', s), 30);
+for (let i = 0; i < 10; i++) { preview(i); await sleep(10); }
 ```
 
-The throttle above is *leading-edge only*: the last call in a burst may be dropped. A full implementation also schedules a *trailing* call with the latest arguments; you will write one in the exercises.
+The throttle above is *leading-edge only*: the last call in a burst may be dropped, so the preview may not match the final slider position. A full implementation also schedules a *trailing* call with the latest arguments; you will write one in the exercises.
 
-Inside a game, do not throttle gameplay with `setTimeout` or wall-clock time. Timers fire between frames at unpredictable moments, keep running while the game is paused, and break determinism. A weapon's fire rate is a **cooldown in game time**: subtract `dt` each update and fire when it reaches zero. Debounce and throttle are for the edges: UI, saving, networking, analytics.
+Inside a render loop, do not use timers at all. Timers fire between frames at unpredictable moments and keep running while the app is paused. Animation advances by the frame's `dt` (seconds since the last frame), and anything periodic is a countdown decremented by `dt`. Debounce and throttle are for the edges: UI, regeneration requests, saving, networking.
 
 ## once and function decorators
 
@@ -165,18 +184,18 @@ function timed(fn, label = fn.name) {
     finally { const ms = performance.now() - t0; if (ms > 1000) console.log(`${label} took ${ms.toFixed(1)}ms`); }
   };
 }
-const initAudio = once(() => { console.log('audio context created'); return { ready: true }; });
-console.log(initAudio(), initAudio() === initAudio());
+const initGpu = once(() => { console.log('requesting GPU device'); return { ready: true }; });
+console.log(initGpu(), initGpu() === initGpu());
 
-const player = { hp: 10, hit: timed(function (d) { return this.hp -= d; }) };
-console.log(player.hit(3), player.hp);
+const mesh = { triangles: 12, subdivide: timed(function (k) { return this.triangles *= 4 ** k; }) };
+console.log(mesh.subdivide(2), mesh.triangles);
 ```
 
-Decorators compose like any other function: `const fire = once(timed(loadLevel))`. The TC39 `@decorator` syntax for classes is standardized but not yet shipped in browsers, so you only see it with a build step (TypeScript, Babel); underneath it is exactly this pattern.
+Decorators compose like any other function: `const build = once(timed(buildAtlas))`. The TC39 `@decorator` syntax for classes is standardized but not yet shipped in browsers, so you only see it with a build step (TypeScript, Babel); underneath it is exactly this pattern.
 
 ## Recursion, stack depth and trampolines
 
-V8 does not implement proper tail calls, so every recursive call uses a stack frame, and the stack holds roughly ten thousand frames. A recursive flood fill on a 200 by 200 tile map, or a recursive walk over a long linked list, throws `RangeError: Maximum call stack size exceeded`.
+V8 does not implement proper tail calls, so every recursive call uses a stack frame, and the stack holds roughly ten thousand frames. A recursive flood fill on a 200 by 200 grid, a recursive walk over a deep scene graph, or a recursive L-system interpreter at high generation counts throws `RangeError: Maximum call stack size exceeded`.
 
 ```js
 const depth = n => n === 0 ? 0 : 1 + depth(n - 1);
@@ -194,66 +213,66 @@ const sumTo = trampoline(function go(n, acc = 0) {
 console.log(sumTo(1e6));
 ```
 
-A trampoline keeps the recursive shape of the code. Usually the clearer fix is a loop with an explicit stack (an array you `push` and `pop`), which is also how you make depth-first searches over game maps safe and fast.
+A trampoline keeps the recursive shape of the code. Usually the clearer fix is a loop with an explicit stack (an array you `push` and `pop`), which is also how you make depth-first searches over grids and graphs safe and fast.
 
 > **Performance:** a trampoline allocates one closure per step, so it is a correctness fix, not a speed fix. An explicit stack of plain integers (`stack.push(x, y)`, or `y * width + x` packed into one number) allocates almost nothing.
 
 ## Reducers
 
-A reducer is a pure function `(state, action) => newState`. All changes go through one place, actions are plain data (so they can be logged, sent over the network, or replayed), and the current state is just `actions.reduce(reducer, initial)`.
+A reducer is a pure function `(state, action) => newState`. All changes go through one place, actions are plain data (so they can be logged, sent over the network, or replayed), undo is "keep the old states", and the current state is just `actions.reduce(reducer, initial)`. A layer stack in a texture editor:
 
 ```js
-function inventory(state, action) {
+function layers(state, action) {
   switch (action.type) {
-    case 'add': {
-      const n = (state[action.item] ?? 0) + action.qty;
-      return { ...state, [action.item]: n };
+    case 'add':
+      return [...state, { id: action.id, kind: action.kind, opacity: 1 }];
+    case 'opacity': {
+      const i = state.findIndex(l => l.id === action.id);
+      if (i < 0 || state[i].opacity === action.value) return state;
+      return state.map((l, j) => (j === i ? { ...l, opacity: action.value } : l));
     }
-    case 'use': {
-      const n = state[action.item] ?? 0;
-      if (n === 0) return state;
-      const { [action.item]: _, ...rest } = state;
-      return n === 1 ? rest : { ...state, [action.item]: n - 1 };
-    }
+    case 'remove':
+      return state.some(l => l.id === action.id) ? state.filter(l => l.id !== action.id) : state;
     default:
       return state;
   }
 }
-const actions = [
-  { type: 'add', item: 'potion', qty: 2 },
-  { type: 'add', item: 'arrow', qty: 20 },
-  { type: 'use', item: 'potion' },
-  { type: 'use', item: 'potion' },
-  { type: 'use', item: 'bomb' },
-];
-console.log(actions.reduce(inventory, {}));
+const history = [[]];
+for (const a of [
+  { type: 'add', id: 1, kind: 'noise' },
+  { type: 'add', id: 2, kind: 'gradient' },
+  { type: 'opacity', id: 2, value: 0.5 },
+  { type: 'opacity', id: 2, value: 0.5 },
+  { type: 'remove', id: 1 },
+]) history.push(layers(history.at(-1), a));
+console.log(history.at(-1), history[3] === history[4], history[2][0] === history[3][0]);
 ```
 
-Returning the same `state` object for an action that changes nothing matters: it lets every consumer skip work with a single `===`.
+Returning the same `state` object for an action that changes nothing matters: it lets every consumer (the renderer, the undo stack) skip work with a single `===`.
 
 ## State machines
 
-Game AI, menus, animation, network connections and input combos are all state machines: a finite set of states, and events that move between them. Writing the transitions as **data** instead of nested `if`s makes them inspectable, testable and easy to draw:
+Character controllers, camera modes, animation blending, tool modes in an editor and network connections are all state machines: a finite set of states, and events that move between them. Writing the transitions as **data** instead of nested `if`s makes them inspectable, testable and easy to draw:
 
 ```js
-const ENEMY = {
-  idle:   { seePlayer: 'chase', hurt: 'flee' },
-  chase:  { lostPlayer: 'idle', inRange: 'attack', hurt: 'flee' },
-  attack: { outOfRange: 'chase', hurt: 'flee' },
-  flee:   { healed: 'idle' },
+const CAMERA = {
+  orbit: { dragMiddle: 'pan', wheel: 'zoom', pressF: 'fly' },
+  pan:   { release: 'orbit' },
+  zoom:  { idle: 'orbit' },
+  fly:   { pressF: 'orbit', escape: 'orbit' },
 };
 function transition(state, event) {
-  return ENEMY[state][event] ?? state;      // unknown events are ignored
+  return CAMERA[state][event] ?? state;      // unknown events are ignored
 }
-let s = 'idle';
-for (const ev of ['seePlayer', 'inRange', 'seePlayer', 'hurt', 'inRange', 'healed']) {
+let s = 'orbit';
+for (const ev of ['wheel', 'idle', 'pressF', 'wheel', 'escape', 'dragMiddle', 'release']) {
   const next = transition(s, ev);
   console.log(`${s} --${ev}--> ${next}`);
   s = next;
 }
 ```
 
-Each state can also carry per-state behavior (`enter`, `update(dt)`, `exit` functions), which turns the table into a full behavior system without a single subclass.
+Each state can also carry per-state behavior (`enter`, `update(dt)`, `exit` functions), which turns the table into a full controller without a single subclass.
 
 === exercise curry
 title: pipe and curry
@@ -534,123 +553,103 @@ const sleep_ = ms => new Promise(r => setTimeout(r, ms));
   eq(self.n, 2, 'this passed through on both edges');
 }
 
-=== exercise abilities
-title: Ability decorators in game time
+=== exercise texcomb
+title: Texture combinators
 --- prompt
-Game abilities are functions wrapped with rules. Write three decorators. They work in **game time**: instead of reading a real clock, each takes a `clock` function that returns the current game time in seconds (the harness controls it, which keeps tests deterministic and makes pausing free).
+A texture function maps `(u, v)`, both in [0, 1], to a value in [0, 1]. Write these combinators, each returning a new texture function (no pixels are computed until something samples it):
 
-- `once(fn)`: calls `fn` the first time only, and returns that first result on every call.
-- `cooldown(fn, seconds, clock)`: calls `fn` if at least `seconds` have passed since the last *successful* call (the first call always succeeds); otherwise returns `undefined` without calling it. Attach a method `remaining()` returning the seconds left (0 when ready).
-- `charges(fn, max, rechargeSeconds, clock)`: starts with `max` charges. Each call that has a charge spends one and calls `fn`; with no charges, returns `undefined`. Charges regenerate one per `rechargeSeconds`, continuously, up to `max`. Recharge time is tracked exactly: if you are at 0 charges and 2.5 recharge periods pass, you have 2 charges and are halfway to the third. Attach `count()` returning the current whole number of charges.
+- `constant(c)`: always `c`.
+- `tile(n, f)`: repeats `f` `n` times in each direction: samples `f((u * n) % 1, (v * n) % 1)`.
+- `rotate(angle, f)`: rotates `f` about the centre (0.5, 0.5) by `angle` radians. Sample `f` at `(0.5 + du * cos(a) + dv * sin(a), 0.5 - du * sin(a) + dv * cos(a))` where `du = u - 0.5`, `dv = v - 0.5`.
+- `threshold(t, f)`: `1` where `f(u, v) >= t`, else `0`.
+- `blend(mode, a, b)` with modes `'multiply'` (`a * b`), `'screen'` (`1 - (1 - a)(1 - b)`), `'add'` (`min(1, a + b)`) and `'difference'` (`|a - b|`). An unknown mode throws a `RangeError` **when `blend` is called**, not when the result is sampled. Look the mode up once, outside the returned function.
+- `bake(f, width, height)`: evaluates `f` at every pixel **centre** (`u = (x + 0.5) / width`, `v = (y + 0.5) / height`) and returns a `Float32Array` of `width * height` values, row by row.
 
-All three must pass `this` and arguments through and return `fn`'s result.
+The harness bakes a 512 by 512 composed texture under a time limit, so `bake` must write into one preallocated typed array and must not allocate per pixel.
 --- starter
-function once(fn) {
-  return fn;
-}
-
-function cooldown(fn, seconds, clock) {
-  const f = function (...args) { return fn.apply(this, args); };
-  f.remaining = () => 0;
-  return f;
-}
-
-function charges(fn, max, rechargeSeconds, clock) {
-  const f = function (...args) { return fn.apply(this, args); };
-  f.count = () => max;
-  return f;
+const constant = c => (u, v) => 0;
+const tile = (n, f) => (u, v) => 0;
+const rotate = (angle, f) => (u, v) => 0;
+const threshold = (t, f) => (u, v) => 0;
+const blend = (mode, a, b) => (u, v) => 0;
+function bake(f, width, height) {
+  return [];
 }
 --- solution
-function once(fn) {
-  let done = false, result;
-  return function (...args) {
-    if (!done) { done = true; result = fn.apply(this, args); }
-    return result;
+const constant = c => () => c;
+const tile = (n, f) => (u, v) => f((u * n) % 1, (v * n) % 1);
+const rotate = (angle, f) => {
+  const c = Math.cos(angle), s = Math.sin(angle);
+  return (u, v) => {
+    const du = u - 0.5, dv = v - 0.5;
+    return f(0.5 + du * c + dv * s, 0.5 - du * s + dv * c);
   };
-}
-
-function cooldown(fn, seconds, clock) {
-  let last = -Infinity;
-  const f = function (...args) {
-    const now = clock();
-    if (now - last < seconds) return undefined;
-    last = now;
-    return fn.apply(this, args);
-  };
-  f.remaining = () => Math.max(0, seconds - (clock() - last));
-  return f;
-}
-
-function charges(fn, max, rechargeSeconds, clock) {
-  let stored = max, since = clock();          // stored may be fractional
-  const update = () => {
-    const now = clock();
-    stored = Math.min(max, stored + (now - since) / rechargeSeconds);
-    since = now;
-  };
-  const f = function (...args) {
-    update();
-    if (stored < 1) return undefined;
-    stored -= 1;
-    return fn.apply(this, args);
-  };
-  f.count = () => { update(); return Math.floor(stored + 1e-9); };
-  return f;
+};
+const threshold = (t, f) => (u, v) => (f(u, v) >= t ? 1 : 0);
+const BLEND_ = {
+  multiply: (a, b) => a * b,
+  screen: (a, b) => 1 - (1 - a) * (1 - b),
+  add: (a, b) => Math.min(1, a + b),
+  difference: (a, b) => Math.abs(a - b),
+};
+const blend = (mode, a, b) => {
+  if (!Object.hasOwn(BLEND_, mode)) throw new RangeError(`unknown blend mode: ${mode}`);
+  const op = BLEND_[mode];
+  return (u, v) => op(a(u, v), b(u, v));
+};
+function bake(f, width, height) {
+  const out = new Float32Array(width * height);
+  for (let y = 0, i = 0; y < height; y++) {
+    const v = (y + 0.5) / height;
+    for (let x = 0; x < width; x++, i++) out[i] = f((x + 0.5) / width, v);
+  }
+  return out;
 }
 --- hint
-`cooldown` only needs the time of the last successful call, starting at `-Infinity`.
+Compute `Math.cos(angle)` and `Math.sin(angle)` once in `rotate`, outside the returned function: the returned function runs per pixel, `rotate` runs once.
 --- hint
-For `charges`, store a fractional charge count and the time you last updated it. On every call, add `elapsed / rechargeSeconds` (capped at `max`), then spend 1 if at least 1 is available.
+`blend` validates and picks the operation from a lookup table when it is called; the returned function only calls `op(a(u, v), b(u, v))`.
 --- harness
 {
-  let t = 0;
-  const clock = () => t;
-  let n = 0;
-  const init = once(function (x) { n++; return this.k + x; });
-  const o = { k: 1, init };
-  eq(o.init(1), 2); eq(o.init(5), 2, 'same first result'); eq(n, 1);
-  const und = once(() => { n++; });
-  und(); und(); eq(n, 2, 'once with undefined result still runs once');
-
-  const shots = [];
-  const fire = cooldown(function (dir) { shots.push(this.name + dir); return 'bang'; }, 0.5, clock);
-  const gun = { name: 'gun', fire };
-  eq(gun.fire('L'), 'bang', 'first shot');
-  eq(fire.remaining(), 0.5);
-  t = 0.3; eq(gun.fire('R'), undefined, 'on cooldown');
-  near(fire.remaining(), 0.2, 1e-9);
-  t = 0.5; eq(gun.fire('U'), 'bang', 'ready exactly at 0.5');
-  t = 0.9; gun.fire('X');
-  t = 1.2; gun.fire('D');
-  eq(shots, ['gunL', 'gunU', 'gunD'], 'failed attempts do not reset the cooldown');
-  t = 5; eq(fire.remaining(), 0);
-
-  t = 0;
-  let dashes = 0;
-  const dash = charges(() => ++dashes, 2, 3, clock);
-  eq(dash.count(), 2);
-  eq(dash(), 1); eq(dash(), 2); eq(dash(), undefined, 'out of charges');
-  eq(dash.count(), 0);
-  t = 2.9; eq(dash(), undefined, 'not recharged yet');
-  t = 3; eq(dash.count(), 1); eq(dash(), 3);
-  t = 3 + 7.5; eq(dash.count(), 2, 'capped at max');
-  dash(); dash();
-  eq(dash.count(), 0);
-  t += 7.5;
-  eq(dash.count(), 2, 'exactly 2.5 periods gives 2 (capped at 2)');
-  dash(); dash();
-  t += 2.5 * 1.5;
-  eq(dash.count(), 1, '1.25 periods gives 1');
-  t += 0.75 * 3;
-  eq(dash.count(), 2, 'leftover fraction carried over');
-  const thisCheck = { v: 7, go: charges(function () { return this.v; }, 1, 1, clock) };
-  eq(thisCheck.go(), 7, 'this passed through');
+  const U = (u, v) => u, V = (u, v) => v;
+  eq(constant(0.3)(0.1, 0.9), 0.3);
+  near(tile(2, U)(0.75, 0), 0.5, 1e-12);
+  near(tile(4, V)(0, 0.3), 0.2, 1e-12);
+  eq(tile(3, U)(0, 0), 0);
+  near(rotate(0, U)(0.2, 0.7), 0.2, 1e-12, 'zero rotation is the identity');
+  near(rotate(Math.PI / 2, U)(0.1, 0.8), 0.8, 1e-12, 'quarter turn maps u to v');
+  near(rotate(Math.PI, U)(0.1, 0.8), 0.9, 1e-12, 'half turn mirrors');
+  near(rotate(Math.PI / 2, V)(0.1, 0.8), 0.9, 1e-12);
+  eq(threshold(0.5, U)(0.5, 0), 1); eq(threshold(0.5, U)(0.49, 0), 0);
+  const a = constant(0.5), b = constant(0.4);
+  near(blend('multiply', a, b)(0, 0), 0.2, 1e-12);
+  near(blend('screen', a, b)(0, 0), 0.7, 1e-12);
+  eq(blend('add', constant(0.7), constant(0.6))(0, 0), 1, 'add clamps');
+  near(blend('difference', constant(0.2), a)(0, 0), 0.3, 1e-12);
+  throws(() => blend('overlay2', a, b), 'unknown mode throws at creation');
+  throws(() => blend('toString', a, b), 'inherited names are not modes');
+  let sampled = 0;
+  blend('add', () => { sampled++; return 0; }, a);
+  eq(sampled, 0, 'nothing is sampled until the result is called');
+  const small = bake(U, 4, 2);
+  check(small instanceof Float32Array, 'bake returns a Float32Array');
+  eq(Array.from(small), [0.125, 0.375, 0.625, 0.875, 0.125, 0.375, 0.625, 0.875]);
+  eq(Array.from(bake(V, 1, 4)), [0.125, 0.375, 0.625, 0.875], 'rows are v');
+  const tex = blend('screen', tile(8, threshold(0.5, U)), rotate(0.3, blend('multiply', U, V)));
+  const t0 = performance.now();
+  const big = bake(tex, 512, 512);
+  const ms = performance.now() - t0;
+  eq(big.length, 512 * 512);
+  for (const [x, y] of [[0, 0], [100, 37], [511, 511], [256, 3]]) {
+    eq(big[y * 512 + x], Math.fround(tex((x + 0.5) / 512, (y + 0.5) / 512)), `pixel ${x},${y}`);
+  }
+  check(ms < 1500, '512x512 bake took ' + Math.round(ms) + 'ms');
 }
 
 === exercise floodfill
 title: Flood fill without recursion
 --- prompt
-Write `floodFill(grid, x, y, fill)` for a tile map. `grid` is an array of strings (rows), one character per tile. Replace the connected region (4-directional neighbours) of tiles that have the same character as `grid[y][x]` with the character `fill`, and **return a new grid**: the input must not be modified. Return the original grid object itself if nothing changes (out-of-bounds start, or the start tile already equals `fill`).
+Write `floodFill(grid, x, y, fill)`, the operation behind the paint bucket and behind labelling connected cave regions in a generated map. `grid` is an array of strings (rows), one character per tile. Replace the connected region (4-directional neighbours) of tiles that have the same character as `grid[y][x]` with the character `fill`, and **return a new grid**: the input must not be modified. Return the original grid object itself if nothing changes (out-of-bounds start, or the start tile already equals `fill`).
 
 The tests include a 1000 by 1000 map whose region is one long winding corridor, so a recursive fill overflows the stack. Use an explicit stack (or queue). It also has to be reasonably fast: about a million tiles within the time limit, so convert rows to arrays (or one flat array) once rather than rebuilding strings per tile.
 --- starter
@@ -716,156 +715,194 @@ Check bounds and colour when you *pop* a tile, so pushing neighbours is uncondit
   check(ms < 3000, 'large fill took ' + Math.round(ms) + 'ms');
 }
 
-=== exercise inventory
-title: An immutable inventory reducer
+=== exercise scene
+title: A scene editor reducer with undo
 --- prompt
-Write a pure reducer `inventoryReducer(state, action)` for a game inventory. State has the shape:
+Write a pure reducer `sceneReducer(state, action)` for a tiny 3D scene editor, then a higher-order reducer `undoable(reducer)` that adds undo and redo to any reducer.
 
-```js
-{ gold: 50, slots: [{ id: 'potion', qty: 3 }, { id: 'sword', qty: 1 }], equipped: { weapon: null } }
-```
-
-Actions:
+State: `{ objects: [{ id, mesh, pos: [x, y, z] }, ...], selected, nextId }`.
 
 | action | effect |
 |---|---|
-| `{ type: 'add', id, qty }` | increase the slot's qty, or append a new slot `{ id, qty }` |
-| `{ type: 'remove', id, qty }` | decrease qty; a slot that reaches 0 is removed. If there are fewer than `qty`, nothing changes |
-| `{ type: 'buy', id, price }` | if `gold >= price`, subtract it and add 1 of `id`; else nothing changes |
-| `{ type: 'equip', id }` | if the item is in the inventory, set `equipped.weapon = id`; else nothing changes |
-| anything else | nothing changes |
+| `{ type: 'add', mesh }` | append `{ id: mesh + nextId, mesh, pos: [0, 0, 0] }`, increment `nextId`, select the new object |
+| `{ type: 'move', id, delta: [dx, dy, dz] }` | add `delta` to the object's `pos` (a new array). Missing id or an all-zero delta: no change |
+| `{ type: 'remove', id }` | remove the object; if it was selected, `selected` becomes `null`. Missing id: no change |
+| `{ type: 'select', id }` | select an existing object, or deselect with `id: null`. Selecting a missing id, or what is already selected: no change |
+| anything else | no change |
 
-Rules: never mutate `state` or anything in it (the harness checks that every old state is unchanged afterwards). When nothing changes, return **the same `state` object**. When something changes, share everything you did not change: untouched slot objects and the `equipped` object must be the same references as before.
+Never mutate. When nothing changes, return **the same `state` object**. When something changes, share everything you did not change (untouched objects and their `pos` arrays keep their identity).
+
+`undoable(reducer)` returns a reducer over `{ past: [], present, future: [] }`:
+
+- `{ type: 'undo' }` / `{ type: 'redo' }` move between `past`, `present` and `future` (no change when there is nothing to undo/redo);
+- any other action runs `reducer(present, action)`. If the result is the same object, return the wrapper state unchanged (so no-op actions do not create undo steps); otherwise push the old present onto `past` and clear `future`.
+
+The harness starts from `{ past: [], present: initial, future: [] }`.
 --- starter
-function inventoryReducer(state, action) {
+function sceneReducer(state, action) {
   if (action.type === 'add') {
-    state.slots.push({ id: action.id, qty: action.qty });
+    state.objects.push({ id: action.mesh + state.nextId, mesh: action.mesh, pos: [0, 0, 0] });
+    state.nextId++;
   }
   return state;
 }
+
+function undoable(reducer) {
+  return (state, action) => ({ ...state, present: reducer(state.present, action) });
+}
 --- solution
-function inventoryReducer(state, action) {
-  const find = id => state.slots.findIndex(s => s.id === id);
+function sceneReducer(state, action) {
+  const find = id => state.objects.findIndex(o => o.id === id);
   switch (action.type) {
     case 'add': {
-      const i = find(action.id);
-      if (i < 0) return { ...state, slots: [...state.slots, { id: action.id, qty: action.qty }] };
-      return { ...state, slots: state.slots.map((s, j) => j === i ? { ...s, qty: s.qty + action.qty } : s) };
+      const obj = { id: action.mesh + state.nextId, mesh: action.mesh, pos: [0, 0, 0] };
+      return { objects: [...state.objects, obj], selected: obj.id, nextId: state.nextId + 1 };
+    }
+    case 'move': {
+      const i = find(action.id), d = action.delta;
+      if (i < 0 || d.every(x => x === 0)) return state;
+      const objects = state.objects.map((o, j) => (j === i ? { ...o, pos: o.pos.map((p, k) => p + d[k]) } : o));
+      return { ...state, objects };
     }
     case 'remove': {
-      const i = find(action.id);
-      if (i < 0 || state.slots[i].qty < action.qty) return state;
-      const qty = state.slots[i].qty - action.qty;
-      const slots = qty === 0
-        ? state.slots.filter((_, j) => j !== i)
-        : state.slots.map((s, j) => j === i ? { ...s, qty } : s);
-      return { ...state, slots };
-    }
-    case 'buy': {
-      if (state.gold < action.price) return state;
-      const next = inventoryReducer(state, { type: 'add', id: action.id, qty: 1 });
-      return { ...next, gold: state.gold - action.price };
-    }
-    case 'equip':
       if (find(action.id) < 0) return state;
-      return { ...state, equipped: { ...state.equipped, weapon: action.id } };
+      return {
+        ...state,
+        objects: state.objects.filter(o => o.id !== action.id),
+        selected: state.selected === action.id ? null : state.selected,
+      };
+    }
+    case 'select': {
+      if (action.id === state.selected) return state;
+      if (action.id !== null && find(action.id) < 0) return state;
+      return { ...state, selected: action.id };
+    }
     default:
       return state;
   }
 }
+
+function undoable(reducer) {
+  return (state, action) => {
+    const { past, present, future } = state;
+    if (action.type === 'undo') {
+      if (!past.length) return state;
+      return { past: past.slice(0, -1), present: past.at(-1), future: [present, ...future] };
+    }
+    if (action.type === 'redo') {
+      if (!future.length) return state;
+      return { past: [...past, present], present: future[0], future: future.slice(1) };
+    }
+    const next = reducer(present, action);
+    if (next === present) return state;
+    return { past: [...past, present], present: next, future: [] };
+  };
+}
 --- hint
-`state.slots.map((s, j) => j === i ? { ...s, qty: newQty } : s)` copies the array but reuses every slot object except the one that changed.
+`state.objects.map((o, j) => j === i ? { ...o, pos: newPos } : o)` copies the array but reuses every object except the one that changed.
 --- hint
-`buy` can reuse the `add` case by calling the reducer recursively, then replace `gold` on the result.
+For `undoable`, `past` is a stack of earlier presents (newest last) and `future` a stack of undone ones (next first). Compare `reducer(present, action) === present` to detect no-op actions.
 --- harness
 {
   const run = (st, a) => {
     const before = structuredClone(st);
-    const out = inventoryReducer(st, a);
+    const out = sceneReducer(st, a);
     eq(st, before, 'state was mutated by ' + a.type);
     return out;
   };
-  const mk = () => ({ gold: 50, slots: [{ id: 'potion', qty: 3 }, { id: 'sword', qty: 1 }], equipped: { weapon: null } });
-  let s = mk(), r;
-  try {
-    r = run(s, { type: 'add', id: 'potion', qty: 2 });
-    eq(r.slots, [{ id: 'potion', qty: 5 }, { id: 'sword', qty: 1 }]);
-    check(r !== s && r.slots !== s.slots, 'new state and slots');
-    check(r.slots[1] === s.slots[1], 'untouched slot shared');
-    check(r.equipped === s.equipped, 'equipped shared');
-    eq(s.slots[0].qty, 3, 'old state intact');
+  const s0 = { objects: [], selected: null, nextId: 1 };
+  const s1 = run(s0, { type: 'add', mesh: 'cube' });
+  eq(s1, { objects: [{ id: 'cube1', mesh: 'cube', pos: [0, 0, 0] }], selected: 'cube1', nextId: 2 });
+  const s2 = run(s1, { type: 'add', mesh: 'sphere' });
+  eq(s2.objects.map(o => o.id), ['cube1', 'sphere2']);
+  eq(s2.selected, 'sphere2');
+  check(s2.objects[0] === s1.objects[0], 'existing object shared on add');
 
-    r = run(s, { type: 'add', id: 'bow', qty: 1 });
-    eq(r.slots.map(x => x.id), ['potion', 'sword', 'bow']);
-    check(r.slots[0] === s.slots[0], 'shared on append');
+  const s3 = run(s2, { type: 'move', id: 'cube1', delta: [1, 0, -2] });
+  eq(s3.objects[0].pos, [1, 0, -2]);
+  check(s3.objects[1] === s2.objects[1], 'untouched object shared on move');
+  check(s3.objects[0].pos !== s2.objects[0].pos, 'new pos array');
+  eq(s3.selected, 'sphere2'); eq(s3.nextId, 3);
+  check(run(s3, { type: 'move', id: 'cube1', delta: [0, 0, 0] }) === s3, 'zero delta: same state');
+  check(run(s3, { type: 'move', id: 'nope', delta: [1, 1, 1] }) === s3, 'missing id: same state');
 
-    r = run(s, { type: 'remove', id: 'potion', qty: 1 });
-    eq(r.slots[0], { id: 'potion', qty: 2 });
-    r = run(s, { type: 'remove', id: 'sword', qty: 1 });
-    eq(r.slots, [{ id: 'potion', qty: 3 }], 'slot removed at 0');
-    check(r.slots[0] === s.slots[0], 'shared on remove');
-    check(run(s, { type: 'remove', id: 'potion', qty: 4 }) === s, 'not enough: same state');
-    check(run(s, { type: 'remove', id: 'shield', qty: 1 }) === s, 'missing: same state');
+  check(run(s3, { type: 'select', id: 'sphere2' }) === s3, 'already selected');
+  check(run(s3, { type: 'select', id: 'ghost' }) === s3, 'select missing');
+  const s4 = run(s3, { type: 'select', id: 'cube1' });
+  eq(s4.selected, 'cube1');
+  check(s4.objects === s3.objects, 'objects shared on select');
+  const s5 = run(s4, { type: 'select', id: null });
+  eq(s5.selected, null);
+  check(run(s5, { type: 'select', id: null }) === s5, 'deselect when nothing selected');
 
-    r = run(s, { type: 'buy', id: 'potion', price: 20 });
-    eq(r.gold, 30); eq(r.slots[0].qty, 4);
-    r = run(r, { type: 'buy', id: 'bomb', price: 30 });
-    eq(r.gold, 0); eq(r.slots.map(x => x.id + x.qty), ['potion4', 'sword1', 'bomb1']);
-    check(run(r, { type: 'buy', id: 'x', price: 1 }) === r, 'too poor: same state');
+  const s6 = run(s4, { type: 'remove', id: 'cube1' });
+  eq(s6.objects.map(o => o.id), ['sphere2']); eq(s6.selected, null, 'removing the selection clears it');
+  const s7 = run(s4, { type: 'remove', id: 'sphere2' });
+  eq(s7.selected, 'cube1', 'removing another object keeps the selection');
+  check(run(s4, { type: 'remove', id: 'x' }) === s4, 'remove missing');
+  check(run(s4, { type: 'explode' }) === s4, 'unknown action');
 
-    r = run(s, { type: 'equip', id: 'sword' });
-    eq(r.equipped, { weapon: 'sword' });
-    check(r.slots === s.slots, 'slots shared on equip');
-    check(run(s, { type: 'equip', id: 'axe' }) === s, 'cannot equip missing item');
-    check(run(s, { type: 'dance' }) === s, 'unknown action');
-
-    const log = [{ type: 'add', id: 'arrow', qty: 10 }, { type: 'remove', id: 'arrow', qty: 4 }, { type: 'buy', id: 'arrow', price: 5 }, { type: 'equip', id: 'arrow' }];
-    const fin = log.reduce((st, a) => run(st, a), mk());
-    eq(fin, { gold: 45, slots: [{ id: 'potion', qty: 3 }, { id: 'sword', qty: 1 }, { id: 'arrow', qty: 7 }], equipped: { weapon: 'arrow' } }, 'replay');
-  } catch (e) {
-    check(false, 'threw ' + e);
-  }
+  const r = undoable(sceneReducer);
+  let h = { past: [], present: s0, future: [] };
+  check(r(h, { type: 'undo' }) === h, 'nothing to undo');
+  check(r(h, { type: 'redo' }) === h, 'nothing to redo');
+  h = r(h, { type: 'add', mesh: 'cube' });
+  h = r(h, { type: 'move', id: 'cube1', delta: [0, 2, 0] });
+  const noop = r(h, { type: 'move', id: 'cube1', delta: [0, 0, 0] });
+  check(noop === h, 'no-op action creates no undo step');
+  eq(h.past.length, 2);
+  eq(h.present.objects[0].pos, [0, 2, 0]);
+  h = r(h, { type: 'undo' });
+  eq(h.present.objects[0].pos, [0, 0, 0]); eq(h.future.length, 1);
+  h = r(h, { type: 'undo' });
+  check(h.present === s0, 'undo back to the initial state object');
+  h = r(h, { type: 'redo' });
+  eq(h.present.objects.length, 1);
+  h = r(h, { type: 'add', mesh: 'cone' });
+  eq(h.future, [], 'new action clears the redo stack');
+  eq(h.present.objects.map(o => o.id), ['cube1', 'cone2']);
+  h = r(h, { type: 'undo' }); h = r(h, { type: 'undo' });
+  check(h.present === s0 && h.past.length === 0, 'full undo');
 }
 
 === exercise fsm
-title: An enemy AI state machine
+title: A character controller state machine
 --- prompt
-Write a table-driven state machine for an enemy and print a trace. Use a transition table object like the chapter's `ENEMY` (do not write the logic as nested `if`s), with these states and events:
+Write a table-driven state machine for a 3D character controller and print a trace. Use a transition table object like the chapter's `CAMERA` (do not write the logic as nested `if`s), with these states and events:
 
 | state | event → next state |
 |---|---|
-| `patrol` | `seePlayer` → `chase`, `hit` → `alert` |
-| `alert` | `seePlayer` → `chase`, `timeout` → `patrol` |
-| `chase` | `inRange` → `attack`, `lostPlayer` → `alert`, `lowHp` → `flee` |
-| `attack` | `outOfRange` → `chase`, `lowHp` → `flee` |
-| `flee` | `safe` → `patrol` |
+| `idle` | `move` → `walk`, `jump` → `jump`, `noGround` → `fall` |
+| `walk` | `stop` → `idle`, `jump` → `jump`, `noGround` → `fall` |
+| `jump` | `apex` → `fall` |
+| `fall` | `land` → `idle` |
 
-Unknown events leave the state unchanged. Run the `events` array from the starter starting in `patrol` and print one line per event: `state --event--> next`, adding ` (ignored)` when the state did not change. Then print how many times each state was **entered** (a transition into a different state counts; the initial state counts once) as `entered: patrol=2 alert=...` with the states in the table's order.
+Unknown events leave the state unchanged. Run the `events` array from the starter starting in `idle` and print one line per event: `state --event--> next`, adding ` (ignored)` when the state did not change. Then print how many times each state was **entered** (a transition into a different state counts; the initial state counts once) as `entered: idle=... walk=...` with the states in the table's order.
 
 ```text
-patrol --hit--> alert
-alert --inRange--> alert (ignored)
+idle --move--> walk
+walk --jump--> jump
+jump --move--> jump (ignored)
 ...
 ```
 --- starter
-const events = ['hit', 'inRange', 'seePlayer', 'inRange', 'outOfRange', 'lostPlayer',
-  'timeout', 'seePlayer', 'inRange', 'lowHp', 'seePlayer', 'safe'];
-let state = 'patrol';
+const events = ['move', 'jump', 'move', 'apex', 'land', 'move', 'noGround', 'stop', 'land',
+  'jump', 'apex', 'land', 'stop'];
+let state = 'idle';
 for (const ev of events) {
   console.log(`${state} --${ev}--> ${state}`);
 }
 --- solution
-const events = ['hit', 'inRange', 'seePlayer', 'inRange', 'outOfRange', 'lostPlayer',
-  'timeout', 'seePlayer', 'inRange', 'lowHp', 'seePlayer', 'safe'];
+const events = ['move', 'jump', 'move', 'apex', 'land', 'move', 'noGround', 'stop', 'land',
+  'jump', 'apex', 'land', 'stop'];
 const TABLE = {
-  patrol: { seePlayer: 'chase', hit: 'alert' },
-  alert: { seePlayer: 'chase', timeout: 'patrol' },
-  chase: { inRange: 'attack', lostPlayer: 'alert', lowHp: 'flee' },
-  attack: { outOfRange: 'chase', lowHp: 'flee' },
-  flee: { safe: 'patrol' },
+  idle: { move: 'walk', jump: 'jump', noGround: 'fall' },
+  walk: { stop: 'idle', jump: 'jump', noGround: 'fall' },
+  jump: { apex: 'fall' },
+  fall: { land: 'idle' },
 };
 const entered = Object.fromEntries(Object.keys(TABLE).map(s => [s, 0]));
-let state = 'patrol';
+let state = 'idle';
 entered[state]++;
 for (const ev of events) {
   const next = TABLE[state][ev] ?? state;
@@ -880,19 +917,20 @@ console.log('entered: ' + Object.entries(entered).map(([k, v]) => `${k}=${v}`).j
 Build the counters with `Object.fromEntries(Object.keys(TABLE).map(s => [s, 0]))` so they come out in table order.
 --- test
 --- out
-patrol --hit--> alert
-alert --inRange--> alert (ignored)
-alert --seePlayer--> chase
-chase --inRange--> attack
-attack --outOfRange--> chase
-chase --lostPlayer--> alert
-alert --timeout--> patrol
-patrol --seePlayer--> chase
-chase --inRange--> attack
-attack --lowHp--> flee
-flee --seePlayer--> flee (ignored)
-flee --safe--> patrol
-entered: patrol=3 alert=2 chase=3 attack=2 flee=1
+idle --move--> walk
+walk --jump--> jump
+jump --move--> jump (ignored)
+jump --apex--> fall
+fall --land--> idle
+idle --move--> walk
+walk --noGround--> fall
+fall --stop--> fall (ignored)
+fall --land--> idle
+idle --jump--> jump
+jump --apex--> fall
+fall --land--> idle
+idle --stop--> idle (ignored)
+entered: idle=4 walk=2 jump=2 fall=3
 
 === quiz
 run: yes

@@ -2,9 +2,9 @@
 title: Binary data and bits
 blurb: ArrayBuffer, typed arrays and shared views, DataView and endianness, 32-bit bitwise math, packing structs, struct-of-arrays, base64 and hex by hand, TextEncoder. The foundation for WebGPU buffers.
 --- body
-## Why games care about bytes
+## Why graphics code cares about bytes
 
-Regular JavaScript arrays and objects are flexible and slow in exactly the ways that matter for games: each object is a separate heap allocation with a hidden class, an array of objects is an array of pointers, and the garbage collector has to trace all of it. **Typed arrays** are the escape hatch: a contiguous block of raw memory with a fixed element type, just like `float[]` in C# or an array in C. They are how you hold thousands of particles without GC pressure, how you read binary file formats and network packets, and the *only* way to hand data to the GPU: every WebGPU vertex buffer, uniform buffer and texture upload is an `ArrayBuffer` you filled byte by byte. The WebGPU course on this site assumes this chapter.
+Regular JavaScript arrays and objects are flexible and slow in exactly the ways that matter for graphics and procedural generation: each object is a separate heap allocation with a hidden class, an array of objects is an array of pointers, and the garbage collector has to trace all of it. **Typed arrays** are the escape hatch: a contiguous block of raw memory with a fixed element type, just like `float[]` in C# or an array in C. They are how you hold a 2048 by 2048 height field or a million vertices without GC pressure, how you read binary file formats (PNG chunks, glTF buffers, mesh caches), and the *only* way to hand data to the GPU: every WebGPU vertex buffer, uniform buffer and texture upload is an `ArrayBuffer` you filled byte by byte. The WebGPU course on this site assumes this chapter.
 
 ## ArrayBuffer and typed arrays
 
@@ -32,6 +32,14 @@ console.log(c.map(x => x * 1000), Array.from(c, x => x * 100000));
 ```
 
 Typed arrays have most array methods (`map`, `filter`, `reduce`, `sort`, `indexOf`, `fill`, `set`, `subarray`, `slice`), but a fixed length: no `push`, `pop` or `splice`. Values are converted on write: integer types wrap modulo 2^n (like C# `unchecked`), floats are rounded to the element precision, and `map` returns the *same* typed array type, so results wrap too. `Float32Array` stores single precision, so `0.1` reads back as `0.10000000149011612`; `Math.fround(x)` does the same rounding on a plain number.
+
+Single precision matters in 3D. A float32 has a 24-bit mantissa, so the gap between neighbouring representable values grows with magnitude: near 1 it is about 1e-7, near 100,000 it is about 0.008, and at 10 million it is a whole unit. A vertex far from the origin snaps to that grid, which shows up as jittering geometry and z-fighting when the camera travels far. The standard fix is to keep world positions in doubles on the CPU and upload positions *relative to the camera* (a floating origin).
+
+```js
+for (const x of [1, 1000, 100000, 1e7]) {
+  console.log(x, Math.fround(x + 0.001) - x);       // what is left of a 1 mm offset in float32
+}
+```
 
 ## Views share memory
 
@@ -92,25 +100,35 @@ console.log((255).toString(2).padStart(16, '0'), parseInt('1010', 2), 0b1010, 0x
 - `>>` is the arithmetic shift (copies the sign bit); `>>>` is the logical shift (fills with zeros). C# has the same pair (`>>` on `int` versus `uint`, or `>>>` since C# 11).
 - Multiplying two large 32-bit values with `*` loses low bits (the product exceeds 2^53). `Math.imul` does a true 32-bit multiply; use it in hashes and RNGs.
 
-Bit flags are the classic use. Collision layers, input state and entity component masks fit in one integer, and tests are a single AND:
+Bit flags and packed values are the classic use. A mesh's vertex format, the features a shader permutation needs and the "dirty" parts of a scene each fit in one integer, and tests are a single AND. Colours are usually packed too: one 32-bit integer per RGBA pixel.
 
 ```js
-const L = { PLAYER: 1 << 0, ENEMY: 1 << 1, BULLET: 1 << 2, WALL: 1 << 3, PICKUP: 1 << 4 };
-const playerMask = L.ENEMY | L.WALL | L.PICKUP;     // what the player collides with
-console.log((playerMask & L.WALL) !== 0, (playerMask & L.BULLET) !== 0);
-let input = 0;
-const UP = 1, DOWN = 2, FIRE = 4;
-input |= UP | FIRE;          // press
-input &= ~UP;                // release
-input ^= DOWN;               // toggle
-console.log(input.toString(2), (input & FIRE) !== 0);
+const ATTR = { POSITION: 1 << 0, NORMAL: 1 << 1, UV: 1 << 2, COLOR: 1 << 3, TANGENT: 1 << 4 };
+const meshFormat = ATTR.POSITION | ATTR.NORMAL | ATTR.UV;
+const shaderNeeds = ATTR.POSITION | ATTR.UV;
+console.log((meshFormat & shaderNeeds) === shaderNeeds, (meshFormat & ATTR.TANGENT) !== 0);
+
+const TEXTURES = 1, MESHES = 2, LIGHTS = 4;
+let dirty = 0;
+dirty |= TEXTURES | LIGHTS;   // mark
+dirty &= ~TEXTURES;           // clear after re-uploading textures
+dirty ^= MESHES;              // toggle
+console.log(dirty.toString(2), (dirty & LIGHTS) !== 0);
+
+// Packed colour: R in the low byte, so a Uint32Array store writes R, G, B, A bytes in order (little-endian).
+const rgba = (r, g, b, a) => (r | g << 8 | b << 16 | a << 24) >>> 0;
+const orange = rgba(255, 128, 0, 255);
+console.log(orange.toString(16), orange & 255, orange >>> 8 & 255, orange >>> 24);
+const pixels = new Uint8ClampedArray(4 * 4);
+new Uint32Array(pixels.buffer).fill(orange);          // four pixels in one call
+console.log(pixels.subarray(0, 8));
 ```
 
-> **Performance:** a bitmask test is one instruction and allocates nothing, versus a `Set` of strings (`layers.has('wall')`) which hashes a string. In code that runs per entity pair per frame, prefer masks. The same goes for packing grid coordinates into one integer key (`y * width + x`) instead of building `` `${x},${y}` `` strings for a `Map`.
+> **Performance:** a bitmask test is one instruction and allocates nothing, versus a `Set` of strings (`features.has('normal')`) which hashes a string. Writing a pixel as one `Uint32Array` store is cheaper than four byte stores, and filling an image with `fill` is a native loop. The same goes for packing grid coordinates into one integer key (`y * width + x`) instead of building `` `${x},${y}` `` strings for a `Map`.
 
 ### Seeded random numbers
 
-`Math.random()` cannot be seeded, so it cannot reproduce a level, a replay or a bug report. Games use small integer generators instead. Here is **mulberry32**, a fast, decent-quality 32-bit generator built entirely from the operators above:
+`Math.random()` cannot be seeded, so it cannot reproduce a texture, a terrain or a bug report. Procedural generators use small integer generators instead, seeded from the user's seed and often re-seeded per tile or per chunk from a hash of its coordinates, so any tile can be generated independently and identically. Here is **mulberry32**, a fast, decent-quality 32-bit generator built entirely from the operators above:
 
 ```js
 function mulberry32(seed) {
@@ -130,7 +148,7 @@ console.log(again(), Math.floor(again() * 6) + 1);     // same sequence: 0.60...
 
 ## Packing structs into bytes
 
-A GPU vertex buffer, a binary save file and a network packet are all arrays of *structs*: fixed-size records laid out at known byte offsets. Say a vertex is a position (3 x `f32`) plus an RGBA colour (4 x `u8`): 12 + 4 = 16 bytes, the **stride**. Two views on one buffer let you write both parts without `DataView` overhead:
+A GPU vertex buffer, a binary mesh file and a network packet are all arrays of *structs*: fixed-size records laid out at known byte offsets. Say a vertex is a position (3 x `f32`) plus an RGBA colour (4 x `u8`): 12 + 4 = 16 bytes, the **stride**. Two views on one buffer let you write both parts without `DataView` overhead:
 
 ```js
 const STRIDE = 16;
@@ -193,7 +211,7 @@ console.log('alive after 2s:', P.count, 'time ok:', performance.now() - t0 < 100
 
 ## Hex and base64 by hand
 
-Binary data often has to travel as text: hashes as hex, save files and data URLs as base64. Doing it by hand is a good bit-manipulation exercise:
+Binary data often has to travel as text: hashes as hex, embedded buffers in glTF files and data URLs as base64. Doing it by hand is a good bit-manipulation exercise:
 
 ```js
 const toHex = bytes => Array.from(bytes, b => b.toString(16).padStart(2, '0')).join('');
@@ -220,7 +238,7 @@ const bytes = enc.encode('Hi é 😀');
 console.log(bytes.length, 'Hi é 😀'.length, bytes);
 console.log(dec.decode(bytes), dec.decode(bytes.subarray(0, 4)));
 const scratch = new Uint8Array(64);
-const { read, written } = enc.encodeInto('player one', scratch);   // no allocation
+const { read, written } = enc.encodeInto('mesh rock_01', scratch);   // no allocation
 console.log(read, written, dec.decode(scratch.subarray(0, written)));
 try { new TextDecoder('utf-8', { fatal: true }).decode(new Uint8Array([0xFF])); } catch (e) { console.log(e.name); }
 console.log(dec.decode(new Uint8Array([0xFF, 0x41])));
@@ -239,7 +257,7 @@ console.log(px, new Uint8Array([250 + 40]), Uint8ClampedArray.from([-5, 0.5, 1.5
 ```
 
 === exercise bits
-title: Bit tricks for collision layers
+title: Bit tricks and packed colours
 --- prompt
 Write these 32-bit helpers using bitwise operators (no string conversion, no `Math.clz32` for `popcount`):
 
@@ -247,7 +265,8 @@ Write these 32-bit helpers using bitwise operators (no string conversion, no `Ma
 - `lowestBit(n)`: the index (0 to 31) of the lowest set bit, or `-1` if `n` is 0. (`Math.clz32` is allowed here, or a loop.)
 - `bitIndices(n)`: an array of the indices of all set bits, ascending (`bitIndices(0b1010)` is `[1, 3]`).
 - `rotl(x, k)`: rotate the 32 bits of `x` left by `k` (any `k`, taken mod 32), returning an **unsigned** result.
-- `collides(a, b)`: `a` and `b` are `{ layer, mask }` objects, where `layer` is a single bit and `mask` the set of layers the object wants to hit. They collide only if **each** one's mask contains the other's layer.
+- `packRGBA(r, g, b, a)`: packs four bytes (0 to 255) into one **unsigned** 32-bit integer with `r` in the lowest byte and `a` in the highest, so storing it into a `Uint32Array` lays the bytes out as R, G, B, A in memory (little-endian).
+- `unpackRGBA(c)`: the inverse, returning `[r, g, b, a]`.
 --- starter
 function popcount(n) {
   return n.toString(2).split('1').length - 1;
@@ -265,8 +284,12 @@ function rotl(x, k) {
   return x << k;
 }
 
-function collides(a, b) {
-  return (a.mask & b.layer) !== 0;
+function packRGBA(r, g, b, a) {
+  return r + g * 256 + b * 65536 + a * 16777216;
+}
+
+function unpackRGBA(c) {
+  return [c & 255, 0, 0, 0];
 }
 --- solution
 function popcount(n) {
@@ -297,8 +320,12 @@ function rotl(x, k) {
   return ((x << k) | (x >>> (32 - k))) >>> 0;
 }
 
-function collides(a, b) {
-  return (a.mask & b.layer) !== 0 && (b.mask & a.layer) !== 0;
+function packRGBA(r, g, b, a) {
+  return (r | (g << 8) | (b << 16) | (a << 24)) >>> 0;
+}
+
+function unpackRGBA(c) {
+  return [c & 255, (c >>> 8) & 255, (c >>> 16) & 255, c >>> 24];
 }
 --- hint
 `n & -n` isolates the lowest set bit, and `n &= n - 1` clears it. A loop of the second is the simple `popcount` (the solution shows the branch-free SWAR version).
@@ -320,18 +347,26 @@ eq(rotl(0x12345678, 0), 0x12345678);
 eq(rotl(0x12345678, 32), 0x12345678);
 eq(rotl(0x12345678, 36), 0x23456781);
 eq(rotl(-1, 5), 0xFFFFFFFF, 'unsigned result');
-const L = { PLAYER: 1, ENEMY: 2, BULLET: 4, WALL: 8, GHOST: 1 << 31 };
-const player = { layer: L.PLAYER, mask: L.ENEMY | L.WALL };
-const enemy = { layer: L.ENEMY, mask: L.PLAYER | L.BULLET | L.WALL };
-const bullet = { layer: L.BULLET, mask: L.ENEMY | L.WALL };
-const wall = { layer: L.WALL, mask: L.PLAYER | L.ENEMY | L.BULLET };
-const ghost = { layer: L.GHOST, mask: L.PLAYER };
-check(collides(player, enemy), 'player-enemy');
-check(collides(bullet, enemy), 'bullet-enemy');
-check(!collides(player, bullet), 'player ignores bullets');
-check(collides(wall, bullet) && collides(bullet, wall), 'symmetric');
-check(!collides(ghost, player), 'player mask does not include ghost');
-check(collides({ layer: L.GHOST, mask: L.GHOST }, { layer: L.GHOST, mask: L.GHOST }), 'bit 31 layer');
+eq(packRGBA(255, 0, 0, 0), 255);
+eq(packRGBA(0, 0, 0, 255), 0xFF000000, 'alpha in the top byte, unsigned');
+eq(packRGBA(0x12, 0x34, 0x56, 0x78), 0x78563412);
+eq(unpackRGBA(0x78563412), [0x12, 0x34, 0x56, 0x78]);
+eq(unpackRGBA(0xFF000000), [0, 0, 0, 255]);
+eq(unpackRGBA(-1), [255, 255, 255, 255], 'signed input still unpacks');
+{
+  const px = new Uint8Array(8);
+  const u32 = new Uint32Array(px.buffer);
+  u32[0] = packRGBA(10, 20, 30, 40);
+  u32[1] = packRGBA(255, 128, 0, 255);
+  eq(Array.from(px), [10, 20, 30, 40, 255, 128, 0, 255], 'bytes in R, G, B, A order');
+  let ok = true;
+  for (let i = 0; i < 2000; i++) {
+    const c = [i * 7 & 255, i * 13 & 255, i * 29 & 255, i * 31 & 255];
+    const p = packRGBA(...c);
+    if (p < 0 || !Number.isInteger(p) || unpackRGBA(p).join() !== c.join()) ok = false;
+  }
+  check(ok, 'round trips, always a non-negative integer');
+}
 
 === exercise hashrng
 title: A hash and a seeded RNG
