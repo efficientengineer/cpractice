@@ -16,6 +16,8 @@ cmake --build build
 
 Quick start without compiling Dawn: `cmake -S world -B build-wgpu -G Ninja -DWORLD_WEBGPU=WGPU` uses the prebuilt wgpu-native library. It implements the same `webgpu.h`, so the code is identical; you never touch Rust.
 
+To build Dawn once and reuse it across build directories: build it yourself (`git clone https://github.com/google/dawn`, then `cmake -S dawn -B dawn/out -G Ninja -DDAWN_FETCH_DEPENDENCIES=ON -DDAWN_BUILD_MONOLITHIC_LIBRARY=SHARED -DDAWN_BUILD_SAMPLES=OFF -DDAWN_BUILD_TESTS=OFF -DTINT_BUILD_TESTS=OFF && ninja -C dawn/out webgpu_dawn`) and configure with `-DWORLD_DAWN_SOURCE=$PWD/dawn -DWORLD_DAWN_BUILD=$PWD/dawn/out`.
+
 Options: `-DWORLD_SANITIZE=ON` (AddressSanitizer + UBSan, use it while developing), `-DWORLD_HEADLESS=ON` (engine and tests only, no SDL).
 
 ## Layout

@@ -37,6 +37,9 @@ void gpu_present(Gpu *gpu);
 // Shaders: from a string, or from shaders/NAME (WORLD_SHADER_DIR). Compile errors are printed.
 WGPUShaderModule gpu_shader(Gpu *gpu, const char *wgsl, const char *label);
 WGPUShaderModule gpu_shader_file(Gpu *gpu, const char *name);
+// The source of shaders/NAME with its //#include "x.wgsl" lines expanded (each file once).
+// malloc'd, caller frees; NULL if a file is missing. gpu_shader_file compiles exactly this.
+char *gpu_shader_source(const char *name);
 
 WGPUBuffer gpu_buffer(Gpu *gpu, uint64_t size, WGPUBufferUsage usage, const void *data, const char *label);
 // Copies size bytes of src into dst (blocking). For tests and tools only, never per frame.

@@ -154,11 +154,61 @@ WGPUShaderModule gpu_shader(Gpu *gpu, const char *wgsl, const char *label) {
     return m;
 }
 
-WGPUShaderModule gpu_shader_file(Gpu *gpu, const char *name) {
+// ---- shader files with //#include "x.wgsl" (chapter 01) ----
+// WGSL has no preprocessor. A line starting with //#include "name" is replaced by the contents of
+// shaders/name (recursively); each file is included at most once per shader, like #pragma once.
+// It is still a valid WGSL comment, so editors and validators can read the unexpanded file.
+
+typedef struct { char *data; size_t len, cap; char seen[32][128]; int nseen; } ShaderSrc;
+
+static void src_append(ShaderSrc *s, const char *p, size_t n) {
+    if (s->len + n + 1 > s->cap) {
+        size_t cap = s->cap ? s->cap : 4096;
+        while (s->len + n + 1 > cap) cap *= 2;
+        s->data = realloc(s->data, cap);
+        s->cap = cap;
+    }
+    memcpy(s->data + s->len, p, n);
+    s->len += n;
+    s->data[s->len] = 0;
+}
+
+static bool src_include(ShaderSrc *s, const char *name, int depth) {
+    for (int i = 0; i < s->nseen; i++) if (strcmp(s->seen[i], name) == 0) return true;   // already included
+    if (depth > 16 || s->nseen == 32) { fprintf(stderr, "shader includes too deep at %s\n", name); return false; }
     char path[1024];
     snprintf(path, sizeof path, "%s%s", WORLD_SHADER_DIR, name);
-    char *src = read_file(path, NULL);
-    if (!src) { fprintf(stderr, "cannot read shader %s\n", path); return NULL; }
+    char *text = read_file(path, NULL);
+    if (!text) { fprintf(stderr, "cannot read shader %s\n", path); return false; }
+    snprintf(s->seen[s->nseen++], sizeof s->seen[0], "%s", name);
+    bool ok = true;
+    for (const char *line = text; ok && *line; ) {
+        const char *end = strchr(line, '\n');
+        size_t n = end ? (size_t)(end - line) + 1 : strlen(line);
+        const char *q;
+        if (strncmp(line, "//#include \"", 12) == 0 && (q = memchr(line + 12, '"', n - 12)) != NULL) {
+            char inc[256];
+            snprintf(inc, sizeof inc, "%.*s", (int)(q - (line + 12)), line + 12);
+            ok = src_include(s, inc, depth + 1);
+        } else {
+            src_append(s, line, n);
+        }
+        line += n;
+    }
+    free(text);
+    return ok;
+}
+
+char *gpu_shader_source(const char *name) {
+    ShaderSrc s = {0};
+    bool ok = src_include(&s, name, 0);
+    if (!ok) { free(s.data); return NULL; }
+    return s.data ? s.data : calloc(1, 1);
+}
+
+WGPUShaderModule gpu_shader_file(Gpu *gpu, const char *name) {
+    char *src = gpu_shader_source(name);
+    if (!src) return NULL;
     WGPUShaderModule m = gpu_shader(gpu, src, name);
     free(src);
     return m;

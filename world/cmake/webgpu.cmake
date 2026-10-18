@@ -1,7 +1,23 @@
 # Provides an imported target `webgpu` (headers + library) for the chosen implementation,
 # the define WORLD_WEBGPU_DAWN or WORLD_WEBGPU_WGPU, and world_copy_runtime(target).
 
-if(WORLD_WEBGPU STREQUAL "DAWN")
+# Reuse an already-built Dawn instead of building it inside this build directory:
+#   -DWORLD_DAWN_SOURCE=/path/to/dawn -DWORLD_DAWN_BUILD=/path/to/dawn/out
+set(WORLD_DAWN_SOURCE "" CACHE PATH "Dawn source checkout (optional, with WORLD_DAWN_BUILD)")
+set(WORLD_DAWN_BUILD "" CACHE PATH "Dawn build directory containing libwebgpu_dawn (optional)")
+
+if(WORLD_WEBGPU STREQUAL "DAWN" AND WORLD_DAWN_BUILD)
+  set(WORLD_WEBGPU_DEFINE WORLD_WEBGPU_DAWN)
+  find_library(WORLD_DAWN_LIB NAMES webgpu_dawn PATHS ${WORLD_DAWN_BUILD}/src/dawn/native NO_DEFAULT_PATH REQUIRED)
+  add_library(webgpu SHARED IMPORTED GLOBAL)
+  set_target_properties(webgpu PROPERTIES IMPORTED_LOCATION ${WORLD_DAWN_LIB}
+    INTERFACE_INCLUDE_DIRECTORIES "${WORLD_DAWN_SOURCE}/include;${WORLD_DAWN_BUILD}/gen/include")
+  get_filename_component(WORLD_DAWN_LIBDIR ${WORLD_DAWN_LIB} DIRECTORY)
+  function(world_copy_runtime target)
+    set_target_properties(${target} PROPERTIES BUILD_RPATH ${WORLD_DAWN_LIBDIR})
+  endfunction()
+
+elseif(WORLD_WEBGPU STREQUAL "DAWN")
   set(WORLD_WEBGPU_DEFINE WORLD_WEBGPU_DAWN)
   # Pinned Dawn release. Dependencies are fetched by Dawn's own script on first configure.
   FetchContent_Declare(dawn

@@ -27,3 +27,11 @@ The `world` course (`content/world/`) is one continuous project: a procedural, h
 ## Chapters
 
 <!-- Each chapter's author documents the exact API they add (CPU headers, GPU modules, shaders) under "### NN-name". -->
+
+### 01-noise
+
+- `engine/noise.h` (CPU, `lib:` of 01): `hash_u32(x)` (PCG), `hash2i(x, z, seed)`, `hash3i(x, y, z, seed)`, `hash_to_unit(h)` [0,1), `noise_fade(t)`, `noise_value2(x, y, seed)` -1..1, `noise_perlin2(x, y, seed)` ~-1..1, `noise_perlin3(x, y, z, seed)`, `noise_simplex2(x, y, seed)`, `fbm2(x, y, seed, octaves, lacunarity, gain)` ~-1..1 (normalized by the amplitude sum; octave i uses seed + i), `ridged2(...)` same params, 0..1, `domain_warp2(&x, &y, seed, amount, freq)` (in place).
+- `shaders/noise.wgsl`: the same functions, same names and math (`hash2i(x: i32, z: i32, seed: u32)`, `noise_perlin2(x: f32, y: f32, seed: u32)`, ...), except `domain_warp2(p: vec2f, seed, amount, freq) -> vec2f` returns the warped point. Parity within 1e-3 tested.
+- `engine/terrain.h` (CPU, `lib:` of 01; chapter 06 extends it, keeping these names): `TerrainParams { u32 seed; i32 octaves; f32 frequency, height, lacunarity, gain, warp, ridge; }` (32 bytes, same layout as the WGSL struct, usable as a uniform), `terrain_default(seed)`, `terrain_height(const TerrainParams *, x, z)` in meters.
+- `shaders/terrain.wgsl` (includes noise.wgsl): `struct TerrainParams`, `terrain_eval(t: TerrainParams, p: vec2f) -> f32`, `terrain_height(p: vec2f) -> f32` which reads a module-scope `terrain: TerrainParams` that the including shader declares (`@group(G) @binding(B) var<uniform> terrain: TerrainParams;`).
+- `gpu_shader_file` expands `//#include "x.wgsl"` lines (recursive, each file once per shader); `char *gpu_shader_source(name)` returns the expanded text (caller frees).
