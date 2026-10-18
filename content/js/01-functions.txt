@@ -1,0 +1,741 @@
+=== chapter functions
+title: Functions and closures
+blurb: Declarations, expressions and arrows, hoisting, scope, closures, parameters, higher-order functions, IIFEs, recursion, and functions as objects.
+--- body
+## Three ways to make a function
+
+```js
+// 1. Declaration: hoisted with its body, has a name
+function add(a, b) { return a + b; }
+
+// 2. Expression: a value assigned to a variable (optionally named)
+const sub = function (a, b) { return a - b; };
+const fact = function f(n) { return n <= 1 ? 1 : n * f(n - 1); };  // name f visible only inside
+
+// 3. Arrow: concise, no own this/arguments, can't be used with new
+const mul = (a, b) => a * b;
+const square = x => x * x;                 // one param: parens optional
+const makePoint = (x, y) => ({ x, y });    // returning an object literal needs ( )
+const log = () => { console.log('block body needs return'); };
+
+console.log(add(1, 2), sub(5, 3), fact(5), mul(3, 4), square(9), makePoint(1, 2), log());
+```
+
+Arrows aren't just shorter syntax. They differ in four ways that matter:
+
+| | `function` | arrow |
+|---|---|---|
+| `this` | set by how it's called | inherited from the enclosing scope (lexical) |
+| `arguments` | its own | inherited |
+| `new` | can be a constructor | `TypeError` |
+| `prototype` property | yes | no |
+
+The `this` rules get their own section in the classes chapter. Rule of thumb: arrows for callbacks and small helpers, `function` declarations for named top-level functions, method syntax inside objects and classes.
+
+## Hoisting
+
+Function *declarations* are hoisted completely: you can call them above the line where they appear. Function *expressions* follow the rules of the variable that holds them: `var` gives you `undefined` (calling it is a `TypeError`), `let`/`const` give you the TDZ.
+
+```js
+console.log(early(2));                 // works
+function early(x) { return x * 10; }
+
+try { late(); } catch (e) { console.log(e.constructor.name, e.message); }
+var late = function () { return 'late'; };
+
+try { later(); } catch (e) { console.log(e.constructor.name); }
+const later = () => 'later';
+```
+
+This is why C#-style "helpers at the bottom" works with declarations but not with arrow functions stored in `const`. Mutual recursion between declarations also just works.
+
+## Scope
+
+JavaScript has **lexical scope**: a function sees the variables of the place where it was *written*, not where it is called. Scopes nest: block (`let`/`const`, `{ }`), function, module/script, global. Lookup walks outward; assignment to a name that is never declared creates a global in sloppy mode (and throws in strict mode), which is one more reason to always declare.
+
+```js
+const level = 'outer';
+function show() { return level; }
+function caller() {
+  const level = 'caller';
+  return show();             // lexical: show sees the outer level, not the caller's
+}
+console.log(caller());
+
+function shadow() {
+  let x = 1;
+  { let x = 2; console.log('inner', x); }
+  console.log('outer', x);
+}
+shadow();
+```
+
+## Closures
+
+A **closure** is a function plus the variables it captured from its enclosing scopes. It captures the *variables*, not copies of their values: if the variable changes later, the closure sees the change, and multiple closures over the same variable share it. C# lambdas work the same way (the compiler builds a hidden class for captured locals); JavaScript just uses them far more.
+
+```js
+function makeCounter(start = 0) {
+  let n = start;                       // private: only reachable through the closures
+  return {
+    inc: () => ++n,
+    dec: () => --n,
+    get value() { return n; },
+  };
+}
+const a = makeCounter(), b = makeCounter(100);
+a.inc(); a.inc(); b.dec();
+console.log(a.value, b.value);          // independent: each call made a new n
+```
+
+Closures are how JavaScript did private state for 20 years before `#private` fields existed, and they are still the lightest way to do it.
+
+> **Performance:** creating a closure allocates (a function object, plus a context object for captured variables). That's nothing at setup time and a real cost in a frame loop. `enemies.forEach(e => e.update(dt))` inside `update()` allocates a fresh arrow every frame; `setTimeout(() => ..., 0)` per bullet allocates per bullet. Hoist callbacks out of hot paths, or use a plain `for` loop, which allocates nothing. Same for `fn.bind(this)` in a loop: bind once in the constructor, not every frame.
+
+### The loop capture classic
+
+`var` has one binding for the whole function, so every closure created in a `var` loop shares the same `i`. `let` in a `for` head creates a **fresh binding per iteration** (copying the previous value forward), so each closure gets its own.
+
+```js
+const withVar = [], withLet = [];
+for (var i = 0; i < 3; i++) withVar.push(() => i);
+for (let j = 0; j < 3; j++) withLet.push(() => j);
+console.log(withVar.map(f => f()), withLet.map(f => f()));
+```
+
+C# had exactly this bug with `foreach` before C# 5 changed the loop variable's scope. The pre-ES2015 workaround was an IIFE (below) to create a new scope per iteration.
+
+## Parameters
+
+JavaScript doesn't check argument counts. Missing arguments are `undefined`, extra ones are ignored (but visible in `arguments` for non-arrow functions). There is no overloading: a second declaration with the same name replaces the first.
+
+```js
+function greet(name = 'world', punct = name.length > 5 ? '!' : '.') {
+  return `Hello, ${name}${punct}`;
+}
+console.log(greet(), greet('JavaScript'), greet(undefined, '?'), greet(null, '!'));
+
+function sum(first, ...rest) {          // rest: a real array of the remaining args
+  return rest.reduce((acc, x) => acc + x, first ?? 0);
+}
+const nums = [1, 2, 3];
+console.log(sum(), sum(...nums), sum(10, ...nums, 100), Math.max(...nums));
+console.log(sum.length, greet.length);  // declared params before the first default/rest
+```
+
+- **Defaults** apply only when the argument is `undefined` (not `null`), are evaluated at call time (a fresh `[]` each call, unlike Python), and can refer to earlier parameters.
+- **Rest** (`...args`) is like C#'s `params T[]`, and must be last.
+- **Spread** (`f(...arr)`) expands any iterable into arguments.
+- **Named arguments** don't exist; use a destructured options object: `function draw({ x = 0, y = 0, color = 'black' } = {}) { ... }`.
+
+> **Performance:** rest parameters and spread build a new array on every call, and an options object is a new object on every call. `spawnParticle({ x, y, vx, vy })` called 500 times a frame creates 500 garbage objects a frame. For hot functions, take positional parameters (`spawnParticle(x, y, vx, vy)`); keep options objects for setup-time APIs. Likewise `Math.max(...hugeArray)` copies the array onto the stack and throws `RangeError` past roughly 100,000 elements: loop instead.
+
+## Higher-order functions
+
+Functions are values, so functions can take and return them. This is the JavaScript equivalent of passing `Func<T, TResult>` around, without any delegate types to declare.
+
+```js
+const compose = (...fns) => x => fns.reduceRight((acc, f) => f(acc), x);
+const pipe = (...fns) => x => fns.reduce((acc, f) => f(acc), x);
+const inc = x => x + 1, dbl = x => x * 2;
+console.log(compose(inc, dbl)(5), pipe(inc, dbl)(5));
+
+// A function that returns a configured function
+const multiplier = k => x => x * k;
+const triple = multiplier(3);
+console.log([1, 2, 3].map(triple));
+
+// Wrapping: add behaviour around any function
+function logged(fn) {
+  return function (...args) {
+    const result = fn.apply(this, args);
+    console.log(`${fn.name}(${args.join(', ')}) = ${result}`);
+    return result;
+  };
+}
+const loggedAdd = logged(function add(a, b) { return a + b; });
+loggedAdd(2, 3);
+```
+
+The wrapper uses `function` and `fn.apply(this, args)` rather than an arrow and `fn(...args)` so that it passes `this` through when the wrapped function is used as a method. That's the standard pattern for decorators like `once`, `memoize`, `debounce`.
+
+### Game flavour: behaviours as functions
+
+Games use higher-order functions for things like easing curves, AI behaviours and event handlers. A function returning a function is a tiny, allocation-free-at-runtime way to configure behaviour up front:
+
+```js
+// Easing functions map t in [0, 1] to progress in [0, 1]
+const linear = t => t;
+const easeOutQuad = t => 1 - (1 - t) * (1 - t);
+const reverse = ease => t => 1 - ease(1 - t);
+
+function tween(from, to, duration, ease = linear) {
+  return elapsed => {
+    const t = Math.min(1, elapsed / duration);
+    return from + (to - from) * ease(t);
+  };
+}
+const slide = tween(0, 100, 500, easeOutQuad);   // configured once...
+const fadeIn = tween(0, 1, 200, reverse(easeOutQuad));
+console.log([0, 125, 250, 500, 900].map(ms => slide(ms)));   // ...called every frame
+console.log(fadeIn(100));
+```
+
+The closures are created once, when the tween starts; calling `slide(ms)` per frame allocates nothing.
+
+### Partial application and currying
+
+```js
+const partial = (fn, ...preset) => (...later) => fn(...preset, ...later);
+const greetIn = (lang, name) => `${lang === 'fr' ? 'Bonjour' : 'Hello'}, ${name}`;
+const french = partial(greetIn, 'fr');
+console.log(french('Ada'));
+
+// Function.prototype.bind also pre-fills arguments (and fixes this)
+const hello = greetIn.bind(null, 'en');
+console.log(hello('Grace'));
+```
+
+## IIFEs
+
+An *immediately invoked function expression* runs once, right where it is written. Before `let` and modules it was the only way to get a private scope; now it's mostly used for an expression that needs statements, or an async block.
+
+```js
+const config = (() => {
+  const env = 'dev';
+  const base = env === 'prod' ? 'https://api.example.com' : 'http://localhost';
+  return { base, timeout: env === 'prod' ? 5000 : 60000 };
+})();
+console.log(config);
+
+(function () { var hidden = 42; console.log('IIFE ran', hidden); })();
+console.log(typeof hidden);
+```
+
+The leading `(` matters: a line starting with `function` is parsed as a declaration, which can't be called immediately. If you omit semicolons, start an IIFE line with `;` to stop it being parsed as a call on the previous line's value.
+
+## Recursion
+
+Recursion works as you'd expect (flood fill, scene graph traversal, minimax), with one caveat: there is **no tail call optimization** in practice (only Safari implements it). The stack is roughly 10,000 frames deep, so deep recursion over large input throws `RangeError: Maximum call stack size exceeded`. For deep structures, or a flood fill over a 1000x1000 map, use an explicit stack.
+
+```js
+function depth(tree) {
+  return Array.isArray(tree) ? 1 + Math.max(0, ...tree.map(depth)) : 0;
+}
+console.log(depth([1, [2, [3, [4]]], []]));
+
+function sumTo(n) { return n === 0 ? 0 : n + sumTo(n - 1); }
+try { sumTo(1e6); } catch (e) { console.log(e.name, e.message); }
+
+// Same thing with an explicit stack: no depth limit
+function flattenDeep(arr) {
+  const out = [], stack = [arr];
+  while (stack.length) {
+    const top = stack.pop();
+    if (Array.isArray(top)) for (let i = top.length - 1; i >= 0; i--) stack.push(top[i]);
+    else out.push(top);
+  }
+  return out;
+}
+console.log(flattenDeep([1, [2, [3, [4, 5]]], 6]));
+```
+
+## Functions are objects
+
+A function is an object with a callable internal slot. It has properties (`name`, `length`), you can add your own, store it in maps, compare it by reference.
+
+```js
+function hit() { hit.count = (hit.count ?? 0) + 1; return hit.count; }
+hit(); hit();
+console.log(hit.count, hit.name, typeof hit, hit instanceof Object);
+
+const ops = { '+': (a, b) => a + b, '-': (a, b) => a - b, '*': (a, b) => a * b };
+console.log(ops['*'](6, 7), Object.keys(ops));
+```
+
+Properties on functions are a cheap way to attach metadata or cache state (a memoized function can keep its cache on itself), though a closure is usually cleaner.
+
+### Memoization, putting it together
+
+```js
+function memoize(fn) {
+  const cache = new Map();
+  return function (n) {
+    if (!cache.has(n)) cache.set(n, fn.call(this, n));
+    return cache.get(n);
+  };
+}
+const fib = memoize(n => (n < 2 ? n : fib(n - 1) + fib(n - 2)));
+console.log(fib(90));
+```
+
+The recursive calls go through `fib`, the *memoized* wrapper, because the arrow looks up the name `fib` when it runs, after the assignment. That's lexical scope and closures working together: without memoization this would take longer than the age of the universe.
+
+=== exercise once
+title: once
+--- prompt
+Some things must happen exactly once however many times the code path is hit: unlocking an achievement, initializing the audio context on the first click. Write `once(fn)` returning a function that calls `fn` the first time it is called (passing all arguments and preserving `this`) and returns its result. Every later call returns that same first result without calling `fn` again.
+
+The result may legitimately be `undefined`; that still counts as "already called". If `fn` throws, the error propagates and the next call tries again.
+--- starter
+function once(fn) {
+  return fn;
+}
+--- solution
+function once(fn) {
+  let done = false, result;
+  return function (...args) {
+    if (!done) {
+      result = fn.apply(this, args);
+      done = true;
+    }
+    return result;
+  };
+}
+--- hint
+Keep a `done` flag and a `result` in the closure. Don't use `result === undefined` as the flag.
+--- hint
+Return a `function` (not an arrow) and call `fn.apply(this, args)` so method calls keep their `this`. Set `done` only after `fn` returns.
+--- harness
+{
+  let calls = 0;
+  const init = once((a, b) => { calls++; return a + b; });
+  eq(init(2, 3), 5);
+  eq(init(10, 10), 5, 'second call returns first result');
+  eq(calls, 1, 'fn called once');
+
+  let n = 0;
+  const u = once(() => { n++; });
+  u(); u(); u();
+  eq(n, 1, 'undefined result still counts');
+
+  const obj = { x: 42, get: once(function () { return this.x; }) };
+  eq(obj.get(), 42, 'this is preserved');
+
+  let tries = 0;
+  const flaky = once(() => { if (++tries < 2) throw new Error('nope'); return 'ok'; });
+  throws(() => flaky(), 'first call throws');
+  eq(flaky(), 'ok', 'retries after a throw');
+  eq(flaky(), 'ok');
+  eq(tries, 2);
+
+  const f1 = once(() => 1), f2 = once(() => 2);
+  eq([f1(), f2(), f1()], [1, 2, 1], 'independent instances');
+}
+
+=== exercise counters
+title: Counter factory
+--- prompt
+Score counters, ammo, combo meters: a clamped counter is everywhere in game code. Write `makeCounter({ start = 0, step = 1, min = -Infinity, max = Infinity } = {})` returning an object with methods:
+
+- `next()`: adds `step` and returns the new value, but never goes above `max` (clamps to it).
+- `prev()`: subtracts `step`, clamped to `min`.
+- `reset()`: returns to `start` and returns it.
+- `value()`: the current value.
+
+The count must be private (not a property of the returned object). Every counter is independent. All options are optional, and calling with no argument at all must work.
+--- starter
+function makeCounter(opts) {
+  return {
+    count: 0,
+    next() { return ++this.count; },
+  };
+}
+--- solution
+function makeCounter({ start = 0, step = 1, min = -Infinity, max = Infinity } = {}) {
+  let n = start;
+  return {
+    next: () => (n = Math.min(max, n + step)),
+    prev: () => (n = Math.max(min, n - step)),
+    reset: () => (n = start),
+    value: () => n,
+  };
+}
+--- hint
+Destructure the options in the parameter list with defaults, and give the whole parameter a default of `{}`.
+--- hint
+Keep `let n` in the factory's scope; the methods close over it. `Math.min(max, n + step)` clamps.
+--- harness
+{
+  const c = makeCounter();
+  eq([c.next(), c.next(), c.next()], [1, 2, 3]);
+  eq(c.prev(), 2);
+  eq(c.value(), 2);
+  eq(c.reset(), 0);
+  eq(c.value(), 0);
+  eq(Object.values(c).filter(v => typeof v === 'number'), [], 'no public number properties');
+
+  const d = makeCounter({ start: 10, step: 5, max: 22, min: 3 });
+  eq([d.next(), d.next(), d.next()], [15, 20, 22], 'clamps at max');
+  eq([d.prev(), d.prev(), d.prev(), d.prev(), d.prev()], [17, 12, 7, 3, 3], 'clamps at min');
+  eq(d.reset(), 10);
+
+  const e = makeCounter({ step: 2 });
+  e.next();
+  eq([c.value(), e.value()], [0, 2], 'independent counters');
+  eq(makeCounter({ start: 7 }).value(), 7);
+}
+
+=== exercise memo
+title: Memoize with any arguments
+--- prompt
+Write `memoize(fn)` that caches results by **all** arguments. Two calls hit the same cache entry when they have the same number of arguments and each argument is the same value (by `Object.is` semantics is fine; a `Map` keyed by each argument does that, with `NaN` matching `NaN`). Arguments may be any values: numbers, strings, objects (by reference), `undefined`.
+
+The tests count how often `fn` runs. Preserve `this` as well.
+
+Watch out for the trap of `JSON.stringify(args)` as a key: `[1]` and `['1']` would collide, and two different objects with the same contents would too.
+--- starter
+function memoize(fn) {
+  const cache = {};
+  return (...args) => {
+    const key = args.join(',');
+    if (!(key in cache)) cache[key] = fn(...args);
+    return cache[key];
+  };
+}
+--- solution
+function memoize(fn) {
+  const root = new Map();
+  const RESULT = Symbol('result');
+  return function (...args) {
+    let node = root.get(args.length);
+    if (!node) root.set(args.length, (node = new Map()));
+    for (const a of args) {
+      let next = node.get(a);
+      if (!next) node.set(a, (next = new Map()));
+      node = next;
+    }
+    if (!node.has(RESULT)) node.set(RESULT, fn.apply(this, args));
+    return node.get(RESULT);
+  };
+}
+--- hint
+Build a tree of `Map`s: one level per argument. `Map` keys can be any value, compared by identity, so objects and `'1'` vs `1` stay distinct.
+--- hint
+Store the result at the leaf under a unique key (a `Symbol` works well), and start the tree from the argument count so `f(1)` and `f(1, undefined)` differ.
+--- harness
+{
+  let calls = 0;
+  const f = memoize((...a) => { calls++; return a.length; });
+  f(1); f(1); eq(calls, 1, 'same number arg cached');
+  f('1'); eq(calls, 2, "'1' differs from 1");
+  f(1, 2); f(1, 2); eq(calls, 3);
+  f(1, '2'); eq(calls, 4, '1,"2" differs from 1,2');
+  f('1,2'); eq(calls, 5, "'1,2' differs from (1, 2)");
+  f(); f(); eq(calls, 6, 'zero args cached');
+  f(undefined); eq(calls, 7, 'f(undefined) differs from f()');
+  f(1, undefined); eq(calls, 8, 'f(1, undefined) differs from f(1)');
+  f(NaN); f(NaN); eq(calls, 9, 'NaN matches NaN');
+  const o1 = { a: 1 }, o2 = { a: 1 };
+  f(o1); f(o1); eq(calls, 10, 'same object cached');
+  f(o2); eq(calls, 11, 'different object with same contents not shared');
+  f(null); f('null'); eq(calls, 13);
+
+  let n = 0;
+  const undef = memoize(() => { n++; return undefined; });
+  undef(5); undef(5);
+  eq(n, 1, 'undefined results are cached too');
+
+  let slow = 0;
+  const fib = memoize(k => { slow++; return k < 2 ? k : fib(k - 1) + fib(k - 2); });
+  eq(fib(70), 190392490709135);
+  eq(slow, 71, 'each fib(k) computed once');
+}
+
+=== exercise debounceSync
+title: Weapon cooldown
+--- prompt
+Holding the fire button calls `fire()` every frame, but the gun should only shoot every `interval` ms. Write a general `throttle(fn, interval, now)` where `now` is a function returning the current time in milliseconds (the tests pass a fake clock, so no real timers are involved; games use a game clock for exactly this reason, so that pausing and replays work).
+
+The returned function calls `fn` (with its arguments and `this`) if at least `interval` ms have passed since the last call **that actually ran** (the first call always runs), and returns `fn`'s result. Otherwise it skips `fn` and returns the result of the last call that ran.
+
+It will be called every frame, so don't allocate anything per call beyond what `fn` itself does (no new arrays or closures in the hot path).
+--- starter
+function throttle(fn, interval, now) {
+  return (...args) => fn(...args);
+}
+--- solution
+function throttle(fn, interval, now) {
+  let last = -Infinity, result;
+  return function () {
+    const t = now();
+    if (t - last >= interval) {
+      last = t;
+      result = fn.apply(this, arguments);   // no rest array per call
+    }
+    return result;
+  };
+}
+--- hint
+Keep `last` (time of the last run) and `result` in the closure. Starting `last` at `-Infinity` makes the first call always run.
+--- harness
+{
+  let t = 1000;
+  const clock = () => t;
+  const seen = [];
+  const f = throttle(x => { seen.push(x); return x * 10; }, 100, clock);
+  eq(f(1), 10);
+  t = 1050; eq(f(2), 10, 'skipped, returns last result');
+  t = 1099; eq(f(3), 10);
+  t = 1100; eq(f(4), 40, 'exactly interval later runs');
+  t = 1150; eq(f(5), 40);
+  t = 1260; eq(f(6), 60);
+  eq(seen, [1, 4, 6]);
+
+  let t2 = 0;
+  const g = throttle((a, b) => a + b, 0, () => t2);
+  eq([g(1, 2), g(3, 4)], [3, 7], 'interval 0 always runs');
+
+  let t3 = 0;
+  const h = throttle(() => 'x', 1000, () => t3);
+  eq(h(), 'x', 'first call runs even at time 0');
+}
+
+=== exercise curry
+title: curry
+--- prompt
+Write `curry(fn)` that lets you supply `fn`'s arguments in any number of separate calls. It collects arguments until it has at least `fn.length` of them, then calls `fn` with all of them (extra arguments included).
+
+```js
+const add3 = curry((a, b, c) => a + b + c);
+add3(1)(2)(3)    // 6
+add3(1, 2)(3)    // 6
+add3(1)(2, 3)    // 6
+add3(1, 2, 3, 4) // 6 (fn receives 4 args)
+```
+
+Each partial application must be independent and reusable: `const p = add3(1); p(2)(3); p(10)(20)` both work. Calling a partial with no arguments returns an equivalent partial.
+--- starter
+function curry(fn) {
+  return (...args) => fn(...args);
+}
+--- solution
+function curry(fn) {
+  const collect = (have) => (...more) => {
+    const all = [...have, ...more];
+    return all.length >= fn.length ? fn(...all) : collect(all);
+  };
+  return collect([]);
+}
+--- hint
+Write an inner function that takes the arguments collected so far and returns a function that accepts more.
+--- hint
+Never push into a shared array: build a new array `[...have, ...more]` each time so partials stay independent.
+--- harness
+{
+  const add3 = curry((a, b, c) => a + b + c);
+  eq(add3(1)(2)(3), 6);
+  eq(add3(1, 2)(3), 6);
+  eq(add3(1)(2, 3), 6);
+  eq(add3(1, 2, 3), 6);
+  eq(add3()(1)()(2)(3), 6, 'empty calls are fine');
+  const p = add3(1);
+  eq(p(2)(3), 6);
+  eq(p(10)(20), 31, 'partials are reusable');
+  const q = p(100);
+  eq(q(1), 102);
+  eq(q(2), 103);
+  const argc = curry(function (a, b) { return arguments.length; });
+  eq(argc(1)(2), 2);
+  eq(argc(1, 2, 3, 4), 4, 'extra arguments are passed');
+  const zero = curry(() => 'now');
+  eq(zero(), 'now', 'length 0 calls immediately');
+  const str = curry((a, b, c, d) => [a, b, c, d].join('-'));
+  eq(str('a')('b', 'c')('d'), 'a-b-c-d');
+}
+
+=== exercise closurePrint
+title: Fix the closures
+--- prompt
+The starter is supposed to print `handler 0` through `handler 2`, then the three greetings, but it prints the wrong thing. Fix it (any way you like) so it prints exactly:
+
+```text
+handler 0
+handler 1
+handler 2
+hi Ada
+hi Bob
+hi Cy
+```
+--- starter
+var handlers = [];
+for (var i = 0; i < 3; i++) {
+  handlers.push(function () { console.log('handler ' + i); });
+}
+handlers.forEach(h => h());
+
+var names = ['Ada', 'Bob', 'Cy'];
+var greeters = [];
+for (var k = 0; k < names.length; k++) {
+  var name = names[k];
+  greeters.push(() => console.log('hi ' + name));
+}
+greeters.forEach(g => g());
+--- solution
+const handlers = [];
+for (let i = 0; i < 3; i++) {
+  handlers.push(function () { console.log('handler ' + i); });
+}
+handlers.forEach(h => h());
+
+const names = ['Ada', 'Bob', 'Cy'];
+const greeters = [];
+for (let k = 0; k < names.length; k++) {
+  const name = names[k];
+  greeters.push(() => console.log('hi ' + name));
+}
+greeters.forEach(g => g());
+--- hint
+Every closure in a `var` loop shares one variable. Which declaration gives each iteration its own?
+--- hint
+`var name` inside the loop body is also one function-wide variable. It needs to be block scoped too.
+--- test
+--- out
+handler 0
+handler 1
+handler 2
+hi Ada
+hi Bob
+hi Cy
+
+=== quiz
+run: yes
+--- q
+What does this print?
+--- code
+const fns = [];
+for (var i = 0; i < 3; i++) fns.push(() => i);
+for (let j = 0; j < 3; j++) fns.push(() => j);
+console.log(fns.map(f => f()));
+--- choice
+[ 0, 1, 2, 0, 1, 2 ]
+--- answer
+[ 3, 3, 3, 0, 1, 2 ]
+--- choice
+[ 2, 2, 2, 0, 1, 2 ]
+--- choice
+[ 3, 3, 3, 3, 3, 3 ]
+--- explain
+The `var` loop has a single `i`, which is `3` by the time the closures run. `let` creates a new `j` per iteration.
+
+=== quiz
+--- q
+What happens when this runs?
+--- code
+console.log(typeof a, typeof b, typeof c);
+function a() {}
+var b = function () {};
+const c = 1 > 0 ? 'later' : 0;
+--- choice
+function function string
+--- choice
+undefined undefined undefined
+--- answer
+It throws a ReferenceError (nothing is printed)
+--- choice
+function undefined undefined
+--- explain
+`a` is hoisted with its body and `b` is hoisted as `undefined`, but `c` is a `const` in its temporal dead zone, so `typeof c` throws before `console.log` runs. Had `c` been declared with `var`, the output would be `function undefined undefined`.
+
+=== quiz
+run: yes
+--- q
+What does this print?
+--- code
+function f(a, b = a * 2, ...rest) {
+  return [a, b, rest.length, arguments.length];
+}
+console.log(f(1), f(1, null, 3, 4), f(1, undefined), f.length);
+--- choice
+[ 1, 2, 0, 1 ] [ 1, 2, 2, 4 ] [ 1, 2, 0, 1 ] 3
+--- answer
+[ 1, 2, 0, 1 ] [ 1, null, 2, 4 ] [ 1, 2, 0, 2 ] 1
+--- choice
+[ 1, 2, 0, 1 ] [ 1, null, 2, 4 ] [ 1, 2, 0, 1 ] 2
+--- choice
+[ 1, 2, 0, 3 ] [ 1, null, 2, 4 ] [ 1, undefined, 0, 2 ] 1
+--- explain
+Defaults apply only for `undefined`, so `null` is kept. `arguments.length` counts what was passed, including an explicit `undefined`. `f.length` counts parameters before the first one with a default.
+
+=== quiz
+run: yes
+--- q
+What does this print?
+--- code
+let x = 'global';
+function outer() {
+  let x = 'outer';
+  return inner();
+}
+function inner() { return x; }
+const getX = () => x;
+x = 'changed';
+console.log(outer(), getX());
+--- choice
+outer changed
+--- choice
+outer global
+--- answer
+changed changed
+--- choice
+global global
+--- explain
+Scope is lexical: `inner` was written at the top level, so it reads the top-level `x` no matter who calls it. Closures capture variables, not values, so both see the reassignment to `'changed'`.
+
+=== quiz
+run: yes
+--- q
+What does this print?
+--- code
+function make() {
+  let n = 0;
+  return [() => ++n, () => n];
+}
+const [inc1, get1] = make();
+const [inc2, get2] = make();
+inc1(); inc1(); inc2();
+console.log(get1(), get2());
+--- choice
+3 3
+--- choice
+0 0
+--- answer
+2 1
+--- choice
+2 2
+--- explain
+Each call to `make` creates a new `n`. The two closures from one call share that call's `n`; the other pair has its own.
+
+=== quiz
+run: yes
+--- q
+What does this print?
+--- code
+const add = (a, b) => a + b;
+const inc = add.bind(null, 1);
+const mk = () => {};
+console.log(inc(5), inc.name, add.length, inc.length, typeof mk.prototype);
+--- choice
+6 inc 2 2 object
+--- answer
+6 bound add 2 1 undefined
+--- choice
+6 add 2 1 undefined
+--- choice
+NaN bound add 2 1 object
+--- explain
+`bind` pre-fills `a = 1` and names the result `bound add`; its `length` is the remaining parameter count. Arrow functions have no `prototype` property (they can't be constructors).
+
+=== quiz
+--- q
+Which statement about arrow functions is false?
+--- choice
+They take `this` from the surrounding scope.
+--- choice
+They can't be called with `new`.
+--- answer
+They are hoisted like function declarations, so they can be called before the line that defines them.
+--- choice
+They have no `arguments` object of their own.
+--- explain
+An arrow is an expression; it's only as hoisted as the variable that holds it. With `const`, calling it early hits the TDZ.

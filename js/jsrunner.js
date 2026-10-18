@@ -77,7 +77,24 @@ self.__testEnd = () => {
 };
 self.onerror = e => { send('err', ['Uncaught ' + (e.message || e)]); };
 self.onunhandledrejection = e => { send('err', ['Unhandled promise rejection: ' + (e.reason && e.reason.stack ? e.reason.stack : inspect(e.reason))]); };
+// Keyboard and mouse forwarded from the page (games). keys holds KeyboardEvent.code values.
+const keyDown_ = [], keyUp_ = [], mouseDown_ = [];
+self.keys = new Set();
+self.mouse = { x: 0, y: 0, down: false };
+self.input = { keys, mouse, onKeyDown: f => keyDown_.push(f), onKeyUp: f => keyUp_.push(f), onMouseDown: f => mouseDown_.push(f) };
 onmessage = async e => {
+  if (e.data.t === 'key') {
+    const { code, down } = e.data;
+    if (code === '*blur') { [...keys].forEach(k => { keys.delete(k); keyUp_.forEach(f => f(k)); }); return; }
+    if (down) { if (!keys.has(code)) { keys.add(code); keyDown_.forEach(f => f(code)); } }
+    else { keys.delete(code); keyUp_.forEach(f => f(code)); }
+    return;
+  }
+  if (e.data.t === 'mouse') {
+    const was = mouse.down; Object.assign(mouse, e.data.m);
+    if (mouse.down && !was) mouseDown_.forEach(f => f(mouse.x, mouse.y));
+    return;
+  }
   const { code, canvas } = e.data;
   self.canvas = canvas;
   let exit = 0;
@@ -99,25 +116,29 @@ onmessage = async e => {
     url ||= URL.createObjectURL(new Blob([WORKER], { type: 'text/javascript' }));
     const w = current = new Worker(url);
     const out = [], err = [];
+    let live = null;
     return new Promise(resolve => {
       const finish = (exit, timedOut) => {
         clearTimeout(timer);
         if (timedOut || !opts.keepAlive) { w.terminate(); if (current === w) current = null; }
+        // Output arriving after the main body finished (game loops, timers) streams to opts.onLate.
+        live = timedOut ? null : opts.onLate || null;
         resolve({ backend: 'your browser (Web Worker)', build: '', didExecute: true, stdout: out.join('\n'), stderr: err.join('\n'), exit, timedOut });
       };
       const timer = setTimeout(() => { err.push(`Timed out after ${(opts.timeout || 5000) / 1000}s (infinite loop?)`); finish(124, true); }, opts.timeout || 5000);
       w.onmessage = e => {
         const m = e.data;
-        if (m.t === 'out') { out.push(m.s); opts.onOut && opts.onOut(m.s); }
-        else if (m.t === 'err') { err.push(m.s); opts.onErr && opts.onErr(m.s); }
+        if (m.t === 'out') { out.push(m.s); live && live('out', m.s); }
+        else if (m.t === 'err') { err.push(m.s); live && live('err', m.s); }
         else if (m.t === 'done') finish(m.exit, false);
       };
       w.onerror = e => { e.preventDefault(); err.push(String(e.message || 'Worker error')); finish(1, false); };
       w.postMessage({ code, canvas: opts.canvas }, opts.canvas ? [opts.canvas] : []);
     });
   }
+  function send(msg) { if (current) current.postMessage(msg); }
   function harness(user, ex) {
     return user + '\n;\n' + ex.harness + '\n;return __testEnd();';
   }
-  window.JSRunner = { run, stop, harness };
+  window.JSRunner = { run, stop, harness, send };
 })();

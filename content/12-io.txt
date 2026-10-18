@@ -1,0 +1,1314 @@
+=== chapter io
+title: Input and output
+blurb: Streams and buffering, printf and scanf in depth, robust line-based input with fgets and strtol, parsing, errno, and files.
+--- body
+## Streams
+
+C's I/O is built on `FILE *` streams from `<stdio.h>`. Three are open before `main` runs:
+
+| Stream | C# equivalent | Default buffering |
+|---|---|---|
+| `stdin` | `Console.In` | line buffered from a terminal, fully buffered from a pipe/file |
+| `stdout` | `Console.Out` | line buffered to a terminal, **fully buffered to a pipe/file** |
+| `stderr` | `Console.Error` | unbuffered |
+
+`printf(...)` is `fprintf(stdout, ...)`, `puts(s)` is roughly `fputs(s, stdout)` plus a newline, `getchar()` is `getc(stdin)`. Error messages and diagnostics go to `stderr` so they don't pollute output that's piped into another program: `./prog > out.txt` still shows errors on screen.
+
+```c
+#include <stdio.h>
+
+int main(void) {
+    fprintf(stdout, "result: %d\n", 42);           // same as printf
+    fprintf(stderr, "warning: using default\n");   // separate stream
+    fputs("no newline added\n", stdout);
+    putchar('!');
+    putchar('\n');
+    return 0;
+}
+```
+
+## Buffering
+
+Writing to the OS is a system call, which is slow, so `stdio` collects output in a buffer and writes it in chunks. What triggers a flush depends on the mode:
+
+- **Fully buffered**: when the buffer (typically 4 KB) fills, on `fflush`, and at normal exit.
+- **Line buffered**: additionally at every `\n`.
+- **Unbuffered**: every call writes immediately.
+
+Consequences you will hit:
+
+1. **Output order between streams.** On a terminal, `printf("a\n"); fprintf(stderr, "b\n");` appears in order. Piped to a file, stdout is fully buffered, so the `b` (unbuffered) lands *before* the `a`.
+2. **Crashes eat output.** If the program segfaults or calls `abort()`, whatever is still in the buffer is never written. A `printf("got here")` debugging line without `\n` (or even with it, when piped) may never show up. Debug prints belong on `stderr`, or follow them with `fflush(stdout)`.
+3. **Prompts.** `printf("Name: ");` without a newline may not appear before the program blocks reading. Most C libraries flush stdout when reading from stdin on a terminal, but don't rely on it: `fflush(stdout)` after a prompt.
+
+`setvbuf(stdout, NULL, _IONBF, 0)` makes a stream unbuffered (call it before any output). `exit()` and returning from `main` flush everything; `_exit()` and crashes don't.
+
+## printf's return value
+
+`printf` returns the number of characters written, or a negative value on error. Rarely checked, but useful for alignment:
+
+```c
+#include <stdio.h>
+
+int main(void) {
+    int n = printf("Total: %d items", 1234);
+    printf("\n%*s^ column %d\n", n, "", n);       // %*s: width taken from an argument
+
+    char buf[8];
+    const char *word = "item";
+    int id = 12345;
+    int need = snprintf(buf, sizeof buf, "%s-%d", word, id);
+    printf("needed %d, got \"%s\"\n", need, buf); // truncated, but always 0-terminated
+    // (gcc spots this truncation at compile time and warns: -Wformat-truncation)
+    return 0;
+}
+```
+
+`snprintf` returns how long the output *would* have been, so `snprintf(NULL, 0, fmt, ...)` tells you how big a buffer to allocate. Never use `sprintf` into a fixed buffer with input you don't control; `snprintf` can't overflow.
+
+## scanf and its traps
+
+`scanf` returns the number of items successfully assigned, or `EOF` if input ended (or failed) before the first conversion. **Always compare the return value with the number you asked for.**
+
+```c
+int a, b;
+int r = scanf("%d %d", &a, &b);
+// r == 2: both read.  r == 1: a read, b failed.  r == 0: a failed.  r == EOF: no input.
+```
+
+The traps, in the order they usually bite:
+
+1. **A failed conversion leaves the bad input in the stream.** If the user types `abc` for `%d`, `scanf` returns 0 and `abc` is still there. A loop `while (scanf("%d", &x) != 1) printf("try again\n");` spins forever on the same characters.
+2. **Leftover newlines.** `%d` skips leading whitespace and stops *after* the digits, leaving the `\n` in the stream. A following `fgets` reads that empty remainder of the line, not the next line. `%c` doesn't skip whitespace either: it reads the `\n`. Write `" %c"` (a space in the format skips any whitespace).
+3. **`%s` has no bounds.** `char name[16]; scanf("%s", name);` overflows on a 20-character word, exactly like `gets`. Always give a width one less than the buffer: `%15s`. It also stops at whitespace, so it reads words, not lines.
+4. **Overflow is undefined.** `%d` on `99999999999` is undefined behavior, not an error you can detect. `strtol` reports it properly.
+5. **Uninitialized variables after failure.** If `scanf` returns 1 for a two-item format, the second variable holds garbage.
+
+`scanf` is fine for trusted, well-formed input (like these exercises' test data). For anything typed by a human or read from a file you don't control, use the pattern below.
+
+## The robust pattern: fgets, then parse
+
+Read a whole line with `fgets`, then pick it apart with `sscanf` or `strtol`. A bad line can't leave junk in the stream, and you can report which line was wrong.
+
+```c
+char *fgets(char *buf, int size, FILE *stream);
+```
+
+It reads up to `size - 1` characters, stopping after a newline, which it **keeps**. It always 0-terminates. It returns `NULL` at end of file (or on error). If the line didn't fit, there's no `\n` at the end of `buf` and the rest of the line comes on the next call.
+
+```c
+#include <stdio.h>
+#include <string.h>
+
+int main(void) {
+    char line[128];
+    int lineno = 0;
+    while (fgets(line, sizeof line, stdin)) {
+        lineno++;
+        line[strcspn(line, "\r\n")] = '\0';     // strip the newline (and a Windows \r)
+        char name[32];
+        int qty;
+        double price;
+        if (sscanf(line, "%31s %d %lf", name, &qty, &price) == 3)
+            printf("%s: %d x %.2f = %.2f\n", name, qty, price, qty * price);
+        else
+            fprintf(stderr, "line %d: can't parse \"%s\"\n", lineno, line);
+    }
+    return 0;
+}
+```
+
+`line[strcspn(line, "\r\n")] = '\0'` is the idiomatic newline strip: `strcspn` returns the index of the first `\r` or `\n`, or the length if there is none, so it's safe either way.
+
+`sscanf` has the same return-value contract as `scanf`. One extra tool: `%n` stores how many characters have been consumed so far (it doesn't count as an item), which lets you check for trailing junk or continue parsing from that point.
+
+## strtol: number parsing done right
+
+`atoi("12abc")` returns 12, `atoi("abc")` returns 0, and `atoi("99999999999")` is undefined. You can't tell any of that apart from real input. `strtol` (and `strtoll`, `strtoul`, `strtod`) tell you everything:
+
+```c
+long strtol(const char *s, char **end, int base);
+```
+
+It skips leading whitespace, accepts an optional sign and digits, sets `*end` to the first character it didn't use, and on overflow returns `LONG_MAX`/`LONG_MIN` and sets `errno` to `ERANGE`. The full check has four parts:
+
+```c
+#include <stdio.h>
+#include <stdlib.h>
+#include <errno.h>
+#include <limits.h>
+#include <ctype.h>
+
+// 0 on success; nonzero (and *out untouched) on any problem.
+int parse_int(const char *s, int *out) {
+    char *end;
+    errno = 0;                                   // 1. strtol only sets errno on error
+    long v = strtol(s, &end, 10);
+    if (end == s) return 1;                      // 2. no digits at all
+    while (isspace((unsigned char)*end)) end++;
+    if (*end != '\0') return 2;                  // 3. trailing junk like "12abc"
+    if (errno == ERANGE || v < INT_MIN || v > INT_MAX) return 3;   // 4. out of range
+    *out = (int)v;
+    return 0;
+}
+
+int main(void) {
+    const char *tests[] = {"42", "  -7 ", "12abc", "", "abc", "99999999999", "2147483648"};
+    for (int i = 0; i < 7; i++) {
+        int v = 0;
+        int err = parse_int(tests[i], &v);
+        printf("[%s] -> err %d, value %d\n", tests[i], err, v);
+    }
+    return 0;
+}
+```
+
+Base 0 means "like C source": `0x1F` is hex, `017` octal. `strtol` is also a tokenizer: because it reports where it stopped, you can walk a line of numbers by feeding `end` back in as the next start:
+
+```c
+#include <stdio.h>
+#include <stdlib.h>
+
+int main(void) {
+    const char *line = "10 -3   7\t100 x 5";
+    const char *p = line;
+    char *end;
+    long sum = 0;
+    for (;;) {
+        long v = strtol(p, &end, 10);
+        if (end == p) break;                    // no number here: stop
+        sum += v;
+        p = end;
+    }
+    printf("sum=%ld, stopped at \"%s\"\n", sum, p);   // sum=114, stopped at " x 5"
+    return 0;
+}
+```
+
+## getchar and EOF
+
+The simplest input loop reads a character at a time:
+
+```c
+#include <stdio.h>
+
+int main(void) {
+    int c;                       // int, NOT char
+    long chars = 0, lines = 0;
+    while ((c = getchar()) != EOF) {
+        chars++;
+        if (c == '\n') lines++;
+    }
+    printf("%ld chars, %ld newlines\n", chars, lines);
+    return 0;
+}
+```
+
+`getchar` returns an `int`: either a byte value 0..255 or `EOF` (usually -1), which must be distinguishable from all of them. Store it in a `char` and either byte 255 becomes indistinguishable from EOF (signed `char`) or EOF is never seen and the loop never ends (unsigned `char`). It's a classic bug.
+
+From a terminal, end of input is Ctrl+D on Linux/macOS (Ctrl+Z, Enter on Windows). `feof(f)` and `ferror(f)` tell you *afterwards* why a read failed; `while (!feof(f))` as a loop condition is a bug, because the flag is only set after a read has already failed.
+
+## Lines of unknown length
+
+`fgets` needs a buffer size. For lines that can be any length, grow a heap buffer as you go. POSIX has `getline()` for this, but it isn't standard C, so it's worth knowing how to write:
+
+```c
+#include <stdio.h>
+#include <stdlib.h>
+
+// Returns a malloc'd line without its '\n', or NULL at end of input. Caller frees.
+char *read_line(FILE *f) {
+    size_t len = 0, cap = 16;
+    char *buf = malloc(cap);
+    if (!buf) return NULL;
+    int c;
+    while ((c = getc(f)) != EOF && c != '\n') {
+        if (len + 1 == cap) {                       // keep room for the '\0'
+            char *nb = realloc(buf, cap *= 2);
+            if (!nb) { free(buf); return NULL; }
+            buf = nb;
+        }
+        buf[len++] = (char)c;
+    }
+    if (c == EOF && len == 0) { free(buf); return NULL; }   // nothing read at all
+    buf[len] = '\0';
+    return buf;
+}
+
+int main(void) {
+    char *line;
+    int n = 0;
+    while ((line = read_line(stdin)) != NULL) {
+        printf("%d: %s\n", ++n, line);
+        free(line);
+    }
+    return 0;
+}
+```
+
+Note the last line of a file may have no trailing newline; this handles it (the loop ends on `EOF` with `len > 0`, and that line is returned).
+
+## Splitting lines
+
+Whitespace-separated input is easiest with `strtol` loops (numbers) or `sscanf` with `%n`. For delimited formats like CSV, avoid `strtok`: it treats a run of delimiters as one (so `a,,b` gives two fields, not three), modifies the string, and keeps hidden global state (not reentrant). `strchr`/`strcspn` give full control:
+
+```c
+#include <stdio.h>
+#include <string.h>
+
+int main(void) {
+    char line[] = "alice,,42,london";
+    char *fields[8];
+    int n = 0;
+    char *p = line;
+    for (;;) {
+        fields[n++] = p;
+        size_t k = strcspn(p, ",");      // length of this field
+        if (p[k] == '\0') break;          // last field
+        p[k] = '\0';                      // terminate it in place
+        p += k + 1;                       // next field starts after the comma
+    }
+    for (int i = 0; i < n; i++) printf("[%s]", fields[i]);
+    printf("\n");                         // [alice][][42][london]
+    return 0;
+}
+```
+
+The fields point into `line` itself: no copying, no allocation, but they're only valid while `line` is. Real CSV adds quoting (`"Smith, J"`, with `""` for a literal quote), which an exercise below handles.
+
+## Errors: return codes and errno
+
+C has no exceptions. Functions report failure through their return value (`NULL`, `EOF`, -1, a short count), and many also set the global `errno` (from `<errno.h>`) to say why. `perror("prefix")` prints `prefix: <message for errno>` to stderr; `strerror(errno)` gives the message as a string.
+
+```c
+#include <stdio.h>
+#include <errno.h>
+#include <string.h>
+
+int main(void) {
+    FILE *f = fopen("/definitely/not/here.txt", "r");
+    if (!f) {
+        int saved = errno;                         // the next library call may overwrite it
+        perror("fopen");                           // fopen: No such file or directory
+        printf("errno=%d (%s)\n", saved, strerror(saved));
+        return 1;
+    }
+    fclose(f);
+    return 0;
+}
+```
+
+Rules: only read `errno` right after a call *reports* failure (successful calls may leave junk in it), and when a function's only failure signal is `errno` (like `strtol`), set `errno = 0` before calling. A common C style for your own functions: return `0` for success and a nonzero error code, and pass results out through pointer parameters, as `parse_int` above does. The equivalent of `try/finally` is a single cleanup path at the end of the function (often reached by `goto cleanup;`), so every early failure still closes files and frees memory.
+
+## Files
+
+Files are the same `FILE *` streams. The site runs your programs without a real file system to share, so the exercises use stdin/stdout and `tmpfile()`, but here is the whole API:
+
+| Function | Purpose |
+|---|---|
+| `fopen(path, mode)` | open; returns `NULL` on failure (check it!) |
+| `fclose(f)` | flush and close; returns `EOF` on error (a full disk shows up here) |
+| `fprintf`, `fputs`, `fputc` | text output |
+| `fgets`, `fscanf`, `getc` | text input |
+| `fread(buf, size, n, f)` / `fwrite` | binary blocks; return the number of *items* transferred |
+| `fseek(f, off, SEEK_SET/SEEK_CUR/SEEK_END)`, `ftell`, `rewind` | move around |
+| `fflush(f)` | push buffered output to the OS |
+| `tmpfile()` | an anonymous temporary file opened `"w+b"`, deleted on close |
+
+Modes: `"r"` read (must exist), `"w"` write (creates or **truncates**), `"a"` append, `"r+"` read/write existing, `"w+"` read/write truncated; add `b` for binary. On Linux text and binary mode are identical; on Windows text mode translates `\n` to `\r\n`, so use `b` for binary data. When switching between reading and writing on the same stream, call `fseek`/`rewind`/`fflush` in between.
+
+```c
+#include <stdio.h>
+
+typedef struct { int id; float x, y; } Point;
+
+int main(void) {
+    FILE *f = tmpfile();
+    if (!f) { perror("tmpfile"); return 1; }
+
+    fprintf(f, "%d %s\n", 3, "points");                // text...
+    Point pts[3] = {{1, 0.5f, 1.5f}, {2, 2.0f, -1.0f}, {3, 0, 0}};
+    size_t w = fwrite(pts, sizeof pts[0], 3, f);       // ...then raw bytes
+    printf("wrote %zu points, file is %ld bytes\n", w, ftell(f));
+
+    rewind(f);                                         // back to the start to read
+    int n;
+    char word[16];
+    if (fscanf(f, "%d %15s", &n, word) == 2) printf("header: %d %s\n", n, word);
+    getc(f);                                           // consume the '\n' after the header
+    Point in[3];
+    size_t r = fread(in, sizeof in[0], 3, f);
+    printf("read %zu, last id %d, x %.1f\n", r, in[2].id, in[1].x);
+    fclose(f);
+    return 0;
+}
+```
+
+`fwrite` of a struct writes its in-memory bytes: padding, native endianness and all. That's fine for a cache file the same program reads back, and wrong for a format another machine or compiler must read (see the bits chapter: serialize field by field instead).
+
+=== exercise parseint
+title: parse_int with full error checking
+--- prompt
+Write `int parse_int(const char *s, int *out)` using `strtol`. It returns:
+
+| Return | Meaning | Examples |
+|---|---|---|
+| `0` | success; `*out` is set | `"42"`, `"  -17\n"`, `"+5 "` |
+| `1` | no number at all | `""`, `"   "`, `"abc"`, `"- 5"` |
+| `2` | a number followed by junk | `"12abc"`, `"1 2"`, `"0x1A"`, `"3.5"` |
+| `3` | outside the range of `int` | `"2147483648"`, `"-99999999999999999999"` |
+
+Leading and trailing whitespace are allowed. On any error, leave `*out` unchanged. A number that is both out of range *and* followed by junk is error 2.
+--- starter
+#include <stdlib.h>
+#include <errno.h>
+#include <limits.h>
+#include <ctype.h>
+
+int parse_int(const char *s, int *out) {
+    *out = atoi(s);
+    return 0;
+}
+--- solution
+#include <stdlib.h>
+#include <errno.h>
+#include <limits.h>
+#include <ctype.h>
+
+int parse_int(const char *s, int *out) {
+    char *end;
+    errno = 0;
+    long v = strtol(s, &end, 10);
+    if (end == s) return 1;
+    while (isspace((unsigned char)*end)) end++;
+    if (*end != '\0') return 2;
+    if (errno == ERANGE || v < INT_MIN || v > INT_MAX) return 3;
+    *out = (int)v;
+    return 0;
+}
+--- hint
+Set `errno = 0` before calling `strtol`. Afterwards, `end == s` means no digits were found.
+--- hint
+Skip whitespace from `end` with `isspace((unsigned char)*end)`; anything left is junk.
+--- hint
+`long` is 64 bits here, so values just outside `int` don't set `ERANGE`. Check `v < INT_MIN || v > INT_MAX` as well as `errno == ERANGE`.
+--- harness
+#include <limits.h>
+int main(void) {
+    int v = 7;
+    CHECK_INT(parse_int("42", &v), 0);          CHECK_INT(v, 42);
+    CHECK_INT(parse_int("  -17\n", &v), 0);     CHECK_INT(v, -17);
+    CHECK_INT(parse_int("+5 ", &v), 0);         CHECK_INT(v, 5);
+    CHECK_INT(parse_int("0", &v), 0);           CHECK_INT(v, 0);
+    CHECK_INT(parse_int("007", &v), 0);         CHECK_INT(v, 7);
+    CHECK_INT(parse_int("2147483647", &v), 0);  CHECK_INT(v, INT_MAX);
+    CHECK_INT(parse_int("-2147483648", &v), 0); CHECK_INT(v, INT_MIN);
+
+    v = 99;
+    CHECK_INT(parse_int("", &v), 1);
+    CHECK_INT(parse_int("   ", &v), 1);
+    CHECK_INT(parse_int("abc", &v), 1);
+    CHECK_INT(parse_int("- 5", &v), 1);
+    CHECK_INT(parse_int("+", &v), 1);
+    CHECK_INT(parse_int("12abc", &v), 2);
+    CHECK_INT(parse_int("1 2", &v), 2);
+    CHECK_INT(parse_int("0x1A", &v), 2);
+    CHECK_INT(parse_int("3.5", &v), 2);
+    CHECK_INT(parse_int("42\n7", &v), 2);
+    CHECK_INT(parse_int("2147483648", &v), 3);
+    CHECK_INT(parse_int("-2147483649", &v), 3);
+    CHECK_INT(parse_int("99999999999999999999", &v), 3);
+    CHECK_INT(parse_int("-99999999999999999999", &v), 3);
+    CHECK_INT(parse_int("99999999999999999999x", &v), 2);
+    CHECK_INT(v, 99);
+    return TEST_END();
+}
+
+=== exercise sumlines
+title: Summing lines with error reports
+--- prompt
+Read stdin line by line with `fgets` (lines are under 200 characters). Each line should hold one integer, optionally surrounded by whitespace.
+
+- A valid number is added to the total.
+- A line that is empty or only whitespace is skipped silently.
+- A line whose number doesn't fit in a `long` prints `line N: out of range: TEXT`.
+- Any other line prints `line N: not a number: TEXT`.
+
+`N` counts all lines from 1, including skipped ones. `TEXT` is the line without its newline. Finally print `sum=S count=C errors=E`. Totals fit in a `long long`.
+
+Input:
+
+```text
+10
+  -4
+12abc
+
+99999999999999999999
+x
+1000000000000
+```
+
+Output:
+
+```text
+line 3: not a number: 12abc
+line 5: out of range: 99999999999999999999
+line 6: not a number: x
+sum=1000000000006 count=3 errors=3
+```
+
+The last line of input may or may not end in a newline.
+--- starter
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <errno.h>
+#include <ctype.h>
+
+int main(void) {
+    char line[256];
+    while (fgets(line, sizeof line, stdin)) {
+        // classify the line
+    }
+    return 0;
+}
+--- solution
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <errno.h>
+#include <ctype.h>
+
+int main(void) {
+    char line[256];
+    long long sum = 0;
+    int lineno = 0, count = 0, errors = 0;
+    while (fgets(line, sizeof line, stdin)) {
+        lineno++;
+        line[strcspn(line, "\r\n")] = '\0';
+        const char *p = line;
+        while (isspace((unsigned char)*p)) p++;
+        if (*p == '\0') continue;
+        char *end;
+        errno = 0;
+        long v = strtol(line, &end, 10);
+        while (isspace((unsigned char)*end)) end++;
+        if (end == line || *end != '\0') {
+            printf("line %d: not a number: %s\n", lineno, line);
+            errors++;
+        } else if (errno == ERANGE) {
+            printf("line %d: out of range: %s\n", lineno, line);
+            errors++;
+        } else {
+            sum += v;
+            count++;
+        }
+    }
+    printf("sum=%lld count=%d errors=%d\n", sum, count, errors);
+    return 0;
+}
+--- hint
+Strip the newline first: `line[strcspn(line, "\r\n")] = '\0';`. Then check for an all-whitespace line before parsing.
+--- hint
+After `strtol`, a line is "not a number" if no digits were consumed or if anything but whitespace follows. Check that before `ERANGE`, so `99999999999999999999x` counts as not a number.
+--- test
+10
+  -4
+12abc
+
+99999999999999999999
+x
+1000000000000
+--- out
+line 3: not a number: 12abc
+line 5: out of range: 99999999999999999999
+line 6: not a number: x
+sum=1000000000006 count=3 errors=3
+--- test
+1
+2
+3
+--- out
+sum=6 count=3 errors=0
+--- test
+--- out
+sum=0 count=0 errors=0
+--- test
+5
+-
++7
+3.0
+
+ 1 1
+-9223372036854775808
+9223372036854775807
+-9223372036854775809
+	42
+--- out
+line 2: not a number: -
+line 4: not a number: 3.0
+line 6: not a number:  1 1
+line 9: out of range: -9223372036854775809
+sum=53 count=5 errors=4
+
+=== exercise wc
+title: wc with getchar
+--- prompt
+Count the input like the Unix `wc` tool, reading with a `getchar()` loop until `EOF`. Print four numbers separated by spaces:
+
+1. **lines**: the number of lines. A final line without a trailing newline still counts (so `"a\nb"` is 2 lines, `"a\nb\n"` is 2, empty input is 0).
+2. **words**: maximal runs of non-whitespace characters (`isspace`).
+3. **chars**: total bytes read.
+4. **longest**: the length of the longest line, not counting its newline.
+
+For the input `hello world` followed by a newline and `  C is fun`, print `2 5 22 11`.
+--- starter
+#include <stdio.h>
+#include <ctype.h>
+
+int main(void) {
+    char c;
+    while ((c = getchar()) != EOF) {
+    }
+    return 0;
+}
+--- solution
+#include <stdio.h>
+#include <ctype.h>
+
+int main(void) {
+    int c, prev = '\n', in_word = 0;
+    long lines = 0, words = 0, chars = 0, cur = 0, longest = 0;
+    while ((c = getchar()) != EOF) {
+        chars++;
+        if (c == '\n') {
+            lines++;
+            if (cur > longest) longest = cur;
+            cur = 0;
+        } else {
+            cur++;
+        }
+        if (isspace(c)) {
+            in_word = 0;
+        } else if (!in_word) {
+            in_word = 1;
+            words++;
+        }
+        prev = c;
+    }
+    if (prev != '\n') lines++;          // last line had no newline
+    if (cur > longest) longest = cur;
+    printf("%ld %ld %ld %ld\n", lines, words, chars, longest);
+    return 0;
+}
+--- hint
+Store the result of `getchar()` in an `int`, not a `char`.
+--- hint
+Track whether you're inside a word; count a word when you go from "not in a word" to a non-space character.
+--- hint
+Remember the last character read (start it as `'\n'` so empty input counts 0 lines). If it isn't `'\n'` at the end, there was one more unterminated line.
+--- test
+hello world
+  C is fun
+--- out
+2 5 22 11
+--- test
+--- out
+0 0 0 0
+--- test
+one
+--- out
+1 1 3 3
+--- test
+a  b	c
+the quick brown fox jumps over the lazy dog
+
+x
+--- out
+4 13 53 43
+--- test
+   leading and trailing spaces
+tab	separated	words
+--- out
+2 7 50 30
+
+=== exercise readline
+title: Reading lines of any length
+--- prompt
+Write `char *read_line(FILE *f, size_t *len)`:
+
+- Read characters from `f` up to and including the next `'\n'` or end of file.
+- Return a `malloc`'d, 0-terminated string holding the line **without** the newline. The caller frees it.
+- If `len` is not `NULL`, store the line's length in `*len`.
+- An empty line (just `'\n'`) returns `""`, not `NULL`.
+- Return `NULL` only when end of file is reached before any character is read (and on allocation failure).
+- Lines may be any length; the tests use 100,000 characters. Grow your buffer geometrically.
+
+The tests write text to a `tmpfile()`, rewind it, and call your function. Every returned line is freed by the tests.
+--- starter
+#include <stdio.h>
+#include <stdlib.h>
+
+char *read_line(FILE *f, size_t *len) {
+    (void)f; (void)len;
+    return NULL;
+}
+--- solution
+#include <stdio.h>
+#include <stdlib.h>
+
+char *read_line(FILE *f, size_t *len) {
+    size_t n = 0, cap = 32;
+    char *buf = malloc(cap);
+    if (!buf) return NULL;
+    int c;
+    while ((c = getc(f)) != EOF && c != '\n') {
+        if (n + 1 >= cap) {
+            char *nb = realloc(buf, cap * 2);
+            if (!nb) { free(buf); return NULL; }
+            buf = nb;
+            cap *= 2;
+        }
+        buf[n++] = (char)c;
+    }
+    if (c == EOF && n == 0) {
+        free(buf);
+        return NULL;
+    }
+    buf[n] = '\0';
+    if (len) *len = n;
+    return buf;
+}
+--- hint
+Read with `getc(f)` into an `int`. Stop at `'\n'` or `EOF`.
+--- hint
+Keep one byte of room for the `'\0'`: grow when `n + 1 == cap`. Use a temporary for `realloc`'s result so you can free the old buffer if it fails.
+--- hint
+After the loop: if you hit `EOF` and read nothing, free the buffer and return `NULL`. An empty line ends on `'\n'` with nothing read, and must return `""`.
+--- harness
+int main(void) {
+    FILE *f = tmpfile();
+    if (!f) { printf("tmpfile failed\n"); return 1; }
+    fputs("first line\n\nthird\t line  \n", f);
+    for (int i = 0; i < 100000; i++) fputc('a' + i % 26, f);
+    fputs("\nlast without newline", f);
+    rewind(f);
+
+    size_t n = 12345;
+    char *s = read_line(f, &n);
+    CHECK_STR(s, "first line");
+    CHECK_INT(n, 10);
+    free(s);
+    s = read_line(f, &n);
+    CHECK_STR(s, "");
+    CHECK_INT(n, 0);
+    free(s);
+    s = read_line(f, NULL);
+    CHECK_STR(s, "third\t line  ");
+    free(s);
+    s = read_line(f, &n);
+    CHECK(s != NULL);
+    CHECK_INT(n, 100000);
+    if (s) {
+        int ok = strlen(s) == 100000;
+        for (int i = 0; ok && i < 100000; i++) if (s[i] != 'a' + i % 26) ok = 0;
+        CHECK(ok);
+    }
+    free(s);
+    s = read_line(f, &n);
+    CHECK_STR(s, "last without newline");
+    CHECK_INT(n, 20);
+    free(s);
+    s = read_line(f, &n);
+    CHECK(s == NULL);
+    free(s);
+    s = read_line(f, &n);
+    CHECK(s == NULL);
+    free(s);
+    fclose(f);
+
+    f = tmpfile();
+    s = read_line(f, &n);
+    CHECK(s == NULL);
+    free(s);
+    fputs("\n", f);
+    rewind(f);
+    s = read_line(f, &n);
+    CHECK_STR(s, "");
+    free(s);
+    s = read_line(f, &n);
+    CHECK(s == NULL);
+    free(s);
+    fclose(f);
+    return TEST_END();
+}
+
+=== exercise csv
+title: A CSV splitter with quotes
+--- prompt
+Write `int csv_split(char *line, char **fields, int max)`, which splits one CSV line **in place** (no allocation): it writes `'\0'` terminators into `line` and stores pointers to the start of each field in `fields`. Return the number of fields, or `-1` if the line is malformed or has more than `max` fields.
+
+Rules:
+
+- First strip a trailing `"\n"` or `"\r\n"`, if present.
+- Fields are separated by commas. Empty fields count: `a,,b` has 3 fields, `a,` has 2, and an empty line has 1 (empty) field.
+- No whitespace trimming: `a, b` has fields `a` and ` b`.
+- A field that **starts** with `"` is quoted. It ends at the next lone `"`; inside it, commas are ordinary characters and `""` stands for one `"`. The stored field excludes the surrounding quotes and has `""` collapsed (shift the text left in place). After the closing quote, the next character must be a comma or the end of the line; otherwise return `-1`. A missing closing quote is also `-1`.
+- A `"` in the middle of an unquoted field is an ordinary character.
+
+Examples: `name,"Smith, J",42` gives `name` / `Smith, J` / `42`. `"say ""hi""",x` gives `say "hi"` / `x`. `"abc"d` is malformed.
+--- starter
+#include <string.h>
+
+int csv_split(char *line, char **fields, int max) {
+    (void)line; (void)fields; (void)max;
+    return 0;
+}
+--- solution
+#include <string.h>
+
+int csv_split(char *line, char **fields, int max) {
+    line[strcspn(line, "\r\n")] = '\0';
+    int n = 0;
+    char *p = line;
+    for (;;) {
+        if (n == max) return -1;
+        if (*p == '"') {
+            char *src = p + 1, *dst = p;
+            fields[n++] = dst;
+            for (;;) {
+                if (*src == '\0') return -1;               // unterminated
+                if (*src == '"') {
+                    if (src[1] == '"') { *dst++ = '"'; src += 2; continue; }
+                    src++;                                   // closing quote
+                    break;
+                }
+                *dst++ = *src++;
+            }
+            if (*src != ',' && *src != '\0') return -1;
+            int last = *src == '\0';
+            *dst = '\0';
+            if (last) return n;
+            p = src + 1;
+        } else {
+            fields[n++] = p;
+            size_t k = strcspn(p, ",");
+            if (p[k] == '\0') return n;
+            p[k] = '\0';
+            p += k + 1;
+        }
+    }
+}
+--- hint
+Loop over fields. For an unquoted one, `strcspn(p, ",")` finds its end; if that's the end of the string you're done, otherwise write `'\0'` over the comma and continue after it.
+--- hint
+For a quoted field, copy with two pointers: `src` reads from just after the opening quote, `dst` writes starting *at* the opening quote (so the field begins at `dst`'s start). `""` writes one `"` and advances `src` by 2; a lone `"` ends the field.
+--- hint
+After a quoted field, remember whether the character after the closing quote was `'\0'` *before* you write the terminator at `dst`: writing it may overwrite that very spot.
+--- harness
+static int t_split_is(const char *in, int max, int want_n, const char *const *want) {
+    char buf[256];
+    char *f[16];
+    strcpy(buf, in);
+    int n = csv_split(buf, f, max);
+    if (n != want_n) { printf("  input [%s]: got %d fields, expected %d\n", in, n, want_n); return 0; }
+    for (int i = 0; i < n; i++)
+        if (strcmp(f[i], want[i]) != 0) { printf("  input [%s]: field %d is [%s], expected [%s]\n", in, i, f[i], want[i]); return 0; }
+    return 1;
+}
+
+int main(void) {
+    CHECK(t_split_is("a,b,c", 16, 3, (const char *[]){"a", "b", "c"}));
+    CHECK(t_split_is("a,b,c\n", 16, 3, (const char *[]){"a", "b", "c"}));
+    CHECK(t_split_is("a,b,c\r\n", 16, 3, (const char *[]){"a", "b", "c"}));
+    CHECK(t_split_is("alice,,42,london", 16, 4, (const char *[]){"alice", "", "42", "london"}));
+    CHECK(t_split_is("a,", 16, 2, (const char *[]){"a", ""}));
+    CHECK(t_split_is(",", 16, 2, (const char *[]){"", ""}));
+    CHECK(t_split_is("", 16, 1, (const char *[]){""}));
+    CHECK(t_split_is("\n", 16, 1, (const char *[]){""}));
+    CHECK(t_split_is(" a , b ", 16, 2, (const char *[]){" a ", " b "}));
+    CHECK(t_split_is("name,\"Smith, J\",42", 16, 3, (const char *[]){"name", "Smith, J", "42"}));
+    CHECK(t_split_is("\"say \"\"hi\"\"\",x", 16, 2, (const char *[]){"say \"hi\"", "x"}));
+    CHECK(t_split_is("\"\"", 16, 1, (const char *[]){""}));
+    CHECK(t_split_is("\"\",\"\"", 16, 2, (const char *[]){"", ""}));
+    CHECK(t_split_is("\"\"\"\"", 16, 1, (const char *[]){"\""}));
+    CHECK(t_split_is("x,\"a,b,c\"", 16, 2, (const char *[]){"x", "a,b,c"}));
+    CHECK(t_split_is("\"end\"\n", 16, 1, (const char *[]){"end"}));
+    CHECK(t_split_is("ab\"c,d", 16, 2, (const char *[]){"ab\"c", "d"}));
+    CHECK(t_split_is("\"a\",", 16, 2, (const char *[]){"a", ""}));
+    CHECK(t_split_is("1,2,3,4", 4, 4, (const char *[]){"1", "2", "3", "4"}));
+    CHECK(t_split_is("1,2,3,4,5", 4, -1, NULL));
+    CHECK(t_split_is("\"abc\"d", 16, -1, NULL));
+    CHECK(t_split_is("\"abc", 16, -1, NULL));
+    CHECK(t_split_is("x,\"open", 16, -1, NULL));
+    CHECK(t_split_is("\"a\" ,b", 16, -1, NULL));
+    return TEST_END();
+}
+
+=== exercise matrix
+title: Validating structured input
+--- prompt
+Read a matrix from stdin with `scanf`, checking every return value.
+
+The input starts with two integers `rows` and `cols`, each from 1 to 10. Then come `rows * cols` integers in row order, separated by any whitespace. Print each row's sum as `row I: S` (I from 0), then a line `cols:` followed by each column sum preceded by a space.
+
+Errors (print the message and exit with status 1):
+
+- The header is missing, not two integers, or out of range: `error: bad header`.
+- Fewer numbers than needed, or something that isn't a number: `error: expected N numbers, got M`, where `M` is how many were read successfully before the problem.
+
+Anything after the last needed number is ignored.
+
+Input `2 3` then `1 2 3` then `4 5 6` prints:
+
+```text
+row 0: 6
+row 1: 15
+cols: 5 7 9
+```
+--- starter
+#include <stdio.h>
+
+int main(void) {
+    int rows, cols;
+    scanf("%d %d", &rows, &cols);
+    return 0;
+}
+--- solution
+#include <stdio.h>
+
+int main(void) {
+    int rows, cols;
+    if (scanf("%d %d", &rows, &cols) != 2 || rows < 1 || rows > 10 || cols < 1 || cols > 10) {
+        printf("error: bad header\n");
+        return 1;
+    }
+    int m[10][10];
+    int need = rows * cols;
+    for (int i = 0; i < need; i++) {
+        if (scanf("%d", &m[i / cols][i % cols]) != 1) {
+            printf("error: expected %d numbers, got %d\n", need, i);
+            return 1;
+        }
+    }
+    long colsum[10] = {0};
+    for (int r = 0; r < rows; r++) {
+        long s = 0;
+        for (int c = 0; c < cols; c++) {
+            s += m[r][c];
+            colsum[c] += m[r][c];
+        }
+        printf("row %d: %ld\n", r, s);
+    }
+    printf("cols:");
+    for (int c = 0; c < cols; c++) printf(" %ld", colsum[c]);
+    printf("\n");
+    return 0;
+}
+--- hint
+`scanf` returns how many conversions succeeded: check `== 2` for the header and `== 1` for each number. It returns `EOF` at end of input and 0 at a non-number; both are "not 1".
+--- hint
+Read element `i` (0-based) of the flattened matrix into `m[i / cols][i % cols]`; on failure `i` is exactly the number read so far.
+--- test
+2 3
+1 2 3
+4 5 6
+--- out
+row 0: 6
+row 1: 15
+cols: 5 7 9
+--- test
+3 2 10 -10
+7 7 0
+-5 extra stuff here
+--- out
+row 0: 0
+row 1: 14
+row 2: -5
+cols: 17 -8
+--- test
+2 2
+1 2
+3
+--- out
+error: expected 4 numbers, got 3
+--- exit
+1
+--- test
+2 2 1 x 3 4
+--- out
+error: expected 4 numbers, got 1
+--- exit
+1
+--- test
+0 5
+--- out
+error: bad header
+--- exit
+1
+--- test
+3
+--- out
+error: bad header
+--- exit
+1
+--- test
+1 1
+-2147483648
+--- out
+row 0: -2147483648
+cols: -2147483648
+
+=== exercise binfile
+title: Binary records with fread and fwrite
+--- prompt
+Save and load an array of records as a binary file: a `uint32_t` count followed by the raw structs.
+
+- `int save_items(FILE *f, const Item *items, size_t n)`: write at the current position. Return 0 on success, -1 if any write was short.
+- `Item *load_items(FILE *f, size_t *n)`: read a count and that many items from the current position into a new `malloc`'d array (the caller frees it); set `*n`. Return `NULL` (without leaking anything) if the count can't be read, if the count is over 1,000,000, or if fewer items than the count can be read. A count of 0 is valid: return a non-`NULL` pointer from `malloc(1)` and set `*n = 0`.
+- `long stream_size(FILE *f)`: the total size of the file in bytes, using `fseek`/`ftell`, **restoring** the original position before returning.
+
+`fread` and `fwrite` return the number of *items* transferred, not bytes.
+--- starter
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdint.h>
+
+typedef struct {
+    int id;
+    double price;
+    char name[16];
+} Item;
+
+int save_items(FILE *f, const Item *items, size_t n) {
+    (void)f; (void)items; (void)n;
+    return -1;
+}
+
+Item *load_items(FILE *f, size_t *n) {
+    (void)f;
+    *n = 0;
+    return NULL;
+}
+
+long stream_size(FILE *f) {
+    (void)f;
+    return 0;
+}
+--- solution
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdint.h>
+
+typedef struct {
+    int id;
+    double price;
+    char name[16];
+} Item;
+
+int save_items(FILE *f, const Item *items, size_t n) {
+    uint32_t count = (uint32_t)n;
+    if (fwrite(&count, sizeof count, 1, f) != 1) return -1;
+    if (n && fwrite(items, sizeof *items, n, f) != n) return -1;
+    return 0;
+}
+
+Item *load_items(FILE *f, size_t *n) {
+    uint32_t count;
+    if (fread(&count, sizeof count, 1, f) != 1) return NULL;
+    if (count > 1000000) return NULL;
+    Item *items = malloc(count ? count * sizeof *items : 1);
+    if (!items) return NULL;
+    if (fread(items, sizeof *items, count, f) != count) {
+        free(items);
+        return NULL;
+    }
+    *n = count;
+    return items;
+}
+
+long stream_size(FILE *f) {
+    long here = ftell(f);
+    if (here < 0 || fseek(f, 0, SEEK_END) != 0) return -1;
+    long size = ftell(f);
+    fseek(f, here, SEEK_SET);
+    return size;
+}
+--- hint
+`fwrite(&count, sizeof count, 1, f)` writes the count; `fwrite(items, sizeof *items, n, f)` writes all items in one call. Compare each result with the number of items you asked for.
+--- hint
+In `load_items`, if the second `fread` comes up short, free the array before returning `NULL`.
+--- hint
+`stream_size`: save `ftell(f)`, `fseek(f, 0, SEEK_END)`, take `ftell` again, then `fseek` back to the saved position.
+--- harness
+#include <stdint.h>
+int main(void) {
+    Item in[3] = {{1, 9.99, "pen"}, {2, 0.5, "clip"}, {42, 1234.25, "laptop stand"}};
+    FILE *f = tmpfile();
+    if (!f) { printf("tmpfile failed\n"); return 1; }
+    CHECK_INT(save_items(f, in, 3), 0);
+    CHECK_INT(stream_size(f), (long)(sizeof(uint32_t) + 3 * sizeof(Item)));
+    CHECK_INT(ftell(f), (long)(sizeof(uint32_t) + 3 * sizeof(Item)));   /* position restored */
+    rewind(f);
+    CHECK_INT(stream_size(f), (long)(sizeof(uint32_t) + 3 * sizeof(Item)));
+    CHECK_INT(ftell(f), 0);
+    size_t n = 99;
+    Item *out = load_items(f, &n);
+    CHECK(out != NULL);
+    CHECK_INT(n, 3);
+    if (out && n == 3) {
+        CHECK_INT(out[2].id, 42);
+        CHECK_DBL(out[2].price, 1234.25);
+        CHECK_STR(out[2].name, "laptop stand");
+        CHECK_STR(out[0].name, "pen");
+        CHECK_DBL(out[1].price, 0.5);
+    }
+    free(out);
+    n = 77;
+    CHECK(load_items(f, &n) == NULL);         /* at end of file */
+    fclose(f);
+
+    f = tmpfile();
+    CHECK_INT(save_items(f, in, 0), 0);
+    CHECK_INT(save_items(f, in, 2), 0);
+    CHECK_INT(stream_size(f), (long)(2 * sizeof(uint32_t) + 2 * sizeof(Item)));
+    rewind(f);
+    out = load_items(f, &n);
+    CHECK(out != NULL);
+    CHECK_INT(n, 0);
+    free(out);
+    out = load_items(f, &n);
+    CHECK_INT(n, 2);
+    if (out && n == 2) CHECK_STR(out[1].name, "clip");
+    free(out);
+    fclose(f);
+
+    f = tmpfile();                            /* truncated: count says 5, only 2 items */
+    uint32_t five = 5;
+    fwrite(&five, sizeof five, 1, f);
+    fwrite(in, sizeof in[0], 2, f);
+    rewind(f);
+    CHECK(load_items(f, &n) == NULL);
+    fclose(f);
+
+    f = tmpfile();                            /* absurd count */
+    uint32_t huge = 4000000000u;
+    fwrite(&huge, sizeof huge, 1, f);
+    rewind(f);
+    CHECK(load_items(f, &n) == NULL);
+    CHECK_INT(stream_size(f), 4);
+    fclose(f);
+
+    f = tmpfile();                            /* empty file */
+    CHECK(load_items(f, &n) == NULL);
+    CHECK_INT(stream_size(f), 0);
+    fclose(f);
+    return TEST_END();
+}
+
+=== quiz
+run: yes
+--- q
+What does this print?
+--- code
+#include <stdio.h>
+
+int main(void) {
+    int n = printf("hello\n");
+    int m = printf("%5d|\n", 42);
+    printf("%d %d\n", n, m);
+    return 0;
+}
+--- choice
+hello
+   42|
+5 3
+--- answer
+hello
+   42|
+6 7
+--- choice
+hello
+   42|
+1 1
+--- choice
+hello
+   42|
+6 4
+--- explain
+`printf` returns the number of characters written, including the newline: `hello\n` is 6, `   42|\n` is 7.
+
+=== quiz
+run: yes
+--- q
+What does this print?
+--- code
+#include <stdio.h>
+
+int main(void) {
+    int a = -1, b = -1;
+    int r1 = sscanf("12 apples", "%d %d", &a, &b);
+    int r2 = sscanf("apples 12", "%d", &b);
+    int r3 = sscanf("", "%d", &b);
+    printf("%d %d %d %d %d\n", r1, r2, r3, a, b);
+    return 0;
+}
+--- choice
+2 1 0 12 12
+--- answer
+1 0 -1 12 -1
+--- choice
+1 0 0 12 0
+--- choice
+1 1 -1 12 12
+--- explain
+The first call converts 12, then fails on `apples`: 1 item. The second fails immediately: 0 items, and `b` is untouched. The third hits the end of the input before any conversion: `EOF`, which is -1.
+
+=== quiz
+run: yes
+--- q
+What does this print?
+--- code
+#include <stdio.h>
+#include <stdlib.h>
+
+int main(void) {
+    const char *s = "  123xyz";
+    char *end;
+    long v = strtol(s, &end, 10);
+    printf("%ld [%s] %td\n", v, end, end - s);
+    return 0;
+}
+--- choice
+0 [  123xyz] 0
+--- choice
+123 [xyz] 3
+--- answer
+123 [xyz] 5
+--- choice
+123 [] 8
+--- explain
+`strtol` skips leading whitespace, converts `123`, and points `end` at the first unused character, `x`, which is 5 characters in (2 spaces + 3 digits). `atoi` would have given 123 with no way to see the junk.
+
+=== quiz
+run: yes
+--- q
+The input holds `42` on one line and `hello` on the next. What does this print?
+--- code
+#include <stdio.h>
+#include <string.h>
+
+int main(void) {
+    FILE *f = tmpfile();
+    fputs("42\nhello\n", f);
+    rewind(f);
+
+    int n;
+    char line[32];
+    fscanf(f, "%d", &n);
+    fgets(line, sizeof line, f);
+    line[strcspn(line, "\n")] = '\0';
+    printf("%d [%s]\n", n, line);
+    fclose(f);
+    return 0;
+}
+--- choice
+42 [hello]
+--- answer
+42 []
+--- choice
+42 [42]
+--- choice
+42 [
+hello]
+--- explain
+`%d` stops right after the digits and leaves the `\n` in the stream. `fgets` then reads just that newline: an empty line. This is the most common `scanf` + `fgets` bug. Read every line with `fgets` and parse it with `sscanf`, or consume the rest of the line first.
+
+=== quiz
+run: yes
+--- q
+What does this print?
+--- code
+#include <stdio.h>
+#include <string.h>
+
+int main(void) {
+    char small[6];
+    FILE *f = tmpfile();
+    fputs("abcdefgh\n", f);
+    rewind(f);
+    while (fgets(small, sizeof small, f)) {
+        printf("[%s] ", small[strlen(small) - 1] == '\n' ? "nl" : small);
+    }
+    printf("\n");
+    fclose(f);
+    return 0;
+}
+--- choice
+[abcdefgh]
+--- choice
+[abcdef] [gh] [nl]
+--- answer
+[abcde] [nl]
+--- choice
+[abcde]
+--- explain
+`fgets` reads at most `size - 1` = 5 characters, so the first call gets `abcde` (no newline: the line didn't fit). The next call continues with `fgh\n`, which ends in a newline, so it prints `[nl]`. A missing `\n` at the end of the buffer is how you detect a truncated line.
+
+=== quiz
+--- q
+What is wrong with this loop?
+
+```c
+char c;
+while ((c = getchar()) != EOF)
+    putchar(c);
+```
+--- choice
+Nothing; it's the standard copy loop
+--- choice
+`getchar` needs a `FILE *` argument
+--- answer
+`getchar` returns an `int`; squeezing it into a `char` either confuses byte 255 with `EOF` or never sees `EOF`
+--- choice
+`putchar` returns `EOF` at the end, so the loop runs once too often
+--- explain
+`EOF` is a value distinct from every byte, so it can only be represented in a type wider than `char`. With signed `char` (x86), byte `0xFF` becomes -1 and ends the loop early. With unsigned `char` (ARM), `c` can never equal -1 and the loop never ends. Declare `int c`.
+
+=== quiz
+--- q
+A program prints progress with `printf("step %d done\n", i);` and later crashes with a segfault. On the terminal you saw all steps. When you run `./prog > log.txt`, the log is empty. Why?
+--- choice
+Redirection only captures stderr
+--- answer
+stdout to a file is fully buffered, and the crash killed the process before the buffer was flushed
+--- choice
+The `\n` is not written to files
+--- choice
+The segfault deleted the file
+--- explain
+On a terminal stdout is line buffered, so each `\n` flushed. Redirected to a file it's fully buffered (a few KB), and a crash skips the flush that happens at normal exit. Log diagnostics to stderr (unbuffered) or `fflush(stdout)` after important lines.
+
+=== quiz
+run: yes
+--- q
+What does this print?
+--- code
+#include <stdio.h>
+
+int main(void) {
+    char buf[4];
+    int n = snprintf(buf, sizeof buf, "%d", 123456);
+    printf("%d %s\n", n, buf);
+    return 0;
+}
+--- choice
+3 123
+--- answer
+6 123
+--- choice
+6 123456
+--- choice
+-1 123
+--- explain
+`snprintf` writes at most `sizeof buf - 1` characters plus the terminator, so `buf` holds `123`. It returns the length the full output *would* have had (6), which is how you detect truncation (`n >= sizeof buf`) and size a buffer.

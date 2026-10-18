@@ -20,9 +20,10 @@ const result = await page.evaluate(async ({ course, prefix }) => {
   const c = COURSES.find(x => x.id === course), log = [];
   let fails = 0, exs = 0, qs = 0, chs = 0;
   const bad = (w, m, extra = '') => { fails++; log.push(`FAIL ${w}: ${m}\n${String(extra).slice(0, 1500)}`); };
+  // Like the app: a canvas when the code mentions it.
   const run = code => {
     let canvas;
-    if (course === 'webgpu') { const el = document.createElement('canvas'); el.width = el.height = 256; canvas = el.transferControlToOffscreen(); }
+    if (/\bcanvas\b/.test(code)) { const el = document.createElement('canvas'); el.width = el.height = 256; canvas = el.transferControlToOffscreen(); }
     return JSRunner.run(code, { canvas, timeout: 20000 });
   };
   const ids = new Set();

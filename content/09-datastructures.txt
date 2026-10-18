@@ -206,6 +206,44 @@ int main(void) {
 
 Linked lists are worse than arrays for almost everything on modern hardware (each node is a separate allocation, and walking them misses the cache). Use them when you need stable node addresses or O(1) splicing, and otherwise reach for a growable array.
 
+> **Performance:** A CPU fetches memory in 64-byte cache lines and prefetches ahead when you walk addresses in order. Iterating a contiguous array of 10,000 entities streams through memory; iterating 10,000 `malloc`'d list nodes is 10,000 potential cache misses (~100 ns each), easily 10-50x slower. In game code, keep things that are updated every frame in arrays. If you need a list, link *array indices* (`int next;`) inside one pre-allocated array instead of `malloc`'ing nodes: that's an object pool with a free list, and it's how most engines store bullets, particles and entities.
+
+## Game entity lists: swap-remove
+
+The bread-and-butter game container is an array of entities that you update every frame and remove dead ones from. Removing from the middle with `memmove` (what `List<T>.RemoveAt` does) is O(n) per removal, so killing many entities in one frame is O(n²). If order doesn't matter, which it usually doesn't for entities, overwrite the dead one with the last element and shrink: O(1).
+
+```c
+#include <stdio.h>
+
+typedef struct { int id; float x, vx; int hp; } Entity;
+
+#define MAX_ENTITIES 1024
+static Entity entities[MAX_ENTITIES];     // allocated once, up front
+static size_t count = 0;
+
+void update(float dt) {
+    for (size_t i = 0; i < count; ) {
+        Entity *e = &entities[i];
+        if (e->hp <= 0) {
+            *e = entities[--count];       // swap-remove: move the last one here...
+            continue;                      // ...and re-check slot i (it's a new entity)
+        }
+        e->x += e->vx * dt;
+        i++;
+    }
+}
+
+int main(void) {
+    for (int i = 0; i < 6; i++)
+        entities[count++] = (Entity){ .id = i, .x = 0, .vx = (float)i, .hp = i % 3 };
+    update(0.5f);                          // ids 0 and 3 have hp 0 and are removed
+    for (size_t i = 0; i < count; i++) printf("id %d at %.1f\n", entities[i].id, entities[i].x);
+    return 0;
+}
+```
+
+> **Performance:** Notice what is *not* in the frame loop: no `malloc`, no `free`, no building of a new "alive" list. Allocate the entity array once at level load (or statically), with a known maximum, and have `spawn` fail (or recycle the oldest) when it's full. `malloc` per frame costs time, fragments the heap, and makes frame times unpredictable; it's the C version of allocating garbage in Unity's `Update()`. If something needs a stable handle to an entity across swap-removes, give out an index into a separate slot table (or an index plus a generation counter) rather than a raw pointer.
+
 ## Stack: the growable array
 
 `List<T>` and `Stack<T>` are an array, a count, and a capacity. When count hits capacity, allocate double and copy. `realloc` does the copying for you:
@@ -250,6 +288,8 @@ int main(void) {
 
 Doubling makes push *amortized* O(1): n pushes cost about 2n copies in total. Growing by a fixed amount (+10) makes n pushes O(n²). Note `p = realloc(...)` into a temporary: `s->data = realloc(s->data, ...)` loses the old pointer (a leak) if `realloc` fails.
 
+> **Performance:** A growable array that's emptied and refilled every frame (a render list, a list of collisions found this frame) should be *cleared* with `len = 0`, never freed and reallocated. After the first few frames it has reached its working size and never allocates again. Reserve a sensible capacity up front when you know it, exactly like `new List<T>(capacity)`.
+
 ## Queue: the ring buffer
 
 A queue needs O(1) at both ends. Shifting an array left on every dequeue is O(n). Instead keep a `head` index and a `len`, and let indices wrap around with `%`:
@@ -288,6 +328,8 @@ int main(void) {
     return 0;
 }
 ```
+
+Games use ring buffers for input event queues, network packet queues, audio sample buffers, and "last N frames" histories (frame-time graphs, replay buffers). They never allocate after setup, which is exactly what you want in a frame loop.
 
 Growing a ring buffer is the subtle part: after a wrap, the elements are in two pieces (`head..cap-1` then `0..tail-1`), so a plain `realloc` puts a gap in the middle. You must copy them out in order. You'll do that in an exercise. (`Queue<T>` in .NET does exactly this.) With a power-of-two capacity, `% cap` can become `& (cap - 1)`, which is why many ring buffers insist on powers of two.
 
@@ -390,6 +432,8 @@ Things C makes you decide that C# hides:
 - **Resizing.** To grow, allocate a bigger bucket array and move every entry to `hash % new_size`. Entries are relinked, not copied, so it's a loop over chains. Keep the load factor around 1 or below and lookups stay O(1) on average.
 - **Hash quality.** `hash % nbuckets` with a weak hash and a power-of-two bucket count uses only the low bits. FNV-1a mixes reasonably; summing characters does not ("ab" and "ba" collide).
 
+> **Performance:** Hashing a string and comparing it is far more expensive than comparing two ints. Don't look up `"health_potion"` by name every frame: resolve names to small integer ids (or direct pointers) once at load time and use those in the hot path. And a linear search through an array of names is fine for 10 items but turns into O(n²) when done once per item per frame. Chained tables like this one cost a pointer chase per entry; production tables often use *open addressing* (entries stored directly in one array, probing to the next slot on collision), which is friendlier to the cache.
+
 ## Binary search tree
 
 Each node's left subtree holds smaller keys, the right subtree larger. Insert and find walk one path from the root, so they're O(height): O(log n) if the tree stays bushy, O(n) if you insert sorted data and it degenerates into a list. Production trees (red-black, AVL; `SortedDictionary`) rebalance on insert. A plain BST is the core of them all.
@@ -452,6 +496,8 @@ int main(void) {
 ```
 
 The insert can also be written with the pointer-to-pointer trick: walk `Tree **link = &root` down to the `NULL` child slot, then `*link = new_node`. Same idea as the list.
+
+> **Performance:** Trees are pointer-chasing structures too. For data that's built once and queried often (a sorted list of item ids, a leaderboard snapshot), a sorted array with binary search does the same O(log n) lookups with no per-node allocations and far better cache behavior. For "what's near this point?" questions in a game, neither is right: use a uniform grid or spatial hash, which turns an O(n²) all-pairs check into roughly O(n).
 
 ## Freeing recursive structures
 
@@ -851,10 +897,152 @@ int main(void) {
     return TEST_END();
 }
 
+=== exercise entities
+title: Entity list with swap-remove
+--- prompt
+Write the per-frame entity container from the chapter. The world allocates its storage **once** and never reallocates, so pointers into it stay valid between frames as long as nothing is removed.
+
+```c
+typedef struct { int id; float x, y, vx, vy; int hp; } Entity;
+typedef struct { Entity *items; size_t len, cap; } World;
+```
+
+- `int world_init(World *w, size_t cap)`: allocate room for `cap` entities in one allocation; return 0 on success, -1 on failure.
+- `Entity *world_spawn(World *w, Entity e)`: copy `e` in and return a pointer to the stored copy, or `NULL` if the world is full. Never grow.
+- `void world_update(World *w, float dt)`: remove every entity with `hp <= 0`, and move every survivor by `vx * dt`, `vy * dt`. Order of survivors doesn't matter: use **swap-remove**.
+- `void world_free(World *w)`.
+
+The tests run a frame where 150,000 of 300,000 entities die. Removing each with `memmove` (shifting everything after it) is O(n²) and times out.
+--- starter
+#include <stdlib.h>
+#include <string.h>
+
+typedef struct { int id; float x, y, vx, vy; int hp; } Entity;
+typedef struct { Entity *items; size_t len, cap; } World;
+
+int world_init(World *w, size_t cap) {
+    w->items = NULL;
+    w->len = 0;
+    w->cap = cap;
+    return -1;
+}
+
+Entity *world_spawn(World *w, Entity e) {
+    (void)w; (void)e;
+    return NULL;
+}
+
+void world_update(World *w, float dt) {
+    for (size_t i = 0; i < w->len; ) {
+        Entity *e = &w->items[i];
+        if (e->hp <= 0) {
+            memmove(e, e + 1, (w->len - i - 1) * sizeof *e);   /* O(n) per removal! */
+            w->len--;
+            continue;
+        }
+        e->x += e->vx * dt;
+        e->y += e->vy * dt;
+        i++;
+    }
+}
+
+void world_free(World *w) {
+    free(w->items);
+}
+--- solution
+#include <stdlib.h>
+#include <string.h>
+
+typedef struct { int id; float x, y, vx, vy; int hp; } Entity;
+typedef struct { Entity *items; size_t len, cap; } World;
+
+int world_init(World *w, size_t cap) {
+    w->items = malloc(cap * sizeof *w->items);
+    w->len = 0;
+    w->cap = w->items ? cap : 0;
+    return w->items ? 0 : -1;
+}
+
+Entity *world_spawn(World *w, Entity e) {
+    if (w->len == w->cap) return NULL;
+    w->items[w->len] = e;
+    return &w->items[w->len++];
+}
+
+void world_update(World *w, float dt) {
+    for (size_t i = 0; i < w->len; ) {
+        Entity *e = &w->items[i];
+        if (e->hp <= 0) {
+            *e = w->items[--w->len];
+            continue;
+        }
+        e->x += e->vx * dt;
+        e->y += e->vy * dt;
+        i++;
+    }
+}
+
+void world_free(World *w) {
+    free(w->items);
+    w->items = NULL;
+    w->len = w->cap = 0;
+}
+--- hint
+Swap-remove: `w->items[i] = w->items[--w->len];` and then *don't* advance `i`, because slot `i` now holds a different entity that still needs checking (and moving).
+--- hint
+`world_spawn` returns `&w->items[w->len++]` after copying, or `NULL` when `len == cap`.
+--- harness
+int main(void) {
+    World w;
+    CHECK_INT(world_init(&w, 4), 0);
+    Entity *first = world_spawn(&w, (Entity){1, 0, 0, 1, 2, 10});
+    CHECK(first != NULL);
+    Entity *base = w.items;
+    world_spawn(&w, (Entity){2, 5, 5, 0, 0, 0});        /* dead on arrival */
+    world_spawn(&w, (Entity){3, 1, 1, -1, 0, 5});
+    Entity *last = world_spawn(&w, (Entity){4, 0, 0, 0, 0, -3});
+    CHECK(last != NULL);
+    CHECK(world_spawn(&w, (Entity){5, 0, 0, 0, 0, 1}) == NULL);   /* full */
+    CHECK(w.items == base);
+    CHECK_INT(w.len, 4);
+    world_update(&w, 0.5f);
+    CHECK_INT(w.len, 2);
+    int seen1 = 0, seen3 = 0;
+    for (size_t i = 0; i < w.len; i++) {
+        Entity *e = &w.items[i];
+        if (e->id == 1) { seen1++; CHECK_DBL(e->x, 0.5); CHECK_DBL(e->y, 1.0); }
+        if (e->id == 3) { seen3++; CHECK_DBL(e->x, 0.5); CHECK_DBL(e->y, 1.0); }
+    }
+    CHECK(seen1 == 1 && seen3 == 1);
+    CHECK(world_spawn(&w, (Entity){6, 0, 0, 0, 0, 1}) != NULL);
+    world_free(&w);
+
+    size_t n = 300000;
+    CHECK_INT(world_init(&w, n), 0);
+    for (size_t i = 0; i < n; i++)
+        world_spawn(&w, (Entity){(int)i, 0, 0, 1, -1, (int)(i % 2)});   /* every even id is dead */
+    world_update(&w, 1.0f);                                             /* one frame */
+    CHECK_INT(w.len, n / 2);
+    char *alive = calloc(n, 1);
+    int ok = 1;
+    for (size_t i = 0; i < w.len; i++) {
+        Entity *e = &w.items[i];
+        if (e->id % 2 == 0 || alive[e->id] || e->x != 1.0f || e->y != -1.0f) ok = 0;
+        else alive[e->id] = 1;
+    }
+    CHECK(ok);
+    for (size_t i = 0; i < w.len; i++) w.items[i].hp = 0;
+    world_update(&w, 1.0f);
+    CHECK_INT(w.len, 0);
+    free(alive);
+    world_free(&w);
+    return TEST_END();
+}
+
 === exercise ringqueue
 title: A growable ring buffer queue
 --- prompt
-Build `Queue<int>` the way .NET does: a circular array that doubles when full.
+Build `Queue<int>` the way .NET does: a circular array that doubles when full. In a game this is the input or event queue: producers push events during the frame, the game loop pops and handles them in order. It only grows during the first busy frames, then never allocates again.
 
 ```c
 typedef struct {
@@ -1034,7 +1222,7 @@ Write a hash table from strings to ints with separate chaining. The starter decl
 - `size_t map_count(const Map *m)`
 - `void map_free(Map *m)`: free every key, entry, the bucket array and the map.
 
-The tests insert 20,000 keys, so a fixed handful of buckets will be slow. Grow the bucket array (double it and rehash every entry) when `count` exceeds the number of buckets.
+This is the core of an inventory (item name to count) or an asset cache (name to handle). The tests insert 200,000 keys and must finish within the time limit, so a linear list of entries, or a fixed handful of buckets, will time out. Grow the bucket array (double it and rehash every entry) when `count` exceeds the number of buckets.
 
 `strdup` is not available under `-std=c17`; write your own copy with `malloc` and `memcpy`.
 --- starter
@@ -1235,17 +1423,17 @@ int main(void) {
     CHECK_INT(map_count(m), 3);
 
     int ok = 1;
-    for (int i = 0; i < 20000; i++) { sprintf(buf, "key%d", i); map_put(m, buf, i * 3); }
-    CHECK_INT(map_count(m), 20003);
-    for (int i = 0; i < 20000; i++) {
+    for (int i = 0; i < 200000; i++) { sprintf(buf, "key%d", i); map_put(m, buf, i * 3); }
+    CHECK_INT(map_count(m), 200003);
+    for (int i = 0; i < 200000; i++) {
         sprintf(buf, "key%d", i);
         if (!map_get(m, buf, &v) || v != i * 3) ok = 0;
     }
     CHECK(ok);
-    for (int i = 0; i < 20000; i += 2) { sprintf(buf, "key%d", i); if (!map_remove(m, buf)) ok = 0; }
+    for (int i = 0; i < 200000; i += 2) { sprintf(buf, "key%d", i); if (!map_remove(m, buf)) ok = 0; }
     CHECK(ok);
-    CHECK_INT(map_count(m), 10003);
-    for (int i = 0; i < 20000; i++) {
+    CHECK_INT(map_count(m), 100003);
+    for (int i = 0; i < 200000; i++) {
         sprintf(buf, "key%d", i);
         int found = map_get(m, buf, &v);
         if (found != (i % 2) || (found && v != i * 3)) ok = 0;
@@ -1253,6 +1441,192 @@ int main(void) {
     CHECK(ok);
     CHECK_INT(map_get(m, "apple", &v), 1); CHECK_INT(v, 10);
     map_free(m);
+    return TEST_END();
+}
+
+=== exercise inventory
+title: Inventory on top of the map
+continues: hashmap
+--- prompt
+Build on your hash table from the previous exercise to make a game inventory (item name to quantity). Add:
+
+- `int map_add(Map *m, const char *key, int delta)`: add `delta` (which may be negative) to the item's quantity, treating a missing item as 0, and return the new quantity. If the result is 0 or less, the item is **removed** from the map entirely and the function returns 0. Never store zero or negative quantities.
+
+Picking up 3 potions is `map_add(inv, "potion", 3)`, drinking one is `map_add(inv, "potion", -1)`. Reuse your existing functions; the whole thing is a few lines. The tests simulate 300,000 pickups and uses over 1,000 distinct items, so it has to stay O(1) per call.
+--- stubs
+int map_add(Map *m, const char *key, int delta) {
+    (void)m; (void)key; (void)delta;
+    return 0;
+}
+--- solution
+#include <stdlib.h>
+#include <string.h>
+
+typedef struct Entry {
+    char *key;
+    int value;
+    struct Entry *next;
+} Entry;
+
+typedef struct {
+    Entry **buckets;
+    size_t nbuckets;
+    size_t count;
+} Map;
+
+static size_t hash_str(const char *s) {
+    size_t h = 1469598103934665603u;
+    for (; *s; s++) {
+        h ^= (unsigned char)*s;
+        h *= 1099511628211u;
+    }
+    return h;
+}
+
+static char *copy_str(const char *s) {
+    size_t n = strlen(s) + 1;
+    char *p = malloc(n);
+    if (!p) abort();
+    memcpy(p, s, n);
+    return p;
+}
+
+Map *map_new(void) {
+    Map *m = malloc(sizeof *m);
+    if (!m) abort();
+    m->nbuckets = 8;
+    m->count = 0;
+    m->buckets = calloc(m->nbuckets, sizeof *m->buckets);
+    if (!m->buckets) abort();
+    return m;
+}
+
+static Entry **find_link(const Map *m, const char *key) {
+    Entry **link = &m->buckets[hash_str(key) % m->nbuckets];
+    while (*link && strcmp((*link)->key, key) != 0) link = &(*link)->next;
+    return link;
+}
+
+static void grow(Map *m) {
+    size_t nb = m->nbuckets * 2;
+    Entry **nbk = calloc(nb, sizeof *nbk);
+    if (!nbk) abort();
+    for (size_t i = 0; i < m->nbuckets; i++) {
+        Entry *e = m->buckets[i];
+        while (e) {
+            Entry *next = e->next;
+            size_t b = hash_str(e->key) % nb;
+            e->next = nbk[b];
+            nbk[b] = e;
+            e = next;
+        }
+    }
+    free(m->buckets);
+    m->buckets = nbk;
+    m->nbuckets = nb;
+}
+
+void map_put(Map *m, const char *key, int value) {
+    Entry **link = find_link(m, key);
+    if (*link) { (*link)->value = value; return; }
+    Entry *e = malloc(sizeof *e);
+    if (!e) abort();
+    e->key = copy_str(key);
+    e->value = value;
+    e->next = NULL;
+    *link = e;
+    if (++m->count > m->nbuckets) grow(m);
+}
+
+int map_get(const Map *m, const char *key, int *out) {
+    Entry *e = *find_link(m, key);
+    if (!e) return 0;
+    *out = e->value;
+    return 1;
+}
+
+int map_remove(Map *m, const char *key) {
+    Entry **link = find_link(m, key);
+    Entry *e = *link;
+    if (!e) return 0;
+    *link = e->next;
+    free(e->key);
+    free(e);
+    m->count--;
+    return 1;
+}
+
+size_t map_count(const Map *m) {
+    return m->count;
+}
+
+void map_free(Map *m) {
+    if (!m) return;
+    for (size_t i = 0; i < m->nbuckets; i++) {
+        Entry *e = m->buckets[i];
+        while (e) {
+            Entry *next = e->next;
+            free(e->key);
+            free(e);
+            e = next;
+        }
+    }
+    free(m->buckets);
+    free(m);
+}
+
+int map_add(Map *m, const char *key, int delta) {
+    int cur = 0;
+    map_get(m, key, &cur);
+    int now = cur + delta;
+    if (now <= 0) {
+        map_remove(m, key);
+        return 0;
+    }
+    map_put(m, key, now);
+    return now;
+}
+--- hint
+`map_get` into a local that starts at 0, compute the new quantity, then either `map_remove` or `map_put`.
+--- harness
+int main(void) {
+    Map *inv = map_new();
+    int v = -1;
+    CHECK_INT(map_add(inv, "potion", 3), 3);
+    CHECK_INT(map_add(inv, "potion", 2), 5);
+    CHECK_INT(map_add(inv, "arrow", 50), 50);
+    CHECK_INT(map_add(inv, "potion", -1), 4);
+    CHECK_INT(map_count(inv), 2);
+    CHECK_INT(map_add(inv, "potion", -4), 0);          /* used up: removed */
+    CHECK_INT(map_count(inv), 1);
+    CHECK_INT(map_get(inv, "potion", &v), 0);
+    CHECK_INT(map_add(inv, "key", -1), 0);              /* never had one: still absent */
+    CHECK_INT(map_get(inv, "key", &v), 0);
+    CHECK_INT(map_add(inv, "arrow", -100), 0);
+    CHECK_INT(map_count(inv), 0);
+    CHECK_INT(map_add(inv, "gem", 0), 0);
+    CHECK_INT(map_count(inv), 0);
+
+    char name[32];
+    unsigned x = 7;
+    long total = 0;
+    for (int i = 0; i < 300000; i++) {                 /* loot drops */
+        x = x * 1103515245u + 12345u;
+        sprintf(name, "item_%u", (x >> 8) % 1500);
+        map_add(inv, name, 1);
+        total++;
+    }
+    long sum = 0;
+    int ok = 1;
+    for (int i = 0; i < 1500; i++) {
+        sprintf(name, "item_%d", i);
+        if (map_get(inv, name, &v)) { if (v <= 0) ok = 0; sum += v; }
+    }
+    CHECK(ok);
+    CHECK_INT(sum, total);
+    for (int i = 0; i < 1500; i++) { sprintf(name, "item_%d", i); map_add(inv, name, -1000000); }
+    CHECK_INT(map_count(inv), 0);
+    map_free(inv);
     return TEST_END();
 }
 

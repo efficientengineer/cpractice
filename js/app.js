@@ -45,16 +45,38 @@
     out.innerHTML = extraHtml + h + `<div class="backend muted">${esc(res.backend)}</div>`;
   }
   // Runs code for the current course. For WebGPU a fresh canvas is created in canvasHost.
+  // Runs code for the current course. JS/WebGPU code that mentions `canvas` gets a fresh canvas
+  // in canvasHost with keyboard/mouse forwarded to the worker; later console output streams into out.
   function execute(code, stdin, canvasHost, out) {
     if (isC()) return Runner.run(code, stdin);
     let canvas;
-    if (canvasHost) {
-      canvasHost.innerHTML = '';
-      const c = document.createElement('canvas'); c.width = 512; c.height = 512; canvasHost.appendChild(c);
+    if (canvasHost) canvasHost.hidden = true;
+    if (canvasHost && /\bcanvas\b/.test(code)) {
+      canvasHost.innerHTML = '<div class="muted small">Click the canvas to give it keyboard focus.</div>';
+      const c = document.createElement('canvas'); c.width = 512; c.height = 512; c.tabIndex = 0; canvasHost.appendChild(c);
       canvasHost.hidden = false;
+      const key = down => e => {
+        if (/^(Arrow|Space)/.test(e.code)) e.preventDefault();
+        if (!e.repeat) JSRunner.send({ t: 'key', code: e.code, down });
+      };
+      c.addEventListener('keydown', key(true)); c.addEventListener('keyup', key(false));
+      c.addEventListener('blur', () => JSRunner.send({ t: 'key', code: '*blur', down: false }));
+      const m = down => e => {
+        const r = c.getBoundingClientRect();
+        JSRunner.send({ t: 'mouse', m: { x: (e.clientX - r.left) * c.width / r.width, y: (e.clientY - r.top) * c.height / r.height, ...(down === null ? {} : { down }) } });
+      };
+      c.addEventListener('mousemove', m(null)); c.addEventListener('mousedown', e => { c.focus(); m(true)(e); }); window.addEventListener('mouseup', m(false), { once: false });
       canvas = c.transferControlToOffscreen();
     }
-    return JSRunner.run(code, { canvas, keepAlive: CUR.lang === 'webgpu', timeout: CUR.lang === 'webgpu' ? 15000 : 5000 });
+    const onLate = (kind, line) => {
+      if (!out) return;
+      let pre = out.querySelector(kind === 'out' ? '.stdout' : '.stderr');
+      if (!pre) { out.insertAdjacentHTML('afterbegin', `<pre class="${kind === 'out' ? 'stdout' : 'stderr'}"></pre>`); pre = out.querySelector(kind === 'out' ? '.stdout' : '.stderr'); }
+      if (pre.querySelector('.muted')) pre.textContent = '';
+      pre.textContent = (pre.textContent ? pre.textContent + '\n' : '') + line;
+      const lines = pre.textContent.split('\n'); if (lines.length > 200) pre.textContent = lines.slice(-200).join('\n');
+    };
+    return JSRunner.run(code, { canvas, keepAlive: true, timeout: CUR.lang === 'webgpu' ? 15000 : 5000, onLate });
   }
   const assemble = (code, ex) => isC() ? Assemble.harness(code, ex) : JSRunner.harness(code, ex);
   const busy = (out, msg) => { out.innerHTML = `<div class="muted spin">${msg}</div>`; };
@@ -75,7 +97,7 @@
       const s = chapterStats(ch), cur = ch === curCh;
       const exs = cur ? '<ul class="exlist">' + ch.exercises.map(e =>
         `<li class="${e === curEx ? 'cur' : ''}"><a href="${R('ex/' + ch.id + '/' + e.id)}">${P.done[exKey(ch, e)] ? '✓' : '○'} ${esc(e.title)}</a></li>`).join('') + '</ul>' : '';
-      return `<li class="${cur ? 'cur' : ''}"><a href="${R('ch/' + ch.id)}"><span class="num">${i}</span> ${esc(ch.title)}
+      return (ch.section ? `<li class="section">${esc(ch.section)}</li>` : '') + `<li class="${cur ? 'cur' : ''}"><a href="${R('ch/' + ch.id)}"><span class="num">${i}</span> ${esc(ch.title)}
         <span class="pct">${s.done}/${s.total}</span></a>${exs}</li>`;
     }).join('') + '</ol>';
   }
@@ -206,17 +228,22 @@
         <div class="canvashost" hidden></div>
         <div class="output"></div>
       </div>`;
-    const out = $('.output', main), stdin = $('.stdin', main) || { value: '' }, canvasHost = CUR.lang === 'webgpu' ? $('.canvashost', main) : null;
-    const ed = makeEditor($('.editorhost', main), P.code[key] ?? ex.starter, v => { P.code[key] = v; save(); });
+    const out = $('.output', main), stdin = $('.stdin', main) || { value: '' }, canvasHost = isC() ? null : $('.canvashost', main);
+    // Project steps start from the learner's own code for the previous step, plus this step's stubs.
+    const prev = ex.continues && list.find(e => e.id === ex.continues), prevKey = prev && exKey(ch, prev);
+    const fromPrev = prev && P.done[prevKey] && P.code[prevKey] != null ? P.code[prevKey].replace(/\s+$/, '') + (ex.stubs ? '\n\n' + ex.stubs : '') + '\n' : null;
+    const ed = makeEditor($('.editorhost', main), P.code[key] ?? fromPrev ?? ex.starter, v => { P.code[key] = v; save(); });
+    if (prev) $('.prompt', main).insertAdjacentHTML('afterbegin', `<blockquote class="small">Builds on <a href="${R('ex/' + ch.id + '/' + prev.id)}">${esc(prev.title)}</a>.
+      ${fromPrev ? 'Your code from that step is loaded, with this step\'s new stubs added at the end.' : 'The starter contains the reference solution of that step plus new stubs.'}</blockquote>`);
     const run = async () => {
       busy(out, 'Compiling and running…');
-      try { showResult(out, await execute(ed.get(), stdin.value, canvasHost)); } catch (e) { fail(out, e); }
+      try { showResult(out, await execute(ed.get(), stdin.value, canvasHost, out)); } catch (e) { fail(out, e); }
     };
     const check = async () => {
       busy(out, 'Checking…');
       try {
         if (ex.harness) {
-          const res = await execute(assemble(ed.get(), ex), '', canvasHost);
+          const res = await execute(assemble(ed.get(), ex), '', canvasHost, out);
           const ok = Assemble.passed(res);
           finish(ok, res, '');
         } else {
@@ -245,7 +272,7 @@
       if (res) showResult(out, res, banner); else out.innerHTML = banner + html + `<div class="backend muted">${esc(last.backend)}</div>`;
     };
     $('#run').onclick = run; $('#check').onclick = check;
-    $('#reset').onclick = () => { if (confirm('Replace your code with the starter?')) ed.set(ex.starter); };
+    $('#reset').onclick = () => { if (confirm('Replace your code with the starter?')) ed.set(fromPrev ?? ex.starter); };
     $('#solution').onclick = () => {
       out.innerHTML = `<div class="label">reference solution</div><pre class="qcode"><code>${MD.highlight(ex.solution, CUR.lang)}</code></pre>
         <button class="btn small" id="usesol">Load into editor</button>`;
@@ -315,10 +342,10 @@ console.log('drew a triangle');
         <button class="btn" id="resetplay">Reset to example</button></div>
       <div class="canvashost" hidden></div>
       <div class="output"></div>`;
-    const out = $('.output', main), stdin = $('.stdin', main) || { value: '' }, canvasHost = CUR.lang === 'webgpu' ? $('.canvashost', main) : null;
+    const out = $('.output', main), stdin = $('.stdin', main) || { value: '' }, canvasHost = isC() ? null : $('.canvashost', main);
     const ed = makeEditor($('.editorhost', main), code, v => localStorage.setItem(pk, v));
     localStorage.setItem(pk, code);
-    const run = async () => { busy(out, isC() ? 'Compiling and running…' : 'Running…'); try { showResult(out, await execute(ed.get(), stdin.value, canvasHost)); } catch (e) { fail(out, e); } };
+    const run = async () => { busy(out, isC() ? 'Compiling and running…' : 'Running…'); try { showResult(out, await execute(ed.get(), stdin.value, canvasHost, out)); } catch (e) { fail(out, e); } };
     $('#run').onclick = run;
     $('#resetplay').onclick = () => ed.set(PLAY_DEFAULT[CUR.id]);
     $('#share').onclick = () => {
@@ -419,13 +446,18 @@ console.log('drew a triangle');
     else home();
   }
   $('#menu').onclick = () => document.body.classList.toggle('menu-open');
-  Promise.all(COURSES.map(c => Promise.all(c.files.map(f => fetch(`${c.dir}/${f}.txt`).then(r => r.ok ? r.text() : null).catch(() => null)))
+  // A files entry starting with '#' is a section heading for the chapters after it.
+  Promise.all(COURSES.map(c => Promise.all(c.files.map(f => f[0] === '#' ? f : fetch(`${c.dir}/${f}.txt`).then(r => r.ok ? r.text() : null).catch(() => null)))
     .then(texts => {
-      c.chapters = texts.filter(Boolean).map(t => {
-        const ch = Format.parseChapter(t);
+      let section = null;
+      c.chapters = texts.filter(Boolean).flatMap(t => {
+        if (t[0] === '#') { section = t.slice(1).trim(); return []; }
+        let ch;
+        try { ch = Format.parseChapter(t); } catch (e) { console.error(e); return []; }
+        if (section) { ch.section = section; section = null; }
         ch.course = c.id;
         ch.quiz.forEach(q => q.id = c.id + '/' + q.id);
-        return ch;
+        return [ch];
       });
     })))
     .then(() => {

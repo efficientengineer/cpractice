@@ -39,6 +39,14 @@
       if (e.tests) for (const t of e.tests) if (t.exit === undefined && e.exit) t.exit = +e.exit;
       return e;
     });
+    // "continues: ID" builds on an earlier step: the starter is that step's solution plus this step's stubs.
+    for (const e of ch.exercises) {
+      if (!e.continues) continue;
+      const prev = ch.exercises.find(x => x.id === e.continues);
+      if (!prev) throw new Error(`${e.id}: continues unknown exercise ${e.continues}`);
+      e.stubs ||= '';
+      if (!e.starter) e.starter = prev.solution + (e.stubs ? '\n\n' + e.stubs : '') + '\n';
+    }
     ch.quiz = blocks.filter(b => b.kind === 'quiz').map((q, i) => ({ ...q, id: ch.id + '-q' + i, run: q.run === 'yes', flags: q.flags ? q.flags.split(/\s+/) : [] }));
     return ch;
   }

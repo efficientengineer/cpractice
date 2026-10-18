@@ -32,6 +32,8 @@ h2 { margin-top: 2em; padding-top: 0.5em; border-top: 1px solid var(--line); }
 #coursetools { display: contents; }
 #coursenav a { color: var(--muted); padding: 2px 8px; border-radius: 6px; }
 #coursenav a.cur { color: var(--text); background: var(--code-bg); font-weight: 600; }
+.chapters li.section { margin: 14px 8px 4px; font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); }
+.canvashost canvas:focus { outline: 2px solid var(--accent); }
 .coursehead { padding: 4px 8px 8px; font-weight: 700; }
 .coursehead a { color: var(--text); }
 .canvashost { margin-top: 12px; }
