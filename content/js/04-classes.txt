@@ -17,15 +17,15 @@ Arrow functions ignore all four: they have no `this` of their own and use the `t
 
 ```js
 function whoAmI() { return this?.label ?? String(this === globalThis ? 'global object' : this); }
-const hero = { label: 'hero', whoAmI };
-const villain = { label: 'villain' };
+const cube = { label: 'cube', whoAmI };
+const sphere = { label: 'sphere' };
 
-console.log(hero.whoAmI());              // method call: hero
-console.log(whoAmI.call(villain));       // explicit: villain
-const detached = hero.whoAmI;
+console.log(cube.whoAmI());              // method call: cube
+console.log(whoAmI.call(sphere));        // explicit: sphere
+const detached = cube.whoAmI;
 console.log(detached());                 // plain call: global object (sloppy) / undefined (strict)
-const bound = whoAmI.bind(villain);
-console.log(bound(), bound.call(hero));  // bind wins over call
+const bound = whoAmI.bind(sphere);
+console.log(bound(), bound.call(cube));  // bind wins over call
 ```
 
 `call` and `apply` differ only in how arguments are passed (`apply` takes an array; with spread syntax you rarely need it). `bind` returns a new function with `this` (and optionally leading arguments) fixed permanently.
@@ -35,39 +35,40 @@ console.log(bound(), bound.call(hero));  // bind wins over call
 The single most common `this` bug: passing a method as a callback. The callee calls it as a plain function, so `this` is gone. Class bodies are always strict, so inside a class method that means `this === undefined` and a `TypeError`.
 
 ```js
-class Spawner {
-  constructor() { this.count = 0; }
-  spawn() { this.count++; return this.count; }
+class MeshBuilder {
+  constructor() { this.vertices = []; }
+  addVertex(v) { this.vertices.push(v); return this.vertices.length; }
 }
-const s = new Spawner();
+const mb = new MeshBuilder();
 try {
-  [1, 2].forEach(s.spawn);               // passes the function, not the binding
+  [[0, 0, 0], [1, 0, 0]].forEach(mb.addVertex);     // passes the function, not the binding
 } catch (e) { console.log(e.name + ': ' + e.message); }
 
-[1, 2].forEach(() => s.spawn());          // fix 1: wrap in an arrow
-[1, 2].forEach(s.spawn.bind(s));          // fix 2: bind
-[1, 2].forEach(s.spawn, s);               // fix 3: many array methods take a thisArg
-console.log(s.count);
+[[0, 0, 0]].forEach(v => mb.addVertex(v));        // fix 1: wrap in an arrow
+[[1, 0, 0]].forEach(mb.addVertex.bind(mb));       // fix 2: bind
+[[0, 1, 0]].forEach(mb.addVertex, mb);            // fix 3: many array methods take a thisArg
+console.log(mb.vertices.length);
 ```
 
-Fix 4 is to define the method as an arrow-valued class field (`spawn = () => {...}`), shown below, which has a cost.
+Fix 4 is to define the method as an arrow-valued class field (`addVertex = (v) => {...}`), shown below, which has a cost.
 
 ### Arrows capture this
 
 Arrows are the fix for the pre-2015 `var self = this` dance: a callback written inside a method sees the method's `this`.
 
 ```js
-const enemy = {
-  label: 'orc',
-  hp: 10,
-  poison(ticks) {
-    // arrow: this is enemy, from poison's call
-    Array.from({ length: ticks }).forEach(() => { this.hp -= 2; });
-    return this.hp;
+const terrain = {
+  label: 'island',
+  heights: [0.25, 0.5, 0.875],
+  max: 1,
+  raise(amount) {
+    // arrow: this is terrain, from raise's call
+    this.heights = this.heights.map(h => Math.min(this.max, h + amount));
+    return this.heights;
   },
   broken: () => typeof this,   // arrow at object level: this from the enclosing scope, not the object
 };
-console.log(enemy.poison(3), enemy.broken());
+console.log(terrain.raise(0.25), terrain.broken());
 ```
 
 Don't use arrows as object methods (the `broken` case): an object literal doesn't create a scope, so `this` is whatever it was outside.
@@ -77,24 +78,24 @@ Don't use arrows as object methods (the `broken` case): an object literal doesn'
 Every object has a hidden link to another object, its **prototype** (`Object.getPrototypeOf(obj)`, historically `obj.__proto__`). Reading a property that isn't on the object itself walks up the chain: object, its prototype, the prototype's prototype, until `null`. Writing always goes to the object itself (shadowing, not modifying, the prototype's copy).
 
 ```js
-const monsterProto = {
-  describe() { return `${this.kind} with ${this.hp} hp`; },
-  hp: 1,                                    // a shared default
+const materialProto = {
+  describe() { return `${this.kind}, roughness ${this.roughness}`; },
+  roughness: 0.5,                           // a shared default
 };
-const goblin = Object.create(monsterProto);
-goblin.kind = 'goblin';
-const rat = Object.create(monsterProto);
-rat.kind = 'rat';
-rat.hp = 3;                                 // own property shadows the prototype's
+const stone = Object.create(materialProto);
+stone.kind = 'stone';
+const chrome = Object.create(materialProto);
+chrome.kind = 'chrome';
+chrome.roughness = 0.05;                    // own property shadows the prototype's
 
-console.log(goblin.describe(), rat.describe());
-console.log(Object.hasOwn(goblin, 'hp'), 'hp' in goblin, Object.keys(goblin));
-console.log(Object.getPrototypeOf(goblin) === monsterProto, Object.getPrototypeOf(monsterProto) === Object.prototype);
+console.log(stone.describe(), '|', chrome.describe());
+console.log(Object.hasOwn(stone, 'roughness'), 'roughness' in stone, Object.keys(stone));
+console.log(Object.getPrototypeOf(stone) === materialProto, Object.getPrototypeOf(materialProto) === Object.prototype);
 ```
 
 That's the whole object model. Methods live once on a shared prototype; instances hold only their data. A C# class does the same thing internally (instance fields per object, methods in the type's method table); JavaScript makes the table an ordinary object you can see and modify.
 
-**Never put mutable shared state on a prototype.** An array default on the prototype is one array shared by every instance, and `goblin.loot.push(...)` mutates it for all of them (reading `loot` finds the prototype's array; `push` mutates it rather than assigning).
+**Never put mutable shared state on a prototype.** An array default on the prototype is one array shared by every instance, and `stone.layers.push(...)` mutates it for all of them (reading `layers` finds the prototype's array; `push` mutates it rather than assigning).
 
 ### Constructor functions: what classes compile to
 
@@ -113,187 +114,196 @@ console.log(v.len(), v instanceof Vec, Object.getPrototypeOf(v) === Vec.prototyp
 `class` is cleaner syntax for the same prototype machinery, with a few real additions: private fields, static blocks, and enforced `new` (calling a class without `new` throws). Class bodies are always strict mode.
 
 ```js
-class Entity {
+class Texture {
   static #nextId = 1;            // private static
   static count = 0;              // public static, lives on the class itself
 
-  id = Entity.#nextId++;         // public instance field, initialized per instance
-  #hp;                           // private instance field
+  id = Texture.#nextId++;        // public instance field, initialized per instance
+  #data;                         // private instance field
 
-  constructor(name, hp) {
-    this.name = name;
-    this.#hp = hp;
-    this.maxHp = hp;
-    Entity.count++;
+  constructor(width, height) {
+    this.width = width;
+    this.height = height;
+    this.#data = new Uint8ClampedArray(width * height * 4);   // RGBA bytes
+    Texture.count++;
   }
 
-  get hp() { return this.#hp; }                 // accessor on the prototype
-  get alive() { return this.#hp > 0; }
+  get byteLength() { return this.#data.length; }               // accessor on the prototype
+  get pixelCount() { return this.width * this.height; }
 
-  damage(n) {                                   // method on the prototype
-    this.#hp = Math.max(0, this.#hp - n);
-    return this;                                // enables chaining
+  setPixel(x, y, r, g, b, a = 255) {                           // method on the prototype
+    const i = (y * this.width + x) * 4;
+    this.#data[i] = r; this.#data[i + 1] = g; this.#data[i + 2] = b; this.#data[i + 3] = a;
+    return this;                                               // enables chaining
+  }
+  getPixel(x, y) {
+    const i = (y * this.width + x) * 4;
+    return [this.#data[i], this.#data[i + 1], this.#data[i + 2], this.#data[i + 3]];
   }
 
-  static compareHp(a, b) { return a.hp - b.hp; }
-  toString() { return `${this.name}#${this.id} (${this.#hp}/${this.maxHp})`; }
+  static compareSize(a, b) { return a.pixelCount - b.pixelCount; }
+  toString() { return `Texture#${this.id} ${this.width}x${this.height}`; }
 }
 
-const a = new Entity('slime', 5), b = new Entity('orc', 12);
-a.damage(2).damage(1);
-console.log(`${a}`, b.alive, a.hp, Entity.count);
-console.log(a, Object.keys(a));                // #hp isn't a property: invisible to keys and JSON
-console.log([b, a].toSorted(Entity.compareHp).map(String));
-a.hp = 99;                       // getter only: ignored in sloppy code like this, a TypeError in strict code
-console.log(a.hp);
-try { Entity('x', 1); } catch (e) { console.log(e.message); }
+const a = new Texture(4, 4), b = new Texture(2, 2);
+a.setPixel(1, 2, 255, 128, 300).setPixel(0, 0, -5, 0, 0);    // Uint8ClampedArray clamps to 0..255
+console.log(`${a}`, a.byteLength, a.getPixel(1, 2), a.getPixel(0, 0), Texture.count);
+console.log(a, Object.keys(a));                // #data isn't a property: invisible to keys and JSON
+console.log([a, b].toSorted(Texture.compareSize).map(String));
+a.byteLength = 0;                              // getter only: ignored in sloppy code like this, a TypeError in strict code
+console.log(a.byteLength);
+try { Texture(1, 1); } catch (e) { console.log(e.message); }
 ```
 
 Notes for C# eyes:
 
 - **Fields** are per-instance and initialized in declaration order, before the constructor body runs (in a subclass: right after `super()` returns).
-- **`#private`** is hard privacy, enforced by the engine: `obj.#hp` from outside the class is a syntax error, and there's no reflection to get around it. `#hp in obj` is a brand check ("was this object constructed by my class?"). The older convention `_hp` is just a name.
-- **`static`** members live on the constructor function. Statics are inherited: `class Boss extends Entity` gets `Boss.compareHp`.
-- **No overloading**, no `protected`, no interfaces, no abstract keyword. Duck typing fills the gap: anything with an `update(dt)` method is an updatable thing. Simulate `abstract` by throwing in the base method.
+- **`#private`** is hard privacy, enforced by the engine: `obj.#data` from outside the class is a syntax error, and there's no reflection to get around it. `#data in obj` is a brand check ("was this object constructed by my class?"). The older convention `_data` is just a name.
+- **`static`** members live on the constructor function. Statics are inherited: `class HdrTexture extends Texture` gets `HdrTexture.compareSize`.
+- **No overloading**, no `protected`, no interfaces, no abstract keyword. Duck typing fills the gap: anything with a `sample(u, v)` method is a texture source. Simulate `abstract` by throwing in the base method.
 - Methods aren't `virtual` or non-virtual: every call is dynamic dispatch through the prototype chain.
+
+> **Performance:** look at what `getPixel` returns: a fresh 4-element array per call. Calling it for every pixel of a 2048x2048 texture allocates 4 million arrays. Hot APIs avoid that by returning one channel (`getChannel(x, y, c)`), writing into a caller-provided `out` array, or simply exposing the underlying typed array so the caller loops over it directly. Convenience methods are for tests and tools; bulk work goes straight at the buffer.
 
 ### Getters, setters, and validation
 
 ```js
-class Stat {
-  #value = 0;
+class Exposure {
+  #stops = 0;
   constructor(min, max) { this.min = min; this.max = max; }
-  get value() { return this.#value; }
-  set value(v) { this.#value = Math.min(this.max, Math.max(this.min, v)); }   // clamp on write
-  get ratio() { return (this.#value - this.min) / (this.max - this.min); }
+  get stops() { return this.#stops; }
+  set stops(v) { this.#stops = Math.min(this.max, Math.max(this.min, v)); }   // clamp on write
+  get multiplier() { return 2 ** this.#stops; }                               // derived value
 }
-const stamina = new Stat(0, 100);
-stamina.value = 150;
-stamina.value -= 30;
-console.log(stamina.value, stamina.ratio);
+const ev = new Exposure(-4, 4);
+ev.stops = 10;
+ev.stops -= 2;
+console.log(ev.stops, ev.multiplier);
 ```
 
 ### Arrow fields: auto-bound but per instance
 
 ```js
-class Button {
-  clicks = 0;
-  onClick = () => { this.clicks++; };   // a new function per instance, this bound to it
-  press() { this.clicks++; }            // one function on the prototype, shared
+class Slider {
+  changes = 0;
+  onInput = () => { this.changes++; };   // a new function per instance, this bound to it
+  nudge() { this.changes++; }            // one function on the prototype, shared
 }
-const btn = new Button();
-const handler = btn.onClick;
+const s = new Slider();
+const handler = s.onInput;
 handler(); handler();
-console.log(btn.clicks, Object.keys(btn), new Button().onClick === btn.onClick, new Button().press === btn.press);
+console.log(s.changes, Object.keys(s), new Slider().onInput === s.onInput, new Slider().nudge === s.nudge);
 ```
 
-> **Performance:** an arrow field is a closure allocated for every instance and stored on it. For a UI with ten buttons, who cares. For 10,000 particles, that's 10,000 extra function objects per method, and bigger objects. Keep methods on the prototype for anything you create in bulk; bind only where a callback is actually needed. Equally, initialize **every** field in the constructor or as a field declaration, so all instances share one shape. Adding a property later to some instances (`if (boss) e.phase = 1`) splits them into different shapes and makes every `e.update()` call site slower.
+> **Performance:** an arrow field is a closure allocated for every instance and stored on it. For a UI with ten sliders, who cares. For 100,000 scattered instances of a `Pebble` class, that's 100,000 extra function objects per method, and bigger objects. Keep methods on the prototype for anything you create in bulk; bind only where a callback is actually needed. Equally, initialize **every** field in the constructor or as a field declaration, so all instances share one shape. Adding a property later to some instances (`if (wet) p.gloss = 1`) splits them into different shapes and makes every call site that touches them slower.
 
 ## Inheritance and super
 
 ```js
-class Unit {
-  constructor(name, hp) { this.name = name; this.hp = hp; }
-  takeHit(dmg) { this.hp -= dmg; return dmg; }
-  describe() { return `${this.name} (${this.hp})`; }
+class Light {
+  constructor(name, intensity) { this.name = name; this.intensity = intensity; }
+  // irradiance at distance d (inverse square)
+  at(d) { return this.intensity / (d * d); }
+  describe() { return `${this.name} (${this.intensity})`; }
 }
 
-class Knight extends Unit {
-  constructor(name, hp, armor) {
-    super(name, hp);               // must run before touching this
-    this.armor = armor;
+class SpotLight extends Light {
+  constructor(name, intensity, coneDeg) {
+    super(name, intensity);          // must run before touching this
+    this.cosCone = Math.cos(coneDeg * Math.PI / 180);
   }
-  takeHit(dmg) {                   // override
-    return super.takeHit(Math.max(1, dmg - this.armor));   // call the base version
+  at(d, cosAngle = 1) {              // override
+    return cosAngle < this.cosCone ? 0 : super.at(d);   // call the base version
   }
-  describe() { return `${super.describe()} [armor ${this.armor}]`; }
+  describe() { return `${super.describe()} [spot]`; }
 }
 
-const k = new Knight('Ser Ada', 20, 3);
-console.log(k.takeHit(5), k.takeHit(2), k.describe());
-console.log(k instanceof Knight, k instanceof Unit, Object.getPrototypeOf(Knight.prototype) === Unit.prototype);
+const spot = new SpotLight('key', 100, 30);
+console.log(spot.at(2), spot.at(2, 0.5), spot.describe());
+console.log(spot instanceof SpotLight, spot instanceof Light, Object.getPrototypeOf(SpotLight.prototype) === Light.prototype);
 ```
 
 - A derived constructor **must** call `super(...)` before using `this` (a `ReferenceError` otherwise), and if it has no constructor, one that forwards all arguments is generated.
 - `super.method()` calls the parent's version, like C#'s `base.Method()`.
 - There's one gotcha C# also has: a base constructor that calls an overridden method runs the derived override **before** the derived class's fields are initialized. Avoid calling overridable methods from constructors.
-- You can extend built-ins: `class Stack extends Array`, `class GameError extends Error`. Custom errors should set `this.name`.
+- You can extend built-ins: `class Palette extends Array`, `class ShaderError extends Error`. Custom errors should set `this.name`.
 
 ```js
-class GameError extends Error {
-  constructor(message, code) { super(message); this.name = 'GameError'; this.code = code; }
+class ShaderError extends Error {
+  constructor(message, line) { super(message); this.name = 'ShaderError'; this.line = line; }
 }
-try { throw new GameError('save corrupt', 42); } catch (e) {
-  console.log(e instanceof GameError, e instanceof Error, e.name, e.code, String(e));
+try { throw new ShaderError('unknown identifier "nrm"', 42); } catch (e) {
+  console.log(e instanceof ShaderError, e instanceof Error, e.name, e.line, String(e));
 }
 ```
 
 ### instanceof and its limits
 
-`x instanceof C` checks whether `C.prototype` is on `x`'s chain. It fails across realms (an array from another iframe or worker isn't `instanceof` your `Array`; use `Array.isArray`), and it says nothing about objects that merely have the right shape. For duck typing, check for the method: `typeof thing.update === 'function'`.
+`x instanceof C` checks whether `C.prototype` is on `x`'s chain. It fails across realms (an array from another iframe or worker isn't `instanceof` your `Array`; use `Array.isArray`), and it says nothing about objects that merely have the right shape. For duck typing, check for the method: `typeof src.sample === 'function'`.
 
 ## Composition and mixins
 
-Deep inheritance hierarchies (`Entity > Actor > Enemy > FlyingEnemy > FlyingFireEnemy`) age badly in games; that's why engines moved to components. JavaScript has two lightweight options.
+Deep inheritance hierarchies (`Node > Mesh > SkinnedMesh > InstancedSkinnedMesh`) age badly; most engines moved towards composition. JavaScript has two lightweight options.
 
 **Mixins**: a function from a class to a subclass. Since `extends` takes any expression, you can stack them:
 
 ```js
 const Positioned = Base => class extends Base {
-  x = 0; y = 0;
-  moveBy(dx, dy) { this.x += dx; this.y += dy; return this; }
+  x = 0; y = 0; z = 0;
+  translate(dx, dy, dz) { this.x += dx; this.y += dy; this.z += dz; return this; }
 };
-const Damageable = Base => class extends Base {
-  hp = 10;
-  hurt(n) { this.hp = Math.max(0, this.hp - n); return this; }
-  get dead() { return this.hp === 0; }
+const Tinted = Base => class extends Base {
+  color = [1, 1, 1];
+  tint(r, g, b) { this.color = [this.color[0] * r, this.color[1] * g, this.color[2] * b]; return this; }
 };
-class Thing {}
-class Barrel extends Damageable(Positioned(Thing)) {
-  explode() { return `boom at ${this.x},${this.y}`; }
+class SceneNode {}
+class Billboard extends Tinted(Positioned(SceneNode)) {
+  describe() { return `billboard at ${this.x},${this.y},${this.z}`; }
 }
-const barrel = new Barrel().moveBy(3, 4).hurt(10);
-console.log(barrel, barrel.dead, barrel.explode());
+const bb = new Billboard().translate(3, 4, 0).tint(1, 0.5, 0.5);
+console.log(bb, bb.describe());
 ```
 
-**Composition**: an entity *has* components (plain objects), and systems loop over entities that have the components they need. That's the start of an entity-component-system, and it's how the Game development track structures its engine.
+**Composition**: a scene node *has* components (plain objects), and systems loop over the nodes that have the components they need. That's the start of an entity-component-system.
 
 ```js
-const entities = [
-  { id: 1, pos: { x: 0, y: 0 }, vel: { x: 1, y: 0 } },
-  { id: 2, pos: { x: 5, y: 5 } },                             // static: no vel
-  { id: 3, pos: { x: 0, y: 0 }, vel: { x: 0, y: 2 }, hp: { value: 3 } },
+const nodes = [
+  { id: 1, transform: { x: 0, y: 0 }, spin: { speed: 1 } },
+  { id: 2, transform: { x: 5, y: 5 } },                             // static: no spin
+  { id: 3, transform: { x: 0, y: 0 }, spin: { speed: 2 }, mesh: { tris: 12 } },
 ];
-function movementSystem(list, dt) {
-  for (const e of list) if (e.vel) { e.pos.x += e.vel.x * dt; e.pos.y += e.vel.y * dt; }
+function spinSystem(list, dt) {
+  for (const n of list) if (n.spin) n.transform.angle = (n.transform.angle ?? 0) + n.spin.speed * dt;
 }
-movementSystem(entities, 0.5);
-console.log(entities.map(e => e.pos));
+spinSystem(nodes, 0.5);
+console.log(nodes.map(n => n.transform));
 ```
+
+(That `angle` added on the fly to some transforms is exactly the shape instability the performance notes warn about; a real system would initialize it everywhere.)
 
 ## C# classes versus JavaScript classes
 
 | C# | JavaScript |
 |---|---|
-| `private int hp;` | `#hp;` (hard private) or `_hp` (convention only) |
+| `private byte[] data;` | `#data;` (hard private) or `_data` (convention only) |
 | `protected` | no equivalent (convention, or symbols) |
-| `public int Hp { get; private set; }` | `#hp` plus `get hp()` |
+| `public int Width { get; private set; }` | `#width` plus `get width()` |
 | `static` | `static` (inherited by subclasses) |
 | `base.M()` | `super.m()` |
 | `abstract` / `interface` | duck typing; throw in a base method; TypeScript for checking |
 | overloads | one function that inspects its arguments, or options objects |
 | `virtual` / `override` | every method is overridable |
-| `struct` value types | no equivalent; objects are always references |
+| `struct` value types (`Vector3`) | no equivalent; objects are always references |
 | `sealed` | no equivalent (`Object.freeze` on the prototype, rarely) |
 | extension methods | adding to a prototype: possible, but don't patch built-ins |
 | `this` always bound | depends on the call: see the start of this chapter |
 
-> **Performance:** there are no value-type structs, so `new Vec2(x, y)` per operation is a heap allocation. A math library where `a.add(b)` returns a new vector is pleasant and fine at setup time, but in a physics step it makes garbage proportional to entity count times frame rate. Real engines provide mutating variants (`a.addInPlace(b)`, or `Vec2.add(out, a, b)` writing into a preallocated `out`), reuse scratch vectors, and pool short-lived objects like bullets and particles instead of creating and dropping them.
+> **Performance:** there are no value-type structs, so `new Vec3(x, y, z)` per operation is a heap allocation. A math library where `a.add(b)` returns a new vector is pleasant and fine at setup time, but in a per-vertex loop it makes garbage proportional to vertex count. Real libraries (gl-matrix is the classic) provide out-parameter functions like `vec3.add(out, a, b)` writing into preallocated vectors, reuse scratch vectors, and store bulk data in `Float32Array`s rather than in objects at all.
 
 === exercise vec2
 title: Vec2
 --- prompt
-Write a `class Vec2` for 2D game math.
+Write a `class Vec2` for 2D graphics math.
 
 - `constructor(x = 0, y = 0)` storing public fields `x`, `y`.
 - `add(v)`, `sub(v)`, `scale(s)`: return **new** vectors.
@@ -302,7 +312,7 @@ Write a `class Vec2` for 2D game math.
 - `dot(v)`.
 - `equals(v, eps = 1e-9)`: component-wise within `eps`.
 - `static fromAngle(rad, len = 1)`: `(cos·len, sin·len)`.
-- In-place variants for hot loops, which **mutate `this` and return `this`** (so they chain and allocate nothing): `addScaledInPlace(v, s)` (adds `v * s`, the classic `pos += vel * dt`) and `set(x, y)`.
+- In-place variants for hot loops, which **mutate `this` and return `this`** (so they chain and allocate nothing): `addScaledInPlace(v, s)` (adds `v * s`, the classic `pos += vel * dt` of a particle step) and `set(x, y)`.
 - `toString()` returning `Vec2(x, y)`, e.g. `Vec2(1, -2.5)`.
 --- starter
 class Vec2 {
@@ -367,7 +377,7 @@ In-place methods end with `return this;`. `static fromAngle` is called as `Vec2.
 === exercise emitter
 title: Event emitter
 --- prompt
-Games are full of events: `'damage'`, `'death'`, `'levelup'`. Write `class Emitter` with:
+A long-running generator reports what it's doing through events: `'progress'`, `'tile'` (a tile of the texture finished), `'done'`. Write `class Emitter` with:
 
 - `on(event, handler)`: subscribe; returns a function that unsubscribes this handler.
 - `off(event, handler)`: unsubscribe (removes one registration; no-op if absent).
@@ -518,115 +528,189 @@ In `emit`, iterate over a copy of the list so removals don't shift indexes under
   eq(c, 0, 'emitters independent');
 }
 
-=== exercise units
-title: A unit hierarchy
+=== exercise shapes
+title: A signed distance shape hierarchy
 --- prompt
-Write three classes.
+A **signed distance function** (SDF) returns, for a point, the distance to a shape's surface: negative inside, zero on the edge, positive outside. SDFs are the backbone of procedural 2D graphics (crisp vector shapes in shaders) and of ray-marched 3D scenes. Write a small class hierarchy:
 
-**`Unit`**: `constructor(name, hp)`. HP is **private** (`#hp`), exposed by a read-only getter `hp`. Also `get alive()` (hp > 0), and `takeDamage(n)`: reduces hp (never below 0), ignores negative `n` (treat as 0), and returns the damage actually dealt (so `5` damage on a unit with 3 hp returns `3`). A static `Unit.created` counts all units ever constructed, including subclasses.
+**`Shape`**: `constructor(name)`. The name is **private** (`#name`) with a read-only getter `name`. `distance(x, y)` throws an `Error` (it's "abstract"). `contains(x, y)` is `distance(x, y) <= 0`. `toString()` returns `` `${name} area=${area.toFixed(2)}` `` using the subclass's `area` getter. A static `Shape.created` counts all shapes ever constructed, including subclasses.
 
-**`Armored extends Unit`**: `constructor(name, hp, armor)`. `takeDamage(n)` subtracts `armor` from incoming damage first (minimum 0) and then applies the rest via the base implementation, returning damage dealt.
+**`Circle extends Shape`**: `constructor(cx, cy, r, name = 'circle')`. Distance: `hypot(x - cx, y - cy) - r`. `get area()`: `π r²`.
 
-**`Boss extends Armored`**: `constructor(name, hp, armor)`. Has a public `phase` field starting at `1`. When a hit brings hp to half of the starting hp or below for the first time, `phase` becomes `2` and `armor` doubles. Returns damage dealt like the others.
+**`Box extends Shape`**: `constructor(cx, cy, hw, hh)` (half width and height), name `'box'`. The exact box SDF:
 
-`toString()` on all of them returns `name (hp/maxHp)`.
+```text
+dx = |x - cx| - hw,  dy = |y - cy| - hh
+distance = hypot(max(dx, 0), max(dy, 0)) + min(max(dx, dy), 0)
+```
+
+`get area()`: `4 · hw · hh`.
+
+**`Ring extends Circle`**: `constructor(cx, cy, r, thickness)`, name `'ring'`. Distance: `|circle distance| - thickness / 2` (the classic "onion" operation, reusing the parent via `super`). `get area()`: `2π r · thickness`.
 --- starter
-class Unit {
-  constructor(name, hp) {
-    this.name = name;
-    this.hp = hp;
-  }
+class Shape {
+  constructor(name) { this.name = name; }
 }
-class Armored extends Unit {}
-class Boss extends Armored {}
+class Circle extends Shape {}
+class Box extends Shape {}
+class Ring extends Circle {}
 --- solution
-class Unit {
+class Shape {
   static created = 0;
-  #hp;
-  constructor(name, hp) {
-    this.name = name;
-    this.maxHp = hp;
-    this.#hp = hp;
-    Unit.created++;
+  #name;
+  constructor(name) {
+    this.#name = name;
+    Shape.created++;
   }
-  get hp() { return this.#hp; }
-  get alive() { return this.#hp > 0; }
-  takeDamage(n) {
-    const dealt = Math.min(this.#hp, Math.max(0, n));
-    this.#hp -= dealt;
-    return dealt;
-  }
-  toString() { return `${this.name} (${this.#hp}/${this.maxHp})`; }
+  get name() { return this.#name; }
+  distance(x, y) { throw new Error('distance is abstract'); }
+  contains(x, y) { return this.distance(x, y) <= 0; }
+  toString() { return `${this.#name} area=${this.area.toFixed(2)}`; }
 }
 
-class Armored extends Unit {
-  constructor(name, hp, armor) {
-    super(name, hp);
-    this.armor = armor;
+class Circle extends Shape {
+  constructor(cx, cy, r, name = 'circle') {
+    super(name);
+    this.cx = cx; this.cy = cy; this.r = r;
   }
-  takeDamage(n) {
-    return super.takeDamage(Math.max(0, n - this.armor));
-  }
+  distance(x, y) { return Math.hypot(x - this.cx, y - this.cy) - this.r; }
+  get area() { return Math.PI * this.r * this.r; }
 }
 
-class Boss extends Armored {
-  phase = 1;
-  takeDamage(n) {
-    const dealt = super.takeDamage(n);
-    if (this.phase === 1 && this.hp <= this.maxHp / 2) {
-      this.phase = 2;
-      this.armor *= 2;
-    }
-    return dealt;
+class Box extends Shape {
+  constructor(cx, cy, hw, hh) {
+    super('box');
+    this.cx = cx; this.cy = cy; this.hw = hw; this.hh = hh;
   }
+  distance(x, y) {
+    const dx = Math.abs(x - this.cx) - this.hw, dy = Math.abs(y - this.cy) - this.hh;
+    return Math.hypot(Math.max(dx, 0), Math.max(dy, 0)) + Math.min(Math.max(dx, dy), 0);
+  }
+  get area() { return 4 * this.hw * this.hh; }
+}
+
+class Ring extends Circle {
+  constructor(cx, cy, r, thickness) {
+    super(cx, cy, r, 'ring');
+    this.thickness = thickness;
+  }
+  distance(x, y) { return Math.abs(super.distance(x, y)) - this.thickness / 2; }
+  get area() { return 2 * Math.PI * this.r * this.thickness; }
 }
 --- hint
-Subclasses can't touch `#hp`: it's private to `Unit`'s body. Route all damage through `super.takeDamage(...)` and read `this.hp` through the getter.
+`Shape` can't know the area, but `toString` can still read `this.area`: the getter is looked up on the actual object's prototype chain, so the subclass's getter runs.
 --- hint
-`Unit.created++` in the base constructor counts subclasses too, since every subclass constructor calls `super`. Use `Unit.created`, not `this.constructor.created`, or each subclass would get its own copy of the counter.
+In `Ring`, `super.distance(x, y)` calls `Circle`'s version with `this` still being the ring.
+--- hint
+Count with `Shape.created++` in `Shape`'s constructor. `this.constructor.created++` would create a separate counter on each subclass the first time it runs.
 --- harness
 {
-  const before = Unit.created;
-  const u = new Unit('rat', 3);
-  eq(u.takeDamage(2), 2);
-  eq(u.hp, 1);
-  eq(u.takeDamage(5), 1, 'only remaining hp dealt');
-  eq([u.hp, u.alive], [0, false]);
-  eq(u.takeDamage(-3), 0, 'negative ignored');
-  eq(u.hp, 0);
-  const v = new Unit('cat', 4);
-  eq(v.takeDamage(-2), 0);
-  eq(v.hp, 4, 'negative does not heal');
-  check(!Object.keys(v).includes('hp'), 'hp is private, not an own property');
-  try { v.hp = 100; } catch {}
-  eq(v.hp, 4, 'hp is read-only');
-  eq(String(v), 'cat (4/4)');
+  const before = Shape.created;
+  const c = new Circle(0, 0, 2);
+  near(c.distance(3, 4), 3);
+  near(c.distance(0, 0), -2);
+  check(c.contains(1, 1) && !c.contains(2, 2), 'contains');
+  check(c.contains(2, 0), 'edge counts as inside');
+  near(c.area, Math.PI * 4);
+  eq(c.name, 'circle');
+  try { c.name = 'x'; } catch {}
+  eq(c.name, 'circle', 'name is read-only');
+  check(!Object.keys(c).includes('name'), 'name is private, not an own property');
+  eq(String(c), 'circle area=12.57');
 
-  const k = new Armored('knight', 20, 3);
-  eq(k.takeDamage(5), 2);
-  eq(k.takeDamage(2), 0, 'armor absorbs');
-  eq(k.hp, 18);
-  check(k instanceof Unit && k instanceof Armored, 'instanceof');
-  eq(`${k}`, 'knight (18/20)');
+  const b = new Box(1, 1, 2, 1);
+  near(b.distance(1, 1), -1, 1e-9, 'centre: nearest edge is 1 away');
+  near(b.distance(4, 1), 1, 1e-9, 'right of box');
+  near(b.distance(1, 3.5), 1.5, 1e-9, 'above box');
+  near(b.distance(6, 6), 5, 1e-9, 'corner region: hypot(3, 4)');
+  near(b.distance(2.5, 1.2), -0.5, 1e-9, 'inside near right edge');
+  eq(b.area, 8);
+  eq(`${b}`, 'box area=8.00');
+  check(b.contains(-1, 0) && !b.contains(-1.1, 0), 'box contains');
 
-  const b = new Boss('dragon', 100, 5);
-  eq(b.phase, 1);
-  eq(b.takeDamage(45), 40);
-  eq([b.hp, b.phase, b.armor], [60, 1, 5]);
-  eq(b.takeDamage(15), 10);
-  eq([b.hp, b.phase, b.armor], [50, 2, 10], 'phase 2 at half hp');
-  eq(b.takeDamage(15), 5, 'doubled armor');
-  eq(b.takeDamage(1000), 45);
-  eq([b.hp, b.alive, b.phase, b.armor], [0, false, 2, 10], 'armor doubles only once');
-  check(b instanceof Armored && b instanceof Unit, 'boss chain');
-  eq(Unit.created - before, 4, 'created counts all units');
-  eq(String(b), 'dragon (0/100)');
+  const r = new Ring(0, 0, 5, 1);
+  near(r.distance(5, 0), -0.5);
+  near(r.distance(0, 0), 4.5);
+  near(r.distance(0, 7), 1.5);
+  check(r.contains(0, 5.4) && !r.contains(0, 4.4), 'ring contains only the band');
+  eq(r.name, 'ring');
+  near(r.area, 10 * Math.PI);
+  check(r instanceof Circle && r instanceof Shape, 'instanceof chain');
+  check(!Object.hasOwn(r, 'distance'), 'methods on prototypes');
+
+  throws(() => new Shape('abstract').distance(0, 0), 'Shape.distance is abstract');
+  eq(Shape.created - before, 4, 'created counts all shapes');
+}
+
+=== exercise mixins
+title: Mixins
+--- prompt
+Write two mixins, functions that take a base class and return a subclass:
+
+- `Transformable(Base)`: adds fields `x = 0`, `y = 0`, `z = 0`, `scale = 1`, and methods `translate(dx, dy, dz)` and `scaleBy(s)` (multiplies `scale`), both returning `this`.
+- `Colored(Base)`: adds a field `color`, a **new** array copied from a static `defaultColor` on the **final** class (`this.constructor.defaultColor`, or `[1, 1, 1]` if the class doesn't define one), plus `tint(r, g, b)` (multiplies each channel, returns `this`) and `get luminance()`: `0.2126 r + 0.7152 g + 0.0722 b`.
+
+Then define `class Sprite extends Colored(Transformable(Object))` with `static defaultColor = [1, 0.5, 0]` and a `name` set from its constructor's argument.
+
+Mixins must not interfere with a base class's constructor arguments: `Colored(Transformable(Named))` where `Named`'s constructor takes `(name)` must still receive it. Tinting one object must never change another's color or the class default.
+--- starter
+const Transformable = Base => Base;
+const Colored = Base => Base;
+class Sprite {}
+--- solution
+const Transformable = Base => class extends Base {
+  x = 0; y = 0; z = 0; scale = 1;
+  translate(dx, dy, dz) { this.x += dx; this.y += dy; this.z += dz; return this; }
+  scaleBy(s) { this.scale *= s; return this; }
+};
+
+const Colored = Base => class extends Base {
+  color = [...(this.constructor.defaultColor ?? [1, 1, 1])];
+  tint(r, g, b) { this.color[0] *= r; this.color[1] *= g; this.color[2] *= b; return this; }
+  get luminance() { const [r, g, b] = this.color; return 0.2126 * r + 0.7152 * g + 0.0722 * b; }
+};
+
+class Sprite extends Colored(Transformable(Object)) {
+  static defaultColor = [1, 0.5, 0];
+  constructor(name) {
+    super();
+    this.name = name;
+  }
+}
+--- hint
+`const Transformable = Base => class extends Base { ... }`. Without an explicit constructor, the generated one forwards all arguments to `Base`.
+--- hint
+A field initializer can read `this.constructor`: it runs during construction, after the base constructors, with `this` being the final object. Copy the default with spread, or every object would share (and tint) one array.
+--- harness
+{
+  const s = new Sprite('spark');
+  eq([s.name, s.x, s.y, s.z, s.scale], ['spark', 0, 0, 0, 1]);
+  eq(s.color, [1, 0.5, 0]);
+  check(s.translate(1, 2, 3) === s && s.scaleBy(2) === s, 'chaining returns this');
+  eq([s.x, s.y, s.z, s.scale], [1, 2, 3, 2]);
+  s.translate(-1, 0, 1).scaleBy(0.25);
+  eq([s.x, s.z, s.scale], [0, 4, 0.5]);
+  s.tint(0.5, 0.5, 1);
+  eq(s.color, [0.5, 0.25, 0]);
+  eq(Sprite.defaultColor, [1, 0.5, 0], 'class default untouched');
+  eq(new Sprite('b').color, [1, 0.5, 0], 'other sprites untouched');
+  near(new Sprite('c').luminance, 0.2126 + 0.7152 * 0.5);
+
+  class Named { constructor(name) { this.name = name; } }
+  class Marker extends Colored(Transformable(Named)) {}
+  const m = new Marker('pin');
+  eq([m.name, m.color], ['pin', [1, 1, 1]], 'base args forwarded, default white');
+  near(m.luminance, 1);
+  check(m instanceof Named, 'instanceof base');
+  class Red extends Colored(Object) { static defaultColor = [1, 0, 0]; }
+  eq(new Red().color, [1, 0, 0]);
+  check(!Object.hasOwn(m, 'translate') && !Object.hasOwn(m, 'tint'), 'methods on prototypes, not instances');
 }
 
 === exercise pool
 title: Object pool
 --- prompt
-Bullets and particles live for a fraction of a second. Creating and discarding thousands per second feeds the garbage collector; a pool recycles them instead. Write `class Pool`:
+Particles live for a fraction of a second. Creating and discarding thousands per second feeds the garbage collector; a pool recycles them instead. Write `class Pool`:
 
 - `constructor(create, reset)`: `create()` makes a new object; `reset(obj)` prepares a recycled one.
 - `acquire()`: returns a free object if there is one (after calling `reset` on it), otherwise a new one from `create()`.
@@ -750,20 +834,20 @@ function isInstance(obj, Ctor) {
 `obj.constructor` can be overwritten and isn't how `instanceof` works. Loop `p = Object.getPrototypeOf(p)` until `null`.
 --- harness
 {
-  function Monster(kind, hp) { this.kind = kind; this.hp = hp; }
-  Monster.prototype.roar = function () { return this.kind + '!'; };
-  function Dragon(hp) { Monster.call(this, 'dragon', hp); }
-  Dragon.prototype = Object.create(Monster.prototype);
-  Dragon.prototype.constructor = Dragon;
+  function Shape3D(kind, hp) { this.kind = kind; this.hp = hp; }
+  Shape3D.prototype.label = function () { return this.kind + '!'; };
+  function Sphere(hp) { Shape3D.call(this, 'sphere', hp); }
+  Sphere.prototype = Object.create(Shape3D.prototype);
+  Sphere.prototype.constructor = Sphere;
 
-  const m = construct(Monster, 'orc', 5);
-  eq([m.kind, m.hp, m.roar()], ['orc', 5, 'orc!']);
-  check(Object.getPrototypeOf(m) === Monster.prototype, 'prototype set');
-  const d = construct(Dragon, 50);
-  eq(d.roar(), 'dragon!');
-  check(isInstance(d, Dragon) && isInstance(d, Monster) && isInstance(d, Object), 'chain');
-  check(!isInstance(m, Dragon), 'not a dragon');
-  check(isInstance(m, Monster) === (m instanceof Monster), 'agrees with instanceof');
+  const m = construct(Shape3D, 'cube', 5);
+  eq([m.kind, m.hp, m.label()], ['cube', 5, 'cube!']);
+  check(Object.getPrototypeOf(m) === Shape3D.prototype, 'prototype set');
+  const d = construct(Sphere, 50);
+  eq(d.label(), 'sphere!');
+  check(isInstance(d, Sphere) && isInstance(d, Shape3D) && isInstance(d, Object), 'chain');
+  check(!isInstance(m, Sphere), 'not a sphere');
+  check(isInstance(m, Shape3D) === (m instanceof Shape3D), 'agrees with instanceof');
 
   function ReturnsObj() { this.a = 1; return { b: 2 }; }
   eq(construct(ReturnsObj), { b: 2 }, 'returned object wins');
@@ -780,75 +864,10 @@ function isInstance(obj, Ctor) {
   check(isInstance([], Array) && isInstance([], Object), 'arrays');
   check(isInstance(fn, Function), 'functions are objects');
   check(!isInstance(Object.create(null), Object), 'null prototype');
-  const fake = { constructor: Monster };
-  check(!isInstance(fake, Monster), 'constructor property is not proof');
+  const fake = { constructor: Shape3D };
+  check(!isInstance(fake, Shape3D), 'constructor property is not proof');
   class Real {}
   check(isInstance(new Real(), Real), 'works with class instances');
-}
-
-=== exercise mixins
-title: Mixins
---- prompt
-Write two mixins, functions that take a base class and return a subclass:
-
-- `Movable(Base)`: adds fields `x = 0`, `y = 0`, `vx = 0`, `vy = 0` and a method `step(dt)` that moves by velocity times `dt` and returns `this`.
-- `Living(Base)`: adds a field `hp` initialized from a static `maxHp` on the **final** class (`this.constructor.maxHp`, default `10` if the class doesn't define one), and `heal(n)` (capped at max hp, returns `this`) and `hurt(n)` (floored at 0, returns `this`), plus `get dead()`.
-
-Then define `class Player extends Living(Movable(Object))` with `static maxHp = 30` and a `name` set from its constructor's argument.
-
-Mixins must not interfere with a base class's constructor arguments: `Living(Movable(Named))` where `Named`'s constructor takes `(name)` must still receive it.
---- starter
-const Movable = Base => Base;
-const Living = Base => Base;
-class Player {}
---- solution
-const Movable = Base => class extends Base {
-  x = 0; y = 0; vx = 0; vy = 0;
-  step(dt) { this.x += this.vx * dt; this.y += this.vy * dt; return this; }
-};
-
-const Living = Base => class extends Base {
-  hp = this.constructor.maxHp ?? 10;
-  get maxHp() { return this.constructor.maxHp ?? 10; }
-  heal(n) { this.hp = Math.min(this.maxHp, this.hp + n); return this; }
-  hurt(n) { this.hp = Math.max(0, this.hp - n); return this; }
-  get dead() { return this.hp === 0; }
-};
-
-class Player extends Living(Movable(Object)) {
-  static maxHp = 30;
-  constructor(name) {
-    super();
-    this.name = name;
-  }
-}
---- hint
-`const Movable = Base => class extends Base { ... }`. Without an explicit constructor, the generated one forwards all arguments to `Base`.
---- hint
-A field initializer can read `this.constructor`: it runs during construction, after the base constructors, with `this` being the final object.
---- harness
-{
-  const p = new Player('ada');
-  eq([p.name, p.hp, p.x, p.y], ['ada', 30, 0, 0]);
-  p.vx = 2; p.vy = -1;
-  check(p.step(0.5) === p, 'step returns this');
-  eq([p.x, p.y], [1, -0.5]);
-  p.hurt(50);
-  eq([p.hp, p.dead], [0, true]);
-  p.heal(100);
-  eq(p.hp, 30, 'heal capped at maxHp');
-  eq(p.hurt(5).heal(2).hp, 27, 'chaining');
-
-  class Named { constructor(name) { this.name = name; } }
-  class Crate extends Living(Movable(Named)) {}
-  const c = new Crate('box');
-  eq([c.name, c.hp], ['box', 10], 'base args forwarded, default max 10');
-  c.heal(5);
-  eq(c.hp, 10);
-  check(c instanceof Named, 'instanceof base');
-  class Tough extends Living(Object) { static maxHp = 99; }
-  eq(new Tough().hp, 99);
-  check(!Object.hasOwn(c, 'step') && !Object.hasOwn(c, 'heal'), 'methods on prototypes, not instances');
 }
 
 === quiz
@@ -881,23 +900,23 @@ run: yes
 --- q
 What does this print?
 --- code
-function Squad() {}
-Squad.prototype.members = [];
-const a = new Squad(), b = new Squad();
-a.members.push('ada');
-b.members = ['bob'];
-b.members.push('cy');
-console.log(a.members, b.members, new Squad().members);
+function Palette() {}
+Palette.prototype.colors = [];
+const a = new Palette(), b = new Palette();
+a.colors.push('red');
+b.colors = ['blue'];
+b.colors.push('teal');
+console.log(a.colors, b.colors, new Palette().colors);
 --- choice
-[ 'ada' ] [ 'bob', 'cy' ] []
+[ 'red' ] [ 'blue', 'teal' ] []
 --- answer
-[ 'ada' ] [ 'bob', 'cy' ] [ 'ada' ]
+[ 'red' ] [ 'blue', 'teal' ] [ 'red' ]
 --- choice
-[ 'ada', 'bob', 'cy' ] [ 'ada', 'bob', 'cy' ] [ 'ada', 'bob', 'cy' ]
+[ 'red', 'blue', 'teal' ] [ 'red', 'blue', 'teal' ] [ 'red', 'blue', 'teal' ]
 --- choice
-[ 'ada' ] [ 'ada', 'bob', 'cy' ] [ 'ada' ]
+[ 'red' ] [ 'red', 'blue', 'teal' ] [ 'red' ]
 --- explain
-`a.members.push` reads the shared array from the prototype and mutates it, so every squad sees `'ada'`. `b.members = [...]` *assigns*, which creates an own property on `b` that shadows the prototype's array.
+`a.colors.push` reads the shared array from the prototype and mutates it, so every squad sees `'red'`. `b.colors = [...]` *assigns*, which creates an own property on `b` that shadows the prototype's array.
 
 === quiz
 run: yes

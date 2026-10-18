@@ -1,6 +1,6 @@
 === chapter collections
 title: Collections, iterators and generators
-blurb: Map versus object, Set and set operations, WeakMap and WeakRef, the iteration protocol, writing iterables, generators for lazy and infinite sequences, and generators as game coroutines.
+blurb: Map versus object, Set and set operations, WeakMap and WeakRef, the iteration protocol, writing iterables, generators for lazy and infinite sequences, L-systems, and time-sliced generation.
 --- body
 ## Map: the real dictionary
 
@@ -17,24 +17,24 @@ Plain objects work as string-keyed dictionaries, but `Map` is the purpose-built 
 | JSON | native | needs conversion (`Object.fromEntries(map)`) |
 
 ```js
-const entities = new Map();
-entities.set(101, { name: 'player', hp: 10 })
-        .set(102, { name: 'slime', hp: 3 });           // set returns the map: chainable
-const player = entities.get(101);
-console.log(entities.size, entities.has(102), entities.get(999), player.name);
-entities.delete(102);
+const meshes = new Map();
+meshes.set(101, { name: 'terrain', tris: 131072 })
+      .set(102, { name: 'rock', tris: 640 });           // set returns the map: chainable
+const terrain = meshes.get(101);
+console.log(meshes.size, meshes.has(102), meshes.get(999), terrain.name);
+meshes.delete(102);
 
-const sprite = { file: 'hero.png' };
-const meta = new Map([[sprite, { frames: 8 }], [NaN, 'not a number'], ['1', 'string one'], [1, 'number one']]);
-console.log(meta.get(sprite).frames, meta.get(NaN), meta.get(1), meta.get('1'));
+const image = { file: 'bark.png' };
+const meta = new Map([[image, { mips: 9 }], [NaN, 'not a number'], ['1', 'string one'], [1, 'number one']]);
+console.log(meta.get(image).mips, meta.get(NaN), meta.get(1), meta.get('1'));
 
-for (const [id, e] of entities) console.log(id, e.name);
-console.log([...meta.keys()].length, Object.fromEntries(entities), new Map(Object.entries({ a: 1 })));
+for (const [id, m] of meshes) console.log(id, m.name);
+console.log([...meta.keys()].length, Object.fromEntries(meshes), new Map(Object.entries({ a: 1 })));
 ```
 
-Use a plain object for records with a fixed set of known fields (an entity, a config). Use a `Map` for lookups keyed by data: id to entity, tile to state, object to metadata.
+Use a plain object for records with a fixed set of known fields (a material, a config). Use a `Map` for lookups keyed by data: id to mesh, cell to contents, object to metadata.
 
-> **Performance:** a Map keyed by numbers is fast. A Map (or object) keyed by strings you build per lookup, like `` grid.get(`${x},${y}`) ``, allocates a string and hashes it on every access: in a pathfinding inner loop that dominates the run time. Pack coordinates into a number instead (`y * width + x`, or `x * 65536 + y` for unbounded maps with small coordinates), or, for a bounded grid, skip the Map entirely and use a flat array.
+> **Performance:** a Map keyed by numbers is fast. A Map (or object) keyed by strings you build per lookup, like `` grid.get(`${x},${y}`) ``, allocates a string and hashes it on every access: in a flood fill or erosion inner loop that dominates the run time. Pack coordinates into a number instead (`y * width + x`, or `x * 65536 + y` for unbounded maps with small coordinates), or, for a bounded grid, skip the Map entirely and use a flat array.
 
 Object keys in a Map are compared by **identity**. Two different `{ x: 1, y: 2 }` objects are two different keys, unlike C# records or tuples with value equality. That's another reason to use numeric or string keys for coordinates.
 
@@ -48,34 +48,40 @@ visited.add(5).add(7).add(5);
 console.log(visited.size, visited.has(7), [...visited]);
 
 // de-duplicate preserving order
-console.log([...new Set(['fire', 'ice', 'fire', 'poison', 'ice'])]);
+console.log([...new Set(['uv', 'normal', 'uv', 'color', 'normal'])]);
 
-const a = new Set(['fire', 'ice', 'poison']), b = new Set(['ice', 'stun']);
+// vertex attributes a mesh provides vs what a shader needs
+const has = new Set(['position', 'normal', 'uv']), needs = new Set(['position', 'normal', 'tangent']);
 // ES2025 set methods: return new sets, don't mutate
-console.log(a.union(b), a.intersection(b), a.difference(b), a.symmetricDifference(b));
-console.log(new Set(['ice']).isSubsetOf(a), a.isDisjointFrom(new Set(['holy'])));
+console.log(has.union(needs), has.intersection(needs), needs.difference(has), has.symmetricDifference(needs));
+console.log(new Set(['position']).isSubsetOf(has), has.isDisjointFrom(new Set(['joints'])));
 ```
 
 On older engines without the set methods, `new Set([...a].filter(x => b.has(x)))` is the intersection idiom.
 
-The `keys` global on this site, the keys currently held down, is a `Set` of key codes, so `keys.has('ArrowLeft')` is how a game's update reads input. One of the exercises builds "just pressed this frame" on top of it.
+`needs.difference(has)` is exactly the check a renderer makes before binding a mesh to a pipeline: which attributes are missing?
 
 ## WeakMap, WeakSet, WeakRef (briefly)
 
 A `WeakMap` holds its keys (which must be objects) **weakly**: if nothing else references a key object, it can be garbage collected and its entry vanishes. That makes it the right tool for attaching data to objects you don't own without leaking them, like C#'s `ConditionalWeakTable`.
 
 ```js
-const bounds = new WeakMap();      // cache computed per entity, dies with the entity
-function getBounds(e) {
-  let b = bounds.get(e);
-  if (!b) { b = { w: e.sprite.length * 8, h: 8 }; bounds.set(e, b); }
+const bounds = new WeakMap();      // cache computed per mesh, dies with the mesh
+function getBounds(mesh) {
+  let b = bounds.get(mesh);
+  if (!b) {
+    let min = Infinity, max = -Infinity;
+    for (const y of mesh.heights) { if (y < min) min = y; if (y > max) max = y; }
+    b = { min, max };
+    bounds.set(mesh, b);
+  }
   return b;
 }
-const orc = { sprite: 'orc' };
-console.log(getBounds(orc), getBounds(orc) === getBounds(orc));
+const hill = { heights: [0.1, 0.7, 0.4] };
+console.log(getBounds(hill), getBounds(hill) === getBounds(hill));
 ```
 
-WeakMaps aren't iterable and have no `size` (their contents depend on when GC runs). `WeakSet` is the set version ("have I processed this object?"). `WeakRef` holds a single object weakly (`ref.deref()` returns it or `undefined`), and `FinalizationRegistry` runs a callback after an object is collected. Both are for caches and resource cleanup at the edges, and GC timing is unpredictable, so don't put game logic on them.
+WeakMaps aren't iterable and have no `size` (their contents depend on when GC runs). `WeakSet` is the set version ("have I processed this object?"). `WeakRef` holds a single object weakly (`ref.deref()` returns it or `undefined`), and `FinalizationRegistry` runs a callback after an object is collected. Both are for caches and resource cleanup at the edges, and GC timing is unpredictable, so don't put program logic on them.
 
 ## The iteration protocol
 
@@ -133,15 +139,15 @@ Nothing runs until something pulls. `take` stops pulling after `n` items, so the
 ### yield*, return values, and two-way communication
 
 ```js
-function* waves() {
-  yield* ['slime', 'slime'];          // delegate to another iterable
-  yield* bossWave();                  // or another generator
-  return 'victory';                   // becomes { value: 'victory', done: true }, ignored by for...of
+function* passes() {
+  yield* ['clear', 'base noise'];     // delegate to another iterable
+  yield* erosion();                   // or another generator
+  return 'finished';                  // becomes { value: 'finished', done: true }, ignored by for...of
 }
-function* bossWave() { yield 'troll'; yield 'dragon'; }
-console.log([...waves()]);
+function* erosion() { yield 'thermal'; yield 'hydraulic'; }
+console.log([...passes()]);
 
-const it = waves();
+const it = passes();
 let r;
 while (!(r = it.next()).done) {}
 console.log(r);
@@ -169,32 +175,64 @@ const m = new Map([['a', 1], ['b', 2], ['c', 3]]);
 console.log(m.values().map(v => v * 2).toArray(), m.keys().find(k => k > 'a'));
 ```
 
-### Generators as coroutines
+### Generators that produce geometry
 
-The killer game use: a generator can **pause in the middle of a function** and resume later, which makes scripted sequences (cutscenes, enemy patterns, tutorials) read top to bottom instead of as a state machine. Unity's coroutines (`IEnumerator` plus `yield return new WaitForSeconds(1)`) are exactly this, built on C#'s iterators.
+Generators are a natural way to describe *where things go* without deciding how many you need or where they're stored: sample points, grid cells, the symbols of an L-system.
 
 ```js
-function* guardPatrol(guard) {
-  while (true) {
-    guard.say = 'walking right';
-    for (let i = 0; i < 3; i++) { guard.x++; yield; }      // one step per frame
-    guard.say = 'looking around';
-    yield 2;                                                 // convention here: yield n = wait n frames
-    guard.x -= 3;
+// Points on a golden-angle spiral (Vogel's method): evenly spread "sunflower" disc sampling
+function* sunflower(n, radius) {
+  const golden = Math.PI * (3 - Math.sqrt(5));
+  for (let i = 0; i < n; i++) {
+    const r = radius * Math.sqrt((i + 0.5) / n), a = i * golden;
+    yield [+(r * Math.cos(a)).toFixed(3), +(r * Math.sin(a)).toFixed(3)];
   }
 }
-const guard = { x: 0, say: '' };
-const co = guardPatrol(guard);
-let wait = 0;
-for (let frame = 0; frame < 8; frame++) {                    // the game loop
-  if (wait > 0) { wait--; } else { wait = co.next().value ?? 0; }
-  console.log(frame, guard.x, guard.say);
+console.log([...sunflower(4, 1)]);
+
+// An L-system rewrites every symbol by a rule, again and again.
+// Expanding lazily, depth first, never builds the (exponentially long) string.
+function* expand(symbols, rules, depth) {
+  for (const c of symbols) {
+    if (depth === 0 || !(c in rules)) yield c;
+    else yield* expand(rules[c], rules, depth - 1);
+  }
 }
+const algae = { A: 'AB', B: 'A' };
+console.log([...expand('A', algae, 5)].join(''));
+const koch = { F: 'F+F-F-F+F' };                       // F = draw forward, +/- = turn
+console.log([...expand('F', koch, 2)].join(''));
 ```
 
-The scheduler is the four lines in the loop; the behaviour reads like a script. One exercise builds a proper scheduler with time-based waits.
+A turtle interpreter then walks the symbols (`F` moves and emits a line segment, `+`/`-` turn, `[`/`]` push and pop the state) to produce the curve or plant. Because `expand` is lazy, the turtle can stream millions of segments straight into a vertex buffer without the whole string existing in memory.
 
-> **Performance:** iterators are an abstraction with a cost: each `next()` returns a result object and each generator resumption saves and restores a frame. Engines optimize `for...of` over plain arrays to roughly an indexed loop, but generator pipelines and iterator helpers are slower than a hand-written loop. Use them for readable setup code, AI scripts and sequences (a few per frame), not for the inner loop over 10,000 particles. Likewise `[...map.values()]` allocates an array: iterate the map directly when you only need to read.
+### Time-sliced generation: generators as coroutines
+
+A generator can **pause in the middle of a function** and resume later. That's how you keep a page responsive while generating something big: do a slice of work, `yield`, let the frame render, continue next frame. Unity's coroutines (`IEnumerator` plus `yield return null`) are exactly this, built on C#'s iterators.
+
+```js
+function* generateTexture(tex, rowsPerSlice) {
+  for (let y = 0; y < tex.height; y++) {
+    for (let x = 0; x < tex.width; x++) {
+      tex.data[y * tex.width + x] = ((x ^ y) & 7) * 32;      // an XOR pattern, cheap stand-in for noise
+    }
+    if ((y + 1) % rowsPerSlice === 0) yield y + 1;          // rows done so far
+  }
+  return 'done';
+}
+const tex = { width: 8, height: 8, data: new Uint8Array(64) };
+const job = generateTexture(tex, 3);
+for (let frame = 0; ; frame++) {                            // stand-in for the render loop
+  const r = job.next();
+  console.log('frame', frame, r.done ? r.value : `${r.value} rows`);
+  if (r.done) break;
+}
+console.log(tex.data.slice(0, 8).join(' '));
+```
+
+The generator keeps its loop variables between slices, so the code reads like the straightforward nested loop, with no manual state machine. One exercise builds a proper scheduler with time-based waits.
+
+> **Performance:** iterators are an abstraction with a cost: each `next()` returns a result object and each generator resumption saves and restores a frame. Engines optimize `for...of` over plain arrays to roughly an indexed loop, but generator pipelines and iterator helpers are slower than a hand-written loop. Use them for structure (a job per texture, a yield per row or per tile), never per pixel or per vertex: notice the generator above yields once per *slice*, and the inner loop is a plain `for`. Likewise `[...map.values()]` allocates an array: iterate the map directly when you only need to read.
 
 ## Spread and for...of over anything iterable
 
@@ -212,10 +250,10 @@ console.log(topName);
 for (const [i, ch] of [...'ab'].entries()) console.log(i, ch);
 ```
 
-=== exercise inventory
-title: Inventory with a Map
+=== exercise histogram
+title: A histogram with a Map
 --- prompt
-Write `class Inventory` backed by a `Map` from item name to quantity:
+Counting things by key is everywhere in procedural work: colors in a palette-reduced image, biome types on a map, symbols in an L-system. Write `class Histogram` backed by a `Map` from key to count:
 
 - `add(item, qty = 1)`: adds; returns the new quantity. `qty` must be a positive integer, otherwise throw a `RangeError`.
 - `remove(item, qty = 1)`: removes if there are at least `qty`; returns `true`, or returns `false` and changes nothing if there aren't enough. When a count reaches 0, the item is deleted entirely.
@@ -225,15 +263,15 @@ Write `class Inventory` backed by a `Map` from item name to quantity:
 - Iterable: `for (const [item, qty] of inv)` yields entries in the order items were first added (an item removed completely and added again goes to the end).
 - `static from(entries)`: builds an inventory from any iterable of `[item, qty]` pairs (repeated items accumulate).
 
-Item names can be any value, including ones like `'constructor'` and `'__proto__'` that would break a plain-object implementation.
+Keys can be any value, including ones like `'constructor'` and `'__proto__'` that would break a plain-object implementation.
 --- starter
-class Inventory {
+class Histogram {
   items = {};
   add(item, qty = 1) { this.items[item] = (this.items[item] || 0) + qty; return this.items[item]; }
   count(item) { return this.items[item] || 0; }
 }
 --- solution
-class Inventory {
+class Histogram {
   #items = new Map();
 
   add(item, qty = 1) {
@@ -261,7 +299,7 @@ class Inventory {
   [Symbol.iterator]() { return this.#items.entries(); }
 
   static from(entries) {
-    const inv = new Inventory();
+    const inv = new Histogram();
     for (const [item, qty] of entries) inv.add(item, qty);
     return inv;
   }
@@ -272,7 +310,7 @@ class Inventory {
 Map preserves insertion order, and a deleted-then-re-added key goes to the end, which is exactly the required order.
 --- harness
 {
-  const inv = new Inventory();
+  const inv = new Histogram();
   eq(inv.add('potion', 3), 3);
   eq(inv.add('sword'), 1);
   eq(inv.add('potion', 2), 5);
@@ -288,95 +326,98 @@ Map preserves insertion order, and a deleted-then-re-added key goes to the end, 
   throws(() => inv.add('x', -2), 'negative qty');
   throws(() => inv.add('x', 1.5), 'fractional qty');
   eq(inv.count('x'), 0);
-  const odd = new Inventory();
+  const odd = new Histogram();
   odd.add('constructor'); odd.add('__proto__', 2); odd.add('toString');
   eq([odd.count('constructor'), odd.count('__proto__'), odd.count('toString'), odd.count('hasOwnProperty')], [1, 2, 1, 0], 'tricky names');
   const key = { id: 1 };
   odd.add(key, 4);
   eq(odd.count(key), 4, 'object keys');
   eq(odd.count({ id: 1 }), 0, 'by identity');
-  const f = Inventory.from([['a', 1], ['b', 2], ['a', 3]]);
-  check(f instanceof Inventory, 'from returns an Inventory');
+  const f = Histogram.from([['a', 1], ['b', 2], ['a', 3]]);
+  check(f instanceof Histogram, 'from returns an Histogram');
   eq([...f], [['a', 4], ['b', 2]]);
   function* gen() { yield ['g', 1]; yield ['g', 1]; }
-  eq(Inventory.from(gen()).count('g'), 2, 'from takes any iterable');
-  eq(new Inventory().total, 0);
+  eq(Histogram.from(gen()).count('g'), 2, 'from takes any iterable');
+  eq(new Histogram().total, 0);
   const fromMap = new Map(f);
   eq(fromMap.get('a'), 4, 'spreadable into a Map');
 }
 
-=== exercise input
-title: Just pressed, just released
+=== exercise weld
+title: Welding vertices
 --- prompt
-Game input needs edges, not just state: jump when Space *goes down*, not every frame it's held. Write `class InputTracker`:
+Mesh generators often emit each triangle with its own three vertices, so a vertex shared by six triangles appears six times. **Welding** merges identical vertices and produces an index buffer, which is what the GPU wants: less vertex data, and the post-transform cache can reuse shared vertices.
 
-- `update(held)`: called once per frame with the set of currently held key codes (an iterable; on this site you'd pass the global `keys`). It must **copy** what it needs, because the caller's Set keeps changing.
-- `pressed(code)`: true if `code` is held this frame but wasn't last frame.
-- `released(code)`: true if it was held last frame but isn't now.
-- `held(code)`: held this frame.
-- `get pressedKeys()`: an array of all codes pressed this frame, sorted.
+Write `weld(positions)` where `positions` is a flat array `[x0, y0, z0, x1, y1, z1, ...]`. Return `{ vertices, indices }`:
 
-Before the first `update`, nothing is held. Each `update` should make the "current" state from the previous call become "previous".
+- `vertices`: a flat array of the **unique** positions, in order of first appearance.
+- `indices`: for each input vertex, the index (vertex number, not array offset) of its unique position.
+
+Two positions are identical only if all three components are exactly equal (`0` and `-0` count as equal). The tests include 300,000 input vertices, which must be welded in well under a second: an `indexOf`-style search over the unique vertices so far is O(n²) and will time out. Use a `Map`. A nested `Map` (x to Map of y to Map of z) avoids building a string per vertex; a string key also passes here, since welding runs once at load time.
 --- starter
-class InputTracker {
-  update(held) { this.now = held; }
-  held(code) { return this.now.has(code); }
-  pressed(code) { return this.held(code); }
-  released(code) { return false; }
-  get pressedKeys() { return []; }
+function weld(positions) {
+  const vertices = [], indices = [];
+  for (let i = 0; i < positions.length; i += 3) {
+    let found = -1;
+    for (let j = 0; j < vertices.length; j += 3) {
+      if (vertices[j] === positions[i] && vertices[j + 1] === positions[i + 1] && vertices[j + 2] === positions[i + 2]) { found = j / 3; break; }
+    }
+    if (found < 0) { found = vertices.length / 3; vertices.push(positions[i], positions[i + 1], positions[i + 2]); }
+    indices.push(found);
+  }
+  return { vertices, indices: indices.slice(1) };
 }
 --- solution
-class InputTracker {
-  #prev = new Set();
-  #cur = new Set();
-
-  update(held) {
-    const t = this.#prev;
-    this.#prev = this.#cur;
-    t.clear();                       // reuse the old set: no allocation per frame
-    for (const k of held) t.add(k);
-    this.#cur = t;
+function weld(positions) {
+  const root = new Map();
+  const vertices = [], indices = [];
+  for (let i = 0; i < positions.length; i += 3) {
+    const x = positions[i], y = positions[i + 1], z = positions[i + 2];
+    let my = root.get(x);
+    if (!my) root.set(x, (my = new Map()));
+    let mz = my.get(y);
+    if (!mz) my.set(y, (mz = new Map()));
+    let idx = mz.get(z);
+    if (idx === undefined) {
+      idx = vertices.length / 3;
+      mz.set(z, idx);
+      vertices.push(x, y, z);
+    }
+    indices.push(idx);
   }
-  held(code) { return this.#cur.has(code); }
-  pressed(code) { return this.#cur.has(code) && !this.#prev.has(code); }
-  released(code) { return !this.#cur.has(code) && this.#prev.has(code); }
-  get pressedKeys() { return [...this.#cur].filter(k => !this.#prev.has(k)).sort(); }
+  return { vertices, indices };
 }
 --- hint
-Keep two Sets, previous and current. On `update`, current becomes previous, and the new current is filled from `held`.
+Map keys use SameValueZero, so `0` and `-0` are the same key automatically, and numbers don't need converting to strings.
 --- hint
-To avoid allocating a Set every frame, swap the two and `clear()` the old one before filling it.
+Three levels of `Map`: `root.get(x)?.get(y)?.get(z)` is the vertex index if it exists. Create the inner maps on demand.
 --- harness
 {
-  const t = new InputTracker();
-  check(!t.held('Space') && !t.pressed('Space') && !t.released('Space'), 'nothing before first update');
-  const keysNow = new Set(['Space']);
-  t.update(keysNow);
-  check(t.pressed('Space') && t.held('Space') && !t.released('Space'), 'frame 1: pressed');
-  keysNow.add('ArrowLeft');
-  check(!t.held('ArrowLeft'), 'copied, not referenced');
-  t.update(keysNow);
-  check(!t.pressed('Space') && t.held('Space'), 'frame 2: held, not pressed again');
-  check(t.pressed('ArrowLeft'), 'frame 2: left pressed');
-  keysNow.delete('Space');
-  t.update(keysNow);
-  check(t.released('Space') && !t.held('Space'), 'frame 3: released');
-  check(!t.pressed('ArrowLeft') && !t.released('ArrowLeft'), 'left still held');
-  t.update(keysNow);
-  check(!t.released('Space'), 'released only for one frame');
-  t.update(['KeyW', 'KeyA', 'ArrowLeft']);
-  eq(t.pressedKeys, ['KeyA', 'KeyW'], 'pressedKeys sorted, from an array');
-  t.update(new Set());
-  eq(t.pressedKeys, []);
-  check(t.released('KeyW') && t.released('ArrowLeft'), 'all released');
-  t.update(['KeyW']); t.update([]); t.update(['KeyW']);
-  check(t.pressed('KeyW'), 'tap, release, tap again');
+  // two triangles of a quad, emitted unshared
+  const quad = [0, 0, 0, 1, 0, 0, 1, 1, 0, 0, 0, 0, 1, 1, 0, 0, 1, 0];
+  eq(weld(quad), { vertices: [0, 0, 0, 1, 0, 0, 1, 1, 0, 0, 1, 0], indices: [0, 1, 2, 0, 2, 3] });
+  eq(weld([]), { vertices: [], indices: [] });
+  eq(weld([0, 0, 0, -0, 0, -0]).indices, [0, 0], '-0 equals 0');
+  eq(weld([1, 2, 3, 1, 3, 2, 3, 2, 1]).indices, [0, 1, 2], 'component order matters');
+  eq(weld([0.1 + 0.2, 0, 0, 0.3, 0, 0]).indices, [0, 1], 'exact equality only');
+  // a 100x500 grid of quads emitted as separate triangles: 300,000 input vertices
+  const W = 100, H = 500, pos = [];
+  for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
+    pos.push(x, y, 0, x + 1, y, 0, x + 1, y + 1, 0, x, y, 0, x + 1, y + 1, 0, x, y + 1, 0);
+  }
+  const t = performance.now();
+  const r = weld(pos);
+  const ms = performance.now() - t;
+  eq(r.indices.length, W * H * 6);
+  eq(r.vertices.length / 3, (W + 1) * (H + 1), 'grid has (W+1)(H+1) unique vertices');
+  eq(r.indices.slice(0, 6), [0, 1, 2, 0, 2, 3]);
+  check(r.indices.every(i => i >= 0 && i < (W + 1) * (H + 1)), 'indices in range');
+  check(ms < 800, `welding ${W * H * 6} vertices took ${ms.toFixed(0)} ms (want < 800)`);
 }
-
 === exercise spatialHash
-title: Collisions with a spatial hash
+title: Overlaps with a spatial hash
 --- prompt
-Checking every pair of `n` objects for collisions is O(n²): 40,000 bullets means 800 million checks per frame. A **spatial hash** buckets objects by grid cell so each object is only tested against its neighbours.
+Scattering 40,000 pebbles or bushes over a terrain, you need to find the ones that overlap (to reject or nudge them). Checking every pair is O(n²): 800 million checks. A **spatial hash** buckets objects by grid cell so each object is only tested against its neighbours. The same structure powers Poisson-disk sampling and particle neighbour searches.
 
 Write `findCollisions(circles, cellSize)` where `circles` is an array of `{ x, y, r }` (radius at most `cellSize / 2`). Return all pairs `[i, j]` (indexes into `circles`, `i < j`) whose circles overlap, meaning the distance between centres is **less than** `ri + rj`. Sort the pairs by `i`, then `j`.
 
@@ -478,7 +519,7 @@ Write these as **generator functions** that work on any iterable, including infi
 - `chunks(iter, size)`: arrays of `size` items; the last may be shorter; no empty chunk at the end.
 - `cycle(iter)`: repeats the items of a finite iterable forever (it may need to remember them on the first pass). An empty input yields nothing.
 
-Game use: `take(cycle(['idle1', 'idle2', 'idle3']), 7)` is a looping animation; `zip(naturals(), waves)` numbers waves.
+Typical use: `take(cycle(palette), n)` repeats a palette across `n` stripes; `zip(naturals(), points)` numbers generated points; `chunks(flatPositions, 3)` groups coordinates into vertices.
 --- starter
 function* naturals(start = 0) {}
 function* take(iter, n) {}
@@ -582,9 +623,9 @@ For `take`, check the counter *after* yielding and `return` right away: a `for..
 === exercise coroutines
 title: A coroutine scheduler
 --- prompt
-Write `class Scheduler` that runs generator-based scripts, the way Unity runs coroutines:
+Generating a large world in one go freezes the page. Instead, each generation job (terrain, then foliage, then a texture bake) is a generator that does a slice of work and yields. Write `class Scheduler` that runs such generator-based jobs, the way Unity runs coroutines:
 
-- `start(gen)`: adds a generator object (already created, e.g. `sched.start(cutscene())`) and **immediately runs it to its first `yield`**.
+- `start(gen)`: adds a generator object (already created, e.g. `sched.start(bakeTerrain())`) and **immediately runs it to its first `yield`**.
 - What a script yields decides when it resumes:
   - `yield` (undefined): resume on the next `update`.
   - `yield seconds` (a number): resume on the first `update` at which at least that much time has passed since the yield. Time is the sum of `dt` values passed to `update`.
@@ -645,24 +686,24 @@ Iterate over a copy of the script list in `update`, so scripts started during th
 --- harness
 {
   const sch = new Scheduler(), log = [];
-  function* cutscene() {
-    log.push('fade in');
+  function* bakeJob() {
+    log.push('alloc');
     yield 1;
-    log.push('hero speaks');
+    log.push('noise');
     yield;
-    log.push('next frame');
+    log.push('normals');
     yield 0.5;
-    log.push('end');
+    log.push('done');
   }
-  sch.start(cutscene());
-  eq(log, ['fade in'], 'runs to first yield immediately');
+  sch.start(bakeJob());
+  eq(log, ['alloc'], 'runs to first yield immediately');
   eq(sch.count, 1);
   sch.update(0.4); eq(log.length, 1);
   sch.update(0.4); eq(log.length, 1);
-  sch.update(0.2); eq(log.at(-1), 'hero speaks', 'after 1.0s (with float error)');
-  sch.update(0.016); eq(log.at(-1), 'next frame');
+  sch.update(0.2); eq(log.at(-1), 'noise', 'after 1.0s (with float error)');
+  sch.update(0.016); eq(log.at(-1), 'normals');
   sch.update(0.3); eq(log.length, 3);
-  sch.update(0.3); eq(log.at(-1), 'end');
+  sch.update(0.3); eq(log.at(-1), 'done');
   eq(sch.count, 0, 'finished scripts removed');
 
   const s2 = new Scheduler(), order = [];
@@ -701,10 +742,93 @@ Iterate over a copy of the script list in `update`, so scripts started during th
   eq([ran, s5.count], [1, 0], 'script that never yields finishes at start');
 }
 
-=== exercise ring
-title: Ring buffer event queue
+=== exercise lsystem
+title: Lazy L-systems
 --- prompt
-An event queue with `push` + `shift` on an array is O(n) per dequeue. Write `class RingBuffer` with a fixed `capacity` backed by a preallocated array:
+Write a generator function `lsystem(axiom, rules, depth)` that yields, one character at a time, the string an L-system produces after `depth` rewriting steps. `rules` is an object mapping a character to its replacement string; characters without a rule (like `+`, `-`, `[`, `]`) are copied unchanged. Depth 0 yields the axiom itself.
+
+```js
+[...lsystem('A', { A: 'AB', B: 'A' }, 4)].join('')   // 'ABAABABA'
+```
+
+The catch: the output grows exponentially. The algae system at depth 40 is about 270 million characters, and the tests read the **first few characters** of it, then count all characters of depth 20, then read a Koch curve. Building strings step by step (`s = s.replace(...)` or `[...s].map(c => rules[c] ?? c).join('')` per level) runs out of time and memory. Expand lazily and depth-first, so memory stays proportional to `depth`.
+
+Also write `turtle(symbols, angleDeg)` that interprets any iterable of symbols and returns the **number of line segments** and the final position, `{ segments, x, y }`, rounded to 6 decimals: start at `(0, 0)` facing `+x`; `F` moves forward 1 and draws a segment; `f` moves 1 without drawing; `+` turns left (counter-clockwise) by `angleDeg`; `-` turns right; `[` pushes position and heading; `]` pops them; anything else is ignored.
+--- starter
+function* lsystem(axiom, rules, depth) {
+  let s = axiom;
+  for (let i = 0; i < depth; i++) s = [...s].map(c => rules[c] ?? c).join('');
+  yield* s;
+}
+
+function turtle(symbols, angleDeg) {
+  return { segments: 0, x: 0, y: 0 };
+}
+--- solution
+function* lsystem(axiom, rules, depth) {
+  for (const c of axiom) {
+    const r = rules[c];
+    if (depth === 0 || r === undefined) yield c;
+    else yield* lsystem(r, rules, depth - 1);
+  }
+}
+
+function turtle(symbols, angleDeg) {
+  const step = angleDeg * Math.PI / 180;
+  let x = 0, y = 0, a = 0, segments = 0;
+  const stack = [];
+  for (const c of symbols) {
+    if (c === 'F' || c === 'f') {
+      x += Math.cos(a); y += Math.sin(a);
+      if (c === 'F') segments++;
+    } else if (c === '+') a += step;
+    else if (c === '-') a -= step;
+    else if (c === '[') stack.push(x, y, a);
+    else if (c === ']') { a = stack.pop(); y = stack.pop(); x = stack.pop(); }
+  }
+  const r6 = v => Math.round(v * 1e6) / 1e6 + 0;
+  return { segments, x: r6(x), y: r6(y) };
+}
+--- hint
+Recursion with `yield*`: for each character of the current string, either yield it (depth 0 or no rule) or delegate to `lsystem(rule, rules, depth - 1)`.
+--- hint
+For the turtle, a flat stack (`push(x, y, a)`, then pop in reverse order) avoids allocating an object per `[`. Round with `Math.round(v * 1e6) / 1e6`, and add `0` to turn `-0` into `0`.
+--- harness
+{
+  const algae = { A: 'AB', B: 'A' };
+  eq([...lsystem('A', algae, 0)].join(''), 'A');
+  eq([...lsystem('A', algae, 4)].join(''), 'ABAABABA');
+  eq([...lsystem('F+F', { F: 'F-F' }, 2)].join(''), 'F-F-F-F+F-F-F-F', 'symbols without rules are copied');
+  eq([...lsystem('', algae, 3)], []);
+  let n = 0;
+  for (const _ of lsystem('A', algae, 20)) n++;
+  eq(n, 17711, 'depth 20 length is fib(22)');
+  const t = performance.now();
+  const it = lsystem('A', algae, 40);
+  const first = [];
+  for (const c of it) { first.push(c); if (first.length === 12) break; }
+  const ms = performance.now() - t;
+  eq(first.join(''), 'ABAABABAABAA', 'prefix of depth 40');
+  check(ms < 200, `reading 12 symbols of depth 40 took ${ms.toFixed(0)} ms (want < 200)`);
+  check(typeof lsystem('A', algae, 1).next === 'function', 'returns an iterator');
+
+  eq(turtle('', 90), { segments: 0, x: 0, y: 0 });
+  eq(turtle('FF+F', 90), { segments: 3, x: 2, y: 1 });
+  eq(turtle('F-F', 90), { segments: 2, x: 1, y: -1 });
+  eq(turtle('fF', 45), { segments: 1, x: 2, y: 0 });
+  eq(turtle('F[+F]F', 90), { segments: 3, x: 2, y: 0 }, 'push/pop restores state');
+  eq(turtle('F+F+F+F', 90), { segments: 4, x: 0, y: 0 }, 'square closes');
+  const koch = turtle(lsystem('F', { F: 'F+F--F+F' }, 3), 60);
+  eq(koch, { segments: 64, x: 27, y: 0 }, 'Koch curve: 4^3 segments, spans 3^3');
+  const plant = turtle(lsystem('X', { X: 'F[+X][-X]FX', F: 'FF' }, 4), 25);
+  eq(plant.segments, 225);
+  near(plant.x, 16 + 0, 1e-6, 'plant trunk goes straight along x');
+}
+
+=== exercise ring
+title: Ring buffer
+--- prompt
+A rolling window of the last N frame times (for a smoothed fps readout) or a BFS work queue built with `push` + `shift` on an array is O(n) per dequeue. Write `class RingBuffer` with a fixed `capacity` backed by a preallocated array:
 
 - `push(x)`: adds at the back; returns `true`, or `false` (and does nothing) when full.
 - `shift()`: removes and returns the front item, or `undefined` if empty.
@@ -964,7 +1088,7 @@ Spreading the *iterable* asks it for a fresh iterator each time. A generator obj
 
 === quiz
 --- q
-An A* pathfinder stores costs in `costs.get(`${x},${y}`)` and runs slowly. What's the most effective fix?
+A flood fill over an image tracks visited pixels with `visited.has(`${x},${y}`)` and runs slowly. What's the most effective fix?
 --- choice
 Switch from a `Map` to a plain object with the same string keys.
 --- answer

@@ -1,0 +1,1843 @@
+=== chapter projects
+title: Projects
+blurb: Capstone projects for procedural graphics tooling: a seeded random number library, a texture formula compiler, a texture cache, a node-graph compositor and an easing library. Built in steps.
+--- body
+## How these projects work
+
+Each project is a small library you would actually want in a procedural graphics toolkit, built in steps. A step marked as continuing an earlier one starts from **your own solution** to that step plus stubs for the new functions, exactly like growing a real codebase: you will live with your earlier design decisions, so make them clean. The tests are thorough, include edge cases, and several have time limits that a naive approach fails. Everything here is deterministic: the same inputs and seeds always give the same outputs, which is what makes procedural content testable and shareable.
+
+These are the tools *around* generation. The procedural generation track builds the generators themselves (noise, textures, terrain, L-systems, meshes); these libraries are what those generators run on.
+
+## 1. A seeded random number library
+
+Chapter 10 built `xorshift32` and FNV-1a. A production procedural toolkit wants more: a generator with better statistical quality (xorshift32 fails several standard tests), string seeds ("world name" seeds), helpers that are easy to get subtly wrong (unbiased shuffles, weighted choice), state you can save and restore, and **stateless hashing** of coordinates so any tile or chunk of an infinite world can be generated independently, in any order, on any thread, with identical results.
+
+> **Performance:** a generator is called millions of times per texture. It must not allocate: keep its state in local variables of a closure (or a small `Uint32Array`), return plain numbers, and use `Math.imul`, `| 0` and `>>> 0` so the engine keeps everything in 32-bit integer registers. Weighted choice over many items must be logarithmic (binary search over cumulative weights), not a linear scan.
+
+## 2. A texture formula compiler
+
+Procedural texture tools let users type formulas: `smoothstep(0.3, 0.7, fract(u * 8)) * (sin(v * tau) * 0.5 + 0.5)`. You will tokenize and parse such formulas into an abstract syntax tree (using the sticky-regex technique from chapter 08 and a recursive descent parser), evaluate the tree, and finally **compile** it into a tree of closures with constant folding, which runs a full-resolution texture about twenty times faster than walking the tree per pixel.
+
+> **Performance:** the bad habit here is doing per pixel what can be done once: re-parsing the formula, looking variables up by name in an object, allocating an environment object per pixel, or re-evaluating subexpressions that do not depend on the pixel. Parse once, resolve names to slots once, fold constants once, then run a tight loop that writes into a `Float32Array`.
+
+## 3. An LRU texture cache
+
+Generated textures are expensive to make and big to keep: a 2048 by 2048 RGBA8 texture is 16 MiB. A cache keeps the most recently used ones under a memory budget, evicts the least recently used when it is over, and tells you which ones it evicted so you can release their GPU memory (`texture.destroy()` in WebGPU). It must also deduplicate concurrent requests: if two materials ask for the same texture while it is being generated, it must be generated once.
+
+> **Performance:** every operation must be O(1). A JavaScript `Map` iterates in insertion order, so deleting and re-inserting a key moves it to the "most recent" end, and the first key is always the least recent: a complete LRU with no linked list. The naive version (`array.indexOf` plus `splice` to reorder) is O(n) per access and collapses at a few thousand entries.
+
+## 4. A node-graph texture compositor
+
+Substance Designer, Blender's shader editor and Houdini all present procedural textures as a **graph**: nodes (generators and filters) connected by edges. Evaluating it means sorting the nodes topologically, detecting cycles, evaluating each needed node exactly once into its own buffer, and, when the user tweaks one slider, re-evaluating **only** the nodes downstream of that change.
+
+> **Performance:** each node's output is a `Float32Array` that is allocated once and overwritten on recompute, never reallocated. Recomputing the whole graph when one parameter changes is the classic bad habit; dirty tracking turns a multi-second rebuild into a few milliseconds when only the last node changed.
+
+## 5. Easing curves
+
+Tweening camera moves, blending parameters over time and animating procedural values all need easing functions, including the designer-friendly `cubic-bezier(x1, y1, x2, y2)` curves from CSS, which require solving a cubic numerically for every sample.
+
+> **Performance:** a bezier easing is evaluated per frame per animated value, so it must not allocate; Newton's method usually converges in three or four iterations, with bisection as a safe fallback. Sampling a long keyframe track should use binary search to find the active segment.
+
+=== exercise prng1
+title: Random library, step 1: the generator
+--- prompt
+Write `createRng(seed)` returning a generator object. The starter contains `fnv1a` from chapter 10.
+
+**Seeding.** `seed` is a number (use `seed >>> 0`) or a string (use `fnv1a(seed)`); anything else (or a non-finite number) throws a `TypeError`. Expand the 32-bit seed into four state words `a, b, c, d` with four calls to **splitmix32**, then discard the first **12** outputs of the generator (warm-up).
+
+**Generator: sfc32.** The two algorithms, with all arithmetic 32-bit:
+
+```text
+splitmix32 (state s):              sfc32 next() (state a, b, c, d):
+  s = (s + 0x9E3779B9) | 0           t = (((a + b) | 0) + d) | 0
+  z = s                              d = (d + 1) | 0
+  z = imul(z ^ (z >>> 16), 0x85EBCA6B)   a = b ^ (b >>> 9)
+  z = imul(z ^ (z >>> 13), 0xC2B2AE35)   b = (c + (c << 3)) | 0
+  return (z ^ (z >>> 16)) >>> 0      c = (c << 21) | (c >>> 11)
+                                     c = (c + t) | 0
+                                     return t >>> 0
+```
+
+**Methods:**
+
+- `next()`: the next unsigned 32-bit integer.
+- `float()`: `next() / 2^32`, in [0, 1).
+- `int(lo, hi)`: an integer in `[lo, hi]` inclusive: `lo + Math.floor(float() * (hi - lo + 1))`. Throws a `RangeError` unless both are integers and `lo <= hi`.
+- `range(lo, hi)`: `lo + float() * (hi - lo)`.
+- `bool(p = 0.5)`: `float() < p`.
+- `getState()`: a new array `[a, b, c, d]` of unsigned values; `setState(arr)` restores it, so a generator can be saved and resumed exactly.
+
+Each method uses exactly one `next()` call. For seed `1`, the first three `next()` values are `1828152527, 3394835397, 2967886022`. The harness generates five million floats under a time limit, so no allocation per call.
+--- starter
+// From chapter 10: FNV-1a over UTF-8 bytes.
+const utf8_ = new TextEncoder();
+function fnv1a(str) {
+  let h = 0x811c9dc5;
+  for (const b of utf8_.encode(str)) h = Math.imul(h ^ b, 0x01000193);
+  return h >>> 0;
+}
+
+function createRng(seed) {
+  return {
+    next() { return 0; },
+    float() { return Math.random(); },
+    int(lo, hi) { return lo; },
+    range(lo, hi) { return lo; },
+    bool(p = 0.5) { return false; },
+    getState() { return []; },
+    setState(s) {},
+  };
+}
+--- solution
+const utf8_ = new TextEncoder();
+function fnv1a(str) {
+  let h = 0x811c9dc5;
+  for (const b of utf8_.encode(str)) h = Math.imul(h ^ b, 0x01000193);
+  return h >>> 0;
+}
+
+function createRng(seed) {
+  if (typeof seed === 'string') seed = fnv1a(seed);
+  else if (typeof seed !== 'number' || !Number.isFinite(seed)) throw new TypeError('seed must be a number or string');
+  let sm = seed >>> 0;
+  const split = () => {
+    sm = (sm + 0x9E3779B9) | 0;
+    let z = sm;
+    z = Math.imul(z ^ (z >>> 16), 0x85EBCA6B);
+    z = Math.imul(z ^ (z >>> 13), 0xC2B2AE35);
+    return (z ^ (z >>> 16)) >>> 0;
+  };
+  let a = split(), b = split(), c = split(), d = split();
+  const rng = {
+    next() {
+      const t = (((a + b) | 0) + d) | 0;
+      d = (d + 1) | 0;
+      a = b ^ (b >>> 9);
+      b = (c + (c << 3)) | 0;
+      c = (c << 21) | (c >>> 11);
+      c = (c + t) | 0;
+      return t >>> 0;
+    },
+    float() { return rng.next() / 4294967296; },
+    int(lo, hi) {
+      if (!Number.isInteger(lo) || !Number.isInteger(hi) || hi < lo) throw new RangeError('bad int range');
+      return lo + Math.floor(rng.float() * (hi - lo + 1));
+    },
+    range(lo, hi) { return lo + rng.float() * (hi - lo); },
+    bool(p = 0.5) { return rng.float() < p; },
+    getState() { return [a >>> 0, b >>> 0, c >>> 0, d >>> 0]; },
+    setState(s) { [a, b, c, d] = s.map(x => x | 0); },
+  };
+  for (let i = 0; i < 12; i++) rng.next();
+  return rng;
+}
+--- hint
+Keep `a, b, c, d` as `let` variables in `createRng`'s scope and write the methods as closures over them. Write `next` first and build every other method on it.
+--- hint
+`| 0` after every addition keeps values in signed 32-bit range; `>>> 0` turns the final result unsigned. In `setState`, convert back with `| 0` so arithmetic stays 32-bit.
+--- harness
+{
+  const r1 = createRng(1);
+  eq([r1.next(), r1.next(), r1.next()], [1828152527, 3394835397, 2967886022], 'seed 1');
+  const rs = createRng('marble');
+  eq([rs.next(), rs.next()], [1925071779, 1762196146], 'string seed via fnv1a');
+  const r42 = createRng(42);
+  eq(r42.float(), 0.23955312534235418, 'float');
+  eq(r42.int(1, 6), 4, 'int');
+  eq(r42.range(-1, 1), -0.8135316744446754, 'range');
+  eq(r42.bool(), true, 'bool');
+  eq(createRng(0).next(), 4205396811, 'seed 0 is fine');
+  eq(createRng(2 ** 32 + 1).next(), 1828152527, 'seed taken mod 2^32');
+  for (const bad of [{}, null, undefined, NaN, Infinity, [1]]) throws(() => createRng(bad), 'bad seed ' + String(bad));
+  const r = createRng(9);
+  throws(() => r.int(5, 1), 'lo > hi');
+  throws(() => r.int(1.5, 3), 'non-integer');
+  const seen = new Set();
+  for (let i = 0; i < 300; i++) { const v = r.int(-1, 1); seen.add(v); }
+  eq([...seen].sort(), [-1, 0, 1], 'int range inclusive');
+  eq(createRng(3).int(7, 7), 7);
+  let fl = true;
+  for (let i = 0; i < 10000; i++) { const f = r.float(); if (!(f >= 0 && f < 1)) fl = false; }
+  check(fl, 'float in [0, 1)');
+  let trues = 0;
+  for (let i = 0; i < 10000; i++) if (r.bool(0.25)) trues++;
+  check(trues > 2200 && trues < 2800, 'bool(0.25) about a quarter: ' + trues);
+
+  const g = createRng('save me');
+  g.next(); g.next();
+  const st = g.getState();
+  check(Array.isArray(st) && st.length === 4 && st.every(x => Number.isInteger(x) && x >= 0 && x < 2 ** 32), 'state is four uint32');
+  const ahead = [g.next(), g.next(), g.next()];
+  st[0] = 12345;
+  g.setState(g.getState());
+  const h = createRng(1);
+  const st2 = createRng('save me'); st2.next(); st2.next();
+  h.setState(st2.getState());
+  eq([h.next(), h.next(), h.next()], ahead, 'restored state resumes the same sequence');
+  const k = createRng('save me'); k.next(); k.next();
+  const snap = k.getState(); snap[1] = 0;
+  eq([k.next(), k.next(), k.next()], ahead, 'getState returns a copy');
+
+  const a1 = createRng(77), a2 = createRng(77), b1 = createRng(78);
+  const sa = [], sb = [];
+  for (let i = 0; i < 5; i++) { sa.push(a1.next()); check(a2.next() === sa[i], 'same seed same sequence'); sb.push(b1.next()); }
+  check(sa.join() !== sb.join(), 'neighbouring seeds differ');
+
+  const fast = createRng(5);
+  const t0 = performance.now();
+  let acc = 0;
+  for (let i = 0; i < 5e6; i++) acc += fast.float();
+  const ms = performance.now() - t0;
+  check(Math.abs(acc / 5e6 - 0.5) < 0.01, 'mean about 0.5');
+  check(ms < 1500, '5 million floats took ' + Math.round(ms) + 'ms');
+}
+
+=== exercise prng2
+title: Random library, step 2: shuffles, weights and coordinate hashing
+continues: prng1
+--- prompt
+Add helpers on top of your generator. All of them take the generator as a parameter so they work with any `createRng` instance.
+
+- `pick(rng, arr)`: `arr[rng.int(0, arr.length - 1)]`. For an empty array return `undefined` **without** consuming a random number.
+- `shuffle(rng, arr)`: shuffles `arr` **in place** with Fisher-Yates and returns it: for `i` from `arr.length - 1` down to `1`, `j = rng.int(0, i)`, swap `arr[i]` and `arr[j]`. (The popular `arr.sort(() => rng.float() - 0.5)` is biased and slow; never use it.)
+- `weightedPicker(weights)`: validates the weights (each finite and `>= 0`, total `> 0`, otherwise `RangeError`), precomputes **cumulative** sums once, and returns a function `rng => index`. The function draws `x = rng.float() * total` and returns the first index whose cumulative sum is **greater than** `x`, found by binary search. Zero-weight items are never chosen.
+- `hash2(seed, x, y)`: a stateless 32-bit hash of integer coordinates (negative ones too), unsigned: start with `h = seed ^ imul(x, 0x27D4EB2D) ^ imul(y, 0x165667B1)`, then apply the murmur3 finalizer: `h ^= h >>> 16; h = imul(h, 0x85EBCA6B); h ^= h >>> 13; h = imul(h, 0xC2B2AE35); h ^= h >>> 16`, and return `h >>> 0`.
+- `tileRng(seed, tx, ty)`: `createRng(hash2(seed, tx, ty))`, a generator for one tile of an infinite world, independent of the order in which tiles are generated.
+
+The harness picks a million times from ten thousand weights under a time limit.
+--- stubs
+function pick(rng, arr) {}
+
+function shuffle(rng, arr) {
+  return arr;
+}
+
+function weightedPicker(weights) {
+  return rng => 0;
+}
+
+function hash2(seed, x, y) {
+  return 0;
+}
+
+function tileRng(seed, tx, ty) {
+  return createRng(seed);
+}
+--- solution
+const utf8_ = new TextEncoder();
+function fnv1a(str) {
+  let h = 0x811c9dc5;
+  for (const b of utf8_.encode(str)) h = Math.imul(h ^ b, 0x01000193);
+  return h >>> 0;
+}
+
+function createRng(seed) {
+  if (typeof seed === 'string') seed = fnv1a(seed);
+  else if (typeof seed !== 'number' || !Number.isFinite(seed)) throw new TypeError('seed must be a number or string');
+  let sm = seed >>> 0;
+  const split = () => {
+    sm = (sm + 0x9E3779B9) | 0;
+    let z = sm;
+    z = Math.imul(z ^ (z >>> 16), 0x85EBCA6B);
+    z = Math.imul(z ^ (z >>> 13), 0xC2B2AE35);
+    return (z ^ (z >>> 16)) >>> 0;
+  };
+  let a = split(), b = split(), c = split(), d = split();
+  const rng = {
+    next() {
+      const t = (((a + b) | 0) + d) | 0;
+      d = (d + 1) | 0;
+      a = b ^ (b >>> 9);
+      b = (c + (c << 3)) | 0;
+      c = (c << 21) | (c >>> 11);
+      c = (c + t) | 0;
+      return t >>> 0;
+    },
+    float() { return rng.next() / 4294967296; },
+    int(lo, hi) {
+      if (!Number.isInteger(lo) || !Number.isInteger(hi) || hi < lo) throw new RangeError('bad int range');
+      return lo + Math.floor(rng.float() * (hi - lo + 1));
+    },
+    range(lo, hi) { return lo + rng.float() * (hi - lo); },
+    bool(p = 0.5) { return rng.float() < p; },
+    getState() { return [a >>> 0, b >>> 0, c >>> 0, d >>> 0]; },
+    setState(s) { [a, b, c, d] = s.map(x => x | 0); },
+  };
+  for (let i = 0; i < 12; i++) rng.next();
+  return rng;
+}
+function pick(rng, arr) {
+  return arr.length ? arr[rng.int(0, arr.length - 1)] : undefined;
+}
+
+function shuffle(rng, arr) {
+  for (let i = arr.length - 1; i > 0; i--) {
+    const j = rng.int(0, i);
+    const tmp = arr[i]; arr[i] = arr[j]; arr[j] = tmp;
+  }
+  return arr;
+}
+
+function weightedPicker(weights) {
+  const cum = new Float64Array(weights.length);
+  let total = 0;
+  weights.forEach((w, i) => {
+    if (!(Number.isFinite(w) && w >= 0)) throw new RangeError(`bad weight at ${i}: ${w}`);
+    total += w;
+    cum[i] = total;
+  });
+  if (!(total > 0)) throw new RangeError('weights must sum to more than 0');
+  return rng => {
+    const x = rng.float() * total;
+    let lo = 0, hi = cum.length - 1;
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1;
+      if (cum[mid] > x) hi = mid; else lo = mid + 1;
+    }
+    return lo;
+  };
+}
+
+function hash2(seed, x, y) {
+  let h = (seed ^ Math.imul(x, 0x27D4EB2D) ^ Math.imul(y, 0x165667B1)) | 0;
+  h ^= h >>> 16;
+  h = Math.imul(h, 0x85EBCA6B);
+  h ^= h >>> 13;
+  h = Math.imul(h, 0xC2B2AE35);
+  h ^= h >>> 16;
+  return h >>> 0;
+}
+
+function tileRng(seed, tx, ty) {
+  return createRng(hash2(seed, tx, ty));
+}
+--- hint
+For `weightedPicker`, store the running totals in a `Float64Array`. The binary search keeps `lo` and `hi` and moves `hi = mid` when `cum[mid] > x`, else `lo = mid + 1`, until they meet.
+--- hint
+`hash2` is the integer hash from chapter 10's toolbox: every multiplication must be `Math.imul`, and `x`, `y` may be negative (imul handles that, since it works on the 32-bit two's complement bits).
+--- harness
+{
+  eq(shuffle(createRng(7), [1, 2, 3, 4, 5, 6, 7, 8]), [1, 7, 4, 8, 5, 6, 3, 2], 'Fisher-Yates with seed 7');
+  const arr = [1, 2, 3];
+  check(shuffle(createRng(1), arr) === arr, 'in place, returns the array');
+  eq(shuffle(createRng(1), []), []);
+  eq(shuffle(createRng(1), ['x']), ['x']);
+  {
+    const r = createRng(11);
+    let ok = true;
+    for (let t = 0; t < 200; t++) {
+      const a = Array.from({ length: t % 17 }, (_, i) => i);
+      const s = shuffle(r, a.slice()).sort((x, y) => x - y);
+      if (s.join() !== a.join()) ok = false;
+    }
+    check(ok, 'always a permutation');
+    const firstCounts = [0, 0, 0, 0];
+    for (let t = 0; t < 8000; t++) firstCounts[shuffle(r, [0, 1, 2, 3])[0]]++;
+    check(firstCounts.every(c => c > 1800 && c < 2200), 'unbiased: ' + firstCounts);
+  }
+  {
+    const r = createRng(7);
+    eq([pick(r, ['a', 'b', 'c']), pick(r, ['a', 'b', 'c']), pick(r, ['a', 'b', 'c'])], ['a', 'b', 'c']);
+    const p = createRng(3), q = createRng(3);
+    eq(pick(p, []), undefined);
+    eq(p.next(), q.next(), 'empty pick consumes nothing');
+  }
+  {
+    const wp = weightedPicker([1, 0, 3]);
+    const r = createRng(5), counts = [0, 0, 0];
+    for (let i = 0; i < 40000; i++) counts[wp(r)]++;
+    eq(counts, [10006, 0, 29994], 'exact deterministic counts');
+    for (const bad of [[], [0, 0], [-1, 2], [1, NaN], [1, Infinity]]) throws(() => weightedPicker(bad), 'bad weights ' + bad);
+    eq(weightedPicker([0, 0, 5])(createRng(1)), 2, 'only positive weight');
+    const N = 10000, ws = Array.from({ length: N }, (_, i) => (i % 10) + 1);
+    const big = weightedPicker(ws), r2 = createRng(8);
+    const t0 = performance.now();
+    let sum = 0;
+    for (let i = 0; i < 1e6; i++) sum += big(r2);
+    const ms = performance.now() - t0;
+    check(Math.abs(sum / 1e6 - 5000) < 100, 'mean index about the middle');
+    check(ms < 1500, 'a million weighted picks took ' + Math.round(ms) + 'ms');
+  }
+  eq(hash2(1, 2, 3), 634893855);
+  eq(hash2(1, -2, 3), 3601038111, 'negative coordinates');
+  eq(hash2(42, 1000, -1000), 2439896532);
+  check(hash2(1, 2, 3) !== hash2(1, 3, 2), 'not symmetric');
+  check(hash2(1, 2, 3) !== hash2(2, 2, 3), 'seed matters');
+  {
+    let ones = 0, n = 0;
+    for (let y = -32; y < 32; y++) for (let x = -32; x < 32; x++) { ones += hash2(7, x, y) >>> 31; n++; }
+    check(Math.abs(ones / n - 0.5) < 0.05, 'top bit balanced over a grid');
+  }
+  eq(tileRng(99, 3, -4).next(), 4266204511);
+  const before = tileRng(5, 10, 10).next();
+  for (let i = 0; i < 5; i++) tileRng(5, i, 0).next();
+  eq(tileRng(5, 10, 10).next(), before, 'tiles are order independent');
+}
+
+=== exercise expr1
+title: Formula compiler, step 1: tokenize and parse
+--- prompt
+Write `parse(src)` that turns a texture formula into an abstract syntax tree. Node shapes:
+
+| node | shape |
+|---|---|
+| number | `{ type: 'num', value }` |
+| variable | `{ type: 'var', name }` |
+| negation | `{ type: 'unary', op: '-', arg }` |
+| binary | `{ type: 'bin', op, left, right }` |
+| call | `{ type: 'call', name, args: [...] }` |
+| conditional | `{ type: 'cond', test, then, else }` |
+
+Grammar, from lowest to highest precedence:
+
+1. `test ? a : b` (right associative: `a ? b : c ? d : e` is `a ? b : (c ? d : e)`)
+2. comparisons `<` `>` `<=` `>=` `==` `!=` (left associative)
+3. `+` `-` (left associative)
+4. `*` `/` `%` (left associative)
+5. unary `-` (may repeat: `--u`)
+6. `^` power, **right** associative, binding tighter than unary minus on its left but allowing one on its right: `-2^2` is `-(2^2)`, `2^3^2` is `2^(3^2)`, `2^-1` is `2^(-1)`
+7. numbers (`3`, `0.5`, `.5`, `1e-3`), identifiers (`[A-Za-z_]\w*`), calls `name(arg, arg, ...)` (zero or more arguments), and parentheses
+
+Whitespace is ignored. Any error (an unexpected character or token, a missing `)` or `:`, a trailing comma, unexpected end of input, leftover tokens) throws a `SyntaxError` whose message ends with `at N`, where `N` is the 0-based character position of the offending token (the input length for end of input). Chapter 08's sticky-regex tokenizer is a good start; a recursive descent parser with one function per precedence level is the standard technique.
+--- starter
+function parse(src) {
+  throw new SyntaxError('not implemented at 0');
+}
+--- solution
+const TOKEN_RE_ = /(?<ws>\s+)|(?<num>(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?)|(?<id>[A-Za-z_]\w*)|(?<op><=|>=|==|!=|[-+*\/%^(),?:<>])/y;
+
+function tokenize(src) {
+  const out = [];
+  TOKEN_RE_.lastIndex = 0;
+  while (TOKEN_RE_.lastIndex < src.length) {
+    const pos = TOKEN_RE_.lastIndex;
+    const m = TOKEN_RE_.exec(src);
+    if (!m) throw new SyntaxError(`Unexpected '${src[pos]}' at ${pos}`);
+    const g = m.groups;
+    if (g.num) out.push({ type: 'num', value: Number(g.num), pos });
+    else if (g.id) out.push({ type: 'id', value: g.id, pos });
+    else if (g.op) out.push({ type: 'op', value: g.op, pos });
+  }
+  out.push({ type: 'eof', value: '', pos: src.length });
+  return out;
+}
+
+function parse(src) {
+  const toks = tokenize(src);
+  let i = 0;
+  const peek = () => toks[i];
+  const isOp = (...ops) => peek().type === 'op' && ops.includes(peek().value);
+  const fail = msg => { throw new SyntaxError(`${msg} at ${peek().pos}`); };
+  const expect = op => { if (!isOp(op)) fail(`Expected '${op}'`); i++; };
+
+  function conditional() {
+    const test = comparison();
+    if (!isOp('?')) return test;
+    i++;
+    const then = conditional();
+    expect(':');
+    const otherwise = conditional();
+    return { type: 'cond', test, then, else: otherwise };
+  }
+  function binaryLevel(next, ops) {
+    return () => {
+      let left = next();
+      while (isOp(...ops)) {
+        const op = toks[i++].value;
+        left = { type: 'bin', op, left, right: next() };
+      }
+      return left;
+    };
+  }
+  function unary() {
+    if (isOp('-')) { i++; return { type: 'unary', op: '-', arg: unary() }; }
+    return power();
+  }
+  function power() {
+    const base = primary();
+    if (isOp('^')) { i++; return { type: 'bin', op: '^', left: base, right: unary() }; }
+    return base;
+  }
+  function primary() {
+    const t = peek();
+    if (t.type === 'num') { i++; return { type: 'num', value: t.value }; }
+    if (t.type === 'id') {
+      i++;
+      if (!isOp('(')) return { type: 'var', name: t.value };
+      i++;
+      const args = [];
+      if (!isOp(')')) {
+        do { args.push(conditional()); } while (isOp(',') && ++i);
+      }
+      expect(')');
+      return { type: 'call', name: t.value, args };
+    }
+    if (isOp('(')) { i++; const e = conditional(); expect(')'); return e; }
+    fail(t.type === 'eof' ? 'Unexpected end of input' : `Unexpected '${t.value}'`);
+  }
+  const multiplicative = binaryLevel(unary, ['*', '/', '%']);
+  const additive = binaryLevel(multiplicative, ['+', '-']);
+  const comparison = binaryLevel(additive, ['<', '>', '<=', '>=', '==', '!=']);
+  const ast = conditional();
+  if (peek().type !== 'eof') fail(`Unexpected '${peek().value}'`);
+  return ast;
+}
+--- hint
+Tokenize first into `{ type, value, pos }` with an `eof` token at the end. Then write one parsing function per precedence level; each calls the next-higher level for its operands and loops while it sees one of its operators (that loop produces left associativity).
+--- hint
+Right associativity falls out of recursion: `power()` parses a primary, and if it sees `^`, parses its right side by calling `unary()` (which handles `-` and then calls `power()` again). The conditional is similar: after `?`, parse the branches by calling `conditional()` itself.
+--- harness
+{
+  const show = n => n.type === 'num' ? String(n.value) : n.type === 'var' ? n.name
+    : n.type === 'unary' ? `(-${show(n.arg)})`
+    : n.type === 'bin' ? `(${show(n.left)} ${n.op} ${show(n.right)})`
+    : n.type === 'call' ? `${n.name}(${n.args.map(show).join(', ')})`
+    : n.type === 'cond' ? `(${show(n.test)} ? ${show(n.then)} : ${show(n.else)})` : '?' + JSON.stringify(n);
+  eq(parse('42'), { type: 'num', value: 42 });
+  eq(parse('u'), { type: 'var', name: 'u' });
+  eq(parse('-u'), { type: 'unary', op: '-', arg: { type: 'var', name: 'u' } });
+  eq(parse('f(1, x)'), { type: 'call', name: 'f', args: [{ type: 'num', value: 1 }, { type: 'var', name: 'x' }] });
+  eq(parse('a ? 1 : 2'), { type: 'cond', test: { type: 'var', name: 'a' }, then: { type: 'num', value: 1 }, else: { type: 'num', value: 2 } });
+  eq(parse('1 + 2'), { type: 'bin', op: '+', left: { type: 'num', value: 1 }, right: { type: 'num', value: 2 } });
+  const cases = {
+    '1 + 2 * 3': '(1 + (2 * 3))',
+    '(1 + 2) * 3': '((1 + 2) * 3)',
+    'a - b - c': '((a - b) - c)',
+    '8 % 3 * 2': '((8 % 3) * 2)',
+    '-2^2': '(-(2 ^ 2))',
+    '2^3^2': '(2 ^ (3 ^ 2))',
+    '2^-1': '(2 ^ (-1))',
+    '--u': '(-(-u))',
+    '-u * v': '((-u) * v)',
+    '1 < 2 == 1': '((1 < 2) == 1)',
+    'u <= .5 != v >= 1e-3': '((u <= 0.5) != (v >= 0.001))',
+    'u < 0.5 ? 1 : v > .2 ? 2 : 3': '((u < 0.5) ? 1 : ((v > 0.2) ? 2 : 3))',
+    'a ? b ? 1 : 2 : 3': '(a ? (b ? 1 : 2) : 3)',
+    'mix(a, b, smoothstep(0, 1, u))': 'mix(a, b, smoothstep(0, 1, u))',
+    'noise()': 'noise()',
+    'sin(u*6.28)*0.5+0.5': '((sin((u * 6.28)) * 0.5) + 0.5)',
+    '  f ( ( x ) )  ': 'f(x)',
+    'fract(u * 8) ^ 2 / 4': '((fract((u * 8)) ^ 2) / 4)',
+    '_x1 + tau': '(_x1 + tau)',
+  };
+  for (const [src, want] of Object.entries(cases)) eq(show(parse(src)), want, src);
+  const errs = { '1 +': 3, '(1': 2, 'f(1,': 4, '1 2': 2, 'a $ b': 2, '': 0, '?': 0, 'f(1,)': 4, 'u ? 1': 5, ')': 0, '1 + * 2': 4, 'f(': 2 };
+  for (const [src, at] of Object.entries(errs)) {
+    let e = null;
+    try { parse(src); } catch (x) { e = x; }
+    check(e instanceof SyntaxError, 'SyntaxError for ' + JSON.stringify(src));
+    check(e && new RegExp('at ' + at + '$').test(e.message), JSON.stringify(src) + ' should report position ' + at + ', got ' + (e && e.message));
+  }
+}
+
+=== exercise expr2
+title: Formula compiler, step 2: evaluate
+continues: expr1
+--- prompt
+Write `evaluate(ast, env)` that computes the value of a parsed formula, and `freeVariables(ast)`.
+
+**Variables** are looked up as own properties of `env` first, then in the built-in constants `pi` and `tau` (2π). An unknown name throws a `ReferenceError`.
+
+**Operators:** `+ - * /` as in JavaScript; `^` is `**`; `%` is the **floored** modulo used by shaders, `a - b * floor(a / b)` (so `-7 % 3` is `2`, unlike JavaScript's `-1`); comparisons return `1` or `0`; a conditional takes `then` when `test !== 0`.
+
+**Functions** (fixed arity; a wrong argument count throws a `TypeError`, an unknown name a `ReferenceError`):
+
+| function | value |
+|---|---|
+| `sin cos tan abs floor sqrt` (1) | as `Math` |
+| `fract(x)` | `x - floor(x)` |
+| `min max pow` (2) | as `Math` |
+| `clamp(x, lo, hi)` | `min(hi, max(lo, x))` |
+| `mix(a, b, t)` | `a + (b - a) * t` |
+| `step(edge, x)` | `x < edge ? 0 : 1` |
+| `smoothstep(e0, e1, x)` | `t = clamp((x - e0) / (e1 - e0), 0, 1)`, then `t * t * (3 - 2t)` |
+
+`freeVariables(ast)` returns the sorted, de-duplicated names of the variables a formula uses, excluding the constants `pi` and `tau`: what a UI needs to show sliders for.
+--- stubs
+function evaluate(ast, env = {}) {
+  return 0;
+}
+
+function freeVariables(ast) {
+  return [];
+}
+--- solution
+const TOKEN_RE_ = /(?<ws>\s+)|(?<num>(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?)|(?<id>[A-Za-z_]\w*)|(?<op><=|>=|==|!=|[-+*\/%^(),?:<>])/y;
+
+function tokenize(src) {
+  const out = [];
+  TOKEN_RE_.lastIndex = 0;
+  while (TOKEN_RE_.lastIndex < src.length) {
+    const pos = TOKEN_RE_.lastIndex;
+    const m = TOKEN_RE_.exec(src);
+    if (!m) throw new SyntaxError(`Unexpected '${src[pos]}' at ${pos}`);
+    const g = m.groups;
+    if (g.num) out.push({ type: 'num', value: Number(g.num), pos });
+    else if (g.id) out.push({ type: 'id', value: g.id, pos });
+    else if (g.op) out.push({ type: 'op', value: g.op, pos });
+  }
+  out.push({ type: 'eof', value: '', pos: src.length });
+  return out;
+}
+
+function parse(src) {
+  const toks = tokenize(src);
+  let i = 0;
+  const peek = () => toks[i];
+  const isOp = (...ops) => peek().type === 'op' && ops.includes(peek().value);
+  const fail = msg => { throw new SyntaxError(`${msg} at ${peek().pos}`); };
+  const expect = op => { if (!isOp(op)) fail(`Expected '${op}'`); i++; };
+
+  function conditional() {
+    const test = comparison();
+    if (!isOp('?')) return test;
+    i++;
+    const then = conditional();
+    expect(':');
+    const otherwise = conditional();
+    return { type: 'cond', test, then, else: otherwise };
+  }
+  function binaryLevel(next, ops) {
+    return () => {
+      let left = next();
+      while (isOp(...ops)) {
+        const op = toks[i++].value;
+        left = { type: 'bin', op, left, right: next() };
+      }
+      return left;
+    };
+  }
+  function unary() {
+    if (isOp('-')) { i++; return { type: 'unary', op: '-', arg: unary() }; }
+    return power();
+  }
+  function power() {
+    const base = primary();
+    if (isOp('^')) { i++; return { type: 'bin', op: '^', left: base, right: unary() }; }
+    return base;
+  }
+  function primary() {
+    const t = peek();
+    if (t.type === 'num') { i++; return { type: 'num', value: t.value }; }
+    if (t.type === 'id') {
+      i++;
+      if (!isOp('(')) return { type: 'var', name: t.value };
+      i++;
+      const args = [];
+      if (!isOp(')')) {
+        do { args.push(conditional()); } while (isOp(',') && ++i);
+      }
+      expect(')');
+      return { type: 'call', name: t.value, args };
+    }
+    if (isOp('(')) { i++; const e = conditional(); expect(')'); return e; }
+    fail(t.type === 'eof' ? 'Unexpected end of input' : `Unexpected '${t.value}'`);
+  }
+  const multiplicative = binaryLevel(unary, ['*', '/', '%']);
+  const additive = binaryLevel(multiplicative, ['+', '-']);
+  const comparison = binaryLevel(additive, ['<', '>', '<=', '>=', '==', '!=']);
+  const ast = conditional();
+  if (peek().type !== 'eof') fail(`Unexpected '${peek().value}'`);
+  return ast;
+}
+const FUNCTIONS_ = {
+  sin: Math.sin, cos: Math.cos, tan: Math.tan, abs: Math.abs, floor: Math.floor, sqrt: Math.sqrt,
+  fract: x => x - Math.floor(x),
+  min: (a, b) => Math.min(a, b),
+  max: (a, b) => Math.max(a, b),
+  pow: (a, b) => a ** b,
+  clamp: (x, lo, hi) => Math.min(hi, Math.max(lo, x)),
+  mix: (a, b, t) => a + (b - a) * t,
+  step: (edge, x) => (x < edge ? 0 : 1),
+  smoothstep: (e0, e1, x) => { const t = Math.min(1, Math.max(0, (x - e0) / (e1 - e0))); return t * t * (3 - 2 * t); },
+};
+const CONSTANTS_ = { pi: Math.PI, tau: 2 * Math.PI };
+const BINOPS_ = {
+  '+': (a, b) => a + b, '-': (a, b) => a - b, '*': (a, b) => a * b, '/': (a, b) => a / b,
+  '%': (a, b) => a - b * Math.floor(a / b), '^': (a, b) => a ** b,
+  '<': (a, b) => +(a < b), '>': (a, b) => +(a > b), '<=': (a, b) => +(a <= b), '>=': (a, b) => +(a >= b),
+  '==': (a, b) => +(a === b), '!=': (a, b) => +(a !== b),
+};
+
+function evaluate(ast, env = {}) {
+  switch (ast.type) {
+    case 'num': return ast.value;
+    case 'var':
+      if (Object.hasOwn(env, ast.name)) return env[ast.name];
+      if (Object.hasOwn(CONSTANTS_, ast.name)) return CONSTANTS_[ast.name];
+      throw new ReferenceError(`unknown variable: ${ast.name}`);
+    case 'unary': return -evaluate(ast.arg, env);
+    case 'bin': return BINOPS_[ast.op](evaluate(ast.left, env), evaluate(ast.right, env));
+    case 'cond': return evaluate(ast.test, env) !== 0 ? evaluate(ast.then, env) : evaluate(ast.else, env);
+    case 'call': {
+      if (!Object.hasOwn(FUNCTIONS_, ast.name)) throw new ReferenceError(`unknown function: ${ast.name}`);
+      const f = FUNCTIONS_[ast.name];
+      if (ast.args.length !== f.length) throw new TypeError(`${ast.name} takes ${f.length} arguments`);
+      return f(...ast.args.map(a => evaluate(a, env)));
+    }
+  }
+  throw new TypeError(`bad node: ${ast.type}`);
+}
+
+function freeVariables(ast) {
+  const names = new Set();
+  const walk = n => {
+    if (n.type === 'var') { if (!Object.hasOwn(CONSTANTS_, n.name)) names.add(n.name); }
+    else if (n.type === 'unary') walk(n.arg);
+    else if (n.type === 'bin') { walk(n.left); walk(n.right); }
+    else if (n.type === 'cond') { walk(n.test); walk(n.then); walk(n.else); }
+    else if (n.type === 'call') n.args.forEach(walk);
+  };
+  walk(ast);
+  return [...names].sort();
+}
+--- hint
+A `switch` on `ast.type` with recursive calls for children is all `evaluate` needs. Put the functions in a lookup object and use each function's `.length` as its arity.
+--- hint
+Look names up with `Object.hasOwn(env, name)` so that `toString` or `constructor` in a formula is not found on `Object.prototype`.
+--- harness
+{
+  const ev = (s, env) => evaluate(parse(s), env);
+  eq(ev('1 + 2 * 3'), 7);
+  eq(ev('2 ^ 3 ^ 2'), 512);
+  eq(ev('-2 ^ 2'), -4);
+  eq(ev('-7 % 3'), 2, 'floored modulo');
+  eq(ev('7 % -3'), -2);
+  eq(ev('5.5 % 2'), 1.5);
+  eq(ev('u * 2', { u: 0.25 }), 0.5);
+  near(ev('sin(u * tau) * 0.5 + 0.5', { u: 0.25 }), 1, 1e-12);
+  near(ev('pi'), Math.PI, 0);
+  eq(ev('pi', { pi: 3 }), 3, 'env shadows constants');
+  eq(ev('u < 0.5 ? 10 : 20', { u: 0.7 }), 20);
+  eq(ev('u < 0.5 ? 10 : 20', { u: 0.2 }), 10);
+  eq(ev('(1 < 2) + (2 <= 2) + (3 > 4) + (1 == 1) + (1 != 1) + (2 >= 3)'), 3, 'comparisons give 1 or 0');
+  eq(ev('0 ? 1 : 2'), 2);
+  eq(ev('-1 ? 1 : 2'), 1, 'any non-zero is true');
+  near(ev('fract(-1.25)'), 0.75, 1e-12);
+  eq(ev('clamp(5, 0, 1) + clamp(-5, 0, 1) + clamp(0.5, 0, 1)'), 1.5);
+  eq(ev('mix(10, 20, 0.25)'), 12.5);
+  eq(ev('step(0.5, 0.5) + step(0.5, 0.4)'), 1);
+  eq(ev('smoothstep(0, 1, 0.5)'), 0.5);
+  eq(ev('smoothstep(0.2, 0.4, 0.1) + smoothstep(0.2, 0.4, 0.9)'), 1);
+  near(ev('smoothstep(0, 2, 0.5)'), 0.15625, 1e-12);
+  eq(ev('min(3, 4) + max(3, 4) + pow(2, 10) + abs(-2) + floor(2.7) + sqrt(16)'), 1037);
+  let calls = 0;
+  const watched = { get u() { calls++; return 1; } };
+  ev('u > 0 ? 1 : u', watched);
+  eq(calls, 1, 'only the taken branch is evaluated');
+  const errOf = f => { try { f(); } catch (e) { return e; } return null; };
+  check(errOf(() => ev('w + 1', { u: 1 })) instanceof ReferenceError, 'unknown variable');
+  check(errOf(() => ev('toString')) instanceof ReferenceError, 'no prototype lookups');
+  check(errOf(() => ev('wobble(1)')) instanceof ReferenceError, 'unknown function');
+  check(errOf(() => ev('mix(1, 2)')) instanceof TypeError, 'wrong arity');
+  check(errOf(() => ev('sin()')) instanceof TypeError, 'wrong arity, zero args');
+  check(errOf(() => ev('constructor(1)')) instanceof ReferenceError, 'no prototype functions');
+  eq(freeVariables(parse('mix(a, b, u) + pi * a - tau')), ['a', 'b', 'u']);
+  eq(freeVariables(parse('1 + 2')), []);
+  eq(freeVariables(parse('z ? y : x')), ['x', 'y', 'z']);
+}
+
+=== exercise expr3
+title: Formula compiler, step 3: compile and bake
+continues: expr2
+--- prompt
+Tree walking is slow for textures: a 1024 by 1024 bake is a million evaluations, each visiting every node, looking variables up by name and (often) allocating an environment object. Write a compiler.
+
+`compile(src, params = ['u', 'v'], extraFunctions = {})` parses `src` once and returns a JavaScript function taking the parameters **positionally**: `compile('u * v')(0.5, 4)` is `2`.
+
+- Resolve everything at compile time: a variable is either one of `params` (read from a slot, not looked up by name), or a constant (`pi`, `tau`), or a `ReferenceError` **thrown by `compile`**. Unknown functions (`ReferenceError`) and wrong arity (`TypeError`) are also compile-time errors. `extraFunctions` adds to (or overrides) the built-in functions.
+- **Constant folding:** any subtree that does not depend on a parameter is computed once, at compile time. That includes calls whose arguments are all constant (functions are assumed pure), and a conditional whose test is constant compiles to just the chosen branch.
+- Same semantics as `evaluate` (floored `%`, 1/0 comparisons, lazy conditional branches).
+
+Then `bakeFormula(src, width, height)` compiles `src` with parameters `u, v` and evaluates it at every pixel centre (`u = (x + 0.5) / width`, `v = (y + 0.5) / height`), returning a `Float32Array` row by row.
+
+The harness bakes a 1024 by 1024 texture under a time limit that per-pixel tree walking does not meet. One approach is to turn every node into a closure that calls its children's closures (no `new Function` needed); generating JavaScript source with `new Function` is the other classic approach, and is fine too if you are careful with names.
+--- stubs
+function compile(src, params = ['u', 'v'], extraFunctions = {}) {
+  const ast = parse(src);
+  return (...xs) => evaluate(ast, Object.fromEntries(params.map((p, i) => [p, xs[i]])));
+}
+
+function bakeFormula(src, width, height) {
+  const f = compile(src);
+  const out = new Float32Array(width * height);
+  for (let y = 0; y < height; y++)
+    for (let x = 0; x < width; x++) out[y * width + x] = f((x + 0.5) / width, (y + 0.5) / height);
+  return out;
+}
+--- solution
+const TOKEN_RE_ = /(?<ws>\s+)|(?<num>(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?)|(?<id>[A-Za-z_]\w*)|(?<op><=|>=|==|!=|[-+*\/%^(),?:<>])/y;
+
+function tokenize(src) {
+  const out = [];
+  TOKEN_RE_.lastIndex = 0;
+  while (TOKEN_RE_.lastIndex < src.length) {
+    const pos = TOKEN_RE_.lastIndex;
+    const m = TOKEN_RE_.exec(src);
+    if (!m) throw new SyntaxError(`Unexpected '${src[pos]}' at ${pos}`);
+    const g = m.groups;
+    if (g.num) out.push({ type: 'num', value: Number(g.num), pos });
+    else if (g.id) out.push({ type: 'id', value: g.id, pos });
+    else if (g.op) out.push({ type: 'op', value: g.op, pos });
+  }
+  out.push({ type: 'eof', value: '', pos: src.length });
+  return out;
+}
+
+function parse(src) {
+  const toks = tokenize(src);
+  let i = 0;
+  const peek = () => toks[i];
+  const isOp = (...ops) => peek().type === 'op' && ops.includes(peek().value);
+  const fail = msg => { throw new SyntaxError(`${msg} at ${peek().pos}`); };
+  const expect = op => { if (!isOp(op)) fail(`Expected '${op}'`); i++; };
+
+  function conditional() {
+    const test = comparison();
+    if (!isOp('?')) return test;
+    i++;
+    const then = conditional();
+    expect(':');
+    const otherwise = conditional();
+    return { type: 'cond', test, then, else: otherwise };
+  }
+  function binaryLevel(next, ops) {
+    return () => {
+      let left = next();
+      while (isOp(...ops)) {
+        const op = toks[i++].value;
+        left = { type: 'bin', op, left, right: next() };
+      }
+      return left;
+    };
+  }
+  function unary() {
+    if (isOp('-')) { i++; return { type: 'unary', op: '-', arg: unary() }; }
+    return power();
+  }
+  function power() {
+    const base = primary();
+    if (isOp('^')) { i++; return { type: 'bin', op: '^', left: base, right: unary() }; }
+    return base;
+  }
+  function primary() {
+    const t = peek();
+    if (t.type === 'num') { i++; return { type: 'num', value: t.value }; }
+    if (t.type === 'id') {
+      i++;
+      if (!isOp('(')) return { type: 'var', name: t.value };
+      i++;
+      const args = [];
+      if (!isOp(')')) {
+        do { args.push(conditional()); } while (isOp(',') && ++i);
+      }
+      expect(')');
+      return { type: 'call', name: t.value, args };
+    }
+    if (isOp('(')) { i++; const e = conditional(); expect(')'); return e; }
+    fail(t.type === 'eof' ? 'Unexpected end of input' : `Unexpected '${t.value}'`);
+  }
+  const multiplicative = binaryLevel(unary, ['*', '/', '%']);
+  const additive = binaryLevel(multiplicative, ['+', '-']);
+  const comparison = binaryLevel(additive, ['<', '>', '<=', '>=', '==', '!=']);
+  const ast = conditional();
+  if (peek().type !== 'eof') fail(`Unexpected '${peek().value}'`);
+  return ast;
+}
+const FUNCTIONS_ = {
+  sin: Math.sin, cos: Math.cos, tan: Math.tan, abs: Math.abs, floor: Math.floor, sqrt: Math.sqrt,
+  fract: x => x - Math.floor(x),
+  min: (a, b) => Math.min(a, b),
+  max: (a, b) => Math.max(a, b),
+  pow: (a, b) => a ** b,
+  clamp: (x, lo, hi) => Math.min(hi, Math.max(lo, x)),
+  mix: (a, b, t) => a + (b - a) * t,
+  step: (edge, x) => (x < edge ? 0 : 1),
+  smoothstep: (e0, e1, x) => { const t = Math.min(1, Math.max(0, (x - e0) / (e1 - e0))); return t * t * (3 - 2 * t); },
+};
+const CONSTANTS_ = { pi: Math.PI, tau: 2 * Math.PI };
+const BINOPS_ = {
+  '+': (a, b) => a + b, '-': (a, b) => a - b, '*': (a, b) => a * b, '/': (a, b) => a / b,
+  '%': (a, b) => a - b * Math.floor(a / b), '^': (a, b) => a ** b,
+  '<': (a, b) => +(a < b), '>': (a, b) => +(a > b), '<=': (a, b) => +(a <= b), '>=': (a, b) => +(a >= b),
+  '==': (a, b) => +(a === b), '!=': (a, b) => +(a !== b),
+};
+
+function evaluate(ast, env = {}) {
+  switch (ast.type) {
+    case 'num': return ast.value;
+    case 'var':
+      if (Object.hasOwn(env, ast.name)) return env[ast.name];
+      if (Object.hasOwn(CONSTANTS_, ast.name)) return CONSTANTS_[ast.name];
+      throw new ReferenceError(`unknown variable: ${ast.name}`);
+    case 'unary': return -evaluate(ast.arg, env);
+    case 'bin': return BINOPS_[ast.op](evaluate(ast.left, env), evaluate(ast.right, env));
+    case 'cond': return evaluate(ast.test, env) !== 0 ? evaluate(ast.then, env) : evaluate(ast.else, env);
+    case 'call': {
+      if (!Object.hasOwn(FUNCTIONS_, ast.name)) throw new ReferenceError(`unknown function: ${ast.name}`);
+      const f = FUNCTIONS_[ast.name];
+      if (ast.args.length !== f.length) throw new TypeError(`${ast.name} takes ${f.length} arguments`);
+      return f(...ast.args.map(a => evaluate(a, env)));
+    }
+  }
+  throw new TypeError(`bad node: ${ast.type}`);
+}
+
+function freeVariables(ast) {
+  const names = new Set();
+  const walk = n => {
+    if (n.type === 'var') { if (!Object.hasOwn(CONSTANTS_, n.name)) names.add(n.name); }
+    else if (n.type === 'unary') walk(n.arg);
+    else if (n.type === 'bin') { walk(n.left); walk(n.right); }
+    else if (n.type === 'cond') { walk(n.test); walk(n.then); walk(n.else); }
+    else if (n.type === 'call') n.args.forEach(walk);
+  };
+  walk(ast);
+  return [...names].sort();
+}
+function compile(src, params = ['u', 'v'], extraFunctions = {}) {
+  const funcs = { ...FUNCTIONS_, ...extraFunctions };
+  const slot = new Map(params.map((p, i) => [p, i]));
+  const args = new Float64Array(params.length);
+  const isConst = f => f.constant !== undefined;
+  const konst = v => { const f = () => v; f.constant = v; return f; };
+  function gen(n) {
+    switch (n.type) {
+      case 'num': return konst(n.value);
+      case 'var': {
+        if (slot.has(n.name)) { const i = slot.get(n.name); return () => args[i]; }
+        if (Object.hasOwn(CONSTANTS_, n.name)) return konst(CONSTANTS_[n.name]);
+        throw new ReferenceError(`unknown variable: ${n.name}`);
+      }
+      case 'unary': {
+        const a = gen(n.arg);
+        return isConst(a) ? konst(-a.constant) : () => -a();
+      }
+      case 'bin': {
+        const op = BINOPS_[n.op], l = gen(n.left), r = gen(n.right);
+        if (isConst(l) && isConst(r)) return konst(op(l.constant, r.constant));
+        switch (n.op) {                       // inline the common ones
+          case '+': return () => l() + r();
+          case '-': return () => l() - r();
+          case '*': return () => l() * r();
+          case '/': return () => l() / r();
+          default: return () => op(l(), r());
+        }
+      }
+      case 'cond': {
+        const t = gen(n.test), a = gen(n.then), b = gen(n.else);
+        if (isConst(t)) return t.constant !== 0 ? a : b;
+        return () => (t() !== 0 ? a() : b());
+      }
+      case 'call': {
+        if (!Object.hasOwn(funcs, n.name)) throw new ReferenceError(`unknown function: ${n.name}`);
+        const f = funcs[n.name];
+        if (n.args.length !== f.length) throw new TypeError(`${n.name} takes ${f.length} arguments`);
+        const as = n.args.map(gen);
+        if (as.every(isConst)) return konst(f(...as.map(a => a.constant)));
+        if (as.length === 1) { const [a] = as; return () => f(a()); }
+        if (as.length === 2) { const [a, b] = as; return () => f(a(), b()); }
+        if (as.length === 3) { const [a, b, c] = as; return () => f(a(), b(), c()); }
+        return () => f(...as.map(a => a()));
+      }
+    }
+    throw new TypeError(`bad node: ${n.type}`);
+  }
+  const body = gen(parse(src));
+  return (...xs) => {
+    for (let i = 0; i < args.length; i++) args[i] = xs[i];
+    return body();
+  };
+}
+
+function bakeFormula(src, width, height) {
+  const f = compile(src, ['u', 'v']);
+  const out = new Float32Array(width * height);
+  for (let y = 0, i = 0; y < height; y++) {
+    const v = (y + 0.5) / height;
+    for (let x = 0; x < width; x++, i++) out[i] = f((x + 0.5) / width, v);
+  }
+  return out;
+}
+--- hint
+Write `gen(node)` returning a closure. Mark constant closures (for example with a `constant` property holding the value) so a parent can check whether all of its children are constant and fold itself by computing the value right away.
+--- hint
+For parameters, keep one shared `Float64Array` of slots that the compiled function fills from its arguments before calling the root closure; a variable node's closure is just `() => slots[i]`.
+--- harness
+{
+  eq(compile('u * v')(0.5, 4), 2);
+  eq(compile('x - y', ['y', 'x'])(1, 10), 9, 'positional order follows params');
+  near(compile('sin(u * tau)')(0.25), 1, 1e-12);
+  eq(compile('-7 % 3', [])(), 2);
+  eq(compile('u < 0.5 ? 1 : 2')(0.7), 2);
+  eq(compile('2 ^ 3 ^ 2', [])(), 512);
+  const errOf = f => { try { f(); } catch (e) { return e; } return null; };
+  check(errOf(() => compile('w * 2')) instanceof ReferenceError, 'unknown variable at compile time');
+  check(errOf(() => compile('u ? w : 1')) instanceof ReferenceError, 'even in an untaken branch');
+  check(errOf(() => compile('wobble(u)')) instanceof ReferenceError, 'unknown function at compile time');
+  check(errOf(() => compile('mix(u, v)')) instanceof TypeError, 'arity at compile time');
+  check(errOf(() => compile('1 +')) instanceof SyntaxError, 'syntax error');
+  let calls = 0;
+  const f = compile('k() * u + k()', ['u'], { k: () => { calls++; return 2; } });
+  eq(calls, 2, 'constant calls folded at compile time');
+  eq(f(3), 8); eq(f(4), 10);
+  eq(calls, 2, 'not called again when running');
+  let pc = 0;
+  const g = compile('sq(u) + sq(3)', ['u'], { sq: x => { pc++; return x * x; } });
+  eq(pc, 1, 'only the constant call is folded');
+  eq(g(2), 13); eq(pc, 2);
+  let bc = 0;
+  const h = compile('1 < 2 ? u : boom(u)', ['u'], { boom: x => { bc++; return x; } });
+  eq(h(5), 5); eq(bc, 0, 'constant test picks the branch at compile time');
+  eq(compile('pi * 0 + 1', [])(), 1);
+  const lazy = compile('u > 0 ? 1 : cnt(u)', ['u'], { cnt: x => { bc++; return x; } });
+  lazy(1); eq(bc, 0, 'untaken branch not evaluated at run time');
+  lazy(-1); eq(bc, 1);
+
+  const src = 'smoothstep(0.3, 0.7, fract(u * 8) * 0.5 + fract(v * 8) * 0.5) * (sin(u * tau * 3) * 0.5 + 0.5)';
+  const small = bakeFormula('u + v * 10', 2, 2);
+  check(small instanceof Float32Array, 'Float32Array');
+  eq(Array.from(small), [2.75, 3.25, 7.75, 8.25]);
+  const ast = parse(src);
+  const t0 = performance.now();
+  const img = bakeFormula(src, 1024, 1024);
+  const ms = performance.now() - t0;
+  eq(img.length, 1024 * 1024);
+  for (const [x, y] of [[0, 0], [1000, 3], [512, 700], [1023, 1023]]) {
+    eq(img[y * 1024 + x], Math.fround(evaluate(ast, { u: (x + 0.5) / 1024, v: (y + 0.5) / 1024 })), `pixel ${x},${y} matches evaluate`);
+  }
+  check(ms < 600, '1024x1024 bake took ' + Math.round(ms) + 'ms');
+}
+
+=== exercise lru1
+title: Texture cache, step 1: an O(1) LRU cache
+--- prompt
+Write `class LRUCache` with constructor options `{ maxEntries = Infinity, onEvict = null }` (`maxEntries` below 1 throws a `RangeError`):
+
+- `get(key)`: the value, or `undefined`; marks the key as most recently used.
+- `peek(key)`: the value without changing recency. `has(key)`: also without changing recency.
+- `set(key, value)`: inserts or updates and marks the key most recently used; returns `this`. If the cache now holds more than `maxEntries`, evict least recently used entries, calling `onEvict(key, value)` for each. Updating an existing key with a **different** value also calls `onEvict(key, oldValue)` (the old GPU texture must be released too); setting the same value again does not.
+- `delete(key)`: removes it and returns whether it existed (no `onEvict`: the caller is deleting on purpose). `clear()` removes everything, also without `onEvict`.
+- `size` (getter) and `keys()`: an array of keys from least to most recently used.
+
+Every operation must be O(1) (except `keys`): the harness runs a million operations on a 10,000-entry cache under a time limit. Hint: a `Map` remembers insertion order.
+--- starter
+class LRUCache {
+  constructor({ maxEntries = Infinity, onEvict = null } = {}) {
+    this.max = maxEntries;
+    this.onEvict = onEvict;
+    this.entries = [];             // [key, value] pairs, least recent first
+  }
+  get size() { return this.entries.length; }
+  #find(key) { return this.entries.findIndex(e => e[0] === key); }
+  has(key) { return this.#find(key) >= 0; }
+  peek(key) { const i = this.#find(key); return i < 0 ? undefined : this.entries[i][1]; }
+  get(key) {
+    const i = this.#find(key);
+    if (i < 0) return undefined;
+    const [e] = this.entries.splice(i, 1);
+    this.entries.push(e);
+    return e[1];
+  }
+  set(key, value) {
+    const i = this.#find(key);
+    if (i >= 0) this.entries.splice(i, 1);
+    this.entries.push([key, value]);
+    return this;
+  }
+  delete(key) { return false; }
+  clear() {}
+  keys() { return this.entries.map(e => e[0]); }
+}
+--- solution
+class LRUCache {
+  #map = new Map();                  // insertion order = recency order, least recent first
+  #max;
+  #onEvict;
+  constructor({ maxEntries = Infinity, onEvict = null } = {}) {
+    if (!(maxEntries >= 1)) throw new RangeError('maxEntries must be at least 1');
+    this.#max = maxEntries;
+    this.#onEvict = onEvict;
+  }
+  get size() { return this.#map.size; }
+  has(key) { return this.#map.has(key); }
+  peek(key) { return this.#map.get(key); }
+  get(key) {
+    if (!this.#map.has(key)) return undefined;
+    const v = this.#map.get(key);
+    this.#map.delete(key);
+    this.#map.set(key, v);
+    return v;
+  }
+  set(key, value) {
+    if (this.#map.has(key)) {
+      const old = this.#map.get(key);
+      this.#map.delete(key);
+      if (old !== value && this.#onEvict) this.#onEvict(key, old);
+    }
+    this.#map.set(key, value);
+    while (this.#map.size > this.#max) {
+      const [k, v] = this.#map.entries().next().value;
+      this.#map.delete(k);
+      if (this.#onEvict) this.#onEvict(k, v);
+    }
+    return this;
+  }
+  delete(key) { return this.#map.delete(key); }
+  clear() { this.#map.clear(); }
+  keys() { return [...this.#map.keys()]; }
+}
+--- hint
+Keep one `Map`. To mark a key as most recent, `delete` it and `set` it again: it moves to the end of the iteration order. The least recent key is then `map.keys().next().value`.
+--- hint
+Fire `onEvict` after updating the map, so a callback that inspects the cache sees a consistent state. Keep the fields private (`#map`) so nobody reorders it from outside.
+--- harness
+{
+  const ev = [];
+  const c = new LRUCache({ maxEntries: 3, onEvict: (k, v) => ev.push(k + '=' + v) });
+  check(c.set('a', 1) === c, 'set returns this');
+  c.set('b', 2).set('c', 3);
+  eq(c.keys(), ['a', 'b', 'c']);
+  eq(c.get('a'), 1);
+  eq(c.keys(), ['b', 'c', 'a'], 'get refreshes');
+  eq(c.peek('b'), 2); eq(c.has('b'), true);
+  eq(c.keys(), ['b', 'c', 'a'], 'peek and has do not refresh');
+  c.set('d', 4);
+  eq(ev, ['b=2'], 'least recent evicted');
+  eq(c.keys(), ['c', 'a', 'd']);
+  eq(c.size, 3);
+  eq(c.get('b'), undefined);
+  c.set('c', 30);
+  eq(ev, ['b=2', 'c=3'], 'replacing a value releases the old one');
+  eq(c.keys(), ['a', 'd', 'c'], 'set refreshes');
+  c.set('c', 30);
+  eq(ev.length, 2, 'same value: no onEvict');
+  eq(c.delete('a'), true); eq(c.delete('a'), false);
+  eq(ev.length, 2, 'delete does not call onEvict');
+  eq(c.size, 2);
+  c.clear();
+  eq(c.size, 0); eq(c.keys(), []); eq(ev.length, 2);
+  const objKey = {};
+  const d = new LRUCache({ maxEntries: 2 });
+  d.set(objKey, 'o').set(NaN, 'n');
+  eq(d.get(objKey), 'o'); eq(d.get(NaN), 'n', 'any key, SameValueZero');
+  eq(d.get(undefined), undefined);
+  d.set(undefined, 'u');
+  eq(d.has(objKey), false); eq(d.get(undefined), 'u');
+  const inf = new LRUCache();
+  for (let i = 0; i < 1000; i++) inf.set(i, i);
+  eq(inf.size, 1000, 'default is unbounded');
+  throws(() => new LRUCache({ maxEntries: 0 }), 'maxEntries 0');
+
+  const big = new LRUCache({ maxEntries: 10000 });
+  let evicted = 0;
+  const big2 = new LRUCache({ maxEntries: 10000, onEvict: () => evicted++ });
+  const t0 = performance.now();
+  let hits = 0;
+  for (let i = 0; i < 1e6; i++) {
+    const k = (i * 7919) % 15000;
+    if (big2.get(k) !== undefined) hits++; else big2.set(k, i);
+  }
+  const ms = performance.now() - t0;
+  eq(big2.size, 10000);
+  check(evicted > 0 && hits > 0, 'cache used');
+  check(ms < 1500, 'a million operations took ' + Math.round(ms) + 'ms');
+  big.set(1, 1);
+}
+
+=== exercise lru2
+title: Texture cache, step 2: a byte budget and async loading
+continues: lru1
+--- prompt
+Build `class TextureCache` on top of your `LRUCache` (use an `LRUCache` inside it for the recency order). Constructor options: `{ maxBytes, load, onEvict = () => {} }`, where `load(key)` returns a promise of a texture object with a numeric `bytes` property (for example `{ bytes: 4 * w * h, gpu }`).
+
+- `get(key)` always returns a promise of the texture.
+  - Cached: counts a **hit**, marks it most recently used, resolves to it.
+  - Already loading: counts a **hit** and returns **the same promise** as the first request (two requests, one load).
+  - Otherwise: counts a **miss** and calls `load(key)` once. When it resolves, the texture is cached, its bytes added to the total, and then least recently used textures are evicted (calling `onEvict(key, texture)`) until the total is at most `maxBytes`. The texture just loaded is never evicted by its own arrival, even if it alone is over budget, and **pinned** textures are skipped.
+  - If `load` rejects (or throws synchronously), nothing is cached, the promise rejects with that error, and a later `get` tries again.
+- `pin(key)` / `unpin(key)`: a counter per key (pin twice, unpin twice). A pinned texture is never evicted; pins may be placed before the texture is loaded. `unpin` re-runs eviction, since the budget may be exceeded only because of pins.
+- `has(key)`: cached (not just loading).
+- `stats()`: `{ hits, misses, bytes, count }`.
+--- stubs
+class TextureCache {
+  constructor({ maxBytes, load, onEvict = () => {} }) {
+    this.load = load;
+  }
+  get(key) { return Promise.resolve(this.load(key)); }
+  pin(key) {}
+  unpin(key) {}
+  has(key) { return false; }
+  stats() { return { hits: 0, misses: 0, bytes: 0, count: 0 }; }
+}
+--- solution
+class LRUCache {
+  #map = new Map();                  // insertion order = recency order, least recent first
+  #max;
+  #onEvict;
+  constructor({ maxEntries = Infinity, onEvict = null } = {}) {
+    if (!(maxEntries >= 1)) throw new RangeError('maxEntries must be at least 1');
+    this.#max = maxEntries;
+    this.#onEvict = onEvict;
+  }
+  get size() { return this.#map.size; }
+  has(key) { return this.#map.has(key); }
+  peek(key) { return this.#map.get(key); }
+  get(key) {
+    if (!this.#map.has(key)) return undefined;
+    const v = this.#map.get(key);
+    this.#map.delete(key);
+    this.#map.set(key, v);
+    return v;
+  }
+  set(key, value) {
+    if (this.#map.has(key)) {
+      const old = this.#map.get(key);
+      this.#map.delete(key);
+      if (old !== value && this.#onEvict) this.#onEvict(key, old);
+    }
+    this.#map.set(key, value);
+    while (this.#map.size > this.#max) {
+      const [k, v] = this.#map.entries().next().value;
+      this.#map.delete(k);
+      if (this.#onEvict) this.#onEvict(k, v);
+    }
+    return this;
+  }
+  delete(key) { return this.#map.delete(key); }
+  clear() { this.#map.clear(); }
+  keys() { return [...this.#map.keys()]; }
+}
+class TextureCache {
+  #lru = new LRUCache();
+  #loading = new Map();
+  #pins = new Map();
+  #bytes = 0;
+  #hits = 0;
+  #misses = 0;
+  constructor({ maxBytes, load, onEvict = () => {} }) {
+    this.maxBytes = maxBytes;
+    this.load = load;
+    this.onEvict = onEvict;
+  }
+  get(key) {
+    if (this.#lru.has(key)) { this.#hits++; return Promise.resolve(this.#lru.get(key)); }
+    if (this.#loading.has(key)) { this.#hits++; return this.#loading.get(key); }
+    this.#misses++;
+    const p = Promise.resolve()
+      .then(() => this.load(key))
+      .then(tex => {
+        this.#loading.delete(key);
+        this.#lru.set(key, tex);
+        this.#bytes += tex.bytes;
+        this.#evict(key);
+        return tex;
+      }, err => {
+        this.#loading.delete(key);
+        throw err;
+      });
+    this.#loading.set(key, p);
+    return p;
+  }
+  #evict(keep) {
+    for (const k of this.#lru.keys()) {
+      if (this.#bytes <= this.maxBytes) break;
+      if (k === keep || this.#pins.get(k) > 0) continue;
+      const tex = this.#lru.peek(k);
+      this.#lru.delete(k);
+      this.#bytes -= tex.bytes;
+      this.onEvict(k, tex);
+    }
+  }
+  pin(key) { this.#pins.set(key, (this.#pins.get(key) ?? 0) + 1); }
+  unpin(key) {
+    const n = (this.#pins.get(key) ?? 0) - 1;
+    if (n > 0) this.#pins.set(key, n); else this.#pins.delete(key);
+    this.#evict(null);
+  }
+  has(key) { return this.#lru.has(key); }
+  stats() { return { hits: this.#hits, misses: this.#misses, bytes: this.#bytes, count: this.#lru.size }; }
+}
+--- hint
+Keep a `Map` from key to in-flight promise. Delete the entry when the load settles, in both the success and failure handlers, before you resolve or rethrow.
+--- hint
+For eviction, walk `lru.keys()` (least recent first), skipping pinned keys and the key that just arrived, removing entries and subtracting their bytes until the total fits.
+--- harness
+{
+  const loads = [], evicted = [];
+  let failNext = false;
+  const tc = new TextureCache({
+    maxBytes: 100,
+    load: async k => {
+      loads.push(k);
+      await new Promise(r => setTimeout(r, 5));
+      if (failNext) { failNext = false; throw new Error('gen failed: ' + k); }
+      return { name: k, bytes: k.startsWith('big') ? 150 : 40 };
+    },
+    onEvict: (k, t) => evicted.push(k + ':' + t.name),
+  });
+  const p1 = tc.get('a'), p2 = tc.get('a');
+  check(p1 === p2, 'concurrent requests share one promise');
+  const [a1, a2] = await Promise.all([p1, p2]);
+  check(a1 === a2 && a1.name === 'a', 'same texture');
+  eq(loads, ['a'], 'loaded once');
+  eq(tc.stats(), { hits: 1, misses: 1, bytes: 40, count: 1 });
+  check(tc.has('a'), 'cached');
+  check((await tc.get('a')) === a1, 'cached hit');
+  eq(tc.stats().hits, 2);
+
+  await tc.get('b');
+  await tc.get('a');                    // a is now most recent
+  await tc.get('c');                    // 120 bytes > 100: evict least recent, b
+  eq(evicted, ['b:b']);
+  eq(tc.stats(), { hits: 3, misses: 3, bytes: 80, count: 2 });
+  check(!tc.has('b') && tc.has('a') && tc.has('c'), 'b evicted');
+
+  tc.pin('a'); tc.pin('a');
+  await tc.get('d');                    // a pinned, so c goes
+  eq(evicted, ['b:b', 'c:c']);
+  tc.unpin('a');
+  await tc.get('e');                    // a still pinned once: d goes
+  eq(evicted.at(-1), 'd:d');
+  tc.unpin('a');
+  check(tc.has('a') && tc.has('e'), 'within budget after unpin, nothing to evict');
+
+  tc.pin('big1');
+  await tc.get('big1');                 // 150 alone is over budget: kept, everything unpinned goes
+  check(tc.has('big1'), 'new texture kept even over budget');
+  eq(tc.stats().count, 1);
+  eq(tc.stats().bytes, 150);
+  tc.unpin('big1');
+  check(!tc.has('big1'), 'unpin re-runs eviction: the over-budget texture goes');
+  eq(evicted.at(-1), 'big1:big1');
+  eq(tc.stats().bytes, 0);
+
+  failNext = true;
+  const before = loads.length;
+  await rejects(tc.get('f'), 'failed load rejects');
+  check(!tc.has('f'), 'failure not cached');
+  const f = await tc.get('f');
+  eq(f.name, 'f', 'retry after failure');
+  eq(loads.length - before, 2, 'loaded again');
+
+  const sync = new TextureCache({ maxBytes: 10, load: () => { throw new Error('sync failure'); } });
+  let p;
+  try { p = sync.get('x'); } catch (e) { p = null; }
+  check(p instanceof Promise, 'a synchronous throw still gives a promise');
+  if (p) await rejects(p, 'and it rejects');
+  eq(sync.stats().count, 0);
+}
+
+=== exercise graph1
+title: Node graph, step 1: order and evaluate
+--- prompt
+A texture graph is an object mapping node ids to `{ op, inputs = [], params = {} }`, where `inputs` lists the ids of the nodes feeding it, in order. Every node produces a `size` by `size` grayscale image stored as a `Float32Array` (row by row). Pixel centres are at `u = (x + 0.5) / size`, `v = (y + 0.5) / size`.
+
+Write a top-level object `OPS` with these operations. Each is a function `(out, inputs, params, size)` that **writes into** the preallocated `out` (and returns nothing); `inputs` are the input nodes' output arrays.
+
+| op | inputs | params | pixel value |
+|---|---|---|---|
+| `const` | 0 | `value` | `value` |
+| `gradient` | 0 | `axis` (`'u'` or `'v'`) | `u` or `v` |
+| `checker` | 0 | `n` | `(floor(u * n) + floor(v * n)) & 1` |
+| `add`, `mul` | 2 | | `a + b`, `a * b` |
+| `mix` | 3 | | `a + (b - a) * t` |
+| `invert` | 1 | | `1 - a` |
+| `threshold` | 1 | `t` | `a >= t ? 1 : 0` |
+
+Then:
+
+- `topoOrder(nodes, outputId)`: the ids needed to compute `outputId`, each exactly once, every node after all of its inputs (depth-first, visiting inputs in order, so `{ m: inputs [g, c, inv], inv: inputs [g] }` gives `['g', 'c', 'inv', 'm']`). Nodes the output does not depend on are left out. A cycle throws an `Error` whose message contains `cycle`; a reference to a missing node (or a missing output) throws a `ReferenceError`.
+- `evaluateGraph(nodes, outputId, size, customOps = {})`: evaluates the needed nodes in that order, **each exactly once** even when several nodes share it, and returns the output's array. `customOps` adds or overrides operations. An unknown op throws a `TypeError`.
+--- starter
+const OPS = {};
+
+function topoOrder(nodes, outputId) {
+  return Object.keys(nodes);
+}
+
+function evaluateGraph(nodes, outputId, size, customOps = {}) {
+  return new Float32Array(size * size);
+}
+--- solution
+const OPS = {
+  const: (out, ins, p) => { out.fill(p.value); },
+  gradient: (out, ins, p, size) => {
+    for (let y = 0, i = 0; y < size; y++)
+      for (let x = 0; x < size; x++, i++) out[i] = ((p.axis === 'v' ? y : x) + 0.5) / size;
+  },
+  checker: (out, ins, p, size) => {
+    for (let y = 0, i = 0; y < size; y++)
+      for (let x = 0; x < size; x++, i++) out[i] = (Math.floor((x + 0.5) / size * p.n) + Math.floor((y + 0.5) / size * p.n)) & 1;
+  },
+  add: (out, [a, b]) => { for (let i = 0; i < out.length; i++) out[i] = a[i] + b[i]; },
+  mul: (out, [a, b]) => { for (let i = 0; i < out.length; i++) out[i] = a[i] * b[i]; },
+  mix: (out, [a, b, t]) => { for (let i = 0; i < out.length; i++) out[i] = a[i] + (b[i] - a[i]) * t[i]; },
+  invert: (out, [a]) => { for (let i = 0; i < out.length; i++) out[i] = 1 - a[i]; },
+  threshold: (out, [a], p) => { for (let i = 0; i < out.length; i++) out[i] = a[i] >= p.t ? 1 : 0; },
+};
+
+function topoOrder(nodes, outputId) {
+  const order = [], state = new Map();          // id -> 'visiting' | 'done'
+  const visit = id => {
+    if (!Object.hasOwn(nodes, id)) throw new ReferenceError(`missing node: ${id}`);
+    const s = state.get(id);
+    if (s === 'done') return;
+    if (s === 'visiting') throw new Error(`cycle through node ${id}`);
+    state.set(id, 'visiting');
+    for (const src of nodes[id].inputs ?? []) visit(src);
+    state.set(id, 'done');
+    order.push(id);
+  };
+  visit(outputId);
+  return order;
+}
+
+function evaluateGraph(nodes, outputId, size, customOps = {}) {
+  const ops = { ...OPS, ...customOps };
+  const buffers = new Map();
+  for (const id of topoOrder(nodes, outputId)) {
+    const node = nodes[id];
+    if (!Object.hasOwn(ops, node.op)) throw new TypeError(`unknown op: ${node.op}`);
+    const out = new Float32Array(size * size);
+    ops[node.op](out, (node.inputs ?? []).map(src => buffers.get(src)), node.params ?? {}, size);
+    buffers.set(id, out);
+  }
+  return buffers.get(outputId);
+}
+--- hint
+Depth-first search with three states per node (unvisited, visiting, done) finds cycles: reaching a node that is still "visiting" means you came back to it along the current path. Push a node onto the order when you finish visiting it (post-order).
+--- hint
+Keep a `Map` from id to output buffer during `evaluateGraph`; a node's inputs are `node.inputs.map(id => buffers.get(id))`, and topological order guarantees they are already computed.
+--- harness
+{
+  const nodes = {
+    g: { op: 'gradient', params: { axis: 'u' } },
+    c: { op: 'checker', params: { n: 2 } },
+    inv: { op: 'invert', inputs: ['g'] },
+    m: { op: 'mix', inputs: ['g', 'c', 'inv'] },
+    unused: { op: 'no-such-op' },
+  };
+  eq(topoOrder(nodes, 'm'), ['g', 'c', 'inv', 'm']);
+  eq(topoOrder(nodes, 'g'), ['g']);
+  const out = evaluateGraph(nodes, 'm', 4);
+  check(out instanceof Float32Array && out.length === 16, '4x4 Float32Array');
+  eq(Array.from(out), [0.015625, 0.140625, 0.765625, 0.890625, 0.015625, 0.140625, 0.765625, 0.890625,
+    0.890625, 0.765625, 0.390625, 0.765625, 0.890625, 0.765625, 0.390625, 0.765625], 'mix of gradient and checker');
+  eq(Array.from(evaluateGraph({ v: { op: 'gradient', params: { axis: 'v' } } }, 'v', 2)), [0.25, 0.25, 0.75, 0.75]);
+  eq(Array.from(evaluateGraph({ k: { op: 'const', params: { value: 0.5 } }, t: { op: 'threshold', inputs: ['k'], params: { t: 0.5 } } }, 't', 2)), [1, 1, 1, 1]);
+  eq(Array.from(evaluateGraph({
+    a: { op: 'const', params: { value: 0.25 } }, b: { op: 'const', params: { value: 2 } },
+    s: { op: 'add', inputs: ['a', 'b'] }, p: { op: 'mul', inputs: ['s', 'b'] },
+  }, 'p', 1)), [4.5]);
+
+  let calls = 0;
+  const counting = { count: (o, [a]) => { calls++; for (let i = 0; i < o.length; i++) o[i] = a[i] * 2; } };
+  const diamond = {
+    src: { op: 'gradient', params: { axis: 'u' } },
+    left: { op: 'count', inputs: ['src'] },
+    right: { op: 'invert', inputs: ['left'] },
+    out: { op: 'add', inputs: ['left', 'right'] },
+  };
+  eq(topoOrder(diamond, 'out'), ['src', 'left', 'right', 'out']);
+  eq(Array.from(evaluateGraph(diamond, 'out', 2, counting)), [1, 1, 1, 1]);
+  eq(calls, 1, 'shared node evaluated once');
+  eq(Array.from(evaluateGraph({ g: { op: 'gradient', params: { axis: 'u' } } }, 'g', 2, { gradient: o => o.fill(7) })), [7, 7, 7, 7], 'custom ops override');
+
+  const cyc = { a: { op: 'invert', inputs: ['b'] }, b: { op: 'invert', inputs: ['c'] }, c: { op: 'invert', inputs: ['a'] } };
+  let e = null;
+  try { topoOrder(cyc, 'a'); } catch (x) { e = x; }
+  check(e instanceof Error && /cycle/.test(e.message), 'cycle detected');
+  e = null;
+  try { topoOrder({ self: { op: 'invert', inputs: ['self'] } }, 'self'); } catch (x) { e = x; }
+  check(e && /cycle/.test(e.message), 'self loop');
+  e = null;
+  try { topoOrder({ a: { op: 'invert', inputs: ['ghost'] } }, 'a'); } catch (x) { e = x; }
+  check(e instanceof ReferenceError, 'missing input');
+  e = null;
+  try { topoOrder(nodes, 'nope'); } catch (x) { e = x; }
+  check(e instanceof ReferenceError, 'missing output');
+  e = null;
+  try { evaluateGraph(nodes, 'unused', 2); } catch (x) { e = x; }
+  check(e instanceof TypeError, 'unknown op');
+  check(!('unused' in Object.fromEntries(topoOrder(nodes, 'm').map(k => [k, 1]))), 'unrelated nodes skipped');
+
+  const deep = { n0: { op: 'gradient', params: { axis: 'u' } } };
+  for (let i = 1; i <= 3000; i++) deep['n' + i] = { op: 'invert', inputs: ['n' + (i - 1)] };
+  let order;
+  try { order = topoOrder(deep, 'n3000'); } catch (x) { order = null; }
+  eq(order && order.length, 3001, 'a 3000-node chain');
+
+  const big = {
+    g: { op: 'gradient', params: { axis: 'u' } }, h: { op: 'gradient', params: { axis: 'v' } },
+    c: { op: 'checker', params: { n: 16 } }, m1: { op: 'mul', inputs: ['g', 'h'] },
+    m2: { op: 'mix', inputs: ['m1', 'c', 'g'] }, i: { op: 'invert', inputs: ['m2'] },
+    t: { op: 'threshold', inputs: ['i'], params: { t: 0.5 } }, o: { op: 'add', inputs: ['t', 'm1'] },
+  };
+  const t0 = performance.now();
+  const img = evaluateGraph(big, 'o', 1024);
+  const ms = performance.now() - t0;
+  eq(img.length, 1024 * 1024);
+  check(ms < 1500, '1024x1024 graph took ' + Math.round(ms) + 'ms');
+}
+
+=== exercise graph2
+title: Node graph, step 2: incremental recompute
+continues: graph1
+--- prompt
+In an editor the user drags one slider at a time; recomputing the whole graph for every change is wasteful. Write `class Compositor`:
+
+- `constructor(nodes, size, customOps = {})`: takes a **copy** of the graph (copy each node's `inputs` array and `params` object; the caller's objects must never be modified). Initially every node is dirty.
+- `output(id)`: returns the node's image, recomputing only the **dirty** nodes it depends on, in topological order. Each node has **one** `Float32Array` that is allocated the first time it is computed and then overwritten in place on every recompute, so `output(id)` returns the same array object every time.
+- `setParam(id, key, value)`: changes a parameter. If the value is the same (`Object.is`), nothing happens. Otherwise the node and everything downstream of it become dirty.
+- `connect(id, index, srcId)`: sets `inputs[index]` of node `id` to `srcId` and marks `id` and its downstream dirty. If that would create a cycle, throw an `Error` (message containing `cycle`) and leave the graph exactly as it was. Missing node ids throw a `ReferenceError`.
+- `evaluations`: a public counter of how many times an op has been run.
+--- stubs
+class Compositor {
+  constructor(nodes, size, customOps = {}) {
+    this.nodes = nodes;
+    this.size = size;
+    this.customOps = customOps;
+    this.evaluations = 0;
+  }
+  output(id) {
+    this.evaluations += topoOrder(this.nodes, id).length;
+    return evaluateGraph(this.nodes, id, this.size, this.customOps);
+  }
+  setParam(id, key, value) { this.nodes[id].params[key] = value; }
+  connect(id, index, srcId) { this.nodes[id].inputs[index] = srcId; }
+}
+--- solution
+const OPS = {
+  const: (out, ins, p) => { out.fill(p.value); },
+  gradient: (out, ins, p, size) => {
+    for (let y = 0, i = 0; y < size; y++)
+      for (let x = 0; x < size; x++, i++) out[i] = ((p.axis === 'v' ? y : x) + 0.5) / size;
+  },
+  checker: (out, ins, p, size) => {
+    for (let y = 0, i = 0; y < size; y++)
+      for (let x = 0; x < size; x++, i++) out[i] = (Math.floor((x + 0.5) / size * p.n) + Math.floor((y + 0.5) / size * p.n)) & 1;
+  },
+  add: (out, [a, b]) => { for (let i = 0; i < out.length; i++) out[i] = a[i] + b[i]; },
+  mul: (out, [a, b]) => { for (let i = 0; i < out.length; i++) out[i] = a[i] * b[i]; },
+  mix: (out, [a, b, t]) => { for (let i = 0; i < out.length; i++) out[i] = a[i] + (b[i] - a[i]) * t[i]; },
+  invert: (out, [a]) => { for (let i = 0; i < out.length; i++) out[i] = 1 - a[i]; },
+  threshold: (out, [a], p) => { for (let i = 0; i < out.length; i++) out[i] = a[i] >= p.t ? 1 : 0; },
+};
+
+function topoOrder(nodes, outputId) {
+  const order = [], state = new Map();          // id -> 'visiting' | 'done'
+  const visit = id => {
+    if (!Object.hasOwn(nodes, id)) throw new ReferenceError(`missing node: ${id}`);
+    const s = state.get(id);
+    if (s === 'done') return;
+    if (s === 'visiting') throw new Error(`cycle through node ${id}`);
+    state.set(id, 'visiting');
+    for (const src of nodes[id].inputs ?? []) visit(src);
+    state.set(id, 'done');
+    order.push(id);
+  };
+  visit(outputId);
+  return order;
+}
+
+function evaluateGraph(nodes, outputId, size, customOps = {}) {
+  const ops = { ...OPS, ...customOps };
+  const buffers = new Map();
+  for (const id of topoOrder(nodes, outputId)) {
+    const node = nodes[id];
+    if (!Object.hasOwn(ops, node.op)) throw new TypeError(`unknown op: ${node.op}`);
+    const out = new Float32Array(size * size);
+    ops[node.op](out, (node.inputs ?? []).map(src => buffers.get(src)), node.params ?? {}, size);
+    buffers.set(id, out);
+  }
+  return buffers.get(outputId);
+}
+class Compositor {
+  constructor(nodes, size, customOps = {}) {
+    this.nodes = {};
+    for (const [id, n] of Object.entries(nodes)) {
+      this.nodes[id] = { op: n.op, inputs: [...(n.inputs ?? [])], params: { ...(n.params ?? {}) } };
+    }
+    this.size = size;
+    this.ops = { ...OPS, ...customOps };
+    this.buffers = new Map();      // id -> Float32Array, reused across recomputes
+    this.dirty = new Set(Object.keys(this.nodes));
+    this.evaluations = 0;
+  }
+  #markDirty(id) {
+    const stack = [id];
+    while (stack.length) {
+      const cur = stack.pop();
+      if (this.dirty.has(cur) && cur !== id) continue;
+      this.dirty.add(cur);
+      for (const [other, n] of Object.entries(this.nodes)) if (n.inputs.includes(cur) && !this.dirty.has(other)) stack.push(other);
+    }
+  }
+  output(id) {
+    for (const nid of topoOrder(this.nodes, id)) {
+      if (!this.dirty.has(nid)) continue;
+      const node = this.nodes[nid];
+      if (!Object.hasOwn(this.ops, node.op)) throw new TypeError(`unknown op: ${node.op}`);
+      let out = this.buffers.get(nid);
+      if (!out) this.buffers.set(nid, out = new Float32Array(this.size * this.size));
+      this.ops[node.op](out, node.inputs.map(src => this.buffers.get(src)), node.params, this.size);
+      this.evaluations++;
+      this.dirty.delete(nid);
+    }
+    return this.buffers.get(id);
+  }
+  setParam(id, key, value) {
+    if (!Object.hasOwn(this.nodes, id)) throw new ReferenceError(`missing node: ${id}`);
+    const p = this.nodes[id].params;
+    if (Object.is(p[key], value)) return;
+    p[key] = value;
+    this.#markDirty(id);
+  }
+  connect(id, index, srcId) {
+    if (!Object.hasOwn(this.nodes, id)) throw new ReferenceError(`missing node: ${id}`);
+    if (!Object.hasOwn(this.nodes, srcId)) throw new ReferenceError(`missing node: ${srcId}`);
+    const inputs = this.nodes[id].inputs, old = inputs[index];
+    inputs[index] = srcId;
+    try {
+      topoOrder(this.nodes, id);
+    } catch (e) {
+      inputs[index] = old;
+      throw e;
+    }
+    this.#markDirty(id);
+  }
+}
+--- hint
+Keep a `Set` of dirty ids. Marking dirty walks *downstream*: the nodes whose `inputs` include the changed node, then theirs, and so on (a stack and a scan over the nodes is fine for editor-sized graphs).
+--- hint
+For `connect`, make the change, call `topoOrder(this.nodes, id)` inside `try`, and on error put the old input back before rethrowing.
+--- harness
+{
+  const nodes = {
+    g: { op: 'gradient', params: { axis: 'u' } },
+    c: { op: 'checker', params: { n: 2 } },
+    inv: { op: 'invert', inputs: ['g'] },
+    m: { op: 'mix', inputs: ['g', 'c', 'inv'] },
+  };
+  const snapshot = JSON.stringify(nodes);
+  const comp = new Compositor(nodes, 4);
+  const out = comp.output('m');
+  eq(Array.from(out), Array.from(evaluateGraph(nodes, 'm', 4)), 'same result as evaluateGraph');
+  eq(comp.evaluations, 4);
+  check(comp.output('m') === out, 'same array object');
+  eq(comp.evaluations, 4, 'nothing dirty, nothing recomputed');
+
+  comp.setParam('c', 'n', 4);
+  const out2 = comp.output('m');
+  check(out2 === out, 'buffer reused after recompute');
+  eq(comp.evaluations, 6, 'only c and m recomputed');
+  const changed = JSON.parse(snapshot); changed.c.params.n = 4;
+  eq(Array.from(out2), Array.from(evaluateGraph(changed, 'm', 4)), 'correct after setParam');
+  eq(JSON.stringify(nodes), snapshot, 'caller graph not modified');
+
+  comp.setParam('c', 'n', 4);
+  comp.output('m');
+  eq(comp.evaluations, 6, 'same value: no recompute');
+
+  comp.setParam('g', 'axis', 'v');
+  comp.output('inv');
+  eq(comp.evaluations, 8, 'output(inv) computes only g and inv');
+  comp.output('m');
+  eq(comp.evaluations, 9, 'then m');
+  changed.g.params.axis = 'v';
+  eq(Array.from(comp.output('m')), Array.from(evaluateGraph(changed, 'm', 4)));
+
+  comp.connect('m', 2, 'c');
+  comp.output('m');
+  eq(comp.evaluations, 10, 'connect dirties only m');
+  changed.m.inputs[2] = 'c';
+  eq(Array.from(comp.output('m')), Array.from(evaluateGraph(changed, 'm', 4)), 'correct after connect');
+
+  let e = null;
+  try { comp.connect('inv', 0, 'm'); } catch (x) { e = x; }
+  check(e && /cycle/.test(e.message), 'cycle rejected');
+  eq(comp.output('m'), out, 'graph still works after a rejected connect');
+  eq(comp.evaluations, 10, 'rejected connect dirtied nothing that matters');
+  eq(Array.from(comp.output('m')), Array.from(evaluateGraph(changed, 'm', 4)), 'unchanged after rejection');
+  e = null;
+  try { comp.setParam('ghost', 'x', 1); } catch (x) { e = x; }
+  check(e instanceof ReferenceError, 'setParam on a missing node');
+  e = null;
+  try { comp.connect('m', 0, 'ghost'); } catch (x) { e = x; }
+  check(e instanceof ReferenceError, 'connect to a missing node');
+
+  const chain = { n0: { op: 'gradient', params: { axis: 'u' } } };
+  for (let i = 1; i <= 20; i++) chain['n' + i] = { op: 'threshold', inputs: ['n' + (i - 1)], params: { t: 0.5 } };
+  const big = new Compositor(chain, 512);
+  big.output('n20');
+  eq(big.evaluations, 21);
+  const t0 = performance.now();
+  for (let k = 0; k < 100; k++) { big.setParam('n20', 't', 0.3 + k / 1000); big.output('n20'); }
+  const ms = performance.now() - t0;
+  eq(big.evaluations, 121, 'each tweak of the last node recomputes one node');
+  check(ms < 1000, '100 tweaks took ' + Math.round(ms) + 'ms');
+}
+
+=== exercise easing
+title: Easing curves and keyframe tracks
+--- prompt
+Write an easing library.
+
+**`easings`**, an object of functions on `t` in [0, 1] (each maps 0 to 0 and 1 to 1):
+
+| name | formula |
+|---|---|
+| `linear` | `t` |
+| `quadIn` / `quadOut` | `t * t` / `t * (2 - t)` |
+| `quadInOut` | `t < 0.5 ? 2t² : 1 - 2(1 - t)²` |
+| `cubicInOut` | `t < 0.5 ? 4t³ : 1 - 4(1 - t)³` |
+| `smoothstep` | `t * t * (3 - 2t)` |
+| `backOut` | `1 + 2.70158 (t - 1)³ + 1.70158 (t - 1)²` (overshoots 1) |
+
+**`cubicBezier(x1, y1, x2, y2)`** returns an easing function like CSS `cubic-bezier()`: the curve goes from (0, 0) to (1, 1) with control points (x1, y1) and (x2, y2). For input `t`, find the curve parameter `s` with `x(s) = t` (Newton's method on the cubic, falling back to bisection when the derivative is tiny or Newton does not converge), and return `y(s)`. Accuracy: within `1e-6`. Inputs `<= 0` give 0 and `>= 1` give 1. `x1` or `x2` outside [0, 1] throws a `RangeError` (then `x(s)` would not be monotonic). The y values may be outside [0, 1].
+
+**`sampleTrack(keys, time)`**: `keys` is a non-empty array of `{ t, value, ease }` sorted by `t`. Before the first key return its value, after the last key the last value. Otherwise find the segment `keys[i].t <= time < keys[i + 1].t` by **binary search** and interpolate the values with the starting key's `ease`, which is a name from `easings`, a function, or missing (linear). An unknown easing name throws a `RangeError`; an empty track too.
+
+The harness samples a 10,000-key track a million times and a bezier a million times under time limits, and nothing may allocate per sample.
+--- starter
+const easings = { linear: t => t };
+
+function cubicBezier(x1, y1, x2, y2) {
+  return t => t;
+}
+
+function sampleTrack(keys, time) {
+  const i = keys.findIndex(k => k.t > time);
+  if (i <= 0) return i === 0 ? keys[0].value : keys[keys.length - 1].value;
+  const a = keys[i - 1], b = keys[i];
+  return a.value + (b.value - a.value) * (time - a.t) / (b.t - a.t);
+}
+--- solution
+const easings = {
+  linear: t => t,
+  quadIn: t => t * t,
+  quadOut: t => t * (2 - t),
+  quadInOut: t => (t < 0.5 ? 2 * t * t : 1 - 2 * (1 - t) * (1 - t)),
+  cubicInOut: t => (t < 0.5 ? 4 * t * t * t : 1 - 4 * (1 - t) ** 3),
+  smoothstep: t => t * t * (3 - 2 * t),
+  backOut: t => 1 + 2.70158 * (t - 1) ** 3 + 1.70158 * (t - 1) ** 2,
+};
+
+function cubicBezier(x1, y1, x2, y2) {
+  if (!(x1 >= 0 && x1 <= 1 && x2 >= 0 && x2 <= 1)) throw new RangeError('x control points must be in [0, 1]');
+  const cx = 3 * x1, bx = 3 * (x2 - x1) - cx, ax = 1 - cx - bx;
+  const cy = 3 * y1, by = 3 * (y2 - y1) - cy, ay = 1 - cy - by;
+  const X = s => ((ax * s + bx) * s + cx) * s;
+  const Y = s => ((ay * s + by) * s + cy) * s;
+  const dX = s => (3 * ax * s + 2 * bx) * s + cx;
+  return t => {
+    if (t <= 0) return 0;
+    if (t >= 1) return 1;
+    let s = t;
+    for (let i = 0; i < 8; i++) {                   // Newton's method
+      const err = X(s) - t, d = dX(s);
+      if (Math.abs(err) < 1e-9) return Y(s);
+      if (Math.abs(d) < 1e-9) break;
+      s -= err / d;
+    }
+    let lo = 0, hi = 1;                             // bisection fallback
+    s = t;
+    for (let i = 0; i < 60; i++) {
+      const x = X(s);
+      if (Math.abs(x - t) < 1e-9) break;
+      if (x < t) lo = s; else hi = s;
+      s = (lo + hi) / 2;
+    }
+    return Y(s);
+  };
+}
+
+function sampleTrack(keys, time) {
+  if (!keys.length) throw new RangeError('empty track');
+  if (time <= keys[0].t) return keys[0].value;
+  const last = keys[keys.length - 1];
+  if (time >= last.t) return last.value;
+  let lo = 0, hi = keys.length - 1;                 // find segment with binary search
+  while (hi - lo > 1) {
+    const mid = (lo + hi) >> 1;
+    if (keys[mid].t <= time) lo = mid; else hi = mid;
+  }
+  const a = keys[lo], b = keys[hi];
+  const ease = typeof a.ease === 'function' ? a.ease : easings[a.ease ?? 'linear'];
+  if (!ease) throw new RangeError(`unknown easing: ${a.ease}`);
+  const k = ease((time - a.t) / (b.t - a.t));
+  return a.value + (b.value - a.value) * k;
+}
+--- hint
+Write the polynomial in Horner form: with `cx = 3 x1`, `bx = 3 (x2 - x1) - cx`, `ax = 1 - cx - bx`, the curve is `x(s) = ((ax s + bx) s + cx) s` and its derivative `(3 ax s + 2 bx) s + cx`; the same for `y`. Start Newton at `s = t`.
+--- hint
+For the track, handle the before-first and after-last cases first, then binary search with `lo` and `hi` so that `keys[lo].t <= time < keys[hi].t`, narrowing until `hi - lo === 1`.
+--- harness
+{
+  for (const [name, f] of Object.entries(easings)) {
+    near(f(0), 0, 1e-12, name + '(0)'); near(f(1), 1, 1e-12, name + '(1)');
+  }
+  for (const n of ['linear', 'quadIn', 'quadOut', 'quadInOut', 'cubicInOut', 'smoothstep', 'backOut']) check(typeof easings[n] === 'function', 'has ' + n);
+  near(easings.quadIn(0.5), 0.25, 1e-12); near(easings.quadOut(0.5), 0.75, 1e-12);
+  near(easings.quadInOut(0.25), 0.125, 1e-12); near(easings.quadInOut(0.75), 0.875, 1e-12);
+  near(easings.cubicInOut(0.25), 0.0625, 1e-12); near(easings.cubicInOut(0.5), 0.5, 1e-12);
+  near(easings.smoothstep(0.25), 0.15625, 1e-12);
+  near(easings.backOut(0.5), 1.0876975, 1e-9); check(easings.backOut(0.7) > 1, 'backOut overshoots');
+
+  const refBezier = (x1, y1, x2, y2, t) => {
+    const B = (p1, p2, s) => 3 * (1 - s) ** 2 * s * p1 + 3 * (1 - s) * s * s * p2 + s ** 3;
+    let lo = 0, hi = 1;
+    for (let i = 0; i < 200; i++) { const mid = (lo + hi) / 2; if (B(x1, x2, mid) < t) lo = mid; else hi = mid; }
+    return B(y1, y2, (lo + hi) / 2);
+  };
+  const curves = [[0.25, 0.1, 0.25, 1], [0.42, 0, 0.58, 1], [0, 0, 1, 1], [0.9, 0, 0.1, 1], [0.68, -0.6, 0.32, 1.6], [1, 0, 0, 1], [0, 1, 1, 0], [0.5, 2, 0.5, -1]];
+  for (const c of curves) {
+    const f = cubicBezier(...c);
+    let worst = 0;
+    for (let i = 0; i <= 200; i++) { const t = i / 200; worst = Math.max(worst, Math.abs(f(t) - refBezier(...c, t))); }
+    check(worst < 1e-6, `cubicBezier(${c}) max error ${worst}`);
+  }
+  near(cubicBezier(0.25, 0.1, 0.25, 1)(0.5), 0.8024033877, 1e-6, 'CSS ease at 0.5');
+  eq(cubicBezier(0.25, 0.1, 0.25, 1)(-1), 0); eq(cubicBezier(0.25, 0.1, 0.25, 1)(2), 1);
+  throws(() => cubicBezier(1.2, 0, 0.5, 1), 'x1 out of range');
+  throws(() => cubicBezier(0.5, 0, -0.1, 1), 'x2 out of range');
+  {
+    const f = cubicBezier(0.42, 0, 0.58, 1);
+    const t0 = performance.now();
+    let s = 0;
+    for (let i = 0; i < 1e6; i++) s += f(i / 1e6);
+    const ms = performance.now() - t0;
+    near(s / 1e6, 0.5, 1e-3, 'symmetric curve averages 0.5');
+    check(ms < 1000, 'a million bezier samples took ' + Math.round(ms) + 'ms');
+  }
+
+  const track = [
+    { t: 0, value: 10 },
+    { t: 1, value: 20, ease: 'quadIn' },
+    { t: 3, value: 0, ease: x => x * x * x },
+    { t: 4, value: 5 },
+  ];
+  eq(sampleTrack(track, -5), 10, 'before the first key');
+  eq(sampleTrack(track, 0), 10);
+  eq(sampleTrack(track, 0.5), 15, 'linear by default');
+  eq(sampleTrack(track, 1), 20, 'exactly on a key');
+  eq(sampleTrack(track, 2), 15, 'quadIn: 20 + (0 - 20) * 0.25');
+  near(sampleTrack(track, 3.5), 0.625, 1e-12, 'function easing');
+  eq(sampleTrack(track, 4), 5); eq(sampleTrack(track, 99), 5, 'after the last key');
+  eq(sampleTrack([{ t: 2, value: 7 }], 1), 7, 'single key');
+  eq(sampleTrack([{ t: 2, value: 7 }], 3), 7);
+  throws(() => sampleTrack([], 0), 'empty track');
+  throws(() => sampleTrack([{ t: 0, value: 0, ease: 'wobble' }, { t: 1, value: 1 }], 0.5), 'unknown easing');
+  {
+    const N = 10000;
+    const keys = Array.from({ length: N }, (_, i) => ({ t: i, value: i % 2 ? 1 : 0, ease: i % 3 ? 'smoothstep' : 'linear' }));
+    const t0 = performance.now();
+    let s = 0;
+    for (let i = 0; i < 1e6; i++) s += sampleTrack(keys, (i * 0.0099991) % N);
+    const ms = performance.now() - t0;
+    check(s > 0, 'samples computed');
+    near(sampleTrack(keys, 5000.5), 0.5, 1e-12, 'middle of a smoothstep segment');
+    check(ms < 1500, 'a million track samples took ' + Math.round(ms) + 'ms');
+  }
+}
