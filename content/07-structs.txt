@@ -1,0 +1,1207 @@
+=== chapter structs
+title: Structs, enums, unions
+blurb: C's only way to build your own types: value-semantics structs, padding and layout, enums as plain ints, tagged unions, flexible array members, and methods without classes.
+--- body
+## A struct is a C# struct without the methods
+
+A `struct` groups named fields into one type. The closest relative in your toolbox is a C# `struct`: a value type, copied on assignment, laid out inline. There are no methods, constructors, properties, access modifiers, inheritance or interfaces. Just data.
+
+```c
+#include <stdio.h>
+
+struct point {
+    int x;
+    int y;
+};
+
+int main(void) {
+    struct point p;          // the type's name is "struct point", both words
+    p.x = 3;
+    p.y = 4;
+    struct point q = {1, 2}; // positional initializer, in field order
+    printf("(%d, %d) (%d, %d)\n", p.x, p.y, q.x, q.y);
+    return 0;
+}
+```
+
+The tag `point` lives in its own namespace, which is why you must write `struct point` every time. Most code adds a `typedef` to give the type a one-word name:
+
+```c
+typedef struct {
+    double x, y;
+} Vec2;                         // anonymous struct, named via typedef
+
+typedef struct node {           // tagged too: needed when it refers to itself
+    int value;
+    struct node *next;          // "Node" does not exist yet on this line
+} Node;
+```
+
+Both styles are common. The Linux kernel avoids typedefs for structs on purpose (seeing `struct` tells you it is a struct); most application code uses them. Pick one per project.
+
+## Initialization
+
+```c
+#include <stdio.h>
+
+typedef struct {
+    const char *name;
+    int hp;
+    int x, y;
+    double speed;
+} Player;
+
+int main(void) {
+    Player a = {"Ada", 100, 0, 0, 1.5};             // positional: fragile if fields move
+    Player b = {.name = "Bob", .hp = 80, .speed = 2.0};   // designated: x and y become 0
+    Player c = {0};                                  // everything zero / NULL
+    Player d;                                        // local: garbage, like any local
+
+    printf("%s %d %d %.1f\n", b.name, b.hp, b.x, b.speed);
+    printf("%d %p\n", c.hp, (void *)c.name);
+
+    // A compound literal: an unnamed struct value, created on the spot
+    d = (Player){.name = "Dee", .hp = 50};
+    printf("%s %d\n", d.name, d.hp);
+    (void)a;
+    return 0;
+}
+```
+
+**Designated initializers** (`.field = value`) are the C equivalent of C#'s object initializers, and as with arrays, any field you leave out is zeroed. Prefer them: the code stays correct when someone reorders or adds fields.
+
+**Compound literals** `(Type){ ... }` create a temporary value of any struct (or array) type. They are how you "construct" a value inline: assigning, passing to a function, or returning.
+
+## Value semantics
+
+Assignment copies every byte of a struct. Passing one to a function copies it. Returning one copies it. This includes arrays *inside* a struct, which is the one way to copy or return a whole array with `=`.
+
+```c
+#include <stdio.h>
+
+typedef struct {
+    int scores[3];
+    int count;
+} Stats;
+
+void bump(Stats s) {           // s is a copy (gcc even warns the write is pointless)
+    s.scores[0] = 999;
+}
+
+Stats make(void) {
+    return (Stats){.scores = {7, 8, 9}, .count = 3};   // returning a struct: fine
+}
+
+int main(void) {
+    Stats a = make();
+    Stats b = a;               // copies the whole array too
+    b.scores[0] = 1;
+    bump(a);
+    printf("%d %d\n", a.scores[0], b.scores[0]);   // 7 1
+    return 0;
+}
+```
+
+Structs cannot be compared with `==`. Compare field by field. (`memcmp` is tempting but wrong in general: padding bytes, below, may hold garbage.)
+
+## Pointers to structs and ->
+
+Copying a large struct on every call is wasteful, and a copy cannot be modified on the caller's behalf. So, as with C# `ref` parameters, you pass a pointer. `p->field` is shorthand for `(*p).field`:
+
+```c
+#include <stdio.h>
+
+typedef struct {
+    double x, y;
+} Vec2;
+
+void scale(Vec2 *v, double k) {    // modifies the caller's value
+    v->x *= k;
+    v->y *= k;
+}
+
+double dot(const Vec2 *a, const Vec2 *b) {   // const: read-only, no copy
+    return a->x * b->x + a->y * b->y;
+}
+
+int main(void) {
+    Vec2 v = {3, 4};
+    scale(&v, 2);
+    Vec2 *p = &v;
+    printf("%.1f %.1f %.1f\n", p->x, (*p).y, dot(&v, &v));
+    return 0;
+}
+```
+
+The parentheses in `(*p).x` are required because `.` binds tighter than `*`: `*p.x` means `*(p.x)`. That ugliness is why `->` exists.
+
+Rule of thumb: pass small structs (a couple of numbers) by value, everything else by `const T *` for reading or `T *` for modifying.
+
+## Padding and alignment
+
+Each type has an *alignment*: an `int` wants an address divisible by 4, a `double` or pointer by 8. To satisfy that, the compiler inserts invisible padding between fields, and at the end so that arrays of the struct stay aligned. Fields are never reordered.
+
+```c
+#include <stdio.h>
+#include <stddef.h>   // offsetof
+
+struct bad {
+    char a;      // offset 0, then 7 bytes of padding
+    double b;    // offset 8
+    char c;      // offset 16, then 3 bytes of padding
+    int d;       // offset 20
+};               // size 24
+
+struct good {
+    double b;    // offset 0
+    int d;       // offset 8
+    char a;      // offset 12
+    char c;      // offset 13, then 2 bytes of tail padding
+};               // size 16
+
+int main(void) {
+    printf("bad:  %zu bytes, b at %zu, c at %zu, d at %zu\n",
+           sizeof(struct bad), offsetof(struct bad, b), offsetof(struct bad, c), offsetof(struct bad, d));
+    printf("good: %zu bytes\n", sizeof(struct good));
+    return 0;
+}
+```
+
+The rule that gets you the minimum size almost every time: **order fields from largest alignment to smallest**. It matters when you have a million of them in an array, or when the struct crosses a boundary (a file format, a network packet, a GPU buffer). For those cases never assume a layout: write fields out one by one, and check with `sizeof` and `offsetof` (or `_Static_assert(sizeof(struct good) == 16, "layout")`).
+
+## Nesting and arrays of structs
+
+Structs nest by value (the inner struct is stored inline, not as a reference), and arrays of structs are contiguous:
+
+```c
+#include <stdio.h>
+
+typedef struct { int x, y; } Point;
+typedef struct { Point min, max; } Box;   // 16 bytes, two Points inline
+
+typedef struct {
+    char name[16];      // a fixed buffer, stored inside the struct
+    int price;
+} Item;
+
+int main(void) {
+    Box b = {.min = {0, 0}, .max = {10, 5}};
+    b.max.x += 2;
+    printf("%d x %d\n", b.max.x - b.min.x, b.max.y - b.min.y);
+
+    Item shop[] = {
+        {"sword", 120},
+        {"shield", 90},
+        {.name = "potion", .price = 15},
+    };
+    int n = sizeof shop / sizeof shop[0];
+    int total = 0;
+    for (Item *it = shop; it < shop + n; it++)    // walk with a pointer
+        total += it->price;
+    printf("%d items, total %d, first %s\n", n, total, shop[0].name);
+    return 0;
+}
+```
+
+`char name[16]` puts the characters inside the struct, so copying the struct copies the name. A `const char *name` field would only copy the pointer, with both copies pointing at the same characters. That distinction (deep vs shallow copy) is the same one you know from C#, just more visible.
+
+## Enums are ints
+
+```c
+enum color { RED, GREEN, BLUE };          // 0, 1, 2
+enum http { OK = 200, NOT_FOUND = 404, TEAPOT = 418 };
+typedef enum { DIR_N, DIR_E, DIR_S, DIR_W, DIR_COUNT } Dir;
+```
+
+Unlike C# enums, the constants are plain `int`s in the enclosing scope (no `Color.Red`, so prefix them by hand: `DIR_N`), and an `enum` variable accepts any integer without complaint. There is no `ToString()`; the usual trick is a parallel array of names indexed by the value. A trailing `..._COUNT` constant gives you the number of values for free.
+
+```c
+#include <stdio.h>
+
+typedef enum { DIR_N, DIR_E, DIR_S, DIR_W, DIR_COUNT } Dir;
+static const char *dir_names[DIR_COUNT] = {"north", "east", "south", "west"};
+
+Dir turn_right(Dir d) { return (Dir)((d + 1) % DIR_COUNT); }
+
+int main(void) {
+    Dir d = DIR_W;
+    printf("%s -> %s\n", dir_names[d], dir_names[turn_right(d)]);
+    switch (d) {               // gcc -Wall warns if a switch on an enum misses a value
+    case DIR_N: case DIR_S: puts("vertical"); break;
+    case DIR_E: case DIR_W: puts("horizontal"); break;
+    default: break;
+    }
+    return 0;
+}
+```
+
+## Unions and tagged unions
+
+A `union` looks like a struct, but all its fields share the same memory. Its size is that of its largest member, and only the member you last wrote holds a meaningful value. On its own that is a low-level tool. Paired with an enum saying which member is live, it becomes a **tagged union**: C's version of a discriminated union, F#'s `type Shape = Circle of float | Rect of ...`, or a C# class hierarchy with a `switch` on the type.
+
+```c
+#include <stdio.h>
+
+typedef enum { VAL_INT, VAL_DOUBLE, VAL_STR } ValKind;
+
+typedef struct {
+    ValKind kind;          // the tag: which union member is valid
+    union {                // anonymous union (C11): members accessed as v.i, v.d, v.s
+        int i;
+        double d;
+        const char *s;
+    };
+} Value;
+
+void print_value(const Value *v) {
+    switch (v->kind) {
+    case VAL_INT:    printf("int %d\n", v->i); break;
+    case VAL_DOUBLE: printf("double %g\n", v->d); break;
+    case VAL_STR:    printf("string \"%s\"\n", v->s); break;
+    }
+}
+
+int main(void) {
+    Value vals[] = {
+        {.kind = VAL_INT, .i = 42},
+        {.kind = VAL_DOUBLE, .d = 2.5},
+        {.kind = VAL_STR, .s = "hi"},
+    };
+    for (int i = 0; i < 3; i++) print_value(&vals[i]);
+    printf("sizeof(Value) = %zu\n", sizeof(Value));   // 16: tag + padding + 8-byte union
+    return 0;
+}
+```
+
+Nothing enforces the tag: reading `v->d` when `kind` is `VAL_INT` compiles fine. Keep the tag and the data in sync by only building values through small constructor functions, and always `switch` on the tag. This pattern is everywhere: interpreter values, JSON nodes, events, AST nodes, network messages.
+
+## Flexible array members
+
+The last field of a struct may be an array with no size. The struct then acts as a header, and you allocate it with as much extra room as you need, in a single block:
+
+```c
+#include <stdio.h>
+#include <stdlib.h>
+
+typedef struct {
+    size_t len;
+    int data[];      // flexible array member: must be last, contributes 0 to sizeof
+} IntArray;
+
+int main(void) {
+    size_t n = 5;
+    IntArray *a = malloc(sizeof *a + n * sizeof a->data[0]);   // header + n ints
+    if (!a) return 1;
+    a->len = n;
+    for (size_t i = 0; i < n; i++) a->data[i] = (int)(i * 10);
+    printf("sizeof header %zu, last %d\n", sizeof(IntArray), a->data[a->len - 1]);
+    free(a);         // one block, one free
+    return 0;
+}
+```
+
+`malloc(bytes)` asks the heap for memory and `free` gives it back; the next chapter covers both in depth. The benefit here is one allocation instead of two (header plus separate array), with the data right next to its length. You cannot declare such a struct as a normal variable or put it in an array; it only makes sense through a pointer.
+
+## Methods without classes
+
+C has no methods, but the pattern is easy to fake and is how every large C codebase is organized: a struct, plus functions named after it that take a pointer to it as the first argument. That pointer is `this`, made explicit.
+
+```c
+#include <stdio.h>
+
+typedef struct {
+    int balance;
+    int tx_count;
+} Account;
+
+void account_init(Account *a, int opening) {   // the "constructor"
+    a->balance = opening;
+    a->tx_count = 0;
+}
+
+int account_withdraw(Account *a, int amount) { // returns 0 on failure, no exceptions
+    if (amount <= 0 || amount > a->balance) return 0;
+    a->balance -= amount;
+    a->tx_count++;
+    return 1;
+}
+
+int account_balance(const Account *a) {        // const "this": a read-only method
+    return a->balance;
+}
+
+int main(void) {
+    Account acc;
+    account_init(&acc, 100);
+    printf("%d ", account_withdraw(&acc, 30));
+    printf("%d ", account_withdraw(&acc, 500));
+    printf("%d %d\n", account_balance(&acc), acc.tx_count);
+    return 0;
+}
+```
+
+The `typename_verb` prefix stands in for both the class and the namespace. Taking `const Account *` is the equivalent of a method that does not mutate `this`. Encapsulation, when you want it, comes from declaring only `typedef struct account Account;` in a header and keeping the field list in the `.c` file, so that other files can only hold pointers and call your functions (an *opaque type*, covered with multi-file programs).
+
+=== exercise geometry
+title: Points by value
+--- prompt
+The starter defines `typedef struct { double x, y; } Point;`. Write:
+
+- `double point_dist(Point a, Point b)`: the Euclidean distance (`sqrt` from `<math.h>`).
+- `Point point_mid(Point a, Point b)`: the midpoint.
+- `Point point_add(Point a, Point b)`: the component-wise sum.
+
+Structs are small here, so pass and return them by value.
+--- starter
+#include <math.h>
+
+typedef struct {
+    double x, y;
+} Point;
+
+double point_dist(Point a, Point b) {
+    return 0;
+}
+
+Point point_mid(Point a, Point b) {
+    return a;
+}
+
+Point point_add(Point a, Point b) {
+    return a;
+}
+--- solution
+#include <math.h>
+
+typedef struct {
+    double x, y;
+} Point;
+
+double point_dist(Point a, Point b) {
+    double dx = a.x - b.x, dy = a.y - b.y;
+    return sqrt(dx * dx + dy * dy);
+}
+
+Point point_mid(Point a, Point b) {
+    return (Point){(a.x + b.x) / 2, (a.y + b.y) / 2};
+}
+
+Point point_add(Point a, Point b) {
+    return (Point){.x = a.x + b.x, .y = a.y + b.y};
+}
+--- hint
+A compound literal builds the return value in one line: `return (Point){.x = ..., .y = ...};`
+--- harness
+int main(void) {
+    Point o = {0, 0}, p = {3, 4}, q = {-1, 2.5};
+    CHECK_DBL(point_dist(o, p), 5);
+    CHECK_DBL(point_dist(p, p), 0);
+    CHECK_DBL(point_dist(q, p), sqrt(16 + 2.25));
+    Point m = point_mid(o, p);
+    CHECK_DBL(m.x, 1.5);
+    CHECK_DBL(m.y, 2);
+    m = point_mid(q, q);
+    CHECK_DBL(m.x, -1);
+    CHECK_DBL(m.y, 2.5);
+    Point s = point_add(p, q);
+    CHECK_DBL(s.x, 2);
+    CHECK_DBL(s.y, 6.5);
+    CHECK_DBL(p.x, 3);   // the inputs were copies, untouched
+    return TEST_END();
+}
+
+=== exercise rects
+title: Rectangles by pointer
+--- prompt
+The starter defines `typedef struct { int x, y, w, h; } Rect;`: the top-left corner and a size. A rectangle covers the half-open ranges `x <= px < x + w` and `y <= py < y + h`, so a rect of width 0 contains nothing.
+
+Write:
+
+- `int rect_contains(const Rect *r, int px, int py)`: 1 if the point is inside, else 0.
+- `int rect_intersect(const Rect *a, const Rect *b, Rect *out)`: if the two overlap with a positive area, store the overlapping rectangle in `*out` and return 1. Otherwise return 0 and do not touch `*out`. Rectangles that only share an edge do not overlap.
+--- starter
+typedef struct {
+    int x, y, w, h;
+} Rect;
+
+int rect_contains(const Rect *r, int px, int py) {
+    return 0;
+}
+
+int rect_intersect(const Rect *a, const Rect *b, Rect *out) {
+    return 0;
+}
+--- solution
+typedef struct {
+    int x, y, w, h;
+} Rect;
+
+int rect_contains(const Rect *r, int px, int py) {
+    return px >= r->x && px < r->x + r->w && py >= r->y && py < r->y + r->h;
+}
+
+static int max_i(int a, int b) { return a > b ? a : b; }
+static int min_i(int a, int b) { return a < b ? a : b; }
+
+int rect_intersect(const Rect *a, const Rect *b, Rect *out) {
+    int x0 = max_i(a->x, b->x), y0 = max_i(a->y, b->y);
+    int x1 = min_i(a->x + a->w, b->x + b->w), y1 = min_i(a->y + a->h, b->y + b->h);
+    if (x1 <= x0 || y1 <= y0) return 0;
+    *out = (Rect){x0, y0, x1 - x0, y1 - y0};
+    return 1;
+}
+--- hint
+Work with edges: the overlap's left edge is the larger of the two left edges, its right edge the smaller of the two right edges (`x + w`). Same for top and bottom.
+--- hint
+If right <= left or bottom <= top, there is no overlap.
+--- harness
+int main(void) {
+    Rect r = {10, 20, 5, 3};
+    CHECK_INT(rect_contains(&r, 10, 20), 1);
+    CHECK_INT(rect_contains(&r, 14, 22), 1);
+    CHECK_INT(rect_contains(&r, 15, 22), 0);
+    CHECK_INT(rect_contains(&r, 14, 23), 0);
+    CHECK_INT(rect_contains(&r, 9, 21), 0);
+    CHECK_INT(rect_contains(&r, 12, 19), 0);
+    Rect empty = {0, 0, 0, 10};
+    CHECK_INT(rect_contains(&empty, 0, 0), 0);
+
+    Rect a = {0, 0, 10, 10}, b = {5, 5, 10, 10}, out = {-1, -1, -1, -1};
+    CHECK_INT(rect_intersect(&a, &b, &out), 1);
+    CHECK(out.x == 5 && out.y == 5 && out.w == 5 && out.h == 5);
+
+    Rect inner = {2, 3, 4, 1};
+    CHECK_INT(rect_intersect(&a, &inner, &out), 1);
+    CHECK(out.x == 2 && out.y == 3 && out.w == 4 && out.h == 1);
+    CHECK_INT(rect_intersect(&inner, &a, &out), 1);
+    CHECK(out.x == 2 && out.y == 3 && out.w == 4 && out.h == 1);
+
+    Rect edge = {10, 0, 5, 5}, keep = {7, 7, 7, 7};
+    out = keep;
+    CHECK_INT(rect_intersect(&a, &edge, &out), 0);
+    CHECK(out.x == 7 && out.w == 7);
+    Rect far = {-20, -20, 5, 5};
+    CHECK_INT(rect_intersect(&a, &far, &out), 0);
+    CHECK_INT(rect_intersect(&a, &empty, &out), 0);
+    Rect neg = {-5, -5, 7, 20};
+    CHECK_INT(rect_intersect(&neg, &a, &out), 1);
+    CHECK(out.x == 0 && out.y == 0 && out.w == 2 && out.h == 10);
+    return TEST_END();
+}
+
+=== exercise layout
+title: Shrink the struct
+--- prompt
+The starter's `struct record` is 32 bytes on x86-64 because of padding. Reorder its fields (do not add, remove, rename, or change the type of any) so that `sizeof(struct record)` is **16**.
+
+Work out the offsets of the original by hand first: each field goes at the next offset that is a multiple of its own size here, and the total rounds up to a multiple of the largest (8).
+--- starter
+struct record {
+    char tag;
+    double value;
+    char flag;
+    int count;
+    short id;
+};
+--- solution
+struct record {
+    double value;
+    int count;
+    short id;
+    char tag;
+    char flag;
+};
+--- hint
+Largest alignment first: `double` (8), then `int` (4), then `short` (2), then the two `char`s.
+--- hint
+8 + 4 + 2 + 1 + 1 is exactly 16, so with that order there is no padding at all.
+--- harness
+#include <stddef.h>
+int main(void) {
+    CHECK_UINT(sizeof(struct record), 16);
+    struct record r = {.tag = 'T', .value = 2.5, .flag = 1, .count = -7, .id = 300};
+    CHECK_INT(r.tag, 'T');
+    CHECK_DBL(r.value, 2.5);
+    CHECK_INT(r.flag, 1);
+    CHECK_INT(r.count, -7);
+    CHECK_INT(r.id, 300);
+    CHECK_UINT(sizeof r.value + sizeof r.count + sizeof r.id + sizeof r.tag + sizeof r.flag, 16);
+    return TEST_END();
+}
+
+=== exercise stack
+title: A stack with methods
+--- prompt
+The starter defines a fixed-capacity stack of ints:
+
+```c
+#define STACK_CAP 8
+typedef struct {
+    int items[STACK_CAP];
+    int count;
+} Stack;
+```
+
+Write its "methods", each taking the stack pointer first:
+
+- `void stack_init(Stack *s)`: make it empty.
+- `int stack_push(Stack *s, int v)`: push and return 1, or return 0 if the stack is full.
+- `int stack_pop(Stack *s, int *out)`: pop the top into `*out` and return 1, or return 0 if empty (leave `*out` alone).
+- `int stack_peek(const Stack *s, int *out)`: like pop but does not remove.
+- `int stack_size(const Stack *s)`.
+--- starter
+#define STACK_CAP 8
+typedef struct {
+    int items[STACK_CAP];
+    int count;
+} Stack;
+
+void stack_init(Stack *s) {
+}
+
+int stack_push(Stack *s, int v) {
+    return 0;
+}
+
+int stack_pop(Stack *s, int *out) {
+    return 0;
+}
+
+int stack_peek(const Stack *s, int *out) {
+    return 0;
+}
+
+int stack_size(const Stack *s) {
+    return 0;
+}
+--- solution
+#define STACK_CAP 8
+typedef struct {
+    int items[STACK_CAP];
+    int count;
+} Stack;
+
+void stack_init(Stack *s) {
+    s->count = 0;
+}
+
+int stack_push(Stack *s, int v) {
+    if (s->count == STACK_CAP) return 0;
+    s->items[s->count++] = v;
+    return 1;
+}
+
+int stack_pop(Stack *s, int *out) {
+    if (s->count == 0) return 0;
+    *out = s->items[--s->count];
+    return 1;
+}
+
+int stack_peek(const Stack *s, int *out) {
+    if (s->count == 0) return 0;
+    *out = s->items[s->count - 1];
+    return 1;
+}
+
+int stack_size(const Stack *s) {
+    return s->count;
+}
+--- hint
+`count` is both the size and the index of the next free slot. Push writes `items[count++]`; pop reads `items[--count]`.
+--- harness
+int main(void) {
+    Stack s;
+    s.count = 12345;   // garbage, as an uninitialized local would have
+    stack_init(&s);
+    CHECK_INT(stack_size(&s), 0);
+    int v = -1;
+    CHECK_INT(stack_pop(&s, &v), 0);
+    CHECK_INT(stack_peek(&s, &v), 0);
+    CHECK_INT(v, -1);
+
+    CHECK_INT(stack_push(&s, 10), 1);
+    CHECK_INT(stack_push(&s, 20), 1);
+    CHECK_INT(stack_peek(&s, &v), 1);
+    CHECK_INT(v, 20);
+    CHECK_INT(stack_size(&s), 2);
+    CHECK_INT(stack_pop(&s, &v), 1);
+    CHECK_INT(v, 20);
+    CHECK_INT(stack_pop(&s, &v), 1);
+    CHECK_INT(v, 10);
+    CHECK_INT(stack_pop(&s, &v), 0);
+    CHECK_INT(v, 10);
+
+    for (int i = 0; i < STACK_CAP; i++) CHECK_INT(stack_push(&s, i * i), 1);
+    CHECK_INT(stack_push(&s, 99), 0);
+    CHECK_INT(stack_size(&s), STACK_CAP);
+    CHECK_INT(stack_peek(&s, &v), 1);
+    CHECK_INT(v, 49);
+
+    Stack copy = s;    // value semantics: an independent stack
+    CHECK_INT(stack_pop(&copy, &v), 1);
+    CHECK_INT(stack_size(&copy), STACK_CAP - 1);
+    CHECK_INT(stack_size(&s), STACK_CAP);
+    return TEST_END();
+}
+
+=== exercise shapes
+title: A tagged union of shapes
+--- prompt
+The starter defines a tagged union:
+
+```c
+typedef enum { SHAPE_CIRCLE, SHAPE_RECT, SHAPE_TRIANGLE } ShapeKind;
+
+typedef struct {
+    ShapeKind kind;
+    union {
+        struct { double r; } circle;
+        struct { double w, h; } rect;
+        struct { double a, b, c; } tri;   // three side lengths
+    };
+} Shape;
+```
+
+Write:
+
+- `double shape_area(const Shape *s)`: for a triangle use Heron's formula: with `p = (a + b + c) / 2`, the area is `sqrt(p (p - a) (p - b) (p - c))`. Use the starter's `PI` (`M_PI` is not standard C).
+- `double shape_perimeter(const Shape *s)`.
+- `Shape make_circle(double r)`, `Shape make_rect(double w, double h)`, `Shape make_tri(double a, double b, double c)`: constructors that set the tag and the matching member.
+--- starter
+#include <math.h>
+
+#define PI 3.14159265358979323846
+
+typedef enum { SHAPE_CIRCLE, SHAPE_RECT, SHAPE_TRIANGLE } ShapeKind;
+
+typedef struct {
+    ShapeKind kind;
+    union {
+        struct { double r; } circle;
+        struct { double w, h; } rect;
+        struct { double a, b, c; } tri;
+    };
+} Shape;
+
+Shape make_circle(double r) {
+    Shape s = {0};
+    return s;
+}
+
+Shape make_rect(double w, double h) {
+    Shape s = {0};
+    return s;
+}
+
+Shape make_tri(double a, double b, double c) {
+    Shape s = {0};
+    return s;
+}
+
+double shape_area(const Shape *s) {
+    return 0;
+}
+
+double shape_perimeter(const Shape *s) {
+    return 0;
+}
+--- solution
+#include <math.h>
+
+#define PI 3.14159265358979323846
+
+typedef enum { SHAPE_CIRCLE, SHAPE_RECT, SHAPE_TRIANGLE } ShapeKind;
+
+typedef struct {
+    ShapeKind kind;
+    union {
+        struct { double r; } circle;
+        struct { double w, h; } rect;
+        struct { double a, b, c; } tri;
+    };
+} Shape;
+
+Shape make_circle(double r) {
+    return (Shape){.kind = SHAPE_CIRCLE, .circle = {r}};
+}
+
+Shape make_rect(double w, double h) {
+    return (Shape){.kind = SHAPE_RECT, .rect = {w, h}};
+}
+
+Shape make_tri(double a, double b, double c) {
+    return (Shape){.kind = SHAPE_TRIANGLE, .tri = {a, b, c}};
+}
+
+double shape_area(const Shape *s) {
+    switch (s->kind) {
+    case SHAPE_CIRCLE:
+        return PI * s->circle.r * s->circle.r;
+    case SHAPE_RECT:
+        return s->rect.w * s->rect.h;
+    case SHAPE_TRIANGLE: {
+        double a = s->tri.a, b = s->tri.b, c = s->tri.c;
+        double p = (a + b + c) / 2;
+        return sqrt(p * (p - a) * (p - b) * (p - c));
+    }
+    }
+    return 0;
+}
+
+double shape_perimeter(const Shape *s) {
+    switch (s->kind) {
+    case SHAPE_CIRCLE: return 2 * PI * s->circle.r;
+    case SHAPE_RECT: return 2 * (s->rect.w + s->rect.h);
+    case SHAPE_TRIANGLE: return s->tri.a + s->tri.b + s->tri.c;
+    }
+    return 0;
+}
+--- hint
+A constructor can be one line with a compound literal and designated initializers: `return (Shape){.kind = SHAPE_RECT, .rect = {w, h}};`
+--- hint
+`switch (s->kind)` with one `case` per tag. A `case` that declares variables needs braces around its body.
+--- harness
+int main(void) {
+    Shape c = make_circle(2);
+    CHECK_INT(c.kind, SHAPE_CIRCLE);
+    CHECK_DBL(c.circle.r, 2);
+    CHECK_DBL(shape_area(&c), 4 * PI);
+    CHECK_DBL(shape_perimeter(&c), 4 * PI);
+
+    Shape r = make_rect(3, 4.5);
+    CHECK_INT(r.kind, SHAPE_RECT);
+    CHECK_DBL(shape_area(&r), 13.5);
+    CHECK_DBL(shape_perimeter(&r), 15);
+
+    Shape t = make_tri(3, 4, 5);
+    CHECK_INT(t.kind, SHAPE_TRIANGLE);
+    CHECK_DBL(shape_area(&t), 6);
+    CHECK_DBL(shape_perimeter(&t), 12);
+
+    Shape eq = make_tri(2, 2, 2);
+    CHECK_DBL(shape_area(&eq), sqrt(3));
+
+    Shape flat = make_tri(1, 2, 3);
+    CHECK_DBL(shape_area(&flat), 0);
+
+    Shape z = make_circle(0);
+    CHECK_DBL(shape_area(&z), 0);
+    Shape all[] = {c, r, t};
+    double total = 0;
+    for (int i = 0; i < 3; i++) total += shape_area(&all[i]);
+    CHECK_DBL(total, 4 * PI + 19.5);
+    return TEST_END();
+}
+
+=== exercise ranking
+title: Rank the players
+--- prompt
+Read an integer `n` (1 to 100), then `n` lines of `name score` (names are at most 15 characters, no spaces; scores are ints). Store them in an array of structs, sort them by score descending, breaking ties by name ascending (`strcmp`), then print them as `rank. name score`, where rank starts at 1.
+
+Input:
+
+```text
+4
+cara 70
+abe 90
+bo 70
+dan 85
+```
+
+Output:
+
+```text
+1. abe 90
+2. dan 85
+3. bo 70
+4. cara 70
+```
+
+Write the sort yourself: the swap is just `Player t = a[i]; a[i] = a[j]; a[j] = t;`, because structs copy by value.
+--- starter
+#include <stdio.h>
+#include <string.h>
+
+typedef struct {
+    char name[16];
+    int score;
+} Player;
+
+int main(void) {
+    Player p[100];
+    int n;
+    if (scanf("%d", &n) != 1) return 1;
+    // read, sort, print
+    return 0;
+}
+--- solution
+#include <stdio.h>
+#include <string.h>
+
+typedef struct {
+    char name[16];
+    int score;
+} Player;
+
+static int before(const Player *a, const Player *b) {
+    if (a->score != b->score) return a->score > b->score;
+    return strcmp(a->name, b->name) < 0;
+}
+
+int main(void) {
+    Player p[100];
+    int n;
+    if (scanf("%d", &n) != 1 || n < 1 || n > 100) return 1;
+    for (int i = 0; i < n; i++)
+        if (scanf("%15s %d", p[i].name, &p[i].score) != 2) return 1;
+
+    for (int i = 1; i < n; i++) {
+        Player key = p[i];
+        int j = i;
+        while (j > 0 && before(&key, &p[j - 1])) {
+            p[j] = p[j - 1];
+            j--;
+        }
+        p[j] = key;
+    }
+    for (int i = 0; i < n; i++)
+        printf("%d. %s %d\n", i + 1, p[i].name, p[i].score);
+    return 0;
+}
+--- hint
+`scanf("%15s %d", p[i].name, &p[i].score)`: the array `name` decays to a pointer, so no `&`. The `15` stops a long name from overflowing the 16-byte buffer.
+--- hint
+Write a helper `int before(const Player *a, const Player *b)` that says whether `a` should come first. Then any sort works, using whole-struct assignment to move elements.
+--- test
+4
+cara 70
+abe 90
+bo 70
+dan 85
+--- out
+1. abe 90
+2. dan 85
+3. bo 70
+4. cara 70
+--- test
+1
+solo -5
+--- out
+1. solo -5
+--- test
+5
+e 1
+d 1
+c 1
+b 1
+a 1
+--- out
+1. a 1
+2. b 1
+3. c 1
+4. d 1
+5. e 1
+--- test
+3
+x -10
+y 0
+z -2147483648
+--- out
+1. y 0
+2. x -10
+3. z -2147483648
+
+=== exercise flexarr
+title: A struct with a flexible array
+--- prompt
+The starter defines a length-prefixed string type using a flexible array member:
+
+```c
+typedef struct {
+    size_t len;
+    char chars[];   // len characters plus a '\0'
+} Str;
+```
+
+Write:
+
+- `Str *str_new(const char *s)`: allocate one block with `malloc` big enough for the header, the characters, and a terminator. Copy `s` in and set `len`. Return `NULL` if `malloc` fails. The caller frees the result with `free`.
+- `Str *str_concat(const Str *a, const Str *b)`: a new `Str` holding `a` followed by `b`. The caller frees it.
+- `int str_equal(const Str *a, const Str *b)`: 1 if they hold the same text. Compare lengths first: it is O(1) and settles most cases.
+--- starter
+#include <stdlib.h>
+#include <string.h>
+
+typedef struct {
+    size_t len;
+    char chars[];
+} Str;
+
+Str *str_new(const char *s) {
+    return NULL;
+}
+
+Str *str_concat(const Str *a, const Str *b) {
+    return NULL;
+}
+
+int str_equal(const Str *a, const Str *b) {
+    return 0;
+}
+--- solution
+#include <stdlib.h>
+#include <string.h>
+
+typedef struct {
+    size_t len;
+    char chars[];
+} Str;
+
+static Str *str_alloc(size_t len) {
+    Str *s = malloc(sizeof *s + len + 1);
+    if (s) s->len = len;
+    return s;
+}
+
+Str *str_new(const char *s) {
+    size_t len = strlen(s);
+    Str *r = str_alloc(len);
+    if (!r) return NULL;
+    memcpy(r->chars, s, len + 1);
+    return r;
+}
+
+Str *str_concat(const Str *a, const Str *b) {
+    Str *r = str_alloc(a->len + b->len);
+    if (!r) return NULL;
+    memcpy(r->chars, a->chars, a->len);
+    memcpy(r->chars + a->len, b->chars, b->len + 1);
+    return r;
+}
+
+int str_equal(const Str *a, const Str *b) {
+    return a->len == b->len && memcmp(a->chars, b->chars, a->len) == 0;
+}
+--- hint
+The size to allocate is `sizeof(Str) + len + 1`: the header (just the `size_t` here), the characters, and the terminator.
+--- hint
+`memcpy(r->chars, s, len + 1)` copies the characters and the terminator in one call. For the concatenation, copy `a`'s characters to `r->chars` and `b`'s (with its terminator) to `r->chars + a->len`.
+--- harness
+int main(void) {
+    Str *a = str_new("hello");
+    Str *b = str_new(", world");
+    Str *e = str_new("");
+    CHECK(a && b && e);
+    if (!a || !b || !e) { free(a); free(b); free(e); return TEST_END(); }
+    CHECK_UINT(a->len, 5);
+    CHECK_STR(a->chars, "hello");
+    CHECK_UINT(e->len, 0);
+    CHECK_STR(e->chars, "");
+
+    Str *c = str_concat(a, b);
+    CHECK(c != NULL);
+    if (c) {
+        CHECK_UINT(c->len, 12);
+        CHECK_STR(c->chars, "hello, world");
+    }
+    Str *d = str_concat(e, a);
+    Str *f = str_concat(a, e);
+    Str *g = str_concat(e, e);
+    CHECK(d && f && g);
+    if (d && f && g) {
+        CHECK_STR(d->chars, "hello");
+        CHECK_STR(f->chars, "hello");
+        CHECK_UINT(g->len, 0);
+        CHECK_STR(g->chars, "");
+        CHECK_INT(str_equal(a, d), 1);
+        CHECK_INT(str_equal(d, f), 1);
+        CHECK_INT(str_equal(e, g), 1);
+        CHECK_INT(str_equal(a, b), 0);
+        CHECK_INT(str_equal(a, e), 0);
+    }
+    Str *h = str_new("hellO");
+    if (h) CHECK_INT(str_equal(a, h), 0);
+    free(a); free(b); free(c); free(d); free(e); free(f); free(g); free(h);
+    return TEST_END();
+}
+
+=== quiz
+run: yes
+--- q
+What does this print?
+--- code
+#include <stdio.h>
+
+typedef struct {
+    int hp;
+    int tags[2];
+} Unit;
+
+int main(void) {
+    Unit a = {10, {1, 2}};
+    Unit b = a;
+    b.hp = 99;
+    b.tags[0] = 7;
+    printf("%d %d %d %d\n", a.hp, a.tags[0], b.hp, b.tags[0]);
+    return 0;
+}
+--- choice
+99 7 99 7
+--- choice
+10 7 99 7
+--- answer
+10 1 99 7
+--- choice
+It does not compile: structs containing arrays cannot be assigned
+--- explain
+Struct assignment copies every byte, including the embedded array. `b` is a fully independent copy, like a C# struct (and unlike a C# class).
+
+=== quiz
+run: yes
+--- q
+What does this print on x86-64 Linux?
+--- code
+#include <stdio.h>
+
+struct a { char c; int i; char d; };
+struct b { int i; char c; char d; };
+
+int main(void) {
+    printf("%zu %zu\n", sizeof(struct a), sizeof(struct b));
+    return 0;
+}
+--- choice
+6 6
+--- choice
+12 6
+--- answer
+12 8
+--- choice
+9 8
+--- explain
+In `struct a`, `c` is followed by 3 bytes of padding so `i` sits at offset 4, then `d` at 8 plus 3 bytes of tail padding: 12. In `struct b` the two chars share the 4 bytes after `i`, with 2 bytes of tail padding to keep the size a multiple of 4: 8.
+
+=== quiz
+run: yes
+--- q
+What does this print?
+--- code
+#include <stdio.h>
+
+enum { A, B = 5, C, D = 2, E };
+
+int main(void) {
+    printf("%d %d %d %d\n", A, C, E, (int)sizeof(A));
+    return 0;
+}
+--- choice
+0 2 4 1
+--- answer
+0 6 3 4
+--- choice
+1 6 3 4
+--- choice
+It does not compile: the values are not in order
+--- explain
+Each enumerator without a value is one more than the previous one: `C` is 6 and `E` is 3. Values can repeat and go in any order. The constants are `int`s, so `sizeof` is 4.
+
+=== quiz
+run: yes
+--- q
+What does this print?
+--- code
+#include <stdio.h>
+
+typedef struct { int x, y, z; } P;
+
+int main(void) {
+    P p = {.z = 3, .x = 1};
+    P q = (P){7};
+    printf("%d %d %d / %d %d %d\n", p.x, p.y, p.z, q.x, q.y, q.z);
+    return 0;
+}
+--- answer
+1 0 3 / 7 0 0
+--- choice
+3 0 1 / 7 7 7
+--- choice
+1 garbage 3 / 7 garbage garbage
+--- choice
+3 1 0 / 7 0 0
+--- explain
+Designated initializers go to the named fields regardless of order, and anything not mentioned is zeroed. A positional `{7}` sets the first field and zeroes the rest.
+
+=== quiz
+run: yes
+--- q
+What does this print on x86-64 (a little-endian CPU)?
+--- code
+#include <stdio.h>
+
+union u {
+    unsigned int i;
+    unsigned char b[4];
+};
+
+int main(void) {
+    union u x;
+    x.i = 0x11223344;
+    printf("%zu %x %x\n", sizeof x, x.b[0], x.b[3]);
+    return 0;
+}
+--- choice
+8 11 44
+--- choice
+4 11 44
+--- answer
+4 44 11
+--- choice
+8 44 11
+--- explain
+All members of a union share the same bytes, and its size is that of the largest member: 4. x86-64 stores the least significant byte first (little-endian), so `b[0]` is `0x44`. Reading a different member than the one written is allowed in C (unlike C++) and is the classic way to inspect bytes.
+
+=== quiz
+--- q
+Given `Player *p`, which expression is **not** the same as `p->hp`?
+--- choice
+`(*p).hp`
+--- choice
+`p[0].hp`
+--- answer
+`*p.hp`
+--- choice
+`(&*p)->hp`
+--- explain
+`.` binds tighter than unary `*`, so `*p.hp` means `*(p.hp)`, which does not compile since `p` is a pointer, not a struct. That precedence problem is exactly why `->` exists.
+
+=== quiz
+run: yes
+--- q
+What does this print?
+--- code
+#include <stdio.h>
+
+typedef struct { int count; } Counter;
+
+void inc_val(Counter c) { c.count++; }
+void inc_ptr(Counter *c) { c->count++; }
+
+int main(void) {
+    Counter c = {0};
+    inc_val(c);
+    inc_ptr(&c);
+    inc_val(c);
+    inc_ptr(&c);
+    printf("%d\n", c.count);
+    return 0;
+}
+--- choice
+0
+--- answer
+2
+--- choice
+4
+--- choice
+1
+--- explain
+`inc_val` increments its own copy, which is thrown away on return. Only the two calls through a pointer change `c`.

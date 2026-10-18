@@ -1,0 +1,967 @@
+=== chapter strings
+title: Strings
+blurb: Null-terminated char arrays, string.h and its traps, writing your own string functions, snprintf, ctype.h, and converting between numbers and text.
+--- body
+## There is no string type
+
+In C# a `string` is an immutable object that knows its length. In C a string is a *convention*: a sequence of `char` that ends at the first byte with value `0` (written `'\0'`, the *null terminator*). Every string function walks memory until it finds that zero.
+
+```c
+#include <stdio.h>
+
+int main(void) {
+    char s[] = "cat";                 // 4 bytes: 'c' 'a' 't' '\0'
+    printf("%zu\n", sizeof s);        // 4
+    for (int i = 0; i < 4; i++)
+        printf("%d ", s[i]);          // 99 97 116 0
+    printf("\n");
+
+    char t[] = {'d', 'o', 'g', '\0'}; // the same thing, spelled out
+    printf("%s\n", t);
+    return 0;
+}
+```
+
+Consequences you have to absorb:
+
+- **Length is O(n).** `strlen` counts until the zero. Calling it in a loop condition (`for (i = 0; i < strlen(s); i++)`) makes the loop O(n²).
+- **The buffer needs one extra byte.** A 5-letter word needs `char buf[6]`. Forgetting the `+ 1` is the classic off-by-one.
+- **A missing terminator is a disaster.** `printf("%s")` and `strlen` keep reading past the end of your array until they happen to hit a zero byte.
+- **A string cannot contain a zero byte.** For binary data use a pointer plus a length (and the `mem*` functions).
+- `char` holds one byte. UTF-8 text works (it is just bytes), but `strlen` counts bytes, not characters, and `s[i]` is a byte, not a code point.
+
+## Literals, arrays, and pointers
+
+```c
+char a[] = "hello";       // an array of 6 chars, initialized with a COPY of the literal
+const char *p = "hello";  // a pointer to the literal itself, stored in read-only memory
+```
+
+These look similar and behave very differently:
+
+| | `char a[] = "hello"` | `const char *p = "hello"` |
+|---|---|---|
+| What it is | a 6-byte array you own | an 8-byte pointer to someone else's bytes |
+| `sizeof` | 6 | 8 |
+| Modify `a[0]` / `p[0]` | fine | undefined behavior (usually a segfault) |
+| Reassign `a = ...` / `p = ...` | compile error | fine: point it elsewhere |
+
+String literals live in read-only memory, shared between identical literals. For historical reasons their type is `char[N]`, not `const char[N]`, so `char *p = "hello"; p[0] = 'H';` compiles and then crashes. Always declare pointers to literals as `const char *`, and the compiler will stop you.
+
+Adjacent literals are concatenated at compile time, handy for long strings:
+
+```c
+const char *msg = "first part, "
+                  "second part";
+```
+
+## string.h
+
+`#include <string.h>`. These are the ones you will use every day. All of them assume valid, terminated strings and enough room in the destination. None of them check.
+
+| Function | Does | Trap |
+|---|---|---|
+| `strlen(s)` | length, not counting the `'\0'` | O(n); returns `size_t` |
+| `strcpy(d, s)` | copy `s` into `d` including the `'\0'` | no size: overflows `d` if `s` is too long |
+| `strncpy(d, s, n)` | copy at most `n` chars | does **not** terminate if `s` has `n` or more chars; pads with zeros otherwise |
+| `strcat(d, s)` | append `s` to the end of `d` | rescans `d` every call; no size |
+| `strcmp(a, b)` | `<0`, `0`, `>0` by byte value | not `-1/0/1`; never `a == b` |
+| `strncmp(a, b, n)` | compare at most `n` chars | good for prefixes |
+| `strchr(s, c)` | pointer to first `c`, or `NULL` | `strrchr` finds the last |
+| `strstr(h, n)` | pointer to first occurrence of `n` in `h`, or `NULL` | |
+| `memcpy(d, s, n)` | copy `n` bytes | regions must not overlap |
+| `memmove(d, s, n)` | copy `n` bytes | safe for overlapping regions |
+| `memset(d, v, n)` | fill `n` bytes with byte `v` | sets *bytes*: `memset(ints, 1, ...)` gives 16843009, not 1 |
+| `memcmp(a, b, n)` | compare `n` bytes | |
+
+```c
+#include <stdio.h>
+#include <string.h>
+
+int main(void) {
+    char buf[32];
+    strcpy(buf, "Hello");
+    strcat(buf, ", world");
+    printf("%s (%zu)\n", buf, strlen(buf));
+
+    printf("%d\n", strcmp("apple", "banana") < 0);   // 1: compare like this
+    printf("%d\n", strncmp("prefix-rest", "prefix", 6) == 0);
+
+    const char *comma = strchr(buf, ',');
+    if (comma) printf("comma at index %td\n", comma - buf);
+
+    const char *w = strstr(buf, "world");
+    if (w) printf("found: %s\n", w);                  // "world": a pointer INTO buf
+
+    char line[10];
+    memset(line, '-', sizeof line - 1);
+    line[sizeof line - 1] = '\0';
+    printf("%s\n", line);
+
+    char s[] = "abcdef";
+    memmove(s + 1, s, 3);          // overlapping: memcpy here would be undefined
+    printf("%s\n", s);             // aabcef
+    return 0;
+}
+```
+
+Never compare strings with `==`. `a == b` compares the *pointers*: are they the same address? It can even appear to work, because identical literals often share storage. Use `strcmp(a, b) == 0`.
+
+### Why strncpy is not the safe strcpy
+
+`strncpy` was designed for fixed-width record fields, not for safety. When the source is too long it copies exactly `n` bytes and **no terminator**:
+
+```c
+char buf[4];
+strncpy(buf, "hello", sizeof buf);   // buf = 'h' 'e' 'l' 'l', no '\0'
+printf("%s\n", buf);                 // reads past the end: undefined behavior
+```
+
+If you must use it, terminate by hand: `buf[sizeof buf - 1] = '\0';`. Better: use `snprintf`, below.
+
+## Writing your own
+
+Writing these yourself is the best way to get fluent with pointers. The idioms are short:
+
+```c
+#include <stdio.h>
+#include <stddef.h>
+
+size_t my_strlen(const char *s) {
+    const char *p = s;
+    while (*p) p++;          // *p is false at the '\0'
+    return (size_t)(p - s);
+}
+
+char *my_strcpy(char *dst, const char *src) {
+    char *d = dst;
+    while ((*d++ = *src++))  // copy, including the final '\0', then stop
+        ;
+    return dst;
+}
+
+int my_strcmp(const char *a, const char *b) {
+    while (*a && *a == *b) { a++; b++; }
+    return (unsigned char)*a - (unsigned char)*b;
+}
+
+int main(void) {
+    char buf[16];
+    my_strcpy(buf, "pointer");
+    printf("%s %zu %d %d\n", buf, my_strlen(buf), my_strcmp("abc", "abd") < 0, my_strcmp("x", "x"));
+    return 0;
+}
+```
+
+The `(unsigned char)` casts matter: `strcmp` compares bytes as unsigned, and `char` is signed on x86-64, so a byte like `0xE9` (é in Latin-1) would otherwise compare as negative.
+
+## Buffer overflows
+
+```c
+char name[8];
+scanf("%s", name);     // typing a 20-letter name writes 13 bytes past the array
+gets(name);            // so dangerous it was removed from the language in C11
+strcpy(name, input);   // same problem when input is long
+```
+
+Writing past a buffer on the stack can overwrite the saved return address, which is how decades of exploits worked. Rules:
+
+- Every write into a buffer must know the buffer's size.
+- Read lines with `fgets(buf, sizeof buf, stdin)`. It stops at `sizeof buf - 1` chars, always terminates, and keeps the `'\n'` (strip it with `buf[strcspn(buf, "\n")] = '\0';`).
+- Limit `scanf`: `scanf("%7s", name)` for an 8-byte buffer.
+- Build strings with `snprintf`.
+
+## snprintf: the safe string builder
+
+`snprintf(buf, size, fmt, ...)` is `printf` into a buffer. It writes at most `size - 1` characters plus a terminator, so it **never overflows and always terminates** (when `size > 0`). It returns the length the full output *would* have had, so you can detect truncation:
+
+```c
+#include <stdio.h>
+
+int main(void) {
+    char buf[16];
+    int n = snprintf(buf, sizeof buf, "%s scored %d", "Ada", 97);
+    printf("[%s] %d\n", buf, n);
+
+    // gcc can see this truncation at compile time and warns about it
+    n = snprintf(buf, sizeof buf, "%s scored %d points", "Grace", 100);
+    if ((size_t)n >= sizeof buf)
+        printf("truncated: [%s], needed %d\n", buf, n + 1);
+
+    // Size it first, then allocate exactly: snprintf(NULL, 0, ...) only measures
+    int need = snprintf(NULL, 0, "%d-%d", 2024, 12);
+    printf("needs %d chars\n", need);
+    return 0;
+}
+```
+
+To append, keep a position and pass `buf + pos, size - pos` each time. Treat it as C's `StringBuilder`; `sprintf` (no `n`) has no size and is as dangerous as `strcpy`.
+
+## Characters are small integers
+
+A `char` is an integer type. `'A'` is just 65. All arithmetic works on characters, and the digits and letters are contiguous in ASCII:
+
+```c
+#include <stdio.h>
+
+int main(void) {
+    char d = '7';
+    int value = d - '0';                 // 7: digit character to number
+    char back = (char)('0' + 3);         // '3'
+    char next = 'a' + 1;                 // 'b'
+    int pos = 'e' - 'a';                 // 4: letter position
+    char upper = 'q' - 'a' + 'A';        // 'Q'
+    printf("%d %c %c %d %c %d\n", value, back, next, pos, upper, 'A');
+    return 0;
+}
+```
+
+`<ctype.h>` classifies and converts: `isdigit`, `isalpha`, `isalnum`, `isspace`, `isupper`, `islower`, `ispunct`, `toupper`, `tolower`. One trap: their argument must be an `unsigned char` value or `EOF`. Passing a negative `char` (any byte above 127) is undefined behavior, so cast: `isalpha((unsigned char)c)`.
+
+```c
+#include <stdio.h>
+#include <ctype.h>
+
+int main(void) {
+    const char *s = "Hello, World 42!";
+    int letters = 0, digits = 0, spaces = 0;
+    for (const char *p = s; *p; p++) {
+        unsigned char c = (unsigned char)*p;
+        if (isalpha(c)) letters++;
+        else if (isdigit(c)) digits++;
+        else if (isspace(c)) spaces++;
+        putchar(toupper(c));
+    }
+    printf("\n%d letters, %d digits, %d spaces\n", letters, digits, spaces);
+    return 0;
+}
+```
+
+## Numbers to strings and back
+
+**Number to string**: `snprintf(buf, sizeof buf, "%d", n)`. An `int` needs at most 12 bytes (`-2147483648` plus `'\0'`).
+
+**String to number**: `atoi(s)` exists but cannot report errors (`atoi("abc")` is 0, and overflow is undefined). Use `strtol`, which tells you where it stopped and sets `errno` on overflow:
+
+```c
+#include <stdio.h>
+#include <stdlib.h>
+#include <errno.h>
+
+int main(void) {
+    const char *inputs[] = {"42", "  -17xyz", "abc", "99999999999999999999"};
+    for (int i = 0; i < 4; i++) {
+        char *end;
+        errno = 0;
+        long v = strtol(inputs[i], &end, 10);
+        if (end == inputs[i])
+            printf("'%s': no number\n", inputs[i]);
+        else if (errno == ERANGE)
+            printf("'%s': out of range\n", inputs[i]);
+        else
+            printf("'%s': %ld, rest '%s'\n", inputs[i], v, end);
+    }
+    printf("%f\n", strtod("3.5e2", NULL));   // 350.000000
+    return 0;
+}
+```
+
+For a strict "the whole string is a number" check, also require `*end == '\0'`. The base argument handles hex (`16`), binary (`2`), and `0` for "detect from a `0x` or `0` prefix".
+
+Converting by hand is a good exercise and shows how it works: accumulate `value = value * 10 + (c - '0')` for each digit, and go the other way by repeatedly taking `n % 10` and `n / 10`, which produces digits in reverse.
+
+=== exercise strfuncs
+title: strlen and strcmp by hand
+--- prompt
+Write your own versions of two library functions, without using `<string.h>`:
+
+- `size_t my_strlen(const char *s)`: the number of characters before the `'\0'`.
+- `int my_strcmp(const char *a, const char *b)`: negative if `a` sorts before `b`, zero if equal, positive if after. Compare bytes as `unsigned char`, like the real `strcmp`, so a byte like `'\xff'` sorts after `'a'`.
+
+The tests only check the sign of `my_strcmp`.
+--- starter
+#include <stddef.h>
+
+size_t my_strlen(const char *s) {
+    return 0;
+}
+
+int my_strcmp(const char *a, const char *b) {
+    return 0;
+}
+--- solution
+#include <stddef.h>
+
+size_t my_strlen(const char *s) {
+    const char *p = s;
+    while (*p) p++;
+    return (size_t)(p - s);
+}
+
+int my_strcmp(const char *a, const char *b) {
+    while (*a && *a == *b) {
+        a++;
+        b++;
+    }
+    return (unsigned char)*a - (unsigned char)*b;
+}
+--- hint
+For the length, walk a pointer until `*p == '\0'`; the difference between it and the start is the length.
+--- hint
+For the comparison, advance both pointers while the characters are equal and not the end. Then the answer is the difference of the current characters, both cast to `unsigned char`. If one string is a prefix of the other, its `'\0'` (zero) is smaller than any real character.
+--- harness
+#define SIGN(x) ((x) > 0 ? 1 : (x) < 0 ? -1 : 0)
+int main(void) {
+    CHECK_UINT(my_strlen(""), 0);
+    CHECK_UINT(my_strlen("a"), 1);
+    CHECK_UINT(my_strlen("hello, world"), 12);
+    CHECK_UINT(my_strlen("ab\0cd"), 2);
+    char big[1001];
+    memset(big, 'x', 1000);
+    big[1000] = '\0';
+    CHECK_UINT(my_strlen(big), 1000);
+
+    CHECK_INT(SIGN(my_strcmp("", "")), 0);
+    CHECK_INT(SIGN(my_strcmp("abc", "abc")), 0);
+    CHECK_INT(SIGN(my_strcmp("abc", "abd")), -1);
+    CHECK_INT(SIGN(my_strcmp("abd", "abc")), 1);
+    CHECK_INT(SIGN(my_strcmp("ab", "abc")), -1);
+    CHECK_INT(SIGN(my_strcmp("abc", "ab")), 1);
+    CHECK_INT(SIGN(my_strcmp("", "a")), -1);
+    CHECK_INT(SIGN(my_strcmp("Z", "a")), -1);
+    CHECK_INT(SIGN(my_strcmp("\xff", "a")), 1);
+    CHECK_INT(SIGN(my_strcmp("a", "\xe9")), -1);
+    return TEST_END();
+}
+
+=== exercise strrev
+title: Reverse a string in place
+--- prompt
+Write `void str_reverse(char *s)` that reverses the string `s` in place. `"hello"` becomes `"olleh"`. The terminator stays where it is.
+
+The empty string must work.
+--- starter
+#include <string.h>
+
+void str_reverse(char *s) {
+}
+--- solution
+#include <string.h>
+
+void str_reverse(char *s) {
+    size_t n = strlen(s);
+    if (n < 2) return;
+    char *a = s, *b = s + n - 1;
+    while (a < b) {
+        char t = *a;
+        *a++ = *b;
+        *b-- = t;
+    }
+}
+--- hint
+Find the length with `strlen`, then swap `s[i]` and `s[n - 1 - i]` for the first half.
+--- hint
+Two pointers work nicely: one at the start, one at the last character (`s + n - 1`), swapping and moving inward while `a < b`. Return early for strings shorter than 2.
+--- harness
+int main(void) {
+    char a[] = "hello";
+    str_reverse(a);
+    CHECK_STR(a, "olleh");
+
+    char b[] = "abcd";
+    str_reverse(b);
+    CHECK_STR(b, "dcba");
+
+    char c[] = "x";
+    str_reverse(c);
+    CHECK_STR(c, "x");
+
+    char d[] = "";
+    str_reverse(d);
+    CHECK_STR(d, "");
+
+    char e[] = "racecar";
+    str_reverse(e);
+    CHECK_STR(e, "racecar");
+
+    char f[] = "ab cd!";
+    str_reverse(f);
+    CHECK_STR(f, "!dc ba");
+    return TEST_END();
+}
+
+=== exercise titlecase
+title: Title case
+--- prompt
+Read lines from stdin until end of file (use `fgets` with a 256-byte buffer; lines are shorter than that). For each line, print it with the first letter of every word in upper case and every other letter in lower case. A word starts at a letter that is at the start of the line or follows a non-letter.
+
+Input:
+
+```text
+hello WORLD
+the c programming LANGUAGE, second ed.
+```
+
+Output:
+
+```text
+Hello World
+The C Programming Language, Second Ed.
+```
+
+Non-letters are printed unchanged, and they do end a word: `2nd` becomes `2Nd`, `o'neil` becomes `O'Neil`. Use `<ctype.h>`.
+--- starter
+#include <stdio.h>
+#include <ctype.h>
+
+int main(void) {
+    char line[256];
+    while (fgets(line, sizeof line, stdin)) {
+        printf("%s", line);
+    }
+    return 0;
+}
+--- solution
+#include <stdio.h>
+#include <ctype.h>
+
+int main(void) {
+    char line[256];
+    while (fgets(line, sizeof line, stdin)) {
+        int prev_alpha = 0;
+        for (char *p = line; *p; p++) {
+            unsigned char c = (unsigned char)*p;
+            if (isalpha(c)) {
+                *p = (char)(prev_alpha ? tolower(c) : toupper(c));
+                prev_alpha = 1;
+            } else {
+                prev_alpha = 0;
+            }
+        }
+        printf("%s", line);
+    }
+    return 0;
+}
+--- hint
+Keep a flag: was the previous character a letter? If not, this letter starts a word.
+--- hint
+`fgets` keeps the newline in the buffer, so printing the modified buffer with `"%s"` reproduces the line breaks.
+--- hint
+Cast to `unsigned char` before calling `isalpha`, `toupper` and `tolower`.
+--- test
+hello WORLD
+the c programming LANGUAGE, second ed.
+--- out
+Hello World
+The C Programming Language, Second Ed.
+--- test
+x
+--- out
+X
+--- test
+  mIXED   case-WORDS   o'neil
+--- out
+  Mixed   Case-Words   O'Neil
+--- test
+123abc 4U
+--- out
+123Abc 4U
+
+=== exercise strlcpy
+title: A bounded copy
+--- prompt
+`strcpy` can overflow and `strncpy` may not terminate. Write the function many C libraries add to fix both (BSD calls it `strlcpy`):
+
+`size_t copy_bounded(char *dst, size_t size, const char *src)`
+
+- `size` is the full size of `dst` in bytes.
+- Copy as much of `src` as fits, leaving room for the terminator, and always terminate `dst`, as long as `size > 0`.
+- If `size == 0`, write nothing at all (`dst` might even be `NULL`).
+- Return `strlen(src)`, so the caller can check `if (result >= size)` to detect truncation.
+--- starter
+#include <string.h>
+
+size_t copy_bounded(char *dst, size_t size, const char *src) {
+    strcpy(dst, src);
+    return strlen(src);
+}
+--- solution
+#include <string.h>
+
+size_t copy_bounded(char *dst, size_t size, const char *src) {
+    size_t len = strlen(src);
+    if (size > 0) {
+        size_t n = len < size - 1 ? len : size - 1;
+        memcpy(dst, src, n);
+        dst[n] = '\0';
+    }
+    return len;
+}
+--- hint
+Compute `len = strlen(src)`. The number of characters to copy is the smaller of `len` and `size - 1`.
+--- hint
+Check `size > 0` before computing `size - 1`: it is unsigned.
+--- harness
+int main(void) {
+    char buf[8];
+    CHECK_UINT(copy_bounded(buf, sizeof buf, "hi"), 2);
+    CHECK_STR(buf, "hi");
+
+    CHECK_UINT(copy_bounded(buf, sizeof buf, "1234567"), 7);
+    CHECK_STR(buf, "1234567");
+
+    CHECK_UINT(copy_bounded(buf, sizeof buf, "12345678"), 8);
+    CHECK_STR(buf, "1234567");
+
+    CHECK_UINT(copy_bounded(buf, sizeof buf, "a much longer string"), 20);
+    CHECK_STR(buf, "a much ");
+
+    CHECK_UINT(copy_bounded(buf, sizeof buf, ""), 0);
+    CHECK_STR(buf, "");
+
+    char one[1] = {'Z'};
+    CHECK_UINT(copy_bounded(one, 1, "abc"), 3);
+    CHECK_INT(one[0], 0);
+
+    char guard[4] = {'Q', 'Q', 'Q', 'Q'};
+    CHECK_UINT(copy_bounded(guard, 0, "abc"), 3);
+    CHECK_INT(guard[0], 'Q');
+    CHECK_UINT(copy_bounded(NULL, 0, "hello"), 5);
+
+    char small[3];
+    CHECK_UINT(copy_bounded(small, sizeof small, "xyz"), 3);
+    CHECK_STR(small, "xy");
+    return TEST_END();
+}
+
+=== exercise count
+title: Count occurrences
+--- prompt
+Write `int count_occurrences(const char *hay, const char *needle)` that returns how many times `needle` appears in `hay`, counting non-overlapping matches from left to right. `"aaaa"` contains `"aa"` twice, not three times.
+
+If `needle` is empty, return 0. Use `strstr`.
+--- starter
+#include <string.h>
+
+int count_occurrences(const char *hay, const char *needle) {
+    return 0;
+}
+--- solution
+#include <string.h>
+
+int count_occurrences(const char *hay, const char *needle) {
+    size_t n = strlen(needle);
+    if (n == 0) return 0;
+    int count = 0;
+    const char *p = hay;
+    while ((p = strstr(p, needle)) != NULL) {
+        count++;
+        p += n;
+    }
+    return count;
+}
+--- hint
+`strstr(p, needle)` returns a pointer to the next match at or after `p`, or `NULL`.
+--- hint
+After a match at `p`, continue searching from `p + strlen(needle)` so matches do not overlap.
+--- harness
+int main(void) {
+    CHECK_INT(count_occurrences("the cat sat on the mat", "at"), 3);
+    CHECK_INT(count_occurrences("the cat sat on the mat", "the"), 2);
+    CHECK_INT(count_occurrences("aaaa", "aa"), 2);
+    CHECK_INT(count_occurrences("aaaaa", "aa"), 2);
+    CHECK_INT(count_occurrences("abc", "abcd"), 0);
+    CHECK_INT(count_occurrences("abc", "abc"), 1);
+    CHECK_INT(count_occurrences("", "a"), 0);
+    CHECK_INT(count_occurrences("abc", ""), 0);
+    CHECK_INT(count_occurrences("xyz", "q"), 0);
+    CHECK_INT(count_occurrences("a,b,,c,", ","), 4);
+    return TEST_END();
+}
+
+=== exercise atoi
+title: Parse an integer, strictly
+--- prompt
+Write `int parse_int(const char *s, int *out)` without using `atoi`, `strtol` or `sscanf`.
+
+The string is valid if it is an optional `+` or `-` followed by one or more decimal digits, and nothing else (no spaces). On success, store the value in `*out` and return 1. If the string is invalid **or the value does not fit in an `int`**, return 0 and leave `*out` unchanged.
+
+All of `INT_MIN` (`-2147483648`) through `INT_MAX` must parse. Detecting overflow *before* it happens is the hard part: signed overflow is undefined behavior, and the sanitizer will catch you.
+--- starter
+#include <limits.h>
+
+int parse_int(const char *s, int *out) {
+    return 0;
+}
+--- solution
+#include <limits.h>
+
+int parse_int(const char *s, int *out) {
+    int neg = 0;
+    if (*s == '+' || *s == '-') {
+        neg = *s == '-';
+        s++;
+    }
+    if (*s == '\0') return 0;
+
+    // Accumulate as a negative number: its range is one bigger.
+    int v = 0;
+    for (; *s; s++) {
+        if (*s < '0' || *s > '9') return 0;
+        int d = *s - '0';
+        if (v < (INT_MIN + d) / 10) return 0;
+        v = v * 10 - d;
+    }
+    if (!neg) {
+        if (v == INT_MIN) return 0;
+        v = -v;
+    }
+    *out = v;
+    return 1;
+}
+--- hint
+Handle the sign first, then require at least one character, then require every remaining character to be a digit.
+--- hint
+Before doing `v = v * 10 + d`, check that it cannot exceed the limit: `v > (INT_MAX - d) / 10` means it would overflow.
+--- hint
+`INT_MIN` has no positive counterpart, so `-2147483648` overflows if you build `2147483648` and then negate. Either accumulate in a `long long` and range-check at the end (a `long long` easily holds 10 digits, but you still need to stop once it gets too big), or accumulate as a negative number.
+--- harness
+#include <limits.h>
+static int ok(const char *s, int want) {
+    int v = 12345;
+    return parse_int(s, &v) == 1 && v == want;
+}
+static int bad(const char *s) {
+    int v = 12345;
+    return parse_int(s, &v) == 0 && v == 12345;
+}
+int main(void) {
+    CHECK(ok("0", 0));
+    CHECK(ok("42", 42));
+    CHECK(ok("-42", -42));
+    CHECK(ok("+7", 7));
+    CHECK(ok("-0", 0));
+    CHECK(ok("007", 7));
+    CHECK(ok("2147483647", INT_MAX));
+    CHECK(ok("-2147483648", INT_MIN));
+    CHECK(ok("-2147483647", -2147483647));
+    CHECK(bad("2147483648"));
+    CHECK(bad("-2147483649"));
+    CHECK(bad("99999999999999999999"));
+    CHECK(bad("-99999999999999999999"));
+    CHECK(bad(""));
+    CHECK(bad("-"));
+    CHECK(bad("+"));
+    CHECK(bad("12a"));
+    CHECK(bad("a12"));
+    CHECK(bad(" 12"));
+    CHECK(bad("12 "));
+    CHECK(bad("--1"));
+    CHECK(bad("1-"));
+    return TEST_END();
+}
+
+=== exercise itoa
+title: Integer to string by hand
+--- prompt
+Write `void int_to_str(int v, char *buf)` that writes the decimal representation of `v` into `buf` (at least 12 bytes), terminated. Do not use `printf`-family functions.
+
+`INT_MIN` must work. Negating it is undefined behavior, so think about how to avoid that.
+--- starter
+void int_to_str(int v, char *buf) {
+    buf[0] = '\0';
+}
+--- solution
+void int_to_str(int v, char *buf) {
+    char tmp[12];
+    int n = 0;
+    int neg = v < 0;
+    // Work with non-positive values: every int has a non-positive counterpart.
+    if (!neg) v = -v;
+    do {
+        tmp[n++] = (char)('0' - v % 10);   // v % 10 is in -9..0
+        v /= 10;
+    } while (v != 0);
+    int i = 0;
+    if (neg) buf[i++] = '-';
+    while (n > 0) buf[i++] = tmp[--n];
+    buf[i] = '\0';
+}
+--- hint
+`v % 10` gives the last digit and `v / 10` drops it, so a loop produces the digits backwards. Collect them in a temporary array, then copy them out in reverse.
+--- hint
+Use `do { ... } while (v != 0);` so that `0` produces one digit.
+--- hint
+For `INT_MIN`: convert positive values to negative instead of the other way round, since every `int` has a negative counterpart. In C, `-7 % 10` is `-7`, so the digit is `'0' - v % 10`. Or work in `long long`.
+--- harness
+#include <limits.h>
+int main(void) {
+    char buf[12];
+    int_to_str(0, buf);           CHECK_STR(buf, "0");
+    int_to_str(7, buf);           CHECK_STR(buf, "7");
+    int_to_str(-7, buf);          CHECK_STR(buf, "-7");
+    int_to_str(10, buf);          CHECK_STR(buf, "10");
+    int_to_str(1234509, buf);     CHECK_STR(buf, "1234509");
+    int_to_str(-100, buf);        CHECK_STR(buf, "-100");
+    int_to_str(INT_MAX, buf);     CHECK_STR(buf, "2147483647");
+    int_to_str(INT_MIN, buf);     CHECK_STR(buf, "-2147483648");
+    return TEST_END();
+}
+
+=== exercise listfmt
+title: Build a string with snprintf
+--- prompt
+Write `size_t format_list(char *buf, size_t size, const int *a, size_t n)` that formats the array like `[1, 2, 3]` into `buf`, with `snprintf` semantics:
+
+- Never write more than `size` bytes, and always terminate when `size > 0`. When it does not fit, `buf` holds as much of the start of the text as fits.
+- `size` may be 0, in which case `buf` may be `NULL` and nothing is written.
+- Return the length of the *full* text, whether or not it fit.
+
+An empty array is `[]`. This is the standard "append with a running position" pattern: each `snprintf` call writes at `buf + pos` with `size - pos` bytes left, and its return value advances `pos`.
+--- starter
+#include <stdio.h>
+#include <stddef.h>
+
+size_t format_list(char *buf, size_t size, const int *a, size_t n) {
+    return 0;
+}
+--- solution
+#include <stdio.h>
+#include <stddef.h>
+
+size_t format_list(char *buf, size_t size, const int *a, size_t n) {
+    size_t len = 0;
+    for (size_t i = 0; i <= n + 1; i++) {
+        char *dst = len < size ? buf + len : NULL;
+        size_t room = len < size ? size - len : 0;
+        int w;
+        if (i == 0) w = snprintf(dst, room, "[");
+        else if (i == n + 1) w = snprintf(dst, room, "]");
+        else w = snprintf(dst, room, "%s%d", i > 1 ? ", " : "", a[i - 1]);
+        len += (size_t)w;
+    }
+    return len;
+}
+--- hint
+Keep `len`, the length so far of the full text. Each piece goes to `buf + len` with `size - len` bytes of room, and its return value is added to `len`.
+--- hint
+Once `len >= size`, there is no room left: pass `NULL` and `0` to `snprintf` (it still returns the length it would have written), so you never form a pointer past the buffer or compute a negative size.
+--- hint
+`snprintf(dst, room, "%s%d", first ? "" : ", ", value)` writes a separator and a number in one call.
+--- harness
+#include <limits.h>
+int main(void) {
+    char buf[64];
+    int a[] = {1, 2, 3};
+    CHECK_UINT(format_list(buf, sizeof buf, a, 3), 9);
+    CHECK_STR(buf, "[1, 2, 3]");
+
+    CHECK_UINT(format_list(buf, sizeof buf, a, 0), 2);
+    CHECK_STR(buf, "[]");
+
+    int b[] = {-5};
+    CHECK_UINT(format_list(buf, sizeof buf, b, 1), 4);
+    CHECK_STR(buf, "[-5]");
+
+    int c[] = {INT_MIN, INT_MAX};
+    CHECK_UINT(format_list(buf, sizeof buf, c, 2), 25);
+    CHECK_STR(buf, "[-2147483648, 2147483647]");
+
+    char small[6];
+    CHECK_UINT(format_list(small, sizeof small, a, 3), 9);
+    CHECK_STR(small, "[1, 2");
+
+    char tiny[2];
+    CHECK_UINT(format_list(tiny, sizeof tiny, a, 3), 9);
+    CHECK_STR(tiny, "[");
+
+    char exact[10];
+    CHECK_UINT(format_list(exact, sizeof exact, a, 3), 9);
+    CHECK_STR(exact, "[1, 2, 3]");
+
+    char nine[9];
+    CHECK_UINT(format_list(nine, sizeof nine, a, 3), 9);
+    CHECK_STR(nine, "[1, 2, 3");
+
+    char one[1] = {'Z'};
+    CHECK_UINT(format_list(one, 1, a, 3), 9);
+    CHECK_INT(one[0], 0);
+
+    CHECK_UINT(format_list(NULL, 0, a, 3), 9);
+    return TEST_END();
+}
+
+=== quiz
+run: yes
+--- q
+What does this print on x86-64 Linux?
+--- code
+#include <stdio.h>
+#include <string.h>
+
+int main(void) {
+    char a[] = "hello";
+    const char *p = "hello";
+    printf("%zu %zu %zu %zu\n", sizeof a, strlen(a), sizeof p, strlen(p));
+    return 0;
+}
+--- choice
+5 5 5 5
+--- choice
+6 6 8 8
+--- answer
+6 5 8 5
+--- choice
+6 5 6 5
+--- explain
+The array holds 5 letters plus the terminator: 6 bytes. `p` is a pointer, 8 bytes, no matter what it points to. `strlen` counts characters before the `'\0'` in both cases.
+
+=== quiz
+run: yes
+--- q
+What does this print?
+--- code
+#include <stdio.h>
+#include <string.h>
+
+int main(void) {
+    char s[] = "abc\0def";
+    printf("%zu %zu %s\n", sizeof s, strlen(s), s);
+    return 0;
+}
+--- choice
+7 7 abcdef
+--- choice
+8 7 abc
+--- answer
+8 3 abc
+--- choice
+4 3 abc
+--- explain
+The array holds all 7 characters plus the literal's own terminator: 8 bytes. But every string function stops at the first zero byte, so as a *string* it is just `abc`.
+
+=== quiz
+run: yes
+--- q
+What does this print?
+--- code
+#include <stdio.h>
+
+int main(void) {
+    char c = '7';
+    printf("%d %c %d %c\n", c - '0' + 1, 'a' + 2, 'A', 'z' - 'a' + 'A');
+    return 0;
+}
+--- choice
+71 c A Z
+--- answer
+8 c 65 Z
+--- choice
+8 99 65 90
+--- choice
+56 c 65 z
+--- explain
+Characters are integers. `'7' - '0'` is 7. `'a' + 2` printed with `%c` is `c`. `'A'` printed with `%d` is its code, 65. Shifting a letter by `'A' - 'a'` changes its case.
+
+=== quiz
+run: yes
+--- q
+What does this print?
+--- code
+#include <stdio.h>
+#include <string.h>
+
+int main(void) {
+    printf("%d %d %d\n",
+           strcmp("abc", "abcd") < 0,
+           strcmp("Zebra", "apple") < 0,
+           strcmp("10", "9") < 0);
+    return 0;
+}
+--- choice
+1 0 0
+--- choice
+0 0 1
+--- answer
+1 1 1
+--- choice
+1 0 1
+--- explain
+A prefix sorts first (its `'\0'` is smaller than `'d'`). Uppercase letters (65 to 90) come before lowercase (97 to 122), so `"Zebra"` sorts before `"apple"`. And it is byte-by-byte, not numeric: `'1'` is less than `'9'`.
+
+=== quiz
+run: yes
+--- q
+What does this print?
+--- code
+#include <stdio.h>
+
+int main(void) {
+    char buf[5];
+    int n = snprintf(buf, sizeof buf, "%d", 1234567);
+    printf("%d [%s]\n", n, buf);
+    return 0;
+}
+--- choice
+4 [1234]
+--- choice
+5 [12345]
+--- answer
+7 [1234]
+--- choice
+-1 []
+--- explain
+`snprintf` writes at most `size - 1` characters plus a terminator, so `1234`. It returns the length the full output *would* have had, 7, which is how you detect truncation: `n >= sizeof buf`.
+
+=== quiz
+run: yes
+--- q
+What does this print?
+--- code
+#include <stdio.h>
+#include <stdlib.h>
+
+int main(void) {
+    char *end;
+    long v = strtol("  -42px", &end, 10);
+    printf("%ld [%s] %d\n", v, end, atoi("12abc") + atoi("abc"));
+    return 0;
+}
+--- answer
+-42 [px] 12
+--- choice
+-42 [  -42px] 12
+--- choice
+0 [px] 0
+--- choice
+-42 [] 12
+--- explain
+`strtol` skips leading whitespace, reads the sign and digits, and sets `end` to the first character it did not use. `atoi` reads as much as it can and returns 0 when there is nothing, which is why you cannot tell `atoi("0")` from `atoi("abc")`.
+
+=== quiz
+--- q
+After `char buf[4]; strncpy(buf, "hello", sizeof buf);`, what is in `buf`?
+--- choice
+`"hel"` followed by `'\0'`
+--- answer
+`'h' 'e' 'l' 'l'` with no terminator
+--- choice
+`"hello"`: strncpy grows the array
+--- choice
+Four `'\0'` bytes, because the source was too long
+--- explain
+`strncpy` copies exactly `n` bytes when the source is at least that long and does not add a terminator. Printing `buf` now reads past its end. Terminate it yourself or use `snprintf`.
+
+=== quiz
+--- q
+What happens with `char *p = "hello"; p[0] = 'J';`?
+--- choice
+`p` now points to `"Jello"`
+--- choice
+A compile error, because string literals are `const`
+--- answer
+It compiles, but it is undefined behavior: usually a segmentation fault
+--- choice
+A new copy of the literal is made and modified
+--- explain
+String literals live in read-only memory, but their type is `char[]` for historical reasons, so the compiler accepts the write. Declare `const char *p` and the compiler rejects it; use `char p[] = "hello"` if you need a modifiable copy.

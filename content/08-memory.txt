@@ -1,0 +1,1103 @@
+=== chapter memory
+title: Dynamic memory
+blurb: Stack, heap and static storage, malloc and free, ownership, the classic memory bugs and how AddressSanitizer reports them, and a List<T> built by hand.
+--- body
+## Where things live
+
+There is no garbage collector. Every byte your program uses has a *storage duration* that decides when it exists, and it is your job to know which one you are dealing with.
+
+| Storage | How you get it | Lifetime | Typical size | C# analogy |
+|---|---|---|---|---|
+| **Automatic** (the stack) | local variables, parameters | until the enclosing block ends | small: about 8 MB total on Linux | locals, struct values on the stack |
+| **Static** | globals, `static` locals, string literals | the whole program run | fixed at compile time | `static` fields |
+| **Allocated** (the heap) | `malloc`, `calloc`, `realloc` | until you call `free` | as much as the machine has | `new`, minus the GC |
+
+```c
+#include <stdio.h>
+#include <stdlib.h>
+
+int counter = 0;                 // static storage: zero-initialized, lives forever
+
+int next_id(void) {
+    static int id = 100;         // static local: initialized once, keeps its value between calls
+    return id++;
+}
+
+int main(void) {
+    int local = 5;               // automatic: gone when main returns
+    int *heap = malloc(sizeof *heap);   // allocated: lives until free
+    if (heap == NULL) return 1;
+    *heap = 42;
+
+    int a = next_id();           // 100
+    int b = next_id();           // 101
+    // (calling next_id() twice inside one printf would be a trap: C does not
+    //  specify the order in which function arguments are evaluated)
+    printf("%d %d %d %d %d\n", local, *heap, a, b, counter);
+    free(heap);
+    return 0;
+}
+```
+
+The stack is fast (allocation is just moving a register) and automatically cleaned up, so use it whenever the size is known and small and the data does not need to outlive the function. Reach for the heap when:
+
+- the size is only known at runtime, or is large,
+- the data must outlive the function that creates it,
+- it must grow.
+
+## malloc, calloc, realloc, free
+
+All four live in `<stdlib.h>`.
+
+```c
+void *malloc(size_t size);               // size bytes, uninitialized (garbage)
+void *calloc(size_t count, size_t size); // count * size bytes, all zero
+void *realloc(void *p, size_t size);     // resize p's block, maybe moving it
+void free(void *p);                      // give it back; free(NULL) does nothing
+```
+
+`void *` is a generic pointer that converts implicitly to any object pointer type, so no cast is needed in C (`int *p = malloc(...)`). Casting the result is a C++ habit; in C it only adds noise.
+
+```c
+#include <stdio.h>
+#include <stdlib.h>
+
+int main(void) {
+    size_t n = 5;
+    int *a = malloc(n * sizeof *a);
+    if (a == NULL) {                     // always check
+        fprintf(stderr, "out of memory\n");
+        return 1;
+    }
+    for (size_t i = 0; i < n; i++) a[i] = (int)(i * i);
+
+    int *z = calloc(n, sizeof *z);       // zeroed
+    if (z == NULL) { free(a); return 1; }
+
+    printf("%d %d\n", a[4], z[4]);       // 16 0
+    free(a);
+    free(z);
+    return 0;
+}
+```
+
+### The sizeof(*p) idiom
+
+Write allocations as `p = malloc(n * sizeof *p)`, not `malloc(n * sizeof(int))`. `sizeof` does not evaluate its operand, so `*p` is safe even though `p` is not yet pointing anywhere. The win: if `p`'s type later changes from `int *` to `long *`, the allocation stays correct automatically. With `sizeof(int)` it would silently allocate half the memory you need.
+
+### Checking for NULL
+
+`malloc` returns `NULL` when it cannot satisfy the request. On a desktop Linux machine that is rare for small sizes (the OS overcommits), but it does happen for huge or corrupted sizes, on embedded systems, and under memory limits. Dereferencing `NULL` crashes. Check every allocation, and when a function fails halfway, free what it already allocated before returning.
+
+Watch for overflow in the size computation too: `count * size` can wrap around to a small number with huge counts. `calloc` checks for that internally, which is one reason to prefer it for arrays.
+
+## Ownership: who frees?
+
+C has no destructors, `using`, or GC, so every heap block needs exactly one *owner*: the piece of code responsible for freeing it. This is not enforced by anything except convention and documentation, so the conventions matter:
+
+- **A function that returns heap memory says so**, and the caller owns the result: "returns a newly allocated string; the caller must `free` it." `strdup` works this way.
+- **Paired create/destroy functions** for anything with internal allocations: `vec_init` / `vec_free`, `parser_new` / `parser_destroy`. Callers never `free` the internals by hand.
+- **Borrowing**: a function that takes a `const T *` only reads it during the call and does not keep it or free it.
+- **Caller-provided buffers** avoid the question entirely: `snprintf(buf, size, ...)` writes into memory the caller owns. Many C APIs prefer this.
+
+```c
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+// Returns a newly allocated copy of s, or NULL. The caller frees it.
+char *dup_upper(const char *s) {
+    size_t n = strlen(s);
+    char *r = malloc(n + 1);
+    if (!r) return NULL;
+    for (size_t i = 0; i <= n; i++)
+        r[i] = (s[i] >= 'a' && s[i] <= 'z') ? (char)(s[i] - 32) : s[i];
+    return r;
+}
+
+int main(void) {
+    char *shout = dup_upper("hello");
+    if (!shout) return 1;
+    printf("%s\n", shout);
+    free(shout);          // we own it, so we free it
+    return 0;
+}
+```
+
+Returning heap memory is fine. Returning the address of a *local* is never fine: the local dies when the function returns and the pointer dangles. gcc warns about the obvious cases.
+
+## The classic mistakes
+
+Each of these is undefined behavior. Without sanitizers, they often *seem to work*, then corrupt something far away much later. With `-fsanitize=address` (always on here), each one stops the program at the faulty line with a report. Learn to read them: the first line names the bug, the `#0` frame of the first stack trace is where it happened, and the later traces show where the memory was allocated and freed.
+
+### Memory leak
+
+Losing the last pointer to a block without freeing it:
+
+```c
+int *p = malloc(4 * sizeof *p);
+p = NULL;              // the block is unreachable now
+```
+
+```text
+==3959==ERROR: LeakSanitizer: detected memory leaks
+
+Direct leak of 16 byte(s) in 1 object(s) allocated from:
+    #0 0x7f19c72fd9c7 in malloc
+    #1 0x556475c5121e in main main.c:4
+
+SUMMARY: AddressSanitizer: 16 byte(s) leaked in 1 allocation(s).
+```
+
+Leaks are reported when the program exits. The trace shows where the leaked block was *allocated*; your job is to work out where it should have been freed. Short programs that exit soon after can get away with leaks in practice (the OS reclaims everything), but long-running ones (servers, games, editors) die of them, and the tests on this site treat them as failures.
+
+### Buffer overflow on the heap
+
+```c
+int *p = malloc(4 * sizeof *p);
+p[4] = 1;              // one past the end
+```
+
+```text
+==3935==ERROR: AddressSanitizer: heap-buffer-overflow on address 0x502000000020
+WRITE of size 4 at 0x502000000020 thread T0
+    #0 0x55ebc1d402ea in main main.c:6
+
+0x502000000020 is located 0 bytes after 16-byte region [0x502000000010,0x502000000020)
+allocated by thread T0 here:
+    #0 0x7fb2fb6fd9c7 in malloc
+    #1 0x55ebc1d4025f in main main.c:4
+```
+
+"0 bytes after 16-byte region" is the classic off-by-one: you allocated 16 bytes (4 ints) and touched the first byte past them. Forgetting the `+ 1` for a string's terminator produces exactly this.
+
+### Use after free
+
+```c
+free(p);
+printf("%d\n", p[0]);  // the memory may already belong to someone else
+```
+
+```text
+==3943==ERROR: AddressSanitizer: heap-use-after-free on address 0x502000000010
+READ of size 4 at 0x502000000010 thread T0
+    #0 0x55aa983912cd in main main.c:10
+
+freed by thread T0 here:
+    #0 0x7f4bdc2fc4d8 in free
+    #1 0x55aa9839126e in main main.c:9
+
+previously allocated by thread T0 here:
+    #0 0x7f4bdc2fd9c7 in malloc
+    #1 0x55aa9839125e in main main.c:4
+```
+
+`free` does not change `p`; it still holds the old address, now *dangling*. The usual real-world version is two pointers to one block, where one owner frees it and the other keeps using it. That is exactly the bug a GC makes impossible.
+
+### Double free
+
+```c
+free(p);
+free(p);
+```
+
+```text
+==3951==ERROR: AddressSanitizer: attempting double-free on 0x502000000010 in thread T0:
+    #0 0x7f756d4fc4d8 in free
+    #1 0x555d9ae881da in main main.c:13
+
+freed by thread T0 here:
+    #0 0x7f756d4fc4d8 in free
+    #1 0x555d9ae881ce in main main.c:12
+```
+
+Double frees corrupt the allocator's internal lists and are a known exploitation technique. A cheap defense: set the pointer to `NULL` right after freeing it (`free(p); p = NULL;`), since `free(NULL)` is harmless and a later `NULL` dereference crashes cleanly.
+
+Other things to know: `free` only accepts pointers that came from `malloc`/`calloc`/`realloc` (or `NULL`), and only the *start* of the block, not `p + 1`. Freeing a stack address or a string literal is undefined.
+
+## realloc and its trap
+
+`realloc(p, new_size)` resizes a block. It may extend it in place, or allocate a new block, copy the old contents over, and free the old one. Either way it returns the pointer to use from now on. The old contents (up to the smaller of the two sizes) are preserved; new bytes are uninitialized.
+
+The trap is this line, which looks natural:
+
+```c
+p = realloc(p, new_size);    // WRONG
+```
+
+If `realloc` fails, it returns `NULL` and **leaves the old block alone**. You just overwrote your only pointer to it with `NULL`: a leak, plus a crash on the next use. Always go through a temporary:
+
+```c
+int *tmp = realloc(p, new_size);
+if (tmp == NULL) {
+    // p is still valid and still yours: report the error, free it, or carry on
+    return -1;
+}
+p = tmp;
+```
+
+Also remember that any *other* pointers into the old block are now dangling if the block moved. Never keep a pointer to an element of a growable array across an operation that may grow it. (C#'s `List<T>` hides this by never letting you take such a pointer; `Span<T>` over a list's internals has the same problem.)
+
+`realloc(NULL, n)` behaves like `malloc(n)`, which is handy: a growth function does not need a special case for the first allocation.
+
+## Building a growable array
+
+C has no `List<T>`, so every C programmer writes one. Here it is step by step, specialized to `int`.
+
+**Step 1: the struct.** Three fields: the heap block, how many elements are in use, and how many fit before we must grow.
+
+```c
+typedef struct {
+    int *data;
+    size_t len;     // elements in use        (List<T>.Count)
+    size_t cap;     // elements allocated     (List<T>.Capacity)
+} IntVec;
+```
+
+**Step 2: init and free.** An empty vector needs no allocation at all: `data = NULL` with a capacity of 0. Freeing resets it to that state, so it can be reused safely.
+
+**Step 3: grow by doubling.** When `len == cap`, allocate twice the capacity. Doubling makes `push` amortized O(1): n pushes cause about log2(n) reallocations and copy fewer than 2n elements in total. Growing by a constant (say +10) would make n pushes O(n²).
+
+**Step 4: push.** Grow if full, then write at `data[len++]`. Report allocation failure through the return value.
+
+```c
+#include <stdio.h>
+#include <stdlib.h>
+
+typedef struct {
+    int *data;
+    size_t len;
+    size_t cap;
+} IntVec;
+
+void vec_init(IntVec *v) {
+    v->data = NULL;
+    v->len = 0;
+    v->cap = 0;
+}
+
+void vec_free(IntVec *v) {
+    free(v->data);
+    vec_init(v);               // back to a valid empty state
+}
+
+static int vec_grow(IntVec *v) {
+    size_t new_cap = v->cap ? v->cap * 2 : 4;
+    int *tmp = realloc(v->data, new_cap * sizeof *tmp);   // realloc(NULL, n) is malloc
+    if (!tmp) return 0;        // v is unchanged and still valid
+    v->data = tmp;
+    v->cap = new_cap;
+    return 1;
+}
+
+int vec_push(IntVec *v, int x) {
+    if (v->len == v->cap && !vec_grow(v)) return 0;
+    v->data[v->len++] = x;
+    return 1;
+}
+
+int main(void) {
+    IntVec v;
+    vec_init(&v);
+    for (int i = 0; i < 20; i++) {
+        if (!vec_push(&v, i * i)) { vec_free(&v); return 1; }
+        if (v.len == v.cap) printf("full at len %zu\n", v.len);
+    }
+    printf("len %zu, cap %zu, last %d\n", v.len, v.cap, v.data[v.len - 1]);
+    vec_free(&v);
+    return 0;
+}
+```
+
+The vector itself (the three fields) usually lives on the stack or inside another struct; only the elements are on the heap. Copying an `IntVec` with `=` copies the pointer, not the elements: you would get two owners of one block, and a double free when both are freed. That is the shallow copy problem, with no GC to save you.
+
+## A heap-allocated 2D grid
+
+When both dimensions are runtime values, allocate one flat block and index it by hand. It is one allocation, one free, and cache friendly:
+
+```c
+#include <stdio.h>
+#include <stdlib.h>
+
+int main(void) {
+    size_t rows = 3, cols = 4;
+    int *grid = calloc(rows * cols, sizeof *grid);
+    if (!grid) return 1;
+
+    for (size_t r = 0; r < rows; r++)
+        for (size_t c = 0; c < cols; c++)
+            grid[r * cols + c] = (int)(r * 10 + c);
+
+    printf("%d %d\n", grid[1 * cols + 2], grid[rows * cols - 1]);   // 12 23
+    free(grid);
+    return 0;
+}
+```
+
+The alternative, an array of row pointers (`int **`, each row its own `malloc`), gives you `grid[r][c]` syntax and jagged rows, at the cost of `rows + 1` allocations to manage and free. It is C's version of `int[][]` versus `int[,]`.
+
+> A good habit from now on: for every `malloc` you write, decide on the spot who frees it and write that `free` immediately, before filling in the code in between.
+
+=== exercise firstalloc
+title: Copies on the heap
+--- prompt
+Write two functions that return newly allocated memory. **The caller frees the results** (the tests do).
+
+- `int *int_dup(const int *a, size_t n)`: a heap copy of the `n` ints at `a`. If `n` is 0, return `NULL`.
+- `char *str_repeat(const char *s, size_t times)`: a new string made of `s` repeated `times` times. `str_repeat("ab", 3)` is `"ababab"`. Zero repetitions (or an empty `s`) give a newly allocated empty string `""`, not `NULL`.
+
+Return `NULL` if an allocation fails.
+--- starter
+#include <stdlib.h>
+#include <string.h>
+
+int *int_dup(const int *a, size_t n) {
+    return NULL;
+}
+
+char *str_repeat(const char *s, size_t times) {
+    return NULL;
+}
+--- solution
+#include <stdlib.h>
+#include <string.h>
+
+int *int_dup(const int *a, size_t n) {
+    if (n == 0) return NULL;
+    int *r = malloc(n * sizeof *r);
+    if (!r) return NULL;
+    memcpy(r, a, n * sizeof *r);
+    return r;
+}
+
+char *str_repeat(const char *s, size_t times) {
+    size_t len = strlen(s);
+    char *r = malloc(len * times + 1);
+    if (!r) return NULL;
+    for (size_t i = 0; i < times; i++)
+        memcpy(r + i * len, s, len);
+    r[len * times] = '\0';
+    return r;
+}
+--- hint
+`malloc(n * sizeof *r)` then `memcpy(r, a, n * sizeof *r)`. `memcpy` counts bytes, not elements.
+--- hint
+The repeated string needs `strlen(s) * times + 1` bytes: don't forget the terminator, which you must write yourself after copying the pieces.
+--- harness
+int main(void) {
+    int a[] = {5, -1, 7};
+    int *d = int_dup(a, 3);
+    CHECK(d != NULL && d != a);
+    if (d) {
+        CHECK(d[0] == 5 && d[1] == -1 && d[2] == 7);
+        a[0] = 100;
+        CHECK_INT(d[0], 5);
+    }
+    free(d);
+    CHECK(int_dup(a, 0) == NULL);
+    int one[] = {42};
+    int *o = int_dup(one, 1);
+    if (o) CHECK_INT(o[0], 42);
+    else CHECK(o != NULL);
+    free(o);
+
+    char *r = str_repeat("ab", 3);
+    CHECK_STR(r, "ababab");
+    free(r);
+    r = str_repeat("xyz", 1);
+    CHECK_STR(r, "xyz");
+    free(r);
+    r = str_repeat("ab", 0);
+    CHECK_STR(r, "");
+    free(r);
+    r = str_repeat("", 5);
+    CHECK_STR(r, "");
+    free(r);
+    r = str_repeat("-", 1000);
+    CHECK(r != NULL && strlen(r) == 1000 && r[999] == '-');
+    free(r);
+    return TEST_END();
+}
+
+=== exercise fixjoin
+title: Fix the leaky join
+--- prompt
+The starter's `join_words` is meant to join `n` words with a separator character between them, returning a newly allocated string that the caller frees: `{"a", "bb", "c"}` with `'-'` gives `"a-bb-c"`, and zero words give `""`.
+
+It has three bugs. Run it and read the sanitizer reports: one is a heap-buffer-overflow, one is a leak, and the third is a missing check that any `malloc` call needs. Fix them, or rewrite it so it measures the total length first and allocates exactly once (the better design: one allocation instead of `n`).
+--- starter
+#include <stdlib.h>
+#include <string.h>
+
+char *join_words(const char **words, size_t n, char sep) {
+    char *out = malloc(1);
+    out[0] = '\0';
+    for (size_t i = 0; i < n; i++) {
+        size_t len = strlen(out);
+        char *bigger = malloc(len + strlen(words[i]) + 1);
+        strcpy(bigger, out);
+        if (i > 0) bigger[len++] = sep;
+        strcpy(bigger + len, words[i]);
+        out = bigger;
+    }
+    return out;
+}
+--- solution
+#include <stdlib.h>
+#include <string.h>
+
+char *join_words(const char **words, size_t n, char sep) {
+    size_t total = 0;
+    for (size_t i = 0; i < n; i++)
+        total += strlen(words[i]);
+    if (n > 1) total += n - 1;              // separators
+
+    char *out = malloc(total + 1);
+    if (!out) return NULL;
+    char *p = out;
+    for (size_t i = 0; i < n; i++) {
+        if (i > 0) *p++ = sep;
+        size_t len = strlen(words[i]);
+        memcpy(p, words[i], len);
+        p += len;
+    }
+    *p = '\0';
+    return out;
+}
+--- hint
+The leak: each iteration replaces `out` with `bigger` without freeing the old `out`. The overflow: the size of `bigger` has no room for the separator.
+--- hint
+The single-allocation version: first loop adds up `strlen` of every word, plus `n - 1` separators (when `n > 0`), plus 1 for the terminator. Second loop copies with a moving pointer.
+--- harness
+int main(void) {
+    const char *w[] = {"a", "bb", "c"};
+    char *s = join_words(w, 3, '-');
+    CHECK_STR(s, "a-bb-c");
+    free(s);
+
+    s = join_words(w, 1, '-');
+    CHECK_STR(s, "a");
+    free(s);
+
+    s = join_words(w, 0, '-');
+    CHECK_STR(s, "");
+    free(s);
+
+    const char *e[] = {"", "", ""};
+    s = join_words(e, 3, ',');
+    CHECK_STR(s, ",,");
+    free(s);
+
+    const char *words[] = {"the", "quick", "brown", "fox", "jumps"};
+    s = join_words(words, 5, ' ');
+    CHECK_STR(s, "the quick brown fox jumps");
+    free(s);
+    return TEST_END();
+}
+
+=== exercise intvec
+title: A growable array
+--- prompt
+Build the `IntVec` from the chapter yourself, plus two more operations. The struct is in the starter:
+
+```c
+typedef struct {
+    int *data;
+    size_t len;
+    size_t cap;
+} IntVec;
+```
+
+- `void vec_init(IntVec *v)`: empty, with no allocation.
+- `int vec_push(IntVec *v, int x)`: append; double the capacity when full (start at 4). Return 1, or 0 if allocation fails (leaving `v` unchanged).
+- `int vec_pop(IntVec *v, int *out)`: remove the last element into `*out` and return 1, or return 0 if empty.
+- `int vec_insert(IntVec *v, size_t i, int x)`: insert `x` before index `i`, shifting the rest right (`i == len` appends). Return 0 if `i > len` or allocation fails, else 1. Use `memmove`.
+- `void vec_free(IntVec *v)`: free the elements and reset to empty.
+
+The tests push 100,000 elements, so growth must be by doubling.
+--- starter
+#include <stdlib.h>
+#include <string.h>
+
+typedef struct {
+    int *data;
+    size_t len;
+    size_t cap;
+} IntVec;
+
+void vec_init(IntVec *v) {
+}
+
+int vec_push(IntVec *v, int x) {
+    return 0;
+}
+
+int vec_pop(IntVec *v, int *out) {
+    return 0;
+}
+
+int vec_insert(IntVec *v, size_t i, int x) {
+    return 0;
+}
+
+void vec_free(IntVec *v) {
+}
+--- solution
+#include <stdlib.h>
+#include <string.h>
+
+typedef struct {
+    int *data;
+    size_t len;
+    size_t cap;
+} IntVec;
+
+void vec_init(IntVec *v) {
+    v->data = NULL;
+    v->len = 0;
+    v->cap = 0;
+}
+
+static int vec_reserve_one(IntVec *v) {
+    if (v->len < v->cap) return 1;
+    size_t new_cap = v->cap ? v->cap * 2 : 4;
+    int *tmp = realloc(v->data, new_cap * sizeof *tmp);
+    if (!tmp) return 0;
+    v->data = tmp;
+    v->cap = new_cap;
+    return 1;
+}
+
+int vec_push(IntVec *v, int x) {
+    if (!vec_reserve_one(v)) return 0;
+    v->data[v->len++] = x;
+    return 1;
+}
+
+int vec_pop(IntVec *v, int *out) {
+    if (v->len == 0) return 0;
+    *out = v->data[--v->len];
+    return 1;
+}
+
+int vec_insert(IntVec *v, size_t i, int x) {
+    if (i > v->len || !vec_reserve_one(v)) return 0;
+    memmove(v->data + i + 1, v->data + i, (v->len - i) * sizeof *v->data);
+    v->data[i] = x;
+    v->len++;
+    return 1;
+}
+
+void vec_free(IntVec *v) {
+    free(v->data);
+    vec_init(v);
+}
+--- hint
+Write a helper that makes room for one more element: if `len == cap`, `realloc` to double the capacity (or 4 when it is 0) through a temporary pointer. Both push and insert call it.
+--- hint
+For insert, the elements from `i` to the end move one place right: `memmove(v->data + i + 1, v->data + i, (v->len - i) * sizeof *v->data)`. `memcpy` is wrong here because the regions overlap.
+--- hint
+`vec_free` should call `vec_init` after `free`, so a freed vector is a valid empty one.
+--- harness
+int main(void) {
+    IntVec v;
+    vec_init(&v);
+    CHECK(v.data == NULL && v.len == 0 && v.cap == 0);
+    int x = -1;
+    CHECK_INT(vec_pop(&v, &x), 0);
+    CHECK_INT(x, -1);
+
+    CHECK_INT(vec_push(&v, 10), 1);
+    CHECK_INT(vec_push(&v, 20), 1);
+    CHECK_UINT(v.len, 2);
+    CHECK_UINT(v.cap, 4);
+    CHECK_INT(vec_pop(&v, &x), 1);
+    CHECK_INT(x, 20);
+    CHECK_UINT(v.len, 1);
+
+    CHECK_INT(vec_insert(&v, 0, 5), 1);    // {5, 10}
+    CHECK_INT(vec_insert(&v, 2, 30), 1);   // {5, 10, 30}
+    CHECK_INT(vec_insert(&v, 1, 7), 1);    // {5, 7, 10, 30}
+    CHECK_INT(vec_insert(&v, 5, 99), 0);
+    CHECK_UINT(v.len, 4);
+    if (v.len == 4)
+        CHECK(v.data[0] == 5 && v.data[1] == 7 && v.data[2] == 10 && v.data[3] == 30);
+    CHECK_INT(vec_insert(&v, 2, 8), 1);    // grows: {5, 7, 8, 10, 30}
+    CHECK_UINT(v.cap, 8);
+    if (v.len == 5)
+        CHECK(v.data[2] == 8 && v.data[4] == 30);
+
+    vec_free(&v);
+    CHECK(v.data == NULL && v.len == 0 && v.cap == 0);
+
+    CHECK_INT(vec_insert(&v, 0, 1), 1);    // insert into an empty vector
+    CHECK_UINT(v.len, 1);
+
+    int ok = 1;
+    for (int i = 0; i < 100000; i++) ok &= vec_push(&v, i);
+    CHECK(ok);
+    CHECK_UINT(v.len, 100001);
+    CHECK(v.cap >= v.len && v.cap <= 2 * v.len);
+    long long sum = 0;
+    while (vec_pop(&v, &x)) sum += x;
+    CHECK(sum == 1 + 99999LL * 100000 / 2);
+    vec_free(&v);
+    vec_free(&v);   // freeing twice must be safe after the reset
+    return TEST_END();
+}
+
+=== exercise readall
+title: Read an unknown amount of input
+--- prompt
+Read integers from stdin until end of input. You do not know how many there are, so store them in a heap array that grows (with `realloc`, doubling) as needed.
+
+Then print the count on one line, and the numbers in reverse order on the next, separated by single spaces. With no numbers, print `0` and an empty line.
+
+Input:
+
+```text
+3 1 4
+1 5
+```
+
+Output:
+
+```text
+5
+5 1 4 1 3
+```
+
+Free the array before exiting: the leak checker is watching.
+--- starter
+#include <stdio.h>
+#include <stdlib.h>
+
+int main(void) {
+    int x;
+    while (scanf("%d", &x) == 1) {
+        // store x
+    }
+    return 0;
+}
+--- solution
+#include <stdio.h>
+#include <stdlib.h>
+
+int main(void) {
+    int *a = NULL;
+    size_t len = 0, cap = 0;
+    int x;
+    while (scanf("%d", &x) == 1) {
+        if (len == cap) {
+            size_t new_cap = cap ? cap * 2 : 8;
+            int *tmp = realloc(a, new_cap * sizeof *tmp);
+            if (!tmp) {
+                free(a);
+                return 1;
+            }
+            a = tmp;
+            cap = new_cap;
+        }
+        a[len++] = x;
+    }
+    printf("%zu\n", len);
+    for (size_t i = len; i-- > 0;)
+        printf(i == len - 1 ? "%d" : " %d", a[i]);
+    printf("\n");
+    free(a);
+    return 0;
+}
+--- hint
+Keep `int *a = NULL; size_t len = 0, cap = 0;`. Before storing, if `len == cap`, grow with `realloc` into a temporary pointer. `realloc(NULL, n)` acts like `malloc`, so the first growth needs no special case.
+--- hint
+A backwards loop over `size_t` indices: `for (size_t i = len; i-- > 0; )`. It tests `i > 0` and then decrements, so the body sees `len - 1` down to `0`.
+--- test
+3 1 4
+1 5
+--- out
+5
+5 1 4 1 3
+--- test
+--- out
+0
+--- test
+42
+--- out
+1
+42
+--- test
+1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 -31 -32 -33
+--- out
+33
+-33 -32 -31 30 29 28 27 26 25 24 23 22 21 20 19 18 17 16 15 14 13 12 11 10 9 8 7 6 5 4 3 2 1
+
+=== exercise split
+title: Split a string
+--- prompt
+Write `char **split(const char *s, char sep, size_t *count)` that splits `s` at every `sep` character, like C#'s `s.Split(sep)`:
+
+- `split("a,b,c", ',', &n)` gives `{"a", "b", "c"}` with `n == 3`.
+- Empty parts are kept: `"a,,b"` gives `{"a", "", "b"}`, `",x,"` gives `{"", "x", ""}`.
+- The empty string gives one empty part: `{""}`.
+
+The result is a heap array of `*count` pointers, each to its own heap string. Also write `void free_split(char **parts, size_t count)`, which frees every string and then the array; the tests use it to clean up, so leaks there will be caught. If any allocation fails, free everything allocated so far and return `NULL`. `sep` is never `'\0'`.
+--- starter
+#include <stdlib.h>
+#include <string.h>
+
+char **split(const char *s, char sep, size_t *count) {
+    *count = 0;
+    return NULL;
+}
+
+void free_split(char **parts, size_t count) {
+}
+--- solution
+#include <stdlib.h>
+#include <string.h>
+
+void free_split(char **parts, size_t count) {
+    if (!parts) return;
+    for (size_t i = 0; i < count; i++)
+        free(parts[i]);
+    free(parts);
+}
+
+char **split(const char *s, char sep, size_t *count) {
+    size_t n = 1;
+    for (const char *p = s; *p; p++)
+        if (*p == sep) n++;
+
+    char **parts = malloc(n * sizeof *parts);
+    if (!parts) return NULL;
+
+    const char *start = s;
+    for (size_t i = 0; i < n; i++) {
+        const char *end = strchr(start, sep);
+        if (!end) end = start + strlen(start);
+        size_t len = (size_t)(end - start);
+        parts[i] = malloc(len + 1);
+        if (!parts[i]) {
+            free_split(parts, i);
+            return NULL;
+        }
+        memcpy(parts[i], start, len);
+        parts[i][len] = '\0';
+        start = end + 1;
+    }
+    *count = n;
+    return parts;
+}
+--- hint
+First count the parts: one more than the number of separators. Then allocate the pointer array with `malloc(n * sizeof *parts)`.
+--- hint
+For each part, find its end with `strchr(start, sep)` (or the end of the string when that returns `NULL`), allocate `len + 1` bytes, copy, terminate, and continue from `end + 1`.
+--- hint
+On failure partway through, `free_split(parts, i)` frees exactly the `i` strings made so far plus the array. Note that `free_split` must be defined (or declared) above `split` to be called there.
+--- harness
+static int parts_are(char **p, size_t n, const char **want, size_t wn) {
+    if (!p || n != wn) return 0;
+    for (size_t i = 0; i < n; i++)
+        if (!p[i] || strcmp(p[i], want[i]) != 0) return 0;
+    return 1;
+}
+#define T(str, sep, ...) do { \
+    const char *want_[] = {__VA_ARGS__}; size_t wn_ = sizeof want_ / sizeof want_[0]; \
+    size_t n_ = 12345; char **p_ = split(str, sep, &n_); \
+    CHECK(parts_are(p_, n_, want_, wn_)); \
+    if (p_) free_split(p_, n_); \
+} while (0)
+
+int main(void) {
+    T("a,b,c", ',', "a", "b", "c");
+    T("a,,b", ',', "a", "", "b");
+    T(",x,", ',', "", "x", "");
+    T("", ',', "");
+    T("no separators", ',', "no separators");
+    T(",", ',', "", "");
+    T("key=value", '=', "key", "value");
+    T("/usr/local/bin", '/', "", "usr", "local", "bin");
+    T("a b  c", ' ', "a", "b", "", "c");
+    return TEST_END();
+}
+
+=== exercise matrix
+title: A heap matrix
+--- prompt
+Implement a matrix of doubles whose size is chosen at runtime, stored as **one** allocation for the struct and its elements together (a flexible array member, from the structs chapter):
+
+```c
+typedef struct {
+    size_t rows, cols;
+    double cells[];    // rows * cols values, row-major
+} Matrix;
+```
+
+- `Matrix *mat_new(size_t rows, size_t cols)`: all cells zero. Return `NULL` on allocation failure. The caller frees the result with `free`.
+- `double *mat_at(Matrix *m, size_t r, size_t c)`: a pointer to cell `(r, c)`, so callers can read and write `*mat_at(m, 1, 2) = 5`.
+- `Matrix *mat_mul(const Matrix *a, const Matrix *b)`: a new matrix with the product `a * b`, or `NULL` if `a->cols != b->rows` or allocation fails.
+--- starter
+#include <stdlib.h>
+
+typedef struct {
+    size_t rows, cols;
+    double cells[];
+} Matrix;
+
+Matrix *mat_new(size_t rows, size_t cols) {
+    return NULL;
+}
+
+double *mat_at(Matrix *m, size_t r, size_t c) {
+    return &m->cells[0];
+}
+
+Matrix *mat_mul(const Matrix *a, const Matrix *b) {
+    return NULL;
+}
+--- solution
+#include <stdlib.h>
+
+typedef struct {
+    size_t rows, cols;
+    double cells[];
+} Matrix;
+
+Matrix *mat_new(size_t rows, size_t cols) {
+    Matrix *m = calloc(1, sizeof *m + rows * cols * sizeof m->cells[0]);
+    if (!m) return NULL;
+    m->rows = rows;
+    m->cols = cols;
+    return m;
+}
+
+double *mat_at(Matrix *m, size_t r, size_t c) {
+    return &m->cells[r * m->cols + c];
+}
+
+Matrix *mat_mul(const Matrix *a, const Matrix *b) {
+    if (a->cols != b->rows) return NULL;
+    Matrix *m = mat_new(a->rows, b->cols);
+    if (!m) return NULL;
+    for (size_t i = 0; i < a->rows; i++)
+        for (size_t k = 0; k < a->cols; k++) {
+            double aik = a->cells[i * a->cols + k];
+            for (size_t j = 0; j < b->cols; j++)
+                m->cells[i * m->cols + j] += aik * b->cells[k * b->cols + j];
+        }
+    return m;
+}
+--- hint
+Allocate `sizeof(Matrix) + rows * cols * sizeof(double)` bytes. `calloc(1, that)` zeroes it, including the cells (all-zero bytes are `0.0` on every machine you will meet).
+--- hint
+Cell `(r, c)` is at flat index `r * cols + c`.
+--- hint
+Product: `m[i][j]` is the sum over `k` of `a[i][k] * b[k][j]`. `mat_at` takes a non-const pointer, so inside `mat_mul` index `a->cells` and `b->cells` directly.
+--- harness
+int main(void) {
+    Matrix *a = mat_new(2, 3);
+    Matrix *b = mat_new(3, 2);
+    CHECK(a && b);
+    if (!a || !b) { free(a); free(b); return TEST_END(); }
+    CHECK(a->rows == 2 && a->cols == 3);
+    CHECK_DBL(*mat_at(a, 1, 2), 0);
+
+    double av[] = {1, 2, 3, 4, 5, 6};
+    double bv[] = {7, 8, 9, 10, 11, 12};
+    for (size_t r = 0; r < 2; r++)
+        for (size_t c = 0; c < 3; c++) *mat_at(a, r, c) = av[r * 3 + c];
+    for (size_t r = 0; r < 3; r++)
+        for (size_t c = 0; c < 2; c++) *mat_at(b, r, c) = bv[r * 2 + c];
+    CHECK_DBL(a->cells[5], 6);
+    CHECK_DBL(b->cells[1], 8);
+
+    Matrix *p = mat_mul(a, b);
+    CHECK(p != NULL);
+    if (p) {
+        CHECK(p->rows == 2 && p->cols == 2);
+        CHECK_DBL(*mat_at(p, 0, 0), 58);
+        CHECK_DBL(*mat_at(p, 0, 1), 64);
+        CHECK_DBL(*mat_at(p, 1, 0), 139);
+        CHECK_DBL(*mat_at(p, 1, 1), 154);
+    }
+    CHECK(mat_mul(a, a) == NULL);
+
+    Matrix *q = mat_mul(b, a);   // 3x3
+    CHECK(q != NULL);
+    if (q) {
+        CHECK(q->rows == 3 && q->cols == 3);
+        CHECK_DBL(*mat_at(q, 2, 2), 11 * 3 + 12 * 6);
+    }
+    Matrix *one = mat_new(1, 1);
+    if (one) {
+        *mat_at(one, 0, 0) = 2.5;
+        Matrix *sq = mat_mul(one, one);
+        if (sq) CHECK_DBL(sq->cells[0], 6.25);
+        else CHECK(sq != NULL);
+        free(sq);
+    }
+    free(one);
+    free(a); free(b); free(p); free(q);
+    return TEST_END();
+}
+
+=== quiz
+run: yes
+--- q
+What does this print on x86-64 Linux?
+--- code
+#include <stdio.h>
+#include <stdlib.h>
+
+int main(void) {
+    int *p = malloc(10 * sizeof *p);
+    if (!p) return 1;
+    printf("%zu %zu\n", sizeof p, sizeof *p);
+    free(p);
+    return 0;
+}
+--- choice
+40 4
+--- answer
+8 4
+--- choice
+40 40
+--- choice
+8 40
+--- explain
+`p` is a pointer, 8 bytes, regardless of how much it points to. `*p` is one `int`. There is no way to ask a heap pointer how big its block is: you keep the size yourself.
+
+=== quiz
+run: yes
+--- q
+What does this print?
+--- code
+#include <stdio.h>
+
+int next(void) {
+    static int n = 0;
+    int m = 0;
+    n++;
+    m++;
+    return n * 10 + m;
+}
+
+int main(void) {
+    int a = next();
+    int b = next();
+    int c = next();
+    printf("%d %d %d\n", a, b, c);
+    return 0;
+}
+--- choice
+11 11 11
+--- answer
+11 21 31
+--- choice
+11 22 33
+--- choice
+1 2 3
+--- explain
+A `static` local is initialized once and lives for the whole program, so `n` keeps counting. `m` is automatic: a fresh variable set to 0 on every call.
+
+=== quiz
+run: yes
+--- q
+What does this print?
+--- code
+#include <stdio.h>
+#include <stdlib.h>
+
+int main(void) {
+    int *p = malloc(3 * sizeof *p);
+    if (!p) return 1;
+    p[0] = 1; p[1] = 2; p[2] = 3;
+    int *tmp = realloc(p, 100 * sizeof *p);
+    if (!tmp) { free(p); return 1; }
+    p = tmp;
+    p[99] = 9;
+    printf("%d %d %d\n", p[0], p[2], p[99]);
+    free(p);
+    return 0;
+}
+--- answer
+1 3 9
+--- choice
+0 0 9
+--- choice
+It depends on whether realloc moved the block
+--- choice
+Undefined behavior: p was freed by realloc
+--- explain
+`realloc` preserves the old contents even when it moves the block to a new address. Using `p` again is fine because it was reassigned to the pointer `realloc` returned.
+
+=== quiz
+--- q
+What is wrong with `buf = realloc(buf, new_size);`?
+--- choice
+Nothing: realloc frees the old block and returns the new one
+--- answer
+If realloc fails it returns NULL, overwriting the only pointer to the still-allocated old block: a leak
+--- choice
+realloc cannot be called on memory from malloc
+--- choice
+The old contents are lost, so they must be copied back first
+--- explain
+On failure `realloc` leaves the original block untouched and returns `NULL`. Assign to a temporary, check it, and only then overwrite `buf`.
+
+=== quiz
+--- q
+AddressSanitizer stops your program with `heap-use-after-free ... READ of size 4`. Which code most likely caused it?
+--- choice
+`int *p = malloc(4); p = NULL;`
+--- choice
+`int *p = malloc(4 * sizeof *p); p[4] = 0;`
+--- answer
+`free(node); total += node->value;`
+--- choice
+`free(p); free(p);`
+--- explain
+Reading a 4-byte `int` through a pointer after its block was freed. The first option is a leak (reported at exit), the second a heap-buffer-overflow, the last an attempted double-free.
+
+=== quiz
+--- q
+A library documents `char *path_join(const char *a, const char *b)` as "returns a newly allocated string". What should the caller do?
+--- choice
+Nothing: the library frees it on the next call
+--- answer
+Call `free` on the result once done with it
+--- choice
+Free `a` and `b`, since they were copied
+--- choice
+Copy it into a local array; the returned pointer is only valid until the function returns
+--- explain
+"Newly allocated" is C's way of saying the caller now owns the block. The inputs are only borrowed (they are `const`) and remain the caller's business.
+
+=== quiz
+run: yes
+--- q
+What does this print?
+--- code
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+int main(void) {
+    int *a = calloc(4, sizeof *a);
+    if (!a) return 1;
+    memset(a, 1, 2 * sizeof *a);
+    printf("%d %d %d\n", a[0], a[1], a[3]);
+    free(a);
+    free(NULL);
+    return 0;
+}
+--- choice
+1 1 0
+--- answer
+16843009 16843009 0
+--- choice
+1 1 garbage
+--- choice
+It crashes on free(NULL)
+--- explain
+`calloc` zeroes the block. `memset` sets *bytes*: each of the first two ints becomes `0x01010101`, which is 16843009. And `free(NULL)` is defined to do nothing.

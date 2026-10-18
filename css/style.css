@@ -27,7 +27,16 @@ h2 { margin-top: 2em; padding-top: 0.5em; border-top: 1px solid var(--line); }
 .top { position: sticky; top: 0; z-index: 10; display: flex; align-items: center; gap: 16px; padding: 10px 16px;
   background: var(--panel); border-bottom: 1px solid var(--line); }
 .brand { white-space: nowrap; font-weight: 700; color: var(--text); font-family: var(--mono); }
-.top nav { margin-left: auto; display: flex; gap: 16px; }
+.top nav { display: flex; gap: 16px; }
+.top nav.right { margin-left: auto; }
+#coursetools { display: contents; }
+#coursenav a { color: var(--muted); padding: 2px 8px; border-radius: 6px; }
+#coursenav a.cur { color: var(--text); background: var(--code-bg); font-weight: 600; }
+.coursehead { padding: 4px 8px 8px; font-weight: 700; }
+.coursehead a { color: var(--text); }
+.canvashost { margin-top: 12px; }
+.canvashost canvas { width: 100%; max-width: 512px; aspect-ratio: 1; border-radius: 8px; border: 1px solid var(--line); background: #000; display: block; }
+.card.course h3 { font-size: 1.4rem; }
 .icon { display: none; background: none; border: 0; color: var(--text); font-size: 1.3rem; cursor: pointer; }
 
 .layout { display: grid; grid-template-columns: 280px minmax(0, 1fr); }
@@ -127,5 +136,7 @@ blockquote { margin: 0 0 16px; padding: 8px 16px; border-left: 4px solid var(--a
   .icon { display: block; }
   #main { padding: 16px 16px 60px; }
   .toc ul { columns: 1; }
-  .top nav { gap: 12px; font-size: 0.9rem; }
+  .top { flex-wrap: wrap; gap: 6px 12px; }
+  .top nav { gap: 10px; font-size: 0.9rem; }
+  #side { top: 80px; height: calc(100vh - 80px); }
 }

@@ -2,9 +2,13 @@
 (function () {
   const esc = s => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
   const KW = 'auto break case char const continue default do double else enum extern float for goto if inline int long register restrict return short signed sizeof static struct switch typedef union unsigned void volatile while _Bool _Static_assert _Generic _Alignof _Alignas _Noreturn bool true false NULL size_t uint8_t uint16_t uint32_t uint64_t int8_t int16_t int32_t int64_t uintptr_t intptr_t ptrdiff_t FILE';
-  const KWS = new Set(KW.split(' '));
-  const TOK = /(\/\/[^\n]*|\/\*[\s\S]*?\*\/)|("(?:\\.|[^"\\\n])*"|'(?:\\.|[^'\\\n])*')|(^[ \t]*#[^\n]*)|(\b(?:0[xX][0-9a-fA-F]+|\d+\.?\d*(?:[eE][+-]?\d+)?)[uUlLfF]*\b)|([A-Za-z_]\w*)/gm;
-  function highlight(code) {
+  const JSKW = 'async await break case catch class const continue debugger default delete do else export extends false finally for from function get if import in instanceof let new null of return set static super switch this throw true try typeof undefined var void while with yield NaN Infinity';
+  const WGSLKW = 'alias array atomic bitcast bool break case const const_assert continue continuing default diagnostic discard else enable f16 f32 fn for function i32 if let loop mat2x2f mat3x3f mat4x4f mat2x2 mat3x3 mat4x4 override private ptr return sampler storage struct switch texture_2d texture_storage_2d texture_depth_2d true false u32 uniform var vec2 vec3 vec4 vec2f vec3f vec4f vec2u vec3u vec4u vec2i vec3i vec4i while workgroup read write read_write';
+  const SETS = { c: new Set(KW.split(' ')), js: new Set(JSKW.split(' ')), wgsl: new Set(WGSLKW.split(' ')) };
+  SETS.javascript = SETS.webgpu = SETS.js;
+  const TOK = /(\/\/[^\n]*|\/\*[\s\S]*?\*\/)|("(?:\\.|[^"\\\n])*"|'(?:\\.|[^'\\\n])*'|`(?:\\.|[^`\\])*`)|(^[ \t]*#[^\n]*|@\w+)|(\b(?:0[xX][0-9a-fA-F]+|\d+\.?\d*(?:[eE][+-]?\d+)?)[uUlLfF]*\b)|([A-Za-z_]\w*)/gm;
+  function highlight(code, lang = 'c') {
+    const KWS = SETS[lang] || SETS.c;
     let out = '', last = 0, m;
     TOK.lastIndex = 0;
     while ((m = TOK.exec(code))) {
@@ -12,7 +16,8 @@
       const t = esc(m[0]);
       if (m[1]) out += `<span class="t-com">${t}</span>`;
       else if (m[2]) out += `<span class="t-str">${t}</span>`;
-      else if (m[3]) out += `<span class="t-pre">${t}</span>`;
+      else if (m[3] && (lang === 'c' || m[3].trim()[0] === '@')) out += `<span class="t-pre">${t}</span>`;
+      else if (m[3]) out += t;
       else if (m[4]) out += `<span class="t-num">${t}</span>`;
       else if (KWS.has(m[5])) out += `<span class="t-kw">${t}</span>`;
       else out += t;
@@ -42,9 +47,9 @@
         while (i < lines.length && !/^```/.test(lines[i])) buf.push(lines[i++]);
         i++;
         const code = buf.join('\n');
-        const runnable = lang === 'c' && /\bmain\s*\(/.test(code);
+        const runnable = lang === 'c' ? /\bmain\s*\(/.test(code) : lang === 'js';
         codeBlocks.push(code);
-        html += `<div class="codeblock"><pre><code>${lang === 'c' ? highlight(code) : esc(code)}</code></pre>` +
+        html += `<div class="codeblock"><pre><code>${SETS[lang] ? highlight(code, lang) : esc(code)}</code></pre>` +
           (runnable ? `<button class="small tryit" data-code="${codeBlocks.length - 1}">▶ Open in playground</button>` : '') + '</div>';
       } else if ((m = l.match(/^(#{1,4})\s+(.*)/))) {
         const n = m[1].length + 1, id = m[2].toLowerCase().replace(/[^\w]+/g, '-').replace(/^-|-$/g, '');
