@@ -1,0 +1,4458 @@
+=== chapter p6-lsystems
+title: L-systems
+blurb: String rewriting with exact-size buffers, turtle graphics with an explicit stack, classic fractal curves, stochastic and parametric rules, a 3D turtle, and trees turned into cylinder-and-leaf meshes rendered with a z-buffer.
+--- body
+## Plants as string rewriting
+
+In 1968 the biologist Aristid Lindenmayer modeled the growth of algae as **parallel string rewriting**: start with a string (the *axiom*), and in each generation replace *every* symbol at once by its successor (its *production rule*). Przemysław Prusinkiewicz turned this into a graphics tool by interpreting the result with a **turtle**, and the book he wrote with Lindenmayer, *The Algorithmic Beauty of Plants* (1990, free on algorithmicbotany.org, "ABOP" below), is still the reference. Most of what follows is from its first three chapters.
+
+Lindenmayer's algae:
+
+```text
+axiom:  A
+rules:  A -> AB,  B -> A
+
+gen 0:  A
+gen 1:  AB
+gen 2:  ABA
+gen 3:  ABAAB
+gen 4:  ABAABABA
+```
+
+The lengths are the Fibonacci numbers. That is the first thing to internalize: **L-system strings grow exponentially**. A rule with 5 symbols applied 10 times gives about 10 million symbols. Every piece of code in this chapter has to be written for that.
+
+Symbols without a rule are copied unchanged (`+`, `-`, `[`, `]` usually have none).
+
+## Generating strings without quadratic traps
+
+The naive implementation appends successor after successor with `strcat`, or grows the output with `realloc` for every symbol. `strcat` must find the end of the string first, so building a string of length `n` that way is O(n²): for 10 million symbols, 50 trillion byte reads. Do this instead:
+
+1. **Compute the final length first.** Length is linear: `len_g(c)`, the length that symbol `c` becomes after `g` generations, is 1 for `g = 0` and the sum of `len_{g-1}` over the successor's symbols after that. That is a dynamic program over the ~100 symbols, independent of the string, and it costs microseconds even for 1000 generations (where the string itself would not fit in the universe).
+2. **Allocate once**, two buffers big enough for the largest generation, and ping-pong between them.
+3. **Write with a cursor**: `memcpy(out + len, succ, succ_len); len += succ_len;` with the successor lengths precomputed once per run, not `strlen` per symbol.
+
+```c
+#include <stdio.h>
+#include <stdint.h>
+
+int main(void) {
+    /* length of the algae system after g generations, without building any string */
+    uint64_t a = 1, b = 1;                     /* len_g(A), len_g(B) */
+    for (int g = 1; g <= 90; g++) {
+        uint64_t na = a + b, nb = a;           /* A -> AB, B -> A */
+        a = na; b = nb;
+        if (g % 15 == 0) printf("gen %2d: %llu symbols\n", g, (unsigned long long)a);
+    }
+    return 0;
+}
+```
+
+> **Performance:** "count, allocate once, fill" is the pattern for every generator whose output size can be known: L-systems, meshes, text exports, particle bursts. When the size cannot be known in advance (stochastic rules), the next best is: run the generator twice with the same seed, once counting and once writing, or grow geometrically (double the capacity), never by a constant.
+
+## The turtle
+
+Interpret the string left to right as commands to a pen-carrying turtle with a position and a heading:
+
+| symbol | action |
+|---|---|
+| `F`, `G` | move forward one step, drawing a line |
+| `f` | move forward without drawing |
+| `+` / `-` | turn left / right by the angle δ |
+| `\|` | turn around (180°) |
+| `[` | push the turtle state (position, heading) on a stack |
+| `]` | pop it: jump back to where the branch started |
+
+Brackets are what make plants: `F[+F]F` draws a stem with a side branch. The stack is a fixed-size array of states, not a linked list and not recursion; real plants nest a few dozen levels deep at most, so 64 entries is plenty, and overflowing it is an error you report, not a crash.
+
+> **Performance:** a turn by the same δ happens millions of times, so compute `cos δ` and `sin δ` once and rotate the heading *vector* `(dx, dy)` by them, instead of keeping an angle and calling `cosf`/`sinf` for every `F`. Rounding drift over millions of rotations is real but tiny in `float` for drawings; brackets reset it anyway, since a pop restores the saved vector.
+
+The classic curves are all one-liners (δ is the turn angle):
+
+| curve | axiom | rules | δ |
+|---|---|---|---|
+| Koch snowflake | `F--F--F` | `F -> F+F--F+F` | 60° |
+| Dragon curve (Heighway) | `FX` | `X -> X+YF+`, `Y -> -FX-Y` | 90° |
+| Hilbert curve | `A` | `A -> +BF-AFA-FB+`, `B -> -AF+BFB+FA-` | 90° |
+| Sierpinski arrowhead | `F` | `F -> G-F-G`, `G -> F+G+F` | 60° |
+| Fractal plant (ABOP 1.24) | `X` | `X -> F+[[X]-X]-F[-FX]+X`, `F -> FF` | 25° |
+
+`X`, `Y`, `A`, `B` draw nothing; they only exist to be rewritten. A complete program that rewrites and draws the plant (it uses `strcat`, which is fine at this size, and exactly the habit to drop for the exercises):
+
+```c
+#include <stdio.h>
+#include <string.h>
+#include <math.h>
+
+enum { W = 128, H = 128, MAXLEN = 200000 };
+static char a[MAXLEN], b[MAXLEN];
+static unsigned char img[H][W];
+
+int main(void) {
+    strcpy(a, "X");
+    for (int g = 0; g < 5; g++) {                       /* rewrite 5 times */
+        size_t n = 0;
+        for (const char *p = a; *p; p++) {
+            const char *s = *p == 'X' ? "F+[[X]-X]-F[-FX]+X" : *p == 'F' ? "FF" : NULL;
+            size_t k = s ? strlen(s) : 1;
+            memcpy(b + n, s ? s : p, k);
+            n += k;
+        }
+        b[n] = '\0';
+        memcpy(a, b, n + 1);
+    }
+    float x = 40, y = 127, dx = 0, dy = -1.6f, c = cosf(25 * 3.14159265f / 180), s = sinf(25 * 3.14159265f / 180);
+    float stack[64][4];
+    int sp = 0;
+    for (const char *p = a; *p; p++) {
+        switch (*p) {
+        case 'F':
+            for (int k = 0; k < 4; k++) {               /* 4 dots per step */
+                int px = (int)(x + dx * k * 0.25f), py = (int)(y + dy * k * 0.25f);
+                if (px >= 0 && px < W && py >= 0 && py < H) img[py][px] = 1;
+            }
+            x += dx; y += dy;
+            break;
+        case '+': { float t = dx * c - dy * s; dy = dx * s + dy * c; dx = t; break; }
+        case '-': { float t = dx * c + dy * s; dy = -dx * s + dy * c; dx = t; break; }
+        case '[': stack[sp][0] = x; stack[sp][1] = y; stack[sp][2] = dx; stack[sp][3] = dy; sp++; break;
+        case ']': sp--; x = stack[sp][0]; y = stack[sp][1]; dx = stack[sp][2]; dy = stack[sp][3]; break;
+        }
+    }
+    printf("P2\n%d %d\n1\n", W, H);
+    for (int i = 0; i < H; i++)
+        for (int j = 0; j < W; j++) printf("%d%c", !img[i][j], j == W - 1 ? '\n' : ' ');
+    return 0;
+}
+```
+
+## Stochastic L-systems
+
+Every plant from a deterministic L-system is an exact clone. ABOP's fix (section 1.7): give a symbol several successors with probabilities, and pick one *per symbol occurrence* per generation:
+
+```text
+F -> F[+F]F[-F]F    (weight 1)
+F -> F[+F]F         (weight 1)
+F -> F[-F]F         (weight 1)
+```
+
+Use a seeded PRNG, consumed in a fixed order (left to right, generation by generation), so a seed always gives the same plant: you can store a forest as a list of seeds. The length is no longer known in advance, but because the PRNG is deterministic you can **replay** it: run a generation once with a copy of the PRNG state to count, size the buffer, then run it again with the real state to write.
+
+## Parametric L-systems
+
+Strings of characters cannot say "this branch is 70% as long as its parent". **Parametric L-systems** (ABOP chapter 1.10) attach numbers to symbols: modules like `F(1.0)`, `+(30)`, `!(0.5)`, and productions compute the successors' parameters from the predecessor's:
+
+```text
+A(l) -> F(l) [ +(30) A(l * 0.7) ] [ -(25) A(l * 0.6) ]
+```
+
+The right representation in C is an array of `struct { char sym; float p; }`, not text with parentheses: no parsing, no number formatting, constant size per module, and the generation loop is the same "count, allocate, fill" as before. (Full parametric L-systems also have *conditions*, `A(l) : l > 0.1 -> ...`; we leave them out so that lengths stay computable up front.)
+
+## The 3D turtle
+
+In 3D the turtle carries a frame of three unit vectors: **H** (heading), **L** (left) and **U** (up), with `H × L = U`. Rotations turn two of them around the third:
+
+| symbol | rotation | around |
+|---|---|---|
+| `+` / `-` | turn left / right (yaw) | U |
+| `&` / `^` | pitch down / up | L |
+| `\` / `/` | roll left / right | H |
+| `\|` | turn around | U, 180° |
+
+A branch segment is a cylinder along H; L and U are exactly the two vectors you need to place its ring of vertices, so the turtle's frame doubles as the cylinder's local coordinate system and the rings never twist. ABOP's trees also use `!(w)` to set the branch width, which lets old trunk segments thicken as the tree grows.
+
+> **Performance:** a tree of a few thousand segments becomes tens of thousands of triangles. Count segments and leaves first (just count `F` and `L` modules in the final string), allocate the vertex and index arrays once, and write them with cursors, exactly as for the terrain mesh. Game engines go further: they generate a few tree variants once at load time, bake them into vertex buffers, and draw thousands of instances.
+
+## The project
+
+You will build an L-system engine, then a tree generator on top of it:
+
+1. the final length without generating the string (dynamic programming)
+2. expansion into exact-size ping-pong buffers
+3. a 2D turtle with an explicit stack
+4. drawing segments fitted to an image, and the classic curves
+5. stochastic rules with a seeded PRNG
+6. parametric modules
+7. a 3D turtle with H/L/U frames, widths and leaves
+8. branches as cylinder meshes
+9. leaves as quads, one combined tree mesh
+10. a z-buffered renderer for the tree
+
+The first step's starter contains helpers from earlier chapters (vectors, a hash, the RGB image with its `P3` writer and a Bresenham `img_line`) and this chapter's `LSystem` type: one successor string per 7-bit ASCII symbol, `NULL` meaning "no rule". C99 designated initializers make definitions read like the textbook:
+
+```c
+LSystem algae = {.rule = {['A'] = "AB", ['B'] = "A"}};
+```
+
+=== exercise ls_length
+title: L-systems 1: length without the string
+--- prompt
+Implement `uint64_t ls_length(const LSystem *ls, const char *axiom, int n)`: the length of the string after `n` generations, **without building it**.
+
+Keep an array `len[128]`, where `len[c]` is how long symbol `c` becomes after the current number of generations. Initially (0 generations) every symbol has length 1. One generation later, a symbol with rule `s` has length `len_next[c] = sum of len[s[i]]` over the characters of its successor, and a symbol without a rule stays 1. After `n` rounds, the answer is the sum of `len[c]` over the axiom's characters.
+
+Lengths can exceed 64 bits (the algae system passes `2^64` around generation 92). **Saturate**: if any sum would overflow, use `UINT64_MAX` instead, and keep it there.
+
+The tests ask for generation 1000 of several systems. Expanding the string is impossible; the dynamic program takes `n × (total rule length)` steps.
+
+Symbols are 7-bit ASCII (`ls->rule[(unsigned char)c]`).
+
+--- starter
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdint.h>
+#include <math.h>
+
+/* ===== From earlier chapters: vectors, hashing, images, line drawing ===== */
+
+typedef struct { float x, y, z; } Vec3;
+Vec3 v3(float x, float y, float z) { Vec3 r = {x, y, z}; return r; }
+Vec3 v3_add(Vec3 a, Vec3 b) { return v3(a.x + b.x, a.y + b.y, a.z + b.z); }
+Vec3 v3_sub(Vec3 a, Vec3 b) { return v3(a.x - b.x, a.y - b.y, a.z - b.z); }
+Vec3 v3_scale(Vec3 a, float s) { return v3(a.x * s, a.y * s, a.z * s); }
+float v3_dot(Vec3 a, Vec3 b) { return a.x * b.x + a.y * b.y + a.z * b.z; }
+Vec3 v3_cross(Vec3 a, Vec3 b) { return v3(a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x); }
+float v3_len(Vec3 a) { return sqrtf(v3_dot(a, a)); }
+Vec3 v3_norm(Vec3 a) { float l = v3_len(a); return l > 0 ? v3_scale(a, 1.0f / l) : a; }
+
+uint32_t hash32(uint32_t x) {            /* lowbias32 (Chris Wellons) */
+    x ^= x >> 16; x *= 0x7feb352dU; x ^= x >> 15; x *= 0x846ca68bU; x ^= x >> 16;
+    return x;
+}
+
+typedef struct { int w, h; unsigned char *px; } Image;      /* RGB, 3 bytes per pixel, row-major */
+Image img_new(int w, int h) { Image im = {w, h, calloc((size_t)w * h * 3, 1)}; return im; }
+void img_free(Image *im) { free(im->px); im->px = NULL; }
+void img_fill(Image *im, int r, int g, int b) {
+    for (size_t i = 0, n = (size_t)im->w * im->h; i < n; i++) {
+        im->px[3 * i] = (unsigned char)r; im->px[3 * i + 1] = (unsigned char)g; im->px[3 * i + 2] = (unsigned char)b;
+    }
+}
+void img_set(Image *im, int x, int y, int r, int g, int b) {   /* ignores pixels outside the image */
+    if (x < 0 || y < 0 || x >= im->w || y >= im->h) return;
+    unsigned char *p = im->px + ((size_t)y * im->w + x) * 3;
+    p[0] = (unsigned char)r; p[1] = (unsigned char)g; p[2] = (unsigned char)b;
+}
+void img_line(Image *im, int x0, int y0, int x1, int y1, int r, int g, int b) {   /* Bresenham */
+    int dx = abs(x1 - x0), sx = x0 < x1 ? 1 : -1, dy = -abs(y1 - y0), sy = y0 < y1 ? 1 : -1, err = dx + dy;
+    for (;;) {
+        img_set(im, x0, y0, r, g, b);
+        if (x0 == x1 && y0 == y1) break;
+        int e2 = 2 * err;
+        if (e2 >= dy) { err += dy; x0 += sx; }
+        if (e2 <= dx) { err += dx; y0 += sy; }
+    }
+}
+void img_write_ppm(const Image *im) {                       /* ASCII P3 to stdout: the site draws it */
+    printf("P3\n%d %d\n255\n", im->w, im->h);
+    for (int y = 0; y < im->h; y++) {
+        const unsigned char *p = im->px + (size_t)y * im->w * 3;
+        for (int x = 0; x < im->w * 3; x++) printf("%d%c", p[x], x + 1 < im->w * 3 ? ' ' : '\n');
+    }
+}
+
+/* ===== This chapter: an L-system is one successor string per symbol (NULL: the symbol stays) ===== */
+
+typedef struct { const char *rule[128]; } LSystem;
+
+uint64_t ls_length(const LSystem *ls, const char *axiom, int n) {
+    (void)ls; (void)n;
+    return strlen(axiom);
+}
+
+int main(void) {
+    LSystem algae = {.rule = {['A'] = "AB", ['B'] = "A"}};
+    LSystem plant = {.rule = {['X'] = "F+[[X]-X]-F[-FX]+X", ['F'] = "FF"}};
+    for (int g = 0; g <= 100; g += 10)
+        printf("gen %3d: algae %20llu   plant %20llu\n", g,
+               (unsigned long long)ls_length(&algae, "A", g), (unsigned long long)ls_length(&plant, "X", g));
+    return 0;
+}
+
+--- solution
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdint.h>
+#include <math.h>
+
+/* ===== From earlier chapters: vectors, hashing, images, line drawing ===== */
+
+typedef struct { float x, y, z; } Vec3;
+Vec3 v3(float x, float y, float z) { Vec3 r = {x, y, z}; return r; }
+Vec3 v3_add(Vec3 a, Vec3 b) { return v3(a.x + b.x, a.y + b.y, a.z + b.z); }
+Vec3 v3_sub(Vec3 a, Vec3 b) { return v3(a.x - b.x, a.y - b.y, a.z - b.z); }
+Vec3 v3_scale(Vec3 a, float s) { return v3(a.x * s, a.y * s, a.z * s); }
+float v3_dot(Vec3 a, Vec3 b) { return a.x * b.x + a.y * b.y + a.z * b.z; }
+Vec3 v3_cross(Vec3 a, Vec3 b) { return v3(a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x); }
+float v3_len(Vec3 a) { return sqrtf(v3_dot(a, a)); }
+Vec3 v3_norm(Vec3 a) { float l = v3_len(a); return l > 0 ? v3_scale(a, 1.0f / l) : a; }
+
+uint32_t hash32(uint32_t x) {            /* lowbias32 (Chris Wellons) */
+    x ^= x >> 16; x *= 0x7feb352dU; x ^= x >> 15; x *= 0x846ca68bU; x ^= x >> 16;
+    return x;
+}
+
+typedef struct { int w, h; unsigned char *px; } Image;      /* RGB, 3 bytes per pixel, row-major */
+Image img_new(int w, int h) { Image im = {w, h, calloc((size_t)w * h * 3, 1)}; return im; }
+void img_free(Image *im) { free(im->px); im->px = NULL; }
+void img_fill(Image *im, int r, int g, int b) {
+    for (size_t i = 0, n = (size_t)im->w * im->h; i < n; i++) {
+        im->px[3 * i] = (unsigned char)r; im->px[3 * i + 1] = (unsigned char)g; im->px[3 * i + 2] = (unsigned char)b;
+    }
+}
+void img_set(Image *im, int x, int y, int r, int g, int b) {   /* ignores pixels outside the image */
+    if (x < 0 || y < 0 || x >= im->w || y >= im->h) return;
+    unsigned char *p = im->px + ((size_t)y * im->w + x) * 3;
+    p[0] = (unsigned char)r; p[1] = (unsigned char)g; p[2] = (unsigned char)b;
+}
+void img_line(Image *im, int x0, int y0, int x1, int y1, int r, int g, int b) {   /* Bresenham */
+    int dx = abs(x1 - x0), sx = x0 < x1 ? 1 : -1, dy = -abs(y1 - y0), sy = y0 < y1 ? 1 : -1, err = dx + dy;
+    for (;;) {
+        img_set(im, x0, y0, r, g, b);
+        if (x0 == x1 && y0 == y1) break;
+        int e2 = 2 * err;
+        if (e2 >= dy) { err += dy; x0 += sx; }
+        if (e2 <= dx) { err += dx; y0 += sy; }
+    }
+}
+void img_write_ppm(const Image *im) {                       /* ASCII P3 to stdout: the site draws it */
+    printf("P3\n%d %d\n255\n", im->w, im->h);
+    for (int y = 0; y < im->h; y++) {
+        const unsigned char *p = im->px + (size_t)y * im->w * 3;
+        for (int x = 0; x < im->w * 3; x++) printf("%d%c", p[x], x + 1 < im->w * 3 ? ' ' : '\n');
+    }
+}
+
+/* ===== This chapter: an L-system is one successor string per symbol (NULL: the symbol stays) ===== */
+
+typedef struct { const char *rule[128]; } LSystem;
+
+uint64_t sat_add(uint64_t a, uint64_t b) { return a > UINT64_MAX - b ? UINT64_MAX : a + b; }
+
+uint64_t ls_length(const LSystem *ls, const char *axiom, int n) {
+    uint64_t len[128], next[128];
+    for (int c = 0; c < 128; c++) len[c] = 1;
+    for (int g = 0; g < n; g++) {
+        for (int c = 0; c < 128; c++) {
+            const char *r = ls->rule[c];
+            if (!r) { next[c] = 1; continue; }
+            uint64_t sum = 0;
+            for (const char *p = r; *p; p++) sum = sat_add(sum, len[(unsigned char)*p]);
+            next[c] = sum;
+        }
+        memcpy(len, next, sizeof len);
+    }
+    uint64_t total = 0;
+    for (const char *p = axiom; *p; p++) total = sat_add(total, len[(unsigned char)*p]);
+    return total;
+}
+
+int main(void) {
+    LSystem algae = {.rule = {['A'] = "AB", ['B'] = "A"}};
+    LSystem plant = {.rule = {['X'] = "F+[[X]-X]-F[-FX]+X", ['F'] = "FF"}};
+    for (int g = 0; g <= 100; g += 10)
+        printf("gen %3d: algae %20llu   plant %20llu\n", g,
+               (unsigned long long)ls_length(&algae, "A", g), (unsigned long long)ls_length(&plant, "X", g));
+    return 0;
+}
+
+--- hint
+`next[c]` for a symbol without a rule is 1, not `len[c]`: a constant symbol is one character at every generation.
+
+--- hint
+Saturating add: `a > UINT64_MAX - b ? UINT64_MAX : a + b`.
+
+--- harness
+int main(void) {
+    LSystem algae = {.rule = {['A'] = "AB", ['B'] = "A"}};
+    uint64_t fib[100];
+    fib[0] = 1; fib[1] = 2;
+    for (int i = 2; i < 92; i++) fib[i] = fib[i - 1] + fib[i - 2];
+    for (int g = 0; g < 92; g++) CHECK_UINT(ls_length(&algae, "A", g), fib[g]);
+    CHECK_UINT(ls_length(&algae, "A", 91), 12200160415121876738ULL);
+    CHECK_UINT(ls_length(&algae, "A", 92), UINT64_MAX);
+    CHECK_UINT(ls_length(&algae, "A", 1000), UINT64_MAX);
+    CHECK_UINT(ls_length(&algae, "B", 1), 1);
+    CHECK_UINT(ls_length(&algae, "BAB", 2), 2 + 3 + 2);
+    CHECK_UINT(ls_length(&algae, "", 10), 0);
+    CHECK_UINT(ls_length(&algae, "xyz", 1000), 3);
+
+    LSystem koch = {.rule = {['F'] = "F+F--F+F"}};
+    CHECK_UINT(ls_length(&koch, "F--F--F", 0), 7);
+    CHECK_UINT(ls_length(&koch, "F--F--F", 1), 3 * 8 + 4);
+    /* F count 4^n, total: 3 * len_n(F) + 4, len_n(F) = 4 len_{n-1}(F) + 4 */
+    uint64_t lf = 1;
+    for (int g = 1; g <= 20; g++) lf = 4 * lf + 4;
+    CHECK_UINT(ls_length(&koch, "F--F--F", 20), 3 * lf + 4);
+
+    LSystem dragon = {.rule = {['X'] = "X+YF+", ['Y'] = "-FX-Y"}};
+    CHECK_UINT(ls_length(&dragon, "FX", 1), 6);
+    CHECK_UINT(ls_length(&dragon, "FX", 10), 4094);
+
+    LSystem erase = {.rule = {['A'] = "", ['B'] = "AA"}};
+    CHECK_UINT(ls_length(&erase, "BBB", 1), 6);
+    CHECK_UINT(ls_length(&erase, "BBB", 2), 0);
+    CHECK_UINT(ls_length(&erase, "BAcB", 1000), 1);
+
+    LSystem plant = {.rule = {['X'] = "F+[[X]-X]-F[-FX]+X", ['F'] = "FF"}};
+    CHECK_UINT(ls_length(&plant, "X", 6), 25159);
+    CHECK_UINT(ls_length(&plant, "X", 1000), UINT64_MAX);
+    return TEST_END();
+}
+
+=== exercise ls_expand
+title: L-systems 2: expansion into exact-size buffers
+continues: ls_length
+--- prompt
+Implement `char *ls_expand(const LSystem *ls, const char *axiom, int n, size_t *out_len)`: the string after `n` generations, in a heap buffer the caller frees, with its length in `*out_len`.
+
+- Use `ls_length` for generations `0..n` to find the **largest** length any generation reaches (rules can erase symbols, so it is not always the last one). If it is above `1u << 28`, return `NULL`.
+- Allocate **two** buffers of that size + 1, once. Copy the axiom into one; each generation reads one buffer and writes the other with a write cursor, then swap. Free the buffer you do not return.
+- Precompute each rule's successor length once (`size_t rlen[128]`) instead of calling `strlen` per symbol.
+
+The large test expands the algae system to generation 33: 9.2 million symbols. With a write cursor and `memcpy` that takes a fraction of a second even under the sanitizers. With `strcat` (which rescans the output from the start on every call), or with `strlen(out)` in a loop condition, it takes hours.
+
+--- stubs
+char *ls_expand(const LSystem *ls, const char *axiom, int n, size_t *out_len) {
+    (void)ls; (void)n;
+    char *s = malloc(strlen(axiom) + 1);
+    strcpy(s, axiom);
+    *out_len = strlen(s);
+    return s;
+}
+
+--- solution
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdint.h>
+#include <math.h>
+
+/* ===== From earlier chapters: vectors, hashing, images, line drawing ===== */
+
+typedef struct { float x, y, z; } Vec3;
+Vec3 v3(float x, float y, float z) { Vec3 r = {x, y, z}; return r; }
+Vec3 v3_add(Vec3 a, Vec3 b) { return v3(a.x + b.x, a.y + b.y, a.z + b.z); }
+Vec3 v3_sub(Vec3 a, Vec3 b) { return v3(a.x - b.x, a.y - b.y, a.z - b.z); }
+Vec3 v3_scale(Vec3 a, float s) { return v3(a.x * s, a.y * s, a.z * s); }
+float v3_dot(Vec3 a, Vec3 b) { return a.x * b.x + a.y * b.y + a.z * b.z; }
+Vec3 v3_cross(Vec3 a, Vec3 b) { return v3(a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x); }
+float v3_len(Vec3 a) { return sqrtf(v3_dot(a, a)); }
+Vec3 v3_norm(Vec3 a) { float l = v3_len(a); return l > 0 ? v3_scale(a, 1.0f / l) : a; }
+
+uint32_t hash32(uint32_t x) {            /* lowbias32 (Chris Wellons) */
+    x ^= x >> 16; x *= 0x7feb352dU; x ^= x >> 15; x *= 0x846ca68bU; x ^= x >> 16;
+    return x;
+}
+
+typedef struct { int w, h; unsigned char *px; } Image;      /* RGB, 3 bytes per pixel, row-major */
+Image img_new(int w, int h) { Image im = {w, h, calloc((size_t)w * h * 3, 1)}; return im; }
+void img_free(Image *im) { free(im->px); im->px = NULL; }
+void img_fill(Image *im, int r, int g, int b) {
+    for (size_t i = 0, n = (size_t)im->w * im->h; i < n; i++) {
+        im->px[3 * i] = (unsigned char)r; im->px[3 * i + 1] = (unsigned char)g; im->px[3 * i + 2] = (unsigned char)b;
+    }
+}
+void img_set(Image *im, int x, int y, int r, int g, int b) {   /* ignores pixels outside the image */
+    if (x < 0 || y < 0 || x >= im->w || y >= im->h) return;
+    unsigned char *p = im->px + ((size_t)y * im->w + x) * 3;
+    p[0] = (unsigned char)r; p[1] = (unsigned char)g; p[2] = (unsigned char)b;
+}
+void img_line(Image *im, int x0, int y0, int x1, int y1, int r, int g, int b) {   /* Bresenham */
+    int dx = abs(x1 - x0), sx = x0 < x1 ? 1 : -1, dy = -abs(y1 - y0), sy = y0 < y1 ? 1 : -1, err = dx + dy;
+    for (;;) {
+        img_set(im, x0, y0, r, g, b);
+        if (x0 == x1 && y0 == y1) break;
+        int e2 = 2 * err;
+        if (e2 >= dy) { err += dy; x0 += sx; }
+        if (e2 <= dx) { err += dx; y0 += sy; }
+    }
+}
+void img_write_ppm(const Image *im) {                       /* ASCII P3 to stdout: the site draws it */
+    printf("P3\n%d %d\n255\n", im->w, im->h);
+    for (int y = 0; y < im->h; y++) {
+        const unsigned char *p = im->px + (size_t)y * im->w * 3;
+        for (int x = 0; x < im->w * 3; x++) printf("%d%c", p[x], x + 1 < im->w * 3 ? ' ' : '\n');
+    }
+}
+
+/* ===== This chapter: an L-system is one successor string per symbol (NULL: the symbol stays) ===== */
+
+typedef struct { const char *rule[128]; } LSystem;
+
+uint64_t sat_add(uint64_t a, uint64_t b) { return a > UINT64_MAX - b ? UINT64_MAX : a + b; }
+
+uint64_t ls_length(const LSystem *ls, const char *axiom, int n) {
+    uint64_t len[128], next[128];
+    for (int c = 0; c < 128; c++) len[c] = 1;
+    for (int g = 0; g < n; g++) {
+        for (int c = 0; c < 128; c++) {
+            const char *r = ls->rule[c];
+            if (!r) { next[c] = 1; continue; }
+            uint64_t sum = 0;
+            for (const char *p = r; *p; p++) sum = sat_add(sum, len[(unsigned char)*p]);
+            next[c] = sum;
+        }
+        memcpy(len, next, sizeof len);
+    }
+    uint64_t total = 0;
+    for (const char *p = axiom; *p; p++) total = sat_add(total, len[(unsigned char)*p]);
+    return total;
+}
+
+char *ls_expand(const LSystem *ls, const char *axiom, int n, size_t *out_len) {
+    uint64_t maxlen = 0;
+    for (int g = 0; g <= n; g++) {
+        uint64_t l = ls_length(ls, axiom, g);
+        if (l > maxlen) maxlen = l;
+    }
+    if (maxlen > (1u << 28)) return NULL;
+    size_t rlen[128];
+    for (int c = 0; c < 128; c++) rlen[c] = ls->rule[c] ? strlen(ls->rule[c]) : 0;
+    char *cur = malloc(maxlen + 1), *nxt = malloc(maxlen + 1);
+    size_t len = strlen(axiom);
+    memcpy(cur, axiom, len + 1);
+    for (int g = 0; g < n; g++) {
+        size_t w = 0;
+        for (size_t i = 0; i < len; i++) {
+            unsigned char c = (unsigned char)cur[i];
+            const char *r = ls->rule[c];
+            if (r) { memcpy(nxt + w, r, rlen[c]); w += rlen[c]; }
+            else nxt[w++] = (char)c;
+        }
+        nxt[w] = '\0';
+        char *t = cur; cur = nxt; nxt = t;
+        len = w;
+    }
+    free(nxt);
+    *out_len = len;
+    return cur;
+}
+
+int main(void) {
+    LSystem algae = {.rule = {['A'] = "AB", ['B'] = "A"}};
+    for (int g = 0; g < 8; g++) {
+        size_t n;
+        char *s = ls_expand(&algae, "A", g, &n);
+        printf("gen %d (%zu): %s\n", g, n, s);
+        free(s);
+    }
+    return 0;
+}
+
+--- hint
+The output for a symbol with a rule is `memcpy(nxt + w, rule, rlen[c]); w += rlen[c];` and for one without, `nxt[w++] = c;`.
+
+--- hint
+Write the terminating `'\0'` once per generation, after the loop.
+
+--- harness
+int main(void) {
+    LSystem algae = {.rule = {['A'] = "AB", ['B'] = "A"}};
+    size_t n;
+    char *s = ls_expand(&algae, "A", 0, &n);
+    CHECK_STR(s, "A"); CHECK_INT(n, 1); free(s);
+    s = ls_expand(&algae, "A", 5, &n);
+    CHECK_STR(s, "ABAABABAABAAB"); CHECK_INT(n, 13); free(s);
+    s = ls_expand(&algae, "BxA", 2, &n);
+    CHECK_STR(s, "ABxABA"); free(s);
+
+    LSystem koch = {.rule = {['F'] = "F+F--F+F"}};
+    s = ls_expand(&koch, "F", 2, &n);
+    CHECK_STR(s, "F+F--F+F+F+F--F+F--F+F--F+F+F+F--F+F"); free(s);
+
+    LSystem dragon = {.rule = {['X'] = "X+YF+", ['Y'] = "-FX-Y"}};
+    s = ls_expand(&dragon, "FX", 3, &n);
+    CHECK_STR(s, "FX+YF++-FX-YF++-FX+YF+--FX-YF+"); free(s);
+
+    /* erasing rule: the middle generation is the longest */
+    LSystem erase = {.rule = {['A'] = "", ['B'] = "AAAA", ['C'] = "B"}};
+    s = ls_expand(&erase, "CC", 2, &n);
+    CHECK_STR(s, "AAAAAAAA"); CHECK_INT(n, 8); free(s);
+    s = ls_expand(&erase, "CC", 3, &n);
+    CHECK_STR(s, ""); CHECK_INT(n, 0); free(s);
+
+    LSystem big = {.rule = {['A'] = "AAAA"}};
+    CHECK(ls_expand(&big, "A", 20, &n) == NULL);
+
+    LSystem plant = {.rule = {['X'] = "F+[[X]-X]-F[-FX]+X", ['F'] = "FF"}};
+    s = ls_expand(&plant, "X", 6, &n);
+    CHECK_INT(n, 25159);
+    CHECK_INT(strlen(s), 25159);
+    uint32_t h = 2166136261u;
+    for (size_t i = 0; i < n; i++) h = (h ^ (unsigned char)s[i]) * 16777619u;
+    CHECK_UINT(h, 3327858176u);
+    free(s);
+
+    s = ls_expand(&algae, "A", 33, &n);
+    CHECK_INT(n, 9227465);
+    if (s) {
+        CHECK(strncmp(s, "ABAABABAABAAB", 13) == 0);
+        size_t as = 0;
+        for (size_t i = 0; i < n; i++) as += s[i] == 'A';
+        CHECK_INT(as, 5702887);
+        CHECK(s[n] == '\0');
+    }
+    free(s);
+    return TEST_END();
+}
+
+=== exercise ls_turtle
+title: L-systems 3: a 2D turtle with an explicit stack
+continues: ls_expand
+--- prompt
+Interpret a string as turtle commands and output line segments:
+
+```c
+typedef struct { float x0, y0, x1, y1; int depth; } Seg;
+int turtle2d(const char *s, float step, float angle_deg, float heading_deg, Seg *out, int cap);
+```
+
+The turtle starts at `(0, 0)` facing `heading_deg` (0 is +x, 90 is +y; y points **up** here). Symbols:
+
+- `F`, `G`: move `step` forward and emit a segment from the old to the new position, with `depth` = the current bracket nesting depth;
+- `f`: move `step` forward without a segment;
+- `+`: turn left (counter-clockwise) by `angle_deg`; `-`: turn right; `|`: turn 180°;
+- `[`: push position and heading; `]`: pop them;
+- anything else: ignore.
+
+Return the **total** number of segments, but write only the first `cap` of them (so `turtle2d(s, ..., NULL, 0)` counts, like `snprintf`). Use a fixed stack of 64 states; return `-1` if a `[` would overflow it or a `]` finds it empty.
+
+Keep the heading as a unit vector `(dx, dy)` and rotate it with `cos`/`sin` of the angle computed **once** per call; the tests allow for the tiny drift that causes compared to calling `cosf(heading)` every step.
+
+--- stubs
+typedef struct { float x0, y0, x1, y1; int depth; } Seg;
+
+int turtle2d(const char *s, float step, float angle_deg, float heading_deg, Seg *out, int cap) {
+    (void)s; (void)step; (void)angle_deg; (void)heading_deg; (void)out; (void)cap;
+    return 0;
+}
+
+--- solution
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdint.h>
+#include <math.h>
+
+/* ===== From earlier chapters: vectors, hashing, images, line drawing ===== */
+
+typedef struct { float x, y, z; } Vec3;
+Vec3 v3(float x, float y, float z) { Vec3 r = {x, y, z}; return r; }
+Vec3 v3_add(Vec3 a, Vec3 b) { return v3(a.x + b.x, a.y + b.y, a.z + b.z); }
+Vec3 v3_sub(Vec3 a, Vec3 b) { return v3(a.x - b.x, a.y - b.y, a.z - b.z); }
+Vec3 v3_scale(Vec3 a, float s) { return v3(a.x * s, a.y * s, a.z * s); }
+float v3_dot(Vec3 a, Vec3 b) { return a.x * b.x + a.y * b.y + a.z * b.z; }
+Vec3 v3_cross(Vec3 a, Vec3 b) { return v3(a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x); }
+float v3_len(Vec3 a) { return sqrtf(v3_dot(a, a)); }
+Vec3 v3_norm(Vec3 a) { float l = v3_len(a); return l > 0 ? v3_scale(a, 1.0f / l) : a; }
+
+uint32_t hash32(uint32_t x) {            /* lowbias32 (Chris Wellons) */
+    x ^= x >> 16; x *= 0x7feb352dU; x ^= x >> 15; x *= 0x846ca68bU; x ^= x >> 16;
+    return x;
+}
+
+typedef struct { int w, h; unsigned char *px; } Image;      /* RGB, 3 bytes per pixel, row-major */
+Image img_new(int w, int h) { Image im = {w, h, calloc((size_t)w * h * 3, 1)}; return im; }
+void img_free(Image *im) { free(im->px); im->px = NULL; }
+void img_fill(Image *im, int r, int g, int b) {
+    for (size_t i = 0, n = (size_t)im->w * im->h; i < n; i++) {
+        im->px[3 * i] = (unsigned char)r; im->px[3 * i + 1] = (unsigned char)g; im->px[3 * i + 2] = (unsigned char)b;
+    }
+}
+void img_set(Image *im, int x, int y, int r, int g, int b) {   /* ignores pixels outside the image */
+    if (x < 0 || y < 0 || x >= im->w || y >= im->h) return;
+    unsigned char *p = im->px + ((size_t)y * im->w + x) * 3;
+    p[0] = (unsigned char)r; p[1] = (unsigned char)g; p[2] = (unsigned char)b;
+}
+void img_line(Image *im, int x0, int y0, int x1, int y1, int r, int g, int b) {   /* Bresenham */
+    int dx = abs(x1 - x0), sx = x0 < x1 ? 1 : -1, dy = -abs(y1 - y0), sy = y0 < y1 ? 1 : -1, err = dx + dy;
+    for (;;) {
+        img_set(im, x0, y0, r, g, b);
+        if (x0 == x1 && y0 == y1) break;
+        int e2 = 2 * err;
+        if (e2 >= dy) { err += dy; x0 += sx; }
+        if (e2 <= dx) { err += dx; y0 += sy; }
+    }
+}
+void img_write_ppm(const Image *im) {                       /* ASCII P3 to stdout: the site draws it */
+    printf("P3\n%d %d\n255\n", im->w, im->h);
+    for (int y = 0; y < im->h; y++) {
+        const unsigned char *p = im->px + (size_t)y * im->w * 3;
+        for (int x = 0; x < im->w * 3; x++) printf("%d%c", p[x], x + 1 < im->w * 3 ? ' ' : '\n');
+    }
+}
+
+/* ===== This chapter: an L-system is one successor string per symbol (NULL: the symbol stays) ===== */
+
+typedef struct { const char *rule[128]; } LSystem;
+
+uint64_t sat_add(uint64_t a, uint64_t b) { return a > UINT64_MAX - b ? UINT64_MAX : a + b; }
+
+uint64_t ls_length(const LSystem *ls, const char *axiom, int n) {
+    uint64_t len[128], next[128];
+    for (int c = 0; c < 128; c++) len[c] = 1;
+    for (int g = 0; g < n; g++) {
+        for (int c = 0; c < 128; c++) {
+            const char *r = ls->rule[c];
+            if (!r) { next[c] = 1; continue; }
+            uint64_t sum = 0;
+            for (const char *p = r; *p; p++) sum = sat_add(sum, len[(unsigned char)*p]);
+            next[c] = sum;
+        }
+        memcpy(len, next, sizeof len);
+    }
+    uint64_t total = 0;
+    for (const char *p = axiom; *p; p++) total = sat_add(total, len[(unsigned char)*p]);
+    return total;
+}
+
+char *ls_expand(const LSystem *ls, const char *axiom, int n, size_t *out_len) {
+    uint64_t maxlen = 0;
+    for (int g = 0; g <= n; g++) {
+        uint64_t l = ls_length(ls, axiom, g);
+        if (l > maxlen) maxlen = l;
+    }
+    if (maxlen > (1u << 28)) return NULL;
+    size_t rlen[128];
+    for (int c = 0; c < 128; c++) rlen[c] = ls->rule[c] ? strlen(ls->rule[c]) : 0;
+    char *cur = malloc(maxlen + 1), *nxt = malloc(maxlen + 1);
+    size_t len = strlen(axiom);
+    memcpy(cur, axiom, len + 1);
+    for (int g = 0; g < n; g++) {
+        size_t w = 0;
+        for (size_t i = 0; i < len; i++) {
+            unsigned char c = (unsigned char)cur[i];
+            const char *r = ls->rule[c];
+            if (r) { memcpy(nxt + w, r, rlen[c]); w += rlen[c]; }
+            else nxt[w++] = (char)c;
+        }
+        nxt[w] = '\0';
+        char *t = cur; cur = nxt; nxt = t;
+        len = w;
+    }
+    free(nxt);
+    *out_len = len;
+    return cur;
+}
+
+typedef struct { float x0, y0, x1, y1; int depth; } Seg;
+
+#define TURTLE_STACK 64
+
+int turtle2d(const char *s, float step, float angle_deg, float heading_deg, Seg *out, int cap) {
+    const float rad = 3.14159265358979f / 180;
+    float c = cosf(angle_deg * rad), sn = sinf(angle_deg * rad);
+    float x = 0, y = 0, dx = cosf(heading_deg * rad), dy = sinf(heading_deg * rad);
+    float stack[TURTLE_STACK][4];
+    int sp = 0, count = 0;
+    for (const char *p = s; *p; p++) {
+        float t;
+        switch (*p) {
+        case 'F': case 'G':
+            if (count < cap) {
+                Seg sg = {x, y, x + dx * step, y + dy * step, sp};
+                out[count] = sg;
+            }
+            count++;
+            x += dx * step; y += dy * step;
+            break;
+        case 'f': x += dx * step; y += dy * step; break;
+        case '+': t = dx * c - dy * sn; dy = dx * sn + dy * c; dx = t; break;
+        case '-': t = dx * c + dy * sn; dy = -dx * sn + dy * c; dx = t; break;
+        case '|': dx = -dx; dy = -dy; break;
+        case '[':
+            if (sp == TURTLE_STACK) return -1;
+            stack[sp][0] = x; stack[sp][1] = y; stack[sp][2] = dx; stack[sp][3] = dy; sp++;
+            break;
+        case ']':
+            if (sp == 0) return -1;
+            sp--; x = stack[sp][0]; y = stack[sp][1]; dx = stack[sp][2]; dy = stack[sp][3];
+            break;
+        default: break;
+        }
+    }
+    return count;
+}
+
+int main(void) {
+    /* plot the plant's segments directly (y up, so flip rows) */
+    LSystem plant = {.rule = {['X'] = "F+[[X]-X]-F[-FX]+X", ['F'] = "FF"}};
+    size_t n;
+    char *s = ls_expand(&plant, "X", 5, &n);
+    int count = turtle2d(s, 1, 25, 70, NULL, 0);
+    Seg *segs = malloc(sizeof(Seg) * count);
+    turtle2d(s, 1, 25, 70, segs, count);
+    Image im = img_new(128, 128);
+    img_fill(&im, 245, 245, 235);
+    for (int i = 0; i < count; i++)
+        img_line(&im, 40 + (int)segs[i].x0, 127 - (int)segs[i].y0, 40 + (int)segs[i].x1, 127 - (int)segs[i].y1,
+                 40, 100 + 20 * (segs[i].depth % 6), 40);
+    img_write_ppm(&im);
+    free(segs); free(s); img_free(&im);
+    return 0;
+}
+
+--- hint
+Left turn by angle `a`: `(dx, dy) -> (dx cos a - dy sin a, dx sin a + dy cos a)`. Right turn is the same with `-a`.
+
+--- hint
+Count every segment, but only store it `if (count < cap)`.
+
+--- harness
+static int near_seg(Seg s, float x0, float y0, float x1, float y1) {
+    return fabsf(s.x0 - x0) < 1e-4f && fabsf(s.y0 - y0) < 1e-4f && fabsf(s.x1 - x1) < 1e-4f && fabsf(s.y1 - y1) < 1e-4f;
+}
+int main(void) {
+    Seg sg[64];
+    CHECK_INT(turtle2d("F+F+F+F", 2, 90, 0, sg, 64), 4);
+    CHECK(near_seg(sg[0], 0, 0, 2, 0));
+    CHECK(near_seg(sg[1], 2, 0, 2, 2));
+    CHECK(near_seg(sg[2], 2, 2, 0, 2));
+    CHECK(near_seg(sg[3], 0, 2, 0, 0));
+    CHECK_INT(turtle2d("F-F", 1, 90, 90, sg, 64), 2);
+    CHECK(near_seg(sg[0], 0, 0, 0, 1));
+    CHECK(near_seg(sg[1], 0, 1, 1, 1));
+    CHECK_INT(turtle2d("FfG|F", 1, 45, 0, sg, 64), 3);
+    CHECK(near_seg(sg[1], 2, 0, 3, 0));
+    CHECK(near_seg(sg[2], 3, 0, 2, 0));
+    CHECK_INT(turtle2d("F[+F[-F]]F", 1, 90, 90, sg, 64), 4);
+    CHECK(near_seg(sg[1], 0, 1, -1, 1) && sg[1].depth == 1);
+    CHECK(near_seg(sg[2], -1, 1, -1, 2) && sg[2].depth == 2);
+    CHECK(near_seg(sg[3], 0, 1, 0, 2) && sg[3].depth == 0);
+    CHECK(sg[0].depth == 0);
+    CHECK_INT(turtle2d("XYF+AB", 1, 30, 0, sg, 64), 1);
+    CHECK_INT(turtle2d("", 1, 30, 0, sg, 64), 0);
+
+    /* counting mode and cap */
+    sg[2].x0 = 99;
+    CHECK_INT(turtle2d("FFFFF", 1, 0, 0, NULL, 0), 5);
+    CHECK_INT(turtle2d("FFFFF", 1, 0, 0, sg, 2), 5);
+    CHECK(near_seg(sg[1], 1, 0, 2, 0));
+    CHECK(sg[2].x0 == 99);
+
+    /* stack errors */
+    CHECK_INT(turtle2d("F]F", 1, 90, 0, sg, 64), -1);
+    char deep[200];
+    memset(deep, '[', 64); memset(deep + 64, ']', 64); deep[128] = 'F'; deep[129] = 0;
+    CHECK_INT(turtle2d(deep, 1, 90, 0, sg, 64), 1);
+    memset(deep, '[', 65); memset(deep + 65, ']', 65); deep[130] = 0;
+    CHECK_INT(turtle2d(deep, 1, 90, 0, sg, 64), -1);
+
+    /* Koch snowflake closes on itself; the dragon's end is 2^(n/2) from the start */
+    LSystem koch = {.rule = {['F'] = "F+F--F+F"}};
+    size_t n;
+    char *s = ls_expand(&koch, "F--F--F", 4, &n);
+    int cnt = turtle2d(s, 1, 60, 0, NULL, 0);
+    CHECK_INT(cnt, 3 * 256);
+    Seg *ks = malloc(sizeof(Seg) * cnt);
+    turtle2d(s, 1, 60, 0, ks, cnt);
+    CHECK(fabsf(ks[cnt - 1].x1) < 1e-2f && fabsf(ks[cnt - 1].y1) < 1e-2f);
+    CHECK(fabsf(ks[255].x1 - 81) < 1e-2f && fabsf(ks[255].y1) < 1e-2f);
+    free(ks); free(s);
+    LSystem dragon = {.rule = {['X'] = "X+YF+", ['Y'] = "-FX-Y"}};
+    s = ls_expand(&dragon, "FX", 12, &n);
+    cnt = turtle2d(s, 1, 90, 0, NULL, 0);
+    CHECK_INT(cnt, 4096);
+    Seg *ds = malloc(sizeof(Seg) * cnt);
+    turtle2d(s, 1, 90, 0, ds, cnt);
+    CHECK(fabsf(sqrtf(ds[cnt - 1].x1 * ds[cnt - 1].x1 + ds[cnt - 1].y1 * ds[cnt - 1].y1) - 64) < 1e-2f);
+    free(ds); free(s);
+
+    /* a long run of turns: the rotated vector must stay accurate */
+    s = malloc(100001);
+    for (int i = 0; i < 100000; i++) s[i] = i % 2 ? '+' : 'F';
+    s[100000] = 0;
+    Seg last;
+    cnt = turtle2d(s, 1, 7, 0, &last, 1);
+    CHECK_INT(cnt, 50000);
+    free(s);
+    s = malloc(3602);
+    for (int i = 0; i < 3600; i++) s[i] = '+';
+    s[3600] = 'F'; s[3601] = 0;
+    turtle2d(s, 1, 1, 0, &last, 1);
+    CHECK(fabsf(last.x1 - 1) < 1e-3f && fabsf(last.y1) < 1e-3f);
+    free(s);
+    return TEST_END();
+}
+
+=== exercise ls_draw
+title: L-systems 4: fit to the image, and the classic curves
+continues: ls_turtle
+--- prompt
+Turtle coordinates are in "steps"; images are in pixels with y down. Write
+
+```c
+void seg_bounds(const Seg *s, int n, float *minx, float *miny, float *maxx, float *maxy);
+void draw_segments(Image *im, const Seg *s, int n, int margin, int r, int g, int b);
+```
+
+`seg_bounds` covers both endpoints of every segment (for `n == 0`, all four are 0). `draw_segments` fits the bounds into the image, keeping the aspect ratio and centering:
+
+```text
+aw = W - 1 - 2*margin,  ah = H - 1 - 2*margin,  bw = maxx - minx,  bh = maxy - miny
+scale = min(aw / bw, ah / bh)       (a zero extent does not limit: use the other ratio; both zero: scale = 1)
+ox = margin + (aw - bw * scale) / 2,  oy = margin + (ah - bh * scale) / 2
+pixel x = (int)floorf(ox + (x - minx) * scale + 0.5f)
+pixel y = H - 1 - (int)floorf(oy + (y - miny) * scale + 0.5f)
+```
+
+and draws each segment with the starter's `img_line`. When you click **Run** you get the classic curves from the table in the chapter text: Koch snowflake, dragon, Hilbert and Sierpinski arrowhead.
+
+The tests also check the curves' known properties through your whole pipeline: the Hilbert curve of order 4 visits every point of a 16 × 16 grid exactly once, the dragon curve never draws the same unit edge twice.
+
+--- stubs
+void seg_bounds(const Seg *s, int n, float *minx, float *miny, float *maxx, float *maxy) {
+    (void)s; (void)n;
+    *minx = *miny = *maxx = *maxy = 0;
+}
+
+void draw_segments(Image *im, const Seg *s, int n, int margin, int r, int g, int b) {
+    (void)im; (void)s; (void)n; (void)margin; (void)r; (void)g; (void)b;
+}
+
+--- solution
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdint.h>
+#include <math.h>
+
+/* ===== From earlier chapters: vectors, hashing, images, line drawing ===== */
+
+typedef struct { float x, y, z; } Vec3;
+Vec3 v3(float x, float y, float z) { Vec3 r = {x, y, z}; return r; }
+Vec3 v3_add(Vec3 a, Vec3 b) { return v3(a.x + b.x, a.y + b.y, a.z + b.z); }
+Vec3 v3_sub(Vec3 a, Vec3 b) { return v3(a.x - b.x, a.y - b.y, a.z - b.z); }
+Vec3 v3_scale(Vec3 a, float s) { return v3(a.x * s, a.y * s, a.z * s); }
+float v3_dot(Vec3 a, Vec3 b) { return a.x * b.x + a.y * b.y + a.z * b.z; }
+Vec3 v3_cross(Vec3 a, Vec3 b) { return v3(a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x); }
+float v3_len(Vec3 a) { return sqrtf(v3_dot(a, a)); }
+Vec3 v3_norm(Vec3 a) { float l = v3_len(a); return l > 0 ? v3_scale(a, 1.0f / l) : a; }
+
+uint32_t hash32(uint32_t x) {            /* lowbias32 (Chris Wellons) */
+    x ^= x >> 16; x *= 0x7feb352dU; x ^= x >> 15; x *= 0x846ca68bU; x ^= x >> 16;
+    return x;
+}
+
+typedef struct { int w, h; unsigned char *px; } Image;      /* RGB, 3 bytes per pixel, row-major */
+Image img_new(int w, int h) { Image im = {w, h, calloc((size_t)w * h * 3, 1)}; return im; }
+void img_free(Image *im) { free(im->px); im->px = NULL; }
+void img_fill(Image *im, int r, int g, int b) {
+    for (size_t i = 0, n = (size_t)im->w * im->h; i < n; i++) {
+        im->px[3 * i] = (unsigned char)r; im->px[3 * i + 1] = (unsigned char)g; im->px[3 * i + 2] = (unsigned char)b;
+    }
+}
+void img_set(Image *im, int x, int y, int r, int g, int b) {   /* ignores pixels outside the image */
+    if (x < 0 || y < 0 || x >= im->w || y >= im->h) return;
+    unsigned char *p = im->px + ((size_t)y * im->w + x) * 3;
+    p[0] = (unsigned char)r; p[1] = (unsigned char)g; p[2] = (unsigned char)b;
+}
+void img_line(Image *im, int x0, int y0, int x1, int y1, int r, int g, int b) {   /* Bresenham */
+    int dx = abs(x1 - x0), sx = x0 < x1 ? 1 : -1, dy = -abs(y1 - y0), sy = y0 < y1 ? 1 : -1, err = dx + dy;
+    for (;;) {
+        img_set(im, x0, y0, r, g, b);
+        if (x0 == x1 && y0 == y1) break;
+        int e2 = 2 * err;
+        if (e2 >= dy) { err += dy; x0 += sx; }
+        if (e2 <= dx) { err += dx; y0 += sy; }
+    }
+}
+void img_write_ppm(const Image *im) {                       /* ASCII P3 to stdout: the site draws it */
+    printf("P3\n%d %d\n255\n", im->w, im->h);
+    for (int y = 0; y < im->h; y++) {
+        const unsigned char *p = im->px + (size_t)y * im->w * 3;
+        for (int x = 0; x < im->w * 3; x++) printf("%d%c", p[x], x + 1 < im->w * 3 ? ' ' : '\n');
+    }
+}
+
+/* ===== This chapter: an L-system is one successor string per symbol (NULL: the symbol stays) ===== */
+
+typedef struct { const char *rule[128]; } LSystem;
+
+uint64_t sat_add(uint64_t a, uint64_t b) { return a > UINT64_MAX - b ? UINT64_MAX : a + b; }
+
+uint64_t ls_length(const LSystem *ls, const char *axiom, int n) {
+    uint64_t len[128], next[128];
+    for (int c = 0; c < 128; c++) len[c] = 1;
+    for (int g = 0; g < n; g++) {
+        for (int c = 0; c < 128; c++) {
+            const char *r = ls->rule[c];
+            if (!r) { next[c] = 1; continue; }
+            uint64_t sum = 0;
+            for (const char *p = r; *p; p++) sum = sat_add(sum, len[(unsigned char)*p]);
+            next[c] = sum;
+        }
+        memcpy(len, next, sizeof len);
+    }
+    uint64_t total = 0;
+    for (const char *p = axiom; *p; p++) total = sat_add(total, len[(unsigned char)*p]);
+    return total;
+}
+
+char *ls_expand(const LSystem *ls, const char *axiom, int n, size_t *out_len) {
+    uint64_t maxlen = 0;
+    for (int g = 0; g <= n; g++) {
+        uint64_t l = ls_length(ls, axiom, g);
+        if (l > maxlen) maxlen = l;
+    }
+    if (maxlen > (1u << 28)) return NULL;
+    size_t rlen[128];
+    for (int c = 0; c < 128; c++) rlen[c] = ls->rule[c] ? strlen(ls->rule[c]) : 0;
+    char *cur = malloc(maxlen + 1), *nxt = malloc(maxlen + 1);
+    size_t len = strlen(axiom);
+    memcpy(cur, axiom, len + 1);
+    for (int g = 0; g < n; g++) {
+        size_t w = 0;
+        for (size_t i = 0; i < len; i++) {
+            unsigned char c = (unsigned char)cur[i];
+            const char *r = ls->rule[c];
+            if (r) { memcpy(nxt + w, r, rlen[c]); w += rlen[c]; }
+            else nxt[w++] = (char)c;
+        }
+        nxt[w] = '\0';
+        char *t = cur; cur = nxt; nxt = t;
+        len = w;
+    }
+    free(nxt);
+    *out_len = len;
+    return cur;
+}
+
+typedef struct { float x0, y0, x1, y1; int depth; } Seg;
+
+#define TURTLE_STACK 64
+
+int turtle2d(const char *s, float step, float angle_deg, float heading_deg, Seg *out, int cap) {
+    const float rad = 3.14159265358979f / 180;
+    float c = cosf(angle_deg * rad), sn = sinf(angle_deg * rad);
+    float x = 0, y = 0, dx = cosf(heading_deg * rad), dy = sinf(heading_deg * rad);
+    float stack[TURTLE_STACK][4];
+    int sp = 0, count = 0;
+    for (const char *p = s; *p; p++) {
+        float t;
+        switch (*p) {
+        case 'F': case 'G':
+            if (count < cap) {
+                Seg sg = {x, y, x + dx * step, y + dy * step, sp};
+                out[count] = sg;
+            }
+            count++;
+            x += dx * step; y += dy * step;
+            break;
+        case 'f': x += dx * step; y += dy * step; break;
+        case '+': t = dx * c - dy * sn; dy = dx * sn + dy * c; dx = t; break;
+        case '-': t = dx * c + dy * sn; dy = -dx * sn + dy * c; dx = t; break;
+        case '|': dx = -dx; dy = -dy; break;
+        case '[':
+            if (sp == TURTLE_STACK) return -1;
+            stack[sp][0] = x; stack[sp][1] = y; stack[sp][2] = dx; stack[sp][3] = dy; sp++;
+            break;
+        case ']':
+            if (sp == 0) return -1;
+            sp--; x = stack[sp][0]; y = stack[sp][1]; dx = stack[sp][2]; dy = stack[sp][3];
+            break;
+        default: break;
+        }
+    }
+    return count;
+}
+
+void seg_bounds(const Seg *s, int n, float *minx, float *miny, float *maxx, float *maxy) {
+    if (n <= 0) { *minx = *miny = *maxx = *maxy = 0; return; }
+    float a = s[0].x0, b = s[0].y0, c = s[0].x0, d = s[0].y0;
+    for (int i = 0; i < n; i++) {
+        a = fminf(a, fminf(s[i].x0, s[i].x1)); c = fmaxf(c, fmaxf(s[i].x0, s[i].x1));
+        b = fminf(b, fminf(s[i].y0, s[i].y1)); d = fmaxf(d, fmaxf(s[i].y0, s[i].y1));
+    }
+    *minx = a; *miny = b; *maxx = c; *maxy = d;
+}
+
+void draw_segments(Image *im, const Seg *s, int n, int margin, int r, int g, int b) {
+    float minx, miny, maxx, maxy;
+    seg_bounds(s, n, &minx, &miny, &maxx, &maxy);
+    float aw = (float)(im->w - 1 - 2 * margin), ah = (float)(im->h - 1 - 2 * margin);
+    float bw = maxx - minx, bh = maxy - miny, scale;
+    if (bw > 0 && bh > 0) scale = fminf(aw / bw, ah / bh);
+    else if (bw > 0) scale = aw / bw;
+    else if (bh > 0) scale = ah / bh;
+    else scale = 1;
+    float ox = margin + (aw - bw * scale) / 2, oy = margin + (ah - bh * scale) / 2;
+    for (int i = 0; i < n; i++) {
+        int x0 = (int)floorf(ox + (s[i].x0 - minx) * scale + 0.5f);
+        int y0 = im->h - 1 - (int)floorf(oy + (s[i].y0 - miny) * scale + 0.5f);
+        int x1 = (int)floorf(ox + (s[i].x1 - minx) * scale + 0.5f);
+        int y1 = im->h - 1 - (int)floorf(oy + (s[i].y1 - miny) * scale + 0.5f);
+        img_line(im, x0, y0, x1, y1, r, g, b);
+    }
+}
+
+void draw_curve(Image *out, int ox, int oy, const LSystem *ls, const char *axiom, int gens, float angle, int r, int g, int b) {
+    size_t n;
+    char *s = ls_expand(ls, axiom, gens, &n);
+    int count = turtle2d(s, 1, angle, 0, NULL, 0);
+    Seg *segs = malloc(sizeof(Seg) * count);
+    turtle2d(s, 1, angle, 0, segs, count);
+    Image tile = img_new(64, 64);
+    img_fill(&tile, 250, 248, 240);
+    draw_segments(&tile, segs, count, 3, r, g, b);
+    for (int y = 0; y < 64; y++) memcpy(out->px + 3 * ((size_t)(oy + y) * out->w + ox), tile.px + 3 * (size_t)y * 64, 64 * 3);
+    img_free(&tile); free(segs); free(s);
+}
+
+int main(void) {
+    LSystem koch = {.rule = {['F'] = "F+F--F+F"}};
+    LSystem dragon = {.rule = {['X'] = "X+YF+", ['Y'] = "-FX-Y"}};
+    LSystem hilbert = {.rule = {['A'] = "+BF-AFA-FB+", ['B'] = "-AF+BFB+FA-"}};
+    LSystem arrow = {.rule = {['F'] = "G-F-G", ['G'] = "F+G+F"}};
+    Image im = img_new(128, 128);
+    draw_curve(&im, 0, 0, &koch, "F--F--F", 3, 60, 30, 80, 160);
+    draw_curve(&im, 64, 0, &dragon, "FX", 10, 90, 170, 40, 40);
+    draw_curve(&im, 0, 64, &hilbert, "A", 4, 90, 30, 120, 60);
+    draw_curve(&im, 64, 64, &arrow, "F", 6, 60, 120, 60, 150);
+    img_write_ppm(&im);
+    img_free(&im);
+    return 0;
+}
+
+--- hint
+Handle the degenerate extents explicitly: a single horizontal segment has `bh == 0`, and `ah / 0` is infinity, which `fminf` would happily pick only if the other one were larger. Be explicit rather than clever.
+
+--- hint
+`floorf(v + 0.5f)` rounds to the nearest pixel; plain `(int)v` truncates and shifts the whole drawing by up to a pixel.
+
+--- harness
+static int count_px(const Image *im, int r) {
+    int n = 0;
+    for (int i = 0; i < im->w * im->h; i++) n += im->px[3 * i] == r;
+    return n;
+}
+static int px_is(const Image *im, int x, int y, int r) { return im->px[3 * (y * im->w + x)] == r; }
+int main(void) {
+    Seg one = {0, 0, 10, 0, 0};
+    float a, b, c, d;
+    seg_bounds(&one, 1, &a, &b, &c, &d);
+    CHECK(a == 0 && b == 0 && c == 10 && d == 0);
+    Seg two[2] = {{1, 5, -3, 2, 0}, {0, 7, 4, -1, 1}};
+    seg_bounds(two, 2, &a, &b, &c, &d);
+    CHECK(a == -3 && b == -1 && c == 4 && d == 7);
+    seg_bounds(two, 0, &a, &b, &c, &d);
+    CHECK(a == 0 && b == 0 && c == 0 && d == 0);
+
+    Image im = img_new(21, 11);
+    draw_segments(&im, &one, 1, 0, 255, 0, 0);
+    CHECK_INT(count_px(&im, 255), 21);
+    CHECK(px_is(&im, 0, 5, 255) && px_is(&im, 20, 5, 255));
+    img_free(&im);
+
+    Seg sq[4] = {{0, 0, 1, 0, 0}, {1, 0, 1, 1, 0}, {1, 1, 0, 1, 0}, {0, 1, 0, 0, 0}};
+    im = img_new(11, 11);
+    draw_segments(&im, sq, 4, 1, 200, 0, 0);
+    CHECK_INT(count_px(&im, 200), 32);
+    CHECK(px_is(&im, 1, 1, 200) && px_is(&im, 9, 9, 200) && px_is(&im, 1, 9, 200) && !px_is(&im, 0, 0, 200) && !px_is(&im, 5, 5, 200));
+    img_free(&im);
+
+    /* wide image: the square is centered horizontally */
+    im = img_new(31, 11);
+    draw_segments(&im, sq, 4, 0, 200, 0, 0);
+    CHECK(px_is(&im, 10, 0, 200) && px_is(&im, 20, 10, 200) && !px_is(&im, 9, 5, 200) && !px_is(&im, 21, 5, 200));
+    img_free(&im);
+
+    /* y points up: a segment going up ends near row 0 */
+    Seg up = {0, 0, 1, 4, 0};
+    im = img_new(9, 9);
+    draw_segments(&im, &up, 1, 0, 100, 0, 0);
+    CHECK(px_is(&im, 3, 8, 100) && px_is(&im, 5, 0, 100));
+    img_free(&im);
+
+    Seg dot = {2, 3, 2, 3, 0};
+    im = img_new(5, 5);
+    draw_segments(&im, &dot, 1, 1, 50, 0, 0);
+    CHECK_INT(count_px(&im, 50), 1);
+    CHECK(px_is(&im, 2, 2, 50));
+    img_free(&im);
+
+    /* Hilbert curve, order 4: 255 unit segments visiting all 256 grid points once */
+    LSystem hilbert = {.rule = {['A'] = "+BF-AFA-FB+", ['B'] = "-AF+BFB+FA-"}};
+    size_t n;
+    char *s = ls_expand(&hilbert, "A", 4, &n);
+    int cnt = turtle2d(s, 1, 90, 0, NULL, 0);
+    CHECK_INT(cnt, 255);
+    Seg *hs = malloc(sizeof(Seg) * cnt);
+    turtle2d(s, 1, 90, 0, hs, cnt);
+    seg_bounds(hs, cnt, &a, &b, &c, &d);
+    CHECK(fabsf(c - a - 15) < 1e-3f && fabsf(d - b - 15) < 1e-3f);
+    int seen[16][16] = {{0}}, dup = 0;
+    for (int i = 0; i <= cnt; i++) {
+        float x = i < cnt ? hs[i].x0 : hs[cnt - 1].x1, y = i < cnt ? hs[i].y0 : hs[cnt - 1].y1;
+        int gx = (int)lroundf(x - a), gy = (int)lroundf(y - b);
+        if (gx < 0 || gy < 0 || gx > 15 || gy > 15 || seen[gy][gx]++) dup++;
+    }
+    CHECK_INT(dup, 0);
+    im = img_new(63, 63);
+    draw_segments(&im, hs, cnt, 1, 9, 0, 0);       /* scale exactly 4: 255 segments of 4 pixels, no overlaps */
+    CHECK_INT(count_px(&im, 9), 255 * 4 + 1);
+    img_free(&im);
+    free(hs); free(s);
+
+    /* dragon curve: 1024 unit edges, all distinct */
+    LSystem dragon = {.rule = {['X'] = "X+YF+", ['Y'] = "-FX-Y"}};
+    s = ls_expand(&dragon, "FX", 10, &n);
+    cnt = turtle2d(s, 1, 90, 0, NULL, 0);
+    Seg *ds = malloc(sizeof(Seg) * cnt);
+    turtle2d(s, 1, 90, 0, ds, cnt);
+    int same = 0;
+    for (int i = 0; i < cnt; i++)
+        for (int j = i + 1; j < cnt; j++) {
+            float mx = (ds[i].x0 + ds[i].x1) - (ds[j].x0 + ds[j].x1), my = (ds[i].y0 + ds[i].y1) - (ds[j].y0 + ds[j].y1);
+            if (fabsf(mx) < 0.1f && fabsf(my) < 0.1f) same++;
+        }
+    CHECK_INT(cnt, 1024);
+    CHECK_INT(same, 0);
+    free(ds); free(s);
+    return TEST_END();
+}
+
+=== exercise ls_stochastic
+title: L-systems 5: stochastic rules
+continues: ls_draw
+--- prompt
+Give symbols several weighted successors so every seed grows a different plant:
+
+```c
+typedef struct { const char *succ; int weight; } Choice;
+typedef struct { Choice choice[128][4]; int count[128]; } StochLSystem;    /* count[c] == 0: no rule */
+uint32_t rng_next(uint32_t *state);
+char *ls_expand_stochastic(const StochLSystem *ls, const char *axiom, int n, uint32_t seed, size_t *out_len);
+```
+
+`rng_next` is given in the stubs (an LCG step followed by the starter's `hash32`; every 32-bit state is valid, including 0). The state starts at `seed` and continues across generations.
+
+Each generation goes through the current string left to right. For a symbol `c`:
+
+- `count[c] == 0`: copy it;
+- `count[c] == 1`: write its only successor, **without** touching the PRNG;
+- `count[c] >= 2`: `r = rng_next(&state) % total_weight`; pick the first successor whose running weight sum is `> r`.
+
+The final length now depends on the choices, so `ls_length` cannot size the buffers. Do it in two passes per generation: copy the PRNG state and run the generation once **counting** only; grow the output buffer if needed (to at least that length + 1, and at least double its old capacity); then run it again with the real state, **writing**. Because the PRNG is deterministic, both passes make the same choices. Return the final string (heap, caller frees) and its length.
+
+The large test grows a weed to about 6 million symbols; per-symbol `realloc`, `strcat` or `strlen` will not finish.
+
+--- stubs
+uint32_t rng_next(uint32_t *state) {
+    *state = *state * 1664525u + 1013904223u;
+    return hash32(*state);
+}
+
+typedef struct { const char *succ; int weight; } Choice;
+typedef struct { Choice choice[128][4]; int count[128]; } StochLSystem;
+
+char *ls_expand_stochastic(const StochLSystem *ls, const char *axiom, int n, uint32_t seed, size_t *out_len) {
+    (void)ls; (void)n; (void)seed;
+    char *s = malloc(strlen(axiom) + 1);
+    strcpy(s, axiom);
+    *out_len = strlen(s);
+    return s;
+}
+
+--- solution
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdint.h>
+#include <math.h>
+
+/* ===== From earlier chapters: vectors, hashing, images, line drawing ===== */
+
+typedef struct { float x, y, z; } Vec3;
+Vec3 v3(float x, float y, float z) { Vec3 r = {x, y, z}; return r; }
+Vec3 v3_add(Vec3 a, Vec3 b) { return v3(a.x + b.x, a.y + b.y, a.z + b.z); }
+Vec3 v3_sub(Vec3 a, Vec3 b) { return v3(a.x - b.x, a.y - b.y, a.z - b.z); }
+Vec3 v3_scale(Vec3 a, float s) { return v3(a.x * s, a.y * s, a.z * s); }
+float v3_dot(Vec3 a, Vec3 b) { return a.x * b.x + a.y * b.y + a.z * b.z; }
+Vec3 v3_cross(Vec3 a, Vec3 b) { return v3(a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x); }
+float v3_len(Vec3 a) { return sqrtf(v3_dot(a, a)); }
+Vec3 v3_norm(Vec3 a) { float l = v3_len(a); return l > 0 ? v3_scale(a, 1.0f / l) : a; }
+
+uint32_t hash32(uint32_t x) {            /* lowbias32 (Chris Wellons) */
+    x ^= x >> 16; x *= 0x7feb352dU; x ^= x >> 15; x *= 0x846ca68bU; x ^= x >> 16;
+    return x;
+}
+
+typedef struct { int w, h; unsigned char *px; } Image;      /* RGB, 3 bytes per pixel, row-major */
+Image img_new(int w, int h) { Image im = {w, h, calloc((size_t)w * h * 3, 1)}; return im; }
+void img_free(Image *im) { free(im->px); im->px = NULL; }
+void img_fill(Image *im, int r, int g, int b) {
+    for (size_t i = 0, n = (size_t)im->w * im->h; i < n; i++) {
+        im->px[3 * i] = (unsigned char)r; im->px[3 * i + 1] = (unsigned char)g; im->px[3 * i + 2] = (unsigned char)b;
+    }
+}
+void img_set(Image *im, int x, int y, int r, int g, int b) {   /* ignores pixels outside the image */
+    if (x < 0 || y < 0 || x >= im->w || y >= im->h) return;
+    unsigned char *p = im->px + ((size_t)y * im->w + x) * 3;
+    p[0] = (unsigned char)r; p[1] = (unsigned char)g; p[2] = (unsigned char)b;
+}
+void img_line(Image *im, int x0, int y0, int x1, int y1, int r, int g, int b) {   /* Bresenham */
+    int dx = abs(x1 - x0), sx = x0 < x1 ? 1 : -1, dy = -abs(y1 - y0), sy = y0 < y1 ? 1 : -1, err = dx + dy;
+    for (;;) {
+        img_set(im, x0, y0, r, g, b);
+        if (x0 == x1 && y0 == y1) break;
+        int e2 = 2 * err;
+        if (e2 >= dy) { err += dy; x0 += sx; }
+        if (e2 <= dx) { err += dx; y0 += sy; }
+    }
+}
+void img_write_ppm(const Image *im) {                       /* ASCII P3 to stdout: the site draws it */
+    printf("P3\n%d %d\n255\n", im->w, im->h);
+    for (int y = 0; y < im->h; y++) {
+        const unsigned char *p = im->px + (size_t)y * im->w * 3;
+        for (int x = 0; x < im->w * 3; x++) printf("%d%c", p[x], x + 1 < im->w * 3 ? ' ' : '\n');
+    }
+}
+
+/* ===== This chapter: an L-system is one successor string per symbol (NULL: the symbol stays) ===== */
+
+typedef struct { const char *rule[128]; } LSystem;
+
+uint64_t sat_add(uint64_t a, uint64_t b) { return a > UINT64_MAX - b ? UINT64_MAX : a + b; }
+
+uint64_t ls_length(const LSystem *ls, const char *axiom, int n) {
+    uint64_t len[128], next[128];
+    for (int c = 0; c < 128; c++) len[c] = 1;
+    for (int g = 0; g < n; g++) {
+        for (int c = 0; c < 128; c++) {
+            const char *r = ls->rule[c];
+            if (!r) { next[c] = 1; continue; }
+            uint64_t sum = 0;
+            for (const char *p = r; *p; p++) sum = sat_add(sum, len[(unsigned char)*p]);
+            next[c] = sum;
+        }
+        memcpy(len, next, sizeof len);
+    }
+    uint64_t total = 0;
+    for (const char *p = axiom; *p; p++) total = sat_add(total, len[(unsigned char)*p]);
+    return total;
+}
+
+char *ls_expand(const LSystem *ls, const char *axiom, int n, size_t *out_len) {
+    uint64_t maxlen = 0;
+    for (int g = 0; g <= n; g++) {
+        uint64_t l = ls_length(ls, axiom, g);
+        if (l > maxlen) maxlen = l;
+    }
+    if (maxlen > (1u << 28)) return NULL;
+    size_t rlen[128];
+    for (int c = 0; c < 128; c++) rlen[c] = ls->rule[c] ? strlen(ls->rule[c]) : 0;
+    char *cur = malloc(maxlen + 1), *nxt = malloc(maxlen + 1);
+    size_t len = strlen(axiom);
+    memcpy(cur, axiom, len + 1);
+    for (int g = 0; g < n; g++) {
+        size_t w = 0;
+        for (size_t i = 0; i < len; i++) {
+            unsigned char c = (unsigned char)cur[i];
+            const char *r = ls->rule[c];
+            if (r) { memcpy(nxt + w, r, rlen[c]); w += rlen[c]; }
+            else nxt[w++] = (char)c;
+        }
+        nxt[w] = '\0';
+        char *t = cur; cur = nxt; nxt = t;
+        len = w;
+    }
+    free(nxt);
+    *out_len = len;
+    return cur;
+}
+
+typedef struct { float x0, y0, x1, y1; int depth; } Seg;
+
+#define TURTLE_STACK 64
+
+int turtle2d(const char *s, float step, float angle_deg, float heading_deg, Seg *out, int cap) {
+    const float rad = 3.14159265358979f / 180;
+    float c = cosf(angle_deg * rad), sn = sinf(angle_deg * rad);
+    float x = 0, y = 0, dx = cosf(heading_deg * rad), dy = sinf(heading_deg * rad);
+    float stack[TURTLE_STACK][4];
+    int sp = 0, count = 0;
+    for (const char *p = s; *p; p++) {
+        float t;
+        switch (*p) {
+        case 'F': case 'G':
+            if (count < cap) {
+                Seg sg = {x, y, x + dx * step, y + dy * step, sp};
+                out[count] = sg;
+            }
+            count++;
+            x += dx * step; y += dy * step;
+            break;
+        case 'f': x += dx * step; y += dy * step; break;
+        case '+': t = dx * c - dy * sn; dy = dx * sn + dy * c; dx = t; break;
+        case '-': t = dx * c + dy * sn; dy = -dx * sn + dy * c; dx = t; break;
+        case '|': dx = -dx; dy = -dy; break;
+        case '[':
+            if (sp == TURTLE_STACK) return -1;
+            stack[sp][0] = x; stack[sp][1] = y; stack[sp][2] = dx; stack[sp][3] = dy; sp++;
+            break;
+        case ']':
+            if (sp == 0) return -1;
+            sp--; x = stack[sp][0]; y = stack[sp][1]; dx = stack[sp][2]; dy = stack[sp][3];
+            break;
+        default: break;
+        }
+    }
+    return count;
+}
+
+void seg_bounds(const Seg *s, int n, float *minx, float *miny, float *maxx, float *maxy) {
+    if (n <= 0) { *minx = *miny = *maxx = *maxy = 0; return; }
+    float a = s[0].x0, b = s[0].y0, c = s[0].x0, d = s[0].y0;
+    for (int i = 0; i < n; i++) {
+        a = fminf(a, fminf(s[i].x0, s[i].x1)); c = fmaxf(c, fmaxf(s[i].x0, s[i].x1));
+        b = fminf(b, fminf(s[i].y0, s[i].y1)); d = fmaxf(d, fmaxf(s[i].y0, s[i].y1));
+    }
+    *minx = a; *miny = b; *maxx = c; *maxy = d;
+}
+
+void draw_segments(Image *im, const Seg *s, int n, int margin, int r, int g, int b) {
+    float minx, miny, maxx, maxy;
+    seg_bounds(s, n, &minx, &miny, &maxx, &maxy);
+    float aw = (float)(im->w - 1 - 2 * margin), ah = (float)(im->h - 1 - 2 * margin);
+    float bw = maxx - minx, bh = maxy - miny, scale;
+    if (bw > 0 && bh > 0) scale = fminf(aw / bw, ah / bh);
+    else if (bw > 0) scale = aw / bw;
+    else if (bh > 0) scale = ah / bh;
+    else scale = 1;
+    float ox = margin + (aw - bw * scale) / 2, oy = margin + (ah - bh * scale) / 2;
+    for (int i = 0; i < n; i++) {
+        int x0 = (int)floorf(ox + (s[i].x0 - minx) * scale + 0.5f);
+        int y0 = im->h - 1 - (int)floorf(oy + (s[i].y0 - miny) * scale + 0.5f);
+        int x1 = (int)floorf(ox + (s[i].x1 - minx) * scale + 0.5f);
+        int y1 = im->h - 1 - (int)floorf(oy + (s[i].y1 - miny) * scale + 0.5f);
+        img_line(im, x0, y0, x1, y1, r, g, b);
+    }
+}
+
+uint32_t rng_next(uint32_t *state) {
+    *state = *state * 1664525u + 1013904223u;
+    return hash32(*state);
+}
+
+typedef struct { const char *succ; int weight; } Choice;
+typedef struct { Choice choice[128][4]; int count[128]; } StochLSystem;
+
+/* one generation; out == NULL only counts. Returns the new length. */
+size_t stoch_pass(const StochLSystem *ls, const size_t rlen[128][4], const int total[128],
+                  const char *cur, size_t len, uint32_t *state, char *out) {
+    size_t w = 0;
+    for (size_t i = 0; i < len; i++) {
+        unsigned char c = (unsigned char)cur[i];
+        int k = 0;
+        if (ls->count[c] == 0) {
+            if (out) out[w] = (char)c;
+            w++;
+            continue;
+        }
+        if (ls->count[c] >= 2) {
+            int r = (int)(rng_next(state) % (uint32_t)total[c]), acc = 0;
+            for (k = 0; k < ls->count[c] - 1; k++) {
+                acc += ls->choice[c][k].weight;
+                if (acc > r) break;
+            }
+        }
+        if (out) memcpy(out + w, ls->choice[c][k].succ, rlen[c][k]);
+        w += rlen[c][k];
+    }
+    return w;
+}
+
+char *ls_expand_stochastic(const StochLSystem *ls, const char *axiom, int n, uint32_t seed, size_t *out_len) {
+    size_t rlen[128][4];
+    int total[128];
+    for (int c = 0; c < 128; c++) {
+        total[c] = 0;
+        for (int k = 0; k < ls->count[c]; k++) {
+            rlen[c][k] = strlen(ls->choice[c][k].succ);
+            total[c] += ls->choice[c][k].weight;
+        }
+    }
+    size_t len = strlen(axiom), cap_cur = len + 1, cap_nxt = len + 1;
+    char *cur = malloc(cap_cur), *nxt = malloc(cap_nxt);
+    memcpy(cur, axiom, len + 1);
+    uint32_t state = seed;
+    for (int g = 0; g < n; g++) {
+        uint32_t probe = state;
+        size_t need = stoch_pass(ls, rlen, total, cur, len, &probe, NULL);
+        if (need + 1 > cap_nxt) {
+            size_t nc = cap_nxt * 2 > need + 1 ? cap_nxt * 2 : need + 1;
+            free(nxt);
+            nxt = malloc(nc);
+            cap_nxt = nc;
+        }
+        len = stoch_pass(ls, rlen, total, cur, len, &state, nxt);
+        nxt[len] = '\0';
+        char *t = cur; cur = nxt; nxt = t;
+        size_t tc = cap_cur; cap_cur = cap_nxt; cap_nxt = tc;
+    }
+    free(nxt);
+    *out_len = len;
+    return cur;
+}
+
+int main(void) {
+    /* ABOP figure 1.27: three seeds, three different plants */
+    StochLSystem weed = {
+        .choice = {['F'] = {{"F[+F]F[-F]F", 1}, {"F[+F]F", 1}, {"F[-F]F", 1}}},
+        .count = {['F'] = 3},
+    };
+    Image im = img_new(126, 128);
+    img_fill(&im, 248, 246, 238);
+    for (int k = 0; k < 3; k++) {
+        size_t n;
+        char *s = ls_expand_stochastic(&weed, "F", 5, 100 + k, &n);
+        int count = turtle2d(s, 1, 25.7f, 90, NULL, 0);
+        Seg *segs = malloc(sizeof(Seg) * count);
+        turtle2d(s, 1, 25.7f, 90, segs, count);
+        Image tile = img_new(42, 128);
+        img_fill(&tile, 248, 246, 238);
+        draw_segments(&tile, segs, count, 2, 40 + 40 * k, 110, 50);
+        for (int y = 0; y < 128; y++) memcpy(im.px + 3 * ((size_t)y * 126 + 42 * k), tile.px + 3 * (size_t)y * 42, 42 * 3);
+        img_free(&tile); free(segs); free(s);
+    }
+    img_write_ppm(&im);
+    img_free(&im);
+    return 0;
+}
+
+--- hint
+Write one function that processes a generation and takes an output pointer that may be `NULL`; call it twice, the first time on a copy of the state.
+
+--- hint
+With weights `{1, 1, 2}` (total 4): `r = 0` picks the first, `r = 1` the second, `r = 2` or `3` the third.
+
+--- harness
+static char *ref_stoch(const StochLSystem *ls, const char *ax, int n, uint32_t seed, size_t *ol) {
+    size_t len = strlen(ax), cap = 1 << 16;
+    char *cur = malloc(len + 1);
+    memcpy(cur, ax, len + 1);
+    uint32_t st = seed;
+    for (int g = 0; g < n; g++) {
+        char *nx = malloc(cap); size_t w = 0;
+        for (size_t i = 0; i < len; i++) {
+            int c = (unsigned char)cur[i];
+            const char *succ;
+            if (!ls->count[c]) { if (w + 2 > cap) { cap *= 2; nx = realloc(nx, cap); } nx[w++] = (char)c; continue; }
+            int k = 0;
+            if (ls->count[c] > 1) {
+                int tot = 0; for (int j = 0; j < ls->count[c]; j++) tot += ls->choice[c][j].weight;
+                st = st * 1664525u + 1013904223u;
+                int r = (int)(hash32(st) % (uint32_t)tot), acc = 0;
+                for (k = 0; k < ls->count[c]; k++) { acc += ls->choice[c][k].weight; if (acc > r) break; }
+            }
+            succ = ls->choice[c][k].succ;
+            size_t sl = strlen(succ);
+            while (w + sl + 1 > cap) { cap *= 2; nx = realloc(nx, cap); }
+            memcpy(nx + w, succ, sl); w += sl;
+        }
+        nx[w] = 0; free(cur); cur = nx; len = w;
+    }
+    *ol = len;
+    return cur;
+}
+int main(void) {
+    uint32_t st = 0;
+    CHECK_UINT(rng_next(&st), hash32(1013904223u));
+    StochLSystem det = {.choice = {['A'] = {{"AB", 5}}, ['B'] = {{"A", 1}}}, .count = {['A'] = 1, ['B'] = 1}};
+    size_t n;
+    char *s = ls_expand_stochastic(&det, "A", 5, 123, &n);
+    CHECK_STR(s, "ABAABABAABAAB"); CHECK_INT(n, 13); free(s);
+
+    StochLSystem coin = {.choice = {['X'] = {{"H", 1}, {"T", 1}}}, .count = {['X'] = 2}};
+    s = ls_expand_stochastic(&coin, "XXXXXXXX-X", 1, 7, &n);
+    size_t rn;
+    char *r = ref_stoch(&coin, "XXXXXXXX-X", 1, 7, &rn);
+    CHECK_STR(s, r);
+    free(s); free(r);
+
+    /* weights: about 1/4, 1/4, 1/2 over many draws */
+    StochLSystem w3 = {.choice = {['X'] = {{"a", 1}, {"b", 1}, {"cc", 2}}}, .count = {['X'] = 3}};
+    char many[4001];
+    memset(many, 'X', 4000); many[4000] = 0;
+    s = ls_expand_stochastic(&w3, many, 1, 99, &n);
+    int ca = 0, cb = 0, cc = 0;
+    for (size_t i = 0; i < n; i++) { ca += s[i] == 'a'; cb += s[i] == 'b'; cc += s[i] == 'c'; }
+    CHECK(ca > 850 && ca < 1150 && cb > 850 && cb < 1150 && cc / 2 > 1800 && cc / 2 < 2200);
+    CHECK_INT(n, (size_t)(ca + cb + cc));
+    r = ref_stoch(&w3, many, 1, 99, &rn);
+    CHECK_STR(s, r);
+    free(s); free(r);
+
+    StochLSystem weed = {
+        .choice = {['F'] = {{"F[+F]F[-F]F", 1}, {"F[+F]F", 1}, {"F[-F]F", 1}}},
+        .count = {['F'] = 3},
+    };
+    for (uint32_t seed = 0; seed < 5; seed++) {
+        s = ls_expand_stochastic(&weed, "F", 4, seed, &n);
+        r = ref_stoch(&weed, "F", 4, seed, &rn);
+        CHECK_INT(n, rn);
+        CHECK(strcmp(s, r) == 0);
+        free(s); free(r);
+    }
+    char *a1 = ls_expand_stochastic(&weed, "F", 4, 1, &n), *a2 = ls_expand_stochastic(&weed, "F", 4, 2, &rn);
+    CHECK(n != rn || strcmp(a1, a2) != 0);
+    free(a1); free(a2);
+
+    /* mixed rules: deterministic symbols must not consume random numbers */
+    StochLSystem mix = {
+        .choice = {['X'] = {{"F[+X]X", 2}, {"F[-X]X", 1}}, ['F'] = {{"FF", 1}}},
+        .count = {['X'] = 2, ['F'] = 1},
+    };
+    s = ls_expand_stochastic(&mix, "X", 6, 2024, &n);
+    r = ref_stoch(&mix, "X", 6, 2024, &rn);
+    CHECK_INT(n, rn);
+    CHECK(strcmp(s, r) == 0);
+    free(s); free(r);
+
+    s = ls_expand_stochastic(&weed, "F", 14, 31337, &n);
+    r = ref_stoch(&weed, "F", 14, 31337, &rn);
+    printf("n %zu\n", n);
+    CHECK(n > 3000000);
+    CHECK_INT(n, rn);
+    CHECK(memcmp(s, r, n + 1) == 0);
+    free(s); free(r);
+    return TEST_END();
+}
+
+=== exercise ls_param
+title: L-systems 6: parametric modules
+continues: ls_stochastic
+--- prompt
+Switch from characters to **modules** with one parameter each:
+
+```c
+typedef struct { char sym; float p; } Module;
+typedef struct { char sym; float mul, add; } PSucc;        /* successor parameter = parent * mul + add */
+typedef struct { const PSucc *succ[128]; int n[128]; } PLSystem;   /* n[c] == 0: no rule, module copied as is */
+int pls_expand(const PLSystem *ls, const Module *axiom, int na, int iterations, Module **out);
+```
+
+Rewriting `A(l)` with successors `{'F', 1, 0}, {'+', 0, 30}, {'A', 0.7, 0}` gives `F(l) +(30) A(0.7 l)`: a successor's parameter is the parent's parameter times `mul` plus `add`, so `mul = 0` makes a constant.
+
+`pls_expand` stores the result in `*out` (heap, caller frees) and returns the number of modules. Lengths do not depend on parameters, so size everything up front as in steps 1 and 2: per-symbol module counts per generation (`uint64_t`, saturating), the largest generation's count, two buffers allocated once. If the largest count exceeds `1 << 24`, return `-1` and set `*out = NULL`.
+
+Use `float` arithmetic exactly as written (`parent * mul + add`); the tests compare with a small tolerance.
+
+**Run** draws a parametric 2D tree; its `main` interprets `F(l)`, `+(a)`, `-(a)` with a few lines of inline turtle code, a preview of the next step.
+
+--- stubs
+typedef struct { char sym; float p; } Module;
+typedef struct { char sym; float mul, add; } PSucc;
+typedef struct { const PSucc *succ[128]; int n[128]; } PLSystem;
+
+int pls_expand(const PLSystem *ls, const Module *axiom, int na, int iterations, Module **out) {
+    (void)ls; (void)axiom; (void)na; (void)iterations;
+    *out = NULL;
+    return 0;
+}
+
+--- solution
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdint.h>
+#include <math.h>
+
+/* ===== From earlier chapters: vectors, hashing, images, line drawing ===== */
+
+typedef struct { float x, y, z; } Vec3;
+Vec3 v3(float x, float y, float z) { Vec3 r = {x, y, z}; return r; }
+Vec3 v3_add(Vec3 a, Vec3 b) { return v3(a.x + b.x, a.y + b.y, a.z + b.z); }
+Vec3 v3_sub(Vec3 a, Vec3 b) { return v3(a.x - b.x, a.y - b.y, a.z - b.z); }
+Vec3 v3_scale(Vec3 a, float s) { return v3(a.x * s, a.y * s, a.z * s); }
+float v3_dot(Vec3 a, Vec3 b) { return a.x * b.x + a.y * b.y + a.z * b.z; }
+Vec3 v3_cross(Vec3 a, Vec3 b) { return v3(a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x); }
+float v3_len(Vec3 a) { return sqrtf(v3_dot(a, a)); }
+Vec3 v3_norm(Vec3 a) { float l = v3_len(a); return l > 0 ? v3_scale(a, 1.0f / l) : a; }
+
+uint32_t hash32(uint32_t x) {            /* lowbias32 (Chris Wellons) */
+    x ^= x >> 16; x *= 0x7feb352dU; x ^= x >> 15; x *= 0x846ca68bU; x ^= x >> 16;
+    return x;
+}
+
+typedef struct { int w, h; unsigned char *px; } Image;      /* RGB, 3 bytes per pixel, row-major */
+Image img_new(int w, int h) { Image im = {w, h, calloc((size_t)w * h * 3, 1)}; return im; }
+void img_free(Image *im) { free(im->px); im->px = NULL; }
+void img_fill(Image *im, int r, int g, int b) {
+    for (size_t i = 0, n = (size_t)im->w * im->h; i < n; i++) {
+        im->px[3 * i] = (unsigned char)r; im->px[3 * i + 1] = (unsigned char)g; im->px[3 * i + 2] = (unsigned char)b;
+    }
+}
+void img_set(Image *im, int x, int y, int r, int g, int b) {   /* ignores pixels outside the image */
+    if (x < 0 || y < 0 || x >= im->w || y >= im->h) return;
+    unsigned char *p = im->px + ((size_t)y * im->w + x) * 3;
+    p[0] = (unsigned char)r; p[1] = (unsigned char)g; p[2] = (unsigned char)b;
+}
+void img_line(Image *im, int x0, int y0, int x1, int y1, int r, int g, int b) {   /* Bresenham */
+    int dx = abs(x1 - x0), sx = x0 < x1 ? 1 : -1, dy = -abs(y1 - y0), sy = y0 < y1 ? 1 : -1, err = dx + dy;
+    for (;;) {
+        img_set(im, x0, y0, r, g, b);
+        if (x0 == x1 && y0 == y1) break;
+        int e2 = 2 * err;
+        if (e2 >= dy) { err += dy; x0 += sx; }
+        if (e2 <= dx) { err += dx; y0 += sy; }
+    }
+}
+void img_write_ppm(const Image *im) {                       /* ASCII P3 to stdout: the site draws it */
+    printf("P3\n%d %d\n255\n", im->w, im->h);
+    for (int y = 0; y < im->h; y++) {
+        const unsigned char *p = im->px + (size_t)y * im->w * 3;
+        for (int x = 0; x < im->w * 3; x++) printf("%d%c", p[x], x + 1 < im->w * 3 ? ' ' : '\n');
+    }
+}
+
+/* ===== This chapter: an L-system is one successor string per symbol (NULL: the symbol stays) ===== */
+
+typedef struct { const char *rule[128]; } LSystem;
+
+uint64_t sat_add(uint64_t a, uint64_t b) { return a > UINT64_MAX - b ? UINT64_MAX : a + b; }
+
+uint64_t ls_length(const LSystem *ls, const char *axiom, int n) {
+    uint64_t len[128], next[128];
+    for (int c = 0; c < 128; c++) len[c] = 1;
+    for (int g = 0; g < n; g++) {
+        for (int c = 0; c < 128; c++) {
+            const char *r = ls->rule[c];
+            if (!r) { next[c] = 1; continue; }
+            uint64_t sum = 0;
+            for (const char *p = r; *p; p++) sum = sat_add(sum, len[(unsigned char)*p]);
+            next[c] = sum;
+        }
+        memcpy(len, next, sizeof len);
+    }
+    uint64_t total = 0;
+    for (const char *p = axiom; *p; p++) total = sat_add(total, len[(unsigned char)*p]);
+    return total;
+}
+
+char *ls_expand(const LSystem *ls, const char *axiom, int n, size_t *out_len) {
+    uint64_t maxlen = 0;
+    for (int g = 0; g <= n; g++) {
+        uint64_t l = ls_length(ls, axiom, g);
+        if (l > maxlen) maxlen = l;
+    }
+    if (maxlen > (1u << 28)) return NULL;
+    size_t rlen[128];
+    for (int c = 0; c < 128; c++) rlen[c] = ls->rule[c] ? strlen(ls->rule[c]) : 0;
+    char *cur = malloc(maxlen + 1), *nxt = malloc(maxlen + 1);
+    size_t len = strlen(axiom);
+    memcpy(cur, axiom, len + 1);
+    for (int g = 0; g < n; g++) {
+        size_t w = 0;
+        for (size_t i = 0; i < len; i++) {
+            unsigned char c = (unsigned char)cur[i];
+            const char *r = ls->rule[c];
+            if (r) { memcpy(nxt + w, r, rlen[c]); w += rlen[c]; }
+            else nxt[w++] = (char)c;
+        }
+        nxt[w] = '\0';
+        char *t = cur; cur = nxt; nxt = t;
+        len = w;
+    }
+    free(nxt);
+    *out_len = len;
+    return cur;
+}
+
+typedef struct { float x0, y0, x1, y1; int depth; } Seg;
+
+#define TURTLE_STACK 64
+
+int turtle2d(const char *s, float step, float angle_deg, float heading_deg, Seg *out, int cap) {
+    const float rad = 3.14159265358979f / 180;
+    float c = cosf(angle_deg * rad), sn = sinf(angle_deg * rad);
+    float x = 0, y = 0, dx = cosf(heading_deg * rad), dy = sinf(heading_deg * rad);
+    float stack[TURTLE_STACK][4];
+    int sp = 0, count = 0;
+    for (const char *p = s; *p; p++) {
+        float t;
+        switch (*p) {
+        case 'F': case 'G':
+            if (count < cap) {
+                Seg sg = {x, y, x + dx * step, y + dy * step, sp};
+                out[count] = sg;
+            }
+            count++;
+            x += dx * step; y += dy * step;
+            break;
+        case 'f': x += dx * step; y += dy * step; break;
+        case '+': t = dx * c - dy * sn; dy = dx * sn + dy * c; dx = t; break;
+        case '-': t = dx * c + dy * sn; dy = -dx * sn + dy * c; dx = t; break;
+        case '|': dx = -dx; dy = -dy; break;
+        case '[':
+            if (sp == TURTLE_STACK) return -1;
+            stack[sp][0] = x; stack[sp][1] = y; stack[sp][2] = dx; stack[sp][3] = dy; sp++;
+            break;
+        case ']':
+            if (sp == 0) return -1;
+            sp--; x = stack[sp][0]; y = stack[sp][1]; dx = stack[sp][2]; dy = stack[sp][3];
+            break;
+        default: break;
+        }
+    }
+    return count;
+}
+
+void seg_bounds(const Seg *s, int n, float *minx, float *miny, float *maxx, float *maxy) {
+    if (n <= 0) { *minx = *miny = *maxx = *maxy = 0; return; }
+    float a = s[0].x0, b = s[0].y0, c = s[0].x0, d = s[0].y0;
+    for (int i = 0; i < n; i++) {
+        a = fminf(a, fminf(s[i].x0, s[i].x1)); c = fmaxf(c, fmaxf(s[i].x0, s[i].x1));
+        b = fminf(b, fminf(s[i].y0, s[i].y1)); d = fmaxf(d, fmaxf(s[i].y0, s[i].y1));
+    }
+    *minx = a; *miny = b; *maxx = c; *maxy = d;
+}
+
+void draw_segments(Image *im, const Seg *s, int n, int margin, int r, int g, int b) {
+    float minx, miny, maxx, maxy;
+    seg_bounds(s, n, &minx, &miny, &maxx, &maxy);
+    float aw = (float)(im->w - 1 - 2 * margin), ah = (float)(im->h - 1 - 2 * margin);
+    float bw = maxx - minx, bh = maxy - miny, scale;
+    if (bw > 0 && bh > 0) scale = fminf(aw / bw, ah / bh);
+    else if (bw > 0) scale = aw / bw;
+    else if (bh > 0) scale = ah / bh;
+    else scale = 1;
+    float ox = margin + (aw - bw * scale) / 2, oy = margin + (ah - bh * scale) / 2;
+    for (int i = 0; i < n; i++) {
+        int x0 = (int)floorf(ox + (s[i].x0 - minx) * scale + 0.5f);
+        int y0 = im->h - 1 - (int)floorf(oy + (s[i].y0 - miny) * scale + 0.5f);
+        int x1 = (int)floorf(ox + (s[i].x1 - minx) * scale + 0.5f);
+        int y1 = im->h - 1 - (int)floorf(oy + (s[i].y1 - miny) * scale + 0.5f);
+        img_line(im, x0, y0, x1, y1, r, g, b);
+    }
+}
+
+uint32_t rng_next(uint32_t *state) {
+    *state = *state * 1664525u + 1013904223u;
+    return hash32(*state);
+}
+
+typedef struct { const char *succ; int weight; } Choice;
+typedef struct { Choice choice[128][4]; int count[128]; } StochLSystem;
+
+/* one generation; out == NULL only counts. Returns the new length. */
+size_t stoch_pass(const StochLSystem *ls, const size_t rlen[128][4], const int total[128],
+                  const char *cur, size_t len, uint32_t *state, char *out) {
+    size_t w = 0;
+    for (size_t i = 0; i < len; i++) {
+        unsigned char c = (unsigned char)cur[i];
+        int k = 0;
+        if (ls->count[c] == 0) {
+            if (out) out[w] = (char)c;
+            w++;
+            continue;
+        }
+        if (ls->count[c] >= 2) {
+            int r = (int)(rng_next(state) % (uint32_t)total[c]), acc = 0;
+            for (k = 0; k < ls->count[c] - 1; k++) {
+                acc += ls->choice[c][k].weight;
+                if (acc > r) break;
+            }
+        }
+        if (out) memcpy(out + w, ls->choice[c][k].succ, rlen[c][k]);
+        w += rlen[c][k];
+    }
+    return w;
+}
+
+char *ls_expand_stochastic(const StochLSystem *ls, const char *axiom, int n, uint32_t seed, size_t *out_len) {
+    size_t rlen[128][4];
+    int total[128];
+    for (int c = 0; c < 128; c++) {
+        total[c] = 0;
+        for (int k = 0; k < ls->count[c]; k++) {
+            rlen[c][k] = strlen(ls->choice[c][k].succ);
+            total[c] += ls->choice[c][k].weight;
+        }
+    }
+    size_t len = strlen(axiom), cap_cur = len + 1, cap_nxt = len + 1;
+    char *cur = malloc(cap_cur), *nxt = malloc(cap_nxt);
+    memcpy(cur, axiom, len + 1);
+    uint32_t state = seed;
+    for (int g = 0; g < n; g++) {
+        uint32_t probe = state;
+        size_t need = stoch_pass(ls, rlen, total, cur, len, &probe, NULL);
+        if (need + 1 > cap_nxt) {
+            size_t nc = cap_nxt * 2 > need + 1 ? cap_nxt * 2 : need + 1;
+            free(nxt);
+            nxt = malloc(nc);
+            cap_nxt = nc;
+        }
+        len = stoch_pass(ls, rlen, total, cur, len, &state, nxt);
+        nxt[len] = '\0';
+        char *t = cur; cur = nxt; nxt = t;
+        size_t tc = cap_cur; cap_cur = cap_nxt; cap_nxt = tc;
+    }
+    free(nxt);
+    *out_len = len;
+    return cur;
+}
+
+typedef struct { char sym; float p; } Module;
+typedef struct { char sym; float mul, add; } PSucc;
+typedef struct { const PSucc *succ[128]; int n[128]; } PLSystem;
+
+int pls_expand(const PLSystem *ls, const Module *axiom, int na, int iterations, Module **out) {
+    *out = NULL;
+    uint64_t len[128], next[128], maxlen = (uint64_t)na;
+    for (int c = 0; c < 128; c++) len[c] = 1;
+    for (int g = 0; g < iterations; g++) {
+        for (int c = 0; c < 128; c++) {
+            if (ls->n[c] == 0) { next[c] = 1; continue; }
+            uint64_t s = 0;
+            for (int k = 0; k < ls->n[c]; k++) s = sat_add(s, len[(unsigned char)ls->succ[c][k].sym]);
+            next[c] = s;
+        }
+        memcpy(len, next, sizeof len);
+        uint64_t total = 0;
+        for (int i = 0; i < na; i++) total = sat_add(total, len[(unsigned char)axiom[i].sym]);
+        if (total > maxlen) maxlen = total;
+    }
+    if (maxlen > (1u << 24)) return -1;
+    Module *cur = malloc(sizeof(Module) * (maxlen ? maxlen : 1)), *nxt = malloc(sizeof(Module) * (maxlen ? maxlen : 1));
+    memcpy(cur, axiom, sizeof(Module) * na);
+    size_t count = (size_t)na;
+    for (int g = 0; g < iterations; g++) {
+        size_t w = 0;
+        for (size_t i = 0; i < count; i++) {
+            unsigned char c = (unsigned char)cur[i].sym;
+            if (ls->n[c] == 0) { nxt[w++] = cur[i]; continue; }
+            for (int k = 0; k < ls->n[c]; k++) {
+                const PSucc *ps = &ls->succ[c][k];
+                nxt[w].sym = ps->sym;
+                nxt[w].p = cur[i].p * ps->mul + ps->add;
+                w++;
+            }
+        }
+        Module *t = cur; cur = nxt; nxt = t;
+        count = w;
+    }
+    free(nxt);
+    *out = cur;
+    return (int)count;
+}
+
+int main(void) {
+    /* A(l) -> F(l) [ +(30) A(0.72 l) ] [ -(22) A(0.66 l) ];  F(l) -> F(1.05 l) */
+    static const PSucc A_rule[] = {{'F', 1, 0}, {'[', 0, 0}, {'+', 0, 30}, {'A', 0.72f, 0}, {']', 0, 0},
+                                   {'[', 0, 0}, {'-', 0, 22}, {'A', 0.66f, 0}, {']', 0, 0}};
+    static const PSucc F_rule[] = {{'F', 1.05f, 0}};
+    PLSystem tree = {.succ = {['A'] = A_rule, ['F'] = F_rule}, .n = {['A'] = 9, ['F'] = 1}};
+    Module axiom[] = {{'A', 22}};
+    Module *m;
+    int n = pls_expand(&tree, axiom, 1, 10, &m);
+    Image im = img_new(128, 128);
+    img_fill(&im, 246, 244, 236);
+    float x = 70, y = 127, dx = 0, dy = -1, st[64][4];
+    int sp = 0;
+    const float rad = 3.14159265f / 180;
+    for (int i = 0; i < n; i++) {
+        float a = m[i].p * rad, t;
+        switch (m[i].sym) {
+        case 'F':
+            img_line(&im, (int)x, (int)y, (int)(x + dx * m[i].p), (int)(y + dy * m[i].p), 90, 60 + sp * 12, 40);
+            x += dx * m[i].p; y += dy * m[i].p;
+            break;
+        case '+': t = dx * cosf(a) + dy * sinf(a); dy = -dx * sinf(a) + dy * cosf(a); dx = t; break;
+        case '-': t = dx * cosf(a) - dy * sinf(a); dy = dx * sinf(a) + dy * cosf(a); dx = t; break;
+        case '[': st[sp][0] = x; st[sp][1] = y; st[sp][2] = dx; st[sp][3] = dy; sp++; break;
+        case ']': sp--; x = st[sp][0]; y = st[sp][1]; dx = st[sp][2]; dy = st[sp][3]; break;
+        }
+    }
+    img_write_ppm(&im);
+    free(m); img_free(&im);
+    return 0;
+}
+
+--- hint
+The length DP from step 1 works unchanged if you sum `len[succ[c][k].sym]` over the successor modules.
+
+--- hint
+Copy modules without a rule as whole structs: `nxt[w++] = cur[i];`.
+
+--- harness
+static int mod_eq(const Module *m, char sym, float p) { return m->sym == sym && fabsf(m->p - p) < 1e-4f * (1 + fabsf(p)); }
+int main(void) {
+    static const PSucc A_rule[] = {{'F', 1, 0}, {'+', 0, 30}, {'A', 0.5f, 0}};
+    PLSystem ls = {.succ = {['A'] = A_rule}, .n = {['A'] = 3}};
+    Module ax[] = {{'A', 8}};
+    Module *m;
+    int n = pls_expand(&ls, ax, 1, 0, &m);
+    CHECK_INT(n, 1);
+    if (n == 1) CHECK(mod_eq(&m[0], 'A', 8));
+    free(m);
+    n = pls_expand(&ls, ax, 1, 1, &m);
+    CHECK_INT(n, 3);
+    if (n == 3) CHECK(mod_eq(&m[0], 'F', 8) && mod_eq(&m[1], '+', 30) && mod_eq(&m[2], 'A', 4));
+    free(m);
+    n = pls_expand(&ls, ax, 1, 3, &m);
+    CHECK_INT(n, 7);
+    if (n == 7) {
+        CHECK(mod_eq(&m[0], 'F', 8) && mod_eq(&m[1], '+', 30) && mod_eq(&m[2], 'F', 4) && mod_eq(&m[3], '+', 30));
+        CHECK(mod_eq(&m[4], 'F', 2) && mod_eq(&m[5], '+', 30) && mod_eq(&m[6], 'A', 1));
+    }
+    free(m);
+
+    /* growth: F(l) -> F(1.5 l), constants pass through, unknown symbols copied with their parameter */
+    static const PSucc F_rule[] = {{'F', 1.5f, 0}};
+    static const PSucc B_rule[] = {{'F', 0, 1}, {'[', 0, 0}, {'B', 1, 1}, {']', 0, 0}, {'B', 2, 0}};
+    PLSystem g = {.succ = {['F'] = F_rule, ['B'] = B_rule}, .n = {['F'] = 1, ['B'] = 5}};
+    Module ax2[] = {{'B', 1}, {'x', 42}};
+    n = pls_expand(&g, ax2, 2, 2, &m);
+    /* gen1: F(1) [ B(2) ] B(2) x(42)
+       gen2: F(1.5) [ F(1) [ B(3) ] B(4) ] F(1) [ B(3) ] B(4) x(42) */
+    CHECK_INT(n, 14);
+    if (n == 14) {
+        char syms[15];
+        for (int i = 0; i < 14; i++) syms[i] = m[i].sym;
+        syms[14] = 0;
+        CHECK_STR(syms, "F[F[B]B]F[B]Bx");
+        CHECK(mod_eq(&m[0], 'F', 1.5f) && mod_eq(&m[2], 'F', 1) && mod_eq(&m[4], 'B', 3) && mod_eq(&m[6], 'B', 4));
+        CHECK(mod_eq(&m[12], 'B', 4) && mod_eq(&m[13], 'x', 42) && mod_eq(&m[8], 'F', 1));
+    }
+    free(m);
+
+    /* each axiom module rewritten with its own parameter */
+    static const PSucc E_rule[] = {{'e', 1, 0}, {'e', 2, 0}, {'e', 3, 0}};
+    PLSystem er = {.succ = {['E'] = E_rule}, .n = {['E'] = 3}};
+    Module ax3[] = {{'E', 1}, {'E', 10}};
+    n = pls_expand(&er, ax3, 2, 1, &m);
+    CHECK_INT(n, 6);
+    if (n == 6) CHECK(mod_eq(&m[4], 'e', 20) && mod_eq(&m[5], 'e', 30));
+    free(m);
+
+    /* too big */
+    static const PSucc D_rule[] = {{'D', 1, 0}, {'D', 1, 0}};
+    PLSystem dbl = {.succ = {['D'] = D_rule}, .n = {['D'] = 2}};
+    Module ax4[] = {{'D', 0}};
+    m = (Module *)1;
+    CHECK_INT(pls_expand(&dbl, ax4, 1, 30, &m), -1);
+    CHECK(m == NULL);
+    n = pls_expand(&dbl, ax4, 1, 22, &m);
+    CHECK_INT(n, 1 << 22);
+    free(m);
+
+    /* a tree, 12 generations, against hand-computed totals */
+    static const PSucc T_rule[] = {{'F', 1, 0}, {'[', 0, 0}, {'+', 0, 30}, {'A', 0.72f, 0}, {']', 0, 0},
+                                   {'[', 0, 0}, {'-', 0, 22}, {'A', 0.66f, 0}, {']', 0, 0}};
+    static const PSucc G_rule[] = {{'F', 1.05f, 0}};
+    PLSystem tree = {.succ = {['A'] = T_rule, ['F'] = G_rule}, .n = {['A'] = 9, ['F'] = 1}};
+    Module ax5[] = {{'A', 30}};
+    n = pls_expand(&tree, ax5, 1, 12, &m);
+    CHECK_INT(n, 1 + 8 * 4095);
+    if (n == 1 + 8 * 4095) {
+        double flen = 0; int fs = 0, as = 0;
+        for (int i = 0; i < n; i++) { if (m[i].sym == 'F') { flen += m[i].p; fs++; } as += m[i].sym == 'A'; }
+        CHECK_INT(fs, 4095);
+        CHECK_INT(as, 4096);
+        CHECK(fabs(m[0].p - 30 * pow(1.05, 11)) < 1e-3);
+        double want = 0;
+        for (int d = 0; d < 12; d++) want += 30 * pow(0.72 + 0.66, d) * pow(1.05, 11 - d);
+        CHECK(fabs(flen - want) < 1e-3 * want);
+    }
+    free(m);
+    return TEST_END();
+}
+
+=== exercise ls_turtle3d
+title: L-systems 7: the 3D turtle
+continues: ls_param
+--- prompt
+Interpret modules in 3D. The turtle has a position `P`, a frame `H, L, U` (heading, left, up; `H × L = U`) and a width `w`.
+
+```c
+typedef struct { Vec3 a, b, h, l, u; float r; int depth; } Branch;   /* cylinder from a to b, radius r */
+typedef struct { Vec3 pos, h, l, u; float size; } Leaf;
+void turtle3d_count(const Module *m, int n, int *nbranches, int *nleaves);
+int turtle3d(const Module *m, int n, float width0, Branch *br, Leaf *lf);
+```
+
+`turtle3d_count` counts `F` and `L` modules (that is all it takes to size the arrays). `turtle3d` starts at `P = (0,0,0)`, `H = (0,0,1)` (up the z axis), `L = (-1,0,0)`, `U = (0,-1,0)`, `w = width0`, and processes the modules (angles in degrees, `a` is the module's parameter, `c = cos a`, `s = sin a`):
+
+| module | effect |
+|---|---|
+| `F(l)` | branch from `P` to `P + l H`, with the current `H, L, U`, `r = w / 2`, `depth` = bracket depth; then move `P` there |
+| `f(l)` | move without a branch |
+| `+(a)` / `-(a)` | yaw: `H' = H c + L s`, `L' = L c - H s` (`-` uses `-a`) |
+| `&(a)` / `^(a)` | pitch: `H' = H c - U s`, `U' = U c + H s` (`^` uses `-a`) |
+| `\(a)` / `/(a)` | roll: `L' = L c - U s`, `U' = U c + L s` (`/` uses `-a`) |
+| `\|` | `H = -H`, `L = -L` |
+| `!(x)` | `w = x` |
+| `L(s)` | leaf at `P` with the current frame and `size = s` |
+| `[` / `]` | push / pop `P, H, L, U, w` (64 deep) |
+
+Return 0, or `-1` on stack overflow or an unmatched `]`. Store branches and leaves in order of appearance.
+
+Each rotation keeps the frame orthonormal in exact arithmetic; in `float` it drifts slowly, which the tests tolerate for trees of realistic depth. (Long-lived turtles re-orthonormalize: `H = normalize(H)`, `L = normalize(U × H)`, `U = H × L`.)
+
+**Run** shows ABOP's ternary tree (figure 2.8) projected onto the x-z plane, drawn with step 4's `draw_segments`.
+
+--- stubs
+typedef struct { Vec3 a, b, h, l, u; float r; int depth; } Branch;
+typedef struct { Vec3 pos, h, l, u; float size; } Leaf;
+
+void turtle3d_count(const Module *m, int n, int *nbranches, int *nleaves) {
+    (void)m; (void)n;
+    *nbranches = 0; *nleaves = 0;
+}
+
+int turtle3d(const Module *m, int n, float width0, Branch *br, Leaf *lf) {
+    (void)m; (void)n; (void)width0; (void)br; (void)lf;
+    return -1;
+}
+
+--- solution
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdint.h>
+#include <math.h>
+
+/* ===== From earlier chapters: vectors, hashing, images, line drawing ===== */
+
+typedef struct { float x, y, z; } Vec3;
+Vec3 v3(float x, float y, float z) { Vec3 r = {x, y, z}; return r; }
+Vec3 v3_add(Vec3 a, Vec3 b) { return v3(a.x + b.x, a.y + b.y, a.z + b.z); }
+Vec3 v3_sub(Vec3 a, Vec3 b) { return v3(a.x - b.x, a.y - b.y, a.z - b.z); }
+Vec3 v3_scale(Vec3 a, float s) { return v3(a.x * s, a.y * s, a.z * s); }
+float v3_dot(Vec3 a, Vec3 b) { return a.x * b.x + a.y * b.y + a.z * b.z; }
+Vec3 v3_cross(Vec3 a, Vec3 b) { return v3(a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x); }
+float v3_len(Vec3 a) { return sqrtf(v3_dot(a, a)); }
+Vec3 v3_norm(Vec3 a) { float l = v3_len(a); return l > 0 ? v3_scale(a, 1.0f / l) : a; }
+
+uint32_t hash32(uint32_t x) {            /* lowbias32 (Chris Wellons) */
+    x ^= x >> 16; x *= 0x7feb352dU; x ^= x >> 15; x *= 0x846ca68bU; x ^= x >> 16;
+    return x;
+}
+
+typedef struct { int w, h; unsigned char *px; } Image;      /* RGB, 3 bytes per pixel, row-major */
+Image img_new(int w, int h) { Image im = {w, h, calloc((size_t)w * h * 3, 1)}; return im; }
+void img_free(Image *im) { free(im->px); im->px = NULL; }
+void img_fill(Image *im, int r, int g, int b) {
+    for (size_t i = 0, n = (size_t)im->w * im->h; i < n; i++) {
+        im->px[3 * i] = (unsigned char)r; im->px[3 * i + 1] = (unsigned char)g; im->px[3 * i + 2] = (unsigned char)b;
+    }
+}
+void img_set(Image *im, int x, int y, int r, int g, int b) {   /* ignores pixels outside the image */
+    if (x < 0 || y < 0 || x >= im->w || y >= im->h) return;
+    unsigned char *p = im->px + ((size_t)y * im->w + x) * 3;
+    p[0] = (unsigned char)r; p[1] = (unsigned char)g; p[2] = (unsigned char)b;
+}
+void img_line(Image *im, int x0, int y0, int x1, int y1, int r, int g, int b) {   /* Bresenham */
+    int dx = abs(x1 - x0), sx = x0 < x1 ? 1 : -1, dy = -abs(y1 - y0), sy = y0 < y1 ? 1 : -1, err = dx + dy;
+    for (;;) {
+        img_set(im, x0, y0, r, g, b);
+        if (x0 == x1 && y0 == y1) break;
+        int e2 = 2 * err;
+        if (e2 >= dy) { err += dy; x0 += sx; }
+        if (e2 <= dx) { err += dx; y0 += sy; }
+    }
+}
+void img_write_ppm(const Image *im) {                       /* ASCII P3 to stdout: the site draws it */
+    printf("P3\n%d %d\n255\n", im->w, im->h);
+    for (int y = 0; y < im->h; y++) {
+        const unsigned char *p = im->px + (size_t)y * im->w * 3;
+        for (int x = 0; x < im->w * 3; x++) printf("%d%c", p[x], x + 1 < im->w * 3 ? ' ' : '\n');
+    }
+}
+
+/* ===== This chapter: an L-system is one successor string per symbol (NULL: the symbol stays) ===== */
+
+typedef struct { const char *rule[128]; } LSystem;
+
+uint64_t sat_add(uint64_t a, uint64_t b) { return a > UINT64_MAX - b ? UINT64_MAX : a + b; }
+
+uint64_t ls_length(const LSystem *ls, const char *axiom, int n) {
+    uint64_t len[128], next[128];
+    for (int c = 0; c < 128; c++) len[c] = 1;
+    for (int g = 0; g < n; g++) {
+        for (int c = 0; c < 128; c++) {
+            const char *r = ls->rule[c];
+            if (!r) { next[c] = 1; continue; }
+            uint64_t sum = 0;
+            for (const char *p = r; *p; p++) sum = sat_add(sum, len[(unsigned char)*p]);
+            next[c] = sum;
+        }
+        memcpy(len, next, sizeof len);
+    }
+    uint64_t total = 0;
+    for (const char *p = axiom; *p; p++) total = sat_add(total, len[(unsigned char)*p]);
+    return total;
+}
+
+char *ls_expand(const LSystem *ls, const char *axiom, int n, size_t *out_len) {
+    uint64_t maxlen = 0;
+    for (int g = 0; g <= n; g++) {
+        uint64_t l = ls_length(ls, axiom, g);
+        if (l > maxlen) maxlen = l;
+    }
+    if (maxlen > (1u << 28)) return NULL;
+    size_t rlen[128];
+    for (int c = 0; c < 128; c++) rlen[c] = ls->rule[c] ? strlen(ls->rule[c]) : 0;
+    char *cur = malloc(maxlen + 1), *nxt = malloc(maxlen + 1);
+    size_t len = strlen(axiom);
+    memcpy(cur, axiom, len + 1);
+    for (int g = 0; g < n; g++) {
+        size_t w = 0;
+        for (size_t i = 0; i < len; i++) {
+            unsigned char c = (unsigned char)cur[i];
+            const char *r = ls->rule[c];
+            if (r) { memcpy(nxt + w, r, rlen[c]); w += rlen[c]; }
+            else nxt[w++] = (char)c;
+        }
+        nxt[w] = '\0';
+        char *t = cur; cur = nxt; nxt = t;
+        len = w;
+    }
+    free(nxt);
+    *out_len = len;
+    return cur;
+}
+
+typedef struct { float x0, y0, x1, y1; int depth; } Seg;
+
+#define TURTLE_STACK 64
+
+int turtle2d(const char *s, float step, float angle_deg, float heading_deg, Seg *out, int cap) {
+    const float rad = 3.14159265358979f / 180;
+    float c = cosf(angle_deg * rad), sn = sinf(angle_deg * rad);
+    float x = 0, y = 0, dx = cosf(heading_deg * rad), dy = sinf(heading_deg * rad);
+    float stack[TURTLE_STACK][4];
+    int sp = 0, count = 0;
+    for (const char *p = s; *p; p++) {
+        float t;
+        switch (*p) {
+        case 'F': case 'G':
+            if (count < cap) {
+                Seg sg = {x, y, x + dx * step, y + dy * step, sp};
+                out[count] = sg;
+            }
+            count++;
+            x += dx * step; y += dy * step;
+            break;
+        case 'f': x += dx * step; y += dy * step; break;
+        case '+': t = dx * c - dy * sn; dy = dx * sn + dy * c; dx = t; break;
+        case '-': t = dx * c + dy * sn; dy = -dx * sn + dy * c; dx = t; break;
+        case '|': dx = -dx; dy = -dy; break;
+        case '[':
+            if (sp == TURTLE_STACK) return -1;
+            stack[sp][0] = x; stack[sp][1] = y; stack[sp][2] = dx; stack[sp][3] = dy; sp++;
+            break;
+        case ']':
+            if (sp == 0) return -1;
+            sp--; x = stack[sp][0]; y = stack[sp][1]; dx = stack[sp][2]; dy = stack[sp][3];
+            break;
+        default: break;
+        }
+    }
+    return count;
+}
+
+void seg_bounds(const Seg *s, int n, float *minx, float *miny, float *maxx, float *maxy) {
+    if (n <= 0) { *minx = *miny = *maxx = *maxy = 0; return; }
+    float a = s[0].x0, b = s[0].y0, c = s[0].x0, d = s[0].y0;
+    for (int i = 0; i < n; i++) {
+        a = fminf(a, fminf(s[i].x0, s[i].x1)); c = fmaxf(c, fmaxf(s[i].x0, s[i].x1));
+        b = fminf(b, fminf(s[i].y0, s[i].y1)); d = fmaxf(d, fmaxf(s[i].y0, s[i].y1));
+    }
+    *minx = a; *miny = b; *maxx = c; *maxy = d;
+}
+
+void draw_segments(Image *im, const Seg *s, int n, int margin, int r, int g, int b) {
+    float minx, miny, maxx, maxy;
+    seg_bounds(s, n, &minx, &miny, &maxx, &maxy);
+    float aw = (float)(im->w - 1 - 2 * margin), ah = (float)(im->h - 1 - 2 * margin);
+    float bw = maxx - minx, bh = maxy - miny, scale;
+    if (bw > 0 && bh > 0) scale = fminf(aw / bw, ah / bh);
+    else if (bw > 0) scale = aw / bw;
+    else if (bh > 0) scale = ah / bh;
+    else scale = 1;
+    float ox = margin + (aw - bw * scale) / 2, oy = margin + (ah - bh * scale) / 2;
+    for (int i = 0; i < n; i++) {
+        int x0 = (int)floorf(ox + (s[i].x0 - minx) * scale + 0.5f);
+        int y0 = im->h - 1 - (int)floorf(oy + (s[i].y0 - miny) * scale + 0.5f);
+        int x1 = (int)floorf(ox + (s[i].x1 - minx) * scale + 0.5f);
+        int y1 = im->h - 1 - (int)floorf(oy + (s[i].y1 - miny) * scale + 0.5f);
+        img_line(im, x0, y0, x1, y1, r, g, b);
+    }
+}
+
+uint32_t rng_next(uint32_t *state) {
+    *state = *state * 1664525u + 1013904223u;
+    return hash32(*state);
+}
+
+typedef struct { const char *succ; int weight; } Choice;
+typedef struct { Choice choice[128][4]; int count[128]; } StochLSystem;
+
+/* one generation; out == NULL only counts. Returns the new length. */
+size_t stoch_pass(const StochLSystem *ls, const size_t rlen[128][4], const int total[128],
+                  const char *cur, size_t len, uint32_t *state, char *out) {
+    size_t w = 0;
+    for (size_t i = 0; i < len; i++) {
+        unsigned char c = (unsigned char)cur[i];
+        int k = 0;
+        if (ls->count[c] == 0) {
+            if (out) out[w] = (char)c;
+            w++;
+            continue;
+        }
+        if (ls->count[c] >= 2) {
+            int r = (int)(rng_next(state) % (uint32_t)total[c]), acc = 0;
+            for (k = 0; k < ls->count[c] - 1; k++) {
+                acc += ls->choice[c][k].weight;
+                if (acc > r) break;
+            }
+        }
+        if (out) memcpy(out + w, ls->choice[c][k].succ, rlen[c][k]);
+        w += rlen[c][k];
+    }
+    return w;
+}
+
+char *ls_expand_stochastic(const StochLSystem *ls, const char *axiom, int n, uint32_t seed, size_t *out_len) {
+    size_t rlen[128][4];
+    int total[128];
+    for (int c = 0; c < 128; c++) {
+        total[c] = 0;
+        for (int k = 0; k < ls->count[c]; k++) {
+            rlen[c][k] = strlen(ls->choice[c][k].succ);
+            total[c] += ls->choice[c][k].weight;
+        }
+    }
+    size_t len = strlen(axiom), cap_cur = len + 1, cap_nxt = len + 1;
+    char *cur = malloc(cap_cur), *nxt = malloc(cap_nxt);
+    memcpy(cur, axiom, len + 1);
+    uint32_t state = seed;
+    for (int g = 0; g < n; g++) {
+        uint32_t probe = state;
+        size_t need = stoch_pass(ls, rlen, total, cur, len, &probe, NULL);
+        if (need + 1 > cap_nxt) {
+            size_t nc = cap_nxt * 2 > need + 1 ? cap_nxt * 2 : need + 1;
+            free(nxt);
+            nxt = malloc(nc);
+            cap_nxt = nc;
+        }
+        len = stoch_pass(ls, rlen, total, cur, len, &state, nxt);
+        nxt[len] = '\0';
+        char *t = cur; cur = nxt; nxt = t;
+        size_t tc = cap_cur; cap_cur = cap_nxt; cap_nxt = tc;
+    }
+    free(nxt);
+    *out_len = len;
+    return cur;
+}
+
+typedef struct { char sym; float p; } Module;
+typedef struct { char sym; float mul, add; } PSucc;
+typedef struct { const PSucc *succ[128]; int n[128]; } PLSystem;
+
+int pls_expand(const PLSystem *ls, const Module *axiom, int na, int iterations, Module **out) {
+    *out = NULL;
+    uint64_t len[128], next[128], maxlen = (uint64_t)na;
+    for (int c = 0; c < 128; c++) len[c] = 1;
+    for (int g = 0; g < iterations; g++) {
+        for (int c = 0; c < 128; c++) {
+            if (ls->n[c] == 0) { next[c] = 1; continue; }
+            uint64_t s = 0;
+            for (int k = 0; k < ls->n[c]; k++) s = sat_add(s, len[(unsigned char)ls->succ[c][k].sym]);
+            next[c] = s;
+        }
+        memcpy(len, next, sizeof len);
+        uint64_t total = 0;
+        for (int i = 0; i < na; i++) total = sat_add(total, len[(unsigned char)axiom[i].sym]);
+        if (total > maxlen) maxlen = total;
+    }
+    if (maxlen > (1u << 24)) return -1;
+    Module *cur = malloc(sizeof(Module) * (maxlen ? maxlen : 1)), *nxt = malloc(sizeof(Module) * (maxlen ? maxlen : 1));
+    memcpy(cur, axiom, sizeof(Module) * na);
+    size_t count = (size_t)na;
+    for (int g = 0; g < iterations; g++) {
+        size_t w = 0;
+        for (size_t i = 0; i < count; i++) {
+            unsigned char c = (unsigned char)cur[i].sym;
+            if (ls->n[c] == 0) { nxt[w++] = cur[i]; continue; }
+            for (int k = 0; k < ls->n[c]; k++) {
+                const PSucc *ps = &ls->succ[c][k];
+                nxt[w].sym = ps->sym;
+                nxt[w].p = cur[i].p * ps->mul + ps->add;
+                w++;
+            }
+        }
+        Module *t = cur; cur = nxt; nxt = t;
+        count = w;
+    }
+    free(nxt);
+    *out = cur;
+    return (int)count;
+}
+
+typedef struct { Vec3 a, b, h, l, u; float r; int depth; } Branch;
+typedef struct { Vec3 pos, h, l, u; float size; } Leaf;
+
+void turtle3d_count(const Module *m, int n, int *nbranches, int *nleaves) {
+    int b = 0, l = 0;
+    for (int i = 0; i < n; i++) { b += m[i].sym == 'F'; l += m[i].sym == 'L'; }
+    *nbranches = b; *nleaves = l;
+}
+
+typedef struct { Vec3 p, h, l, u; float w; } Turtle3;
+
+/* rotate the pair (x, y) by angle a: x' = x c + y s, y' = y c - x s */
+void rot_pair(Vec3 *x, Vec3 *y, float a_deg) {
+    float a = a_deg * 3.14159265358979f / 180, c = cosf(a), s = sinf(a);
+    Vec3 nx = v3_add(v3_scale(*x, c), v3_scale(*y, s));
+    Vec3 ny = v3_sub(v3_scale(*y, c), v3_scale(*x, s));
+    *x = nx; *y = ny;
+}
+
+int turtle3d(const Module *m, int n, float width0, Branch *br, Leaf *lf) {
+    Turtle3 t = {v3(0, 0, 0), v3(0, 0, 1), v3(-1, 0, 0), v3(0, -1, 0), width0}, stack[64];
+    int sp = 0, nb = 0, nl = 0;
+    for (int i = 0; i < n; i++) {
+        float a = m[i].p;
+        Vec3 nu;
+        switch (m[i].sym) {
+        case 'F': {
+            Vec3 end = v3_add(t.p, v3_scale(t.h, a));
+            Branch b = {t.p, end, t.h, t.l, t.u, t.w / 2, sp};
+            br[nb++] = b;
+            t.p = end;
+            break;
+        }
+        case 'f': t.p = v3_add(t.p, v3_scale(t.h, a)); break;
+        case '+': rot_pair(&t.h, &t.l, a); break;
+        case '-': rot_pair(&t.h, &t.l, -a); break;
+        case '&': nu = v3_scale(t.u, -1); rot_pair(&t.h, &nu, a); t.u = v3_scale(nu, -1); break;
+        case '^': nu = v3_scale(t.u, -1); rot_pair(&t.h, &nu, -a); t.u = v3_scale(nu, -1); break;
+        case '\\': nu = v3_scale(t.u, -1); rot_pair(&t.l, &nu, a); t.u = v3_scale(nu, -1); break;
+        case '/': nu = v3_scale(t.u, -1); rot_pair(&t.l, &nu, -a); t.u = v3_scale(nu, -1); break;
+        case '|': t.h = v3_scale(t.h, -1); t.l = v3_scale(t.l, -1); break;
+        case '!': t.w = a; break;
+        case 'L': {
+            Leaf l = {t.p, t.h, t.l, t.u, a};
+            lf[nl++] = l;
+            break;
+        }
+        case '[':
+            if (sp == 64) return -1;
+            stack[sp++] = t;
+            break;
+        case ']':
+            if (sp == 0) return -1;
+            t = stack[--sp];
+            break;
+        default: break;
+        }
+    }
+    return 0;
+}
+
+/* ABOP figure 2.8 (ternary tree), as parametric productions:
+   A    -> !(1.732) F(50) [ &(18.95) F(50) A ] /(94.74) [ &(18.95) F(50) A ] /(132.63) [ &(18.95) F(50) A ]
+   F(l) -> F(1.109 l)          !(w) -> !(1.732 w) */
+static const PSucc TT_A[] = {
+    {'!', 0, 1.732f}, {'F', 0, 50}, {'[', 0, 0}, {'&', 0, 18.95f}, {'F', 0, 50}, {'A', 0, 0}, {']', 0, 0},
+    {'/', 0, 94.74f}, {'[', 0, 0}, {'&', 0, 18.95f}, {'F', 0, 50}, {'A', 0, 0}, {']', 0, 0},
+    {'/', 0, 132.63f}, {'[', 0, 0}, {'&', 0, 18.95f}, {'F', 0, 50}, {'A', 0, 0}, {']', 0, 0}};
+static const PSucc TT_F[] = {{'F', 1.109f, 0}};
+static const PSucc TT_W[] = {{'!', 1.732f, 0}};
+
+int main(void) {
+    PLSystem tt = {.succ = {['A'] = TT_A, ['F'] = TT_F, ['!'] = TT_W}, .n = {['A'] = 19, ['F'] = 1, ['!'] = 1}};
+    Module axiom[] = {{'!', 1}, {'F', 200}, {'/', 45}, {'A', 0}};
+    Module *m;
+    int n = pls_expand(&tt, axiom, 4, 6, &m);
+    int nb, nl;
+    turtle3d_count(m, n, &nb, &nl);
+    Branch *br = malloc(sizeof(Branch) * nb);
+    turtle3d(m, n, 1, br, NULL);
+    Seg *segs = malloc(sizeof(Seg) * nb);
+    for (int i = 0; i < nb; i++) {
+        Seg s = {br[i].a.x, br[i].a.z, br[i].b.x, br[i].b.z, br[i].depth};
+        segs[i] = s;
+    }
+    Image im = img_new(128, 128);
+    img_fill(&im, 244, 242, 234);
+    draw_segments(&im, segs, nb, 4, 80, 60, 40);
+    img_write_ppm(&im);
+    free(segs); free(br); free(m); img_free(&im);
+    return 0;
+}
+
+--- hint
+All six rotations are the same operation on a different pair of frame vectors: write one helper `rot_pair(Vec3 *x, Vec3 *y, float deg)` that does `x' = x c + y s, y' = y c - x s`, and call it with `(H, L)`, `(H, -U)` and `(L, -U)`.
+
+--- hint
+The stack holds whole turtle states (a struct), so push and pop are single struct assignments.
+
+--- harness
+static int vnear(Vec3 a, float x, float y, float z) { return fabsf(a.x - x) < 1e-4f && fabsf(a.y - y) < 1e-4f && fabsf(a.z - z) < 1e-4f; }
+static int frame_ok(Vec3 h, Vec3 l, Vec3 u) {
+    Vec3 c = v3_cross(h, l);
+    return fabsf(v3_len(h) - 1) < 1e-3f && fabsf(v3_len(l) - 1) < 1e-3f && fabsf(v3_dot(h, l)) < 1e-3f &&
+           fabsf(c.x - u.x) < 1e-3f && fabsf(c.y - u.y) < 1e-3f && fabsf(c.z - u.z) < 1e-3f;
+}
+int main(void) {
+    Module m1[] = {{'F', 2}, {'+', 90}, {'F', 1}, {'L', 0.5f}};
+    int nb, nl;
+    turtle3d_count(m1, 4, &nb, &nl);
+    CHECK(nb == 2 && nl == 1);
+    Branch br[16]; Leaf lf[16];
+    CHECK_INT(turtle3d(m1, 4, 0.4f, br, lf), 0);
+    CHECK(vnear(br[0].a, 0, 0, 0) && vnear(br[0].b, 0, 0, 2) && fabsf(br[0].r - 0.2f) < 1e-6f && br[0].depth == 0);
+    CHECK(vnear(br[1].a, 0, 0, 2) && vnear(br[1].b, -1, 0, 2));
+    CHECK(vnear(br[1].h, -1, 0, 0) && vnear(br[1].l, 0, 0, -1) && vnear(br[1].u, 0, -1, 0));
+    CHECK(vnear(lf[0].pos, -1, 0, 2) && fabsf(lf[0].size - 0.5f) < 1e-6f);
+
+    Module m2[] = {{'&', 90}, {'F', 1}, {'^', 90}, {'F', 1}};
+    CHECK_INT(turtle3d(m2, 4, 1, br, lf), 0);
+    CHECK(vnear(br[0].b, 0, 1, 0));        /* pitch down: heading toward -U = +y */
+    CHECK(vnear(br[0].u, 0, 0, 1));
+    CHECK(vnear(br[1].b, 0, 1, 1));
+
+    Module m3[] = {{'\\', 90}, {'+', 90}, {'F', 1}, {'/', 90}, {'/', 90}, {'|', 0}, {'F', 3}};
+    CHECK_INT(turtle3d(m3, 7, 1, br, lf), 0);
+    CHECK(vnear(br[0].l, 0, 0, -1) && vnear(br[0].u, -1, 0, 0));
+    CHECK(vnear(br[0].b, 0, 1, 0));
+    CHECK(vnear(br[1].a, 0, 1, 0) && vnear(br[1].b, 0, -2, 0));
+
+    Module m4[] = {{'!', 3}, {'[', 0}, {'-', 45}, {'!', 1}, {'F', 1}, {'[', 0}, {'F', 1}, {']', 0}, {']', 0}, {'f', 2}, {'F', 1}};
+    CHECK_INT(turtle3d(m4, 11, 9, br, lf), 0);
+    float k = 0.70710678f;
+    CHECK(vnear(br[0].b, k, 0, k) && fabsf(br[0].r - 0.5f) < 1e-6f && br[0].depth == 1);
+    CHECK(br[1].depth == 2 && vnear(br[1].b, 2 * k, 0, 2 * k));
+    CHECK(vnear(br[2].a, 0, 0, 2) && vnear(br[2].b, 0, 0, 3) && fabsf(br[2].r - 1.5f) < 1e-6f && br[2].depth == 0);
+
+    Module bad1[] = {{']', 0}};
+    CHECK_INT(turtle3d(bad1, 1, 1, br, lf), -1);
+    Module deep[65];
+    for (int i = 0; i < 65; i++) { deep[i].sym = '['; deep[i].p = 0; }
+    CHECK_INT(turtle3d(deep, 65, 1, br, lf), -1);
+    CHECK_INT(turtle3d(deep, 64, 1, br, lf), 0);
+
+    /* the ternary tree: counts, frames stay orthonormal, the trunk goes straight up */
+    static const PSucc A[] = {
+        {'!', 0, 1.732f}, {'F', 0, 50}, {'[', 0, 0}, {'&', 0, 18.95f}, {'F', 0, 50}, {'A', 0, 0}, {']', 0, 0},
+        {'/', 0, 94.74f}, {'[', 0, 0}, {'&', 0, 18.95f}, {'F', 0, 50}, {'A', 0, 0}, {']', 0, 0},
+        {'/', 0, 132.63f}, {'[', 0, 0}, {'&', 0, 18.95f}, {'F', 0, 50}, {'A', 0, 0}, {']', 0, 0}};
+    static const PSucc Fr[] = {{'F', 1.109f, 0}};
+    static const PSucc Wr[] = {{'!', 1.732f, 0}};
+    PLSystem tt = {.succ = {['A'] = A, ['F'] = Fr, ['!'] = Wr}, .n = {['A'] = 19, ['F'] = 1, ['!'] = 1}};
+    Module ax[] = {{'!', 1}, {'F', 200}, {'/', 45}, {'A', 0}};
+    Module *m;
+    int n = pls_expand(&tt, ax, 4, 6, &m);
+    turtle3d_count(m, n, &nb, &nl);
+    CHECK_INT(nb, 1 + 4 * (1 + 3 + 9 + 27 + 81 + 243));
+    CHECK_INT(nl, 0);
+    Branch *tb = malloc(sizeof(Branch) * nb);
+    CHECK_INT(turtle3d(m, n, 1, tb, NULL), 0);
+    CHECK(vnear(tb[0].a, 0, 0, 0) && fabsf(tb[0].b.z - 200 * powf(1.109f, 6)) < 0.05f);
+    CHECK(fabsf(tb[0].r - 0.5f * powf(1.732f, 6)) < 0.01f);
+    int ok = 1, up = 0;
+    float maxz = 0;
+    for (int i = 0; i < nb; i++) {
+        if (!frame_ok(tb[i].h, tb[i].l, tb[i].u)) ok = 0;
+        Vec3 d = v3_sub(tb[i].b, tb[i].a);
+        if (v3_dot(d, tb[i].h) < 0.999f * v3_len(d)) ok = 0;
+        up += d.z > 0;
+        maxz = fmaxf(maxz, tb[i].b.z);
+    }
+    CHECK(ok);
+    CHECK(up > nb * 3 / 4);
+    CHECK(maxz > 700 && maxz < 1200);
+    int last = nb - 1;
+    CHECK(tb[last].depth == 6);
+    free(tb); free(m);
+    return TEST_END();
+}
+
+=== exercise ls_branches
+title: L-systems 8: branches as cylinder meshes
+continues: ls_turtle3d
+--- prompt
+Turn each branch into a cylinder: a ring of `sides` vertices around `a` and another around `b`, joined by quads.
+
+```c
+typedef struct { int nverts, ntris; float *pos, *nrm; unsigned char *col; uint32_t *idx; } Mesh;
+int mesh_alloc(Mesh *m, int nverts, int ntris);     /* one allocation per array; sets the counts */
+void mesh_free(Mesh *m);
+int branch_mesh(const Branch *br, int n, int sides, Mesh *out);
+```
+
+`mesh_alloc` allocates `pos` and `nrm` (3 floats per vertex), `col` (3 bytes per vertex) and `idx` (3 per triangle), returns 1, or 0 if any allocation failed (freeing the others). `mesh_free` frees and zeroes.
+
+`branch_mesh` (`sides >= 3`) allocates exactly `2 * sides * n` vertices and `2 * sides * n` triangles, and for branch `k`, ring vertex `j` (`θ = 2π j / sides`, `d = L cos θ + U sin θ` using the branch's frame):
+
+- vertex `2 * sides * k + j` = `a + r d` and vertex `2 * sides * k + sides + j` = `b + r d`, both with normal `d`, color (110, 80, 50);
+- quad `j` (with `j1 = (j + 1) % sides`, `p = 2 * sides * k`, `q = p + sides`) is the triangles `(p + j, p + j1, q + j1)` and `(p + j, q + j1, q + j)`, stored at triangle index `2 * sides * k + 2 * j` and `+ 1`.
+
+That winding faces outward (counter-clockwise seen from outside). The cylinder's frame comes from the turtle, so neighboring rings line up and never twist.
+
+> **Performance:** a cylinder per branch is the naive approach used here; production tree generators (SpeedTree, ProcTree, Blender's Sapling) share rings between consecutive segments of a limb and drop the side count with distance. The sizes are still computed before the loop, which is the habit that matters.
+
+--- stubs
+typedef struct { int nverts, ntris; float *pos, *nrm; unsigned char *col; uint32_t *idx; } Mesh;
+
+int mesh_alloc(Mesh *m, int nverts, int ntris) {
+    (void)nverts; (void)ntris;
+    memset(m, 0, sizeof *m);
+    return 0;
+}
+
+void mesh_free(Mesh *m) {
+    (void)m;
+}
+
+int branch_mesh(const Branch *br, int n, int sides, Mesh *out) {
+    (void)br; (void)n; (void)sides;
+    memset(out, 0, sizeof *out);
+    return 0;
+}
+
+--- solution
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdint.h>
+#include <math.h>
+
+/* ===== From earlier chapters: vectors, hashing, images, line drawing ===== */
+
+typedef struct { float x, y, z; } Vec3;
+Vec3 v3(float x, float y, float z) { Vec3 r = {x, y, z}; return r; }
+Vec3 v3_add(Vec3 a, Vec3 b) { return v3(a.x + b.x, a.y + b.y, a.z + b.z); }
+Vec3 v3_sub(Vec3 a, Vec3 b) { return v3(a.x - b.x, a.y - b.y, a.z - b.z); }
+Vec3 v3_scale(Vec3 a, float s) { return v3(a.x * s, a.y * s, a.z * s); }
+float v3_dot(Vec3 a, Vec3 b) { return a.x * b.x + a.y * b.y + a.z * b.z; }
+Vec3 v3_cross(Vec3 a, Vec3 b) { return v3(a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x); }
+float v3_len(Vec3 a) { return sqrtf(v3_dot(a, a)); }
+Vec3 v3_norm(Vec3 a) { float l = v3_len(a); return l > 0 ? v3_scale(a, 1.0f / l) : a; }
+
+uint32_t hash32(uint32_t x) {            /* lowbias32 (Chris Wellons) */
+    x ^= x >> 16; x *= 0x7feb352dU; x ^= x >> 15; x *= 0x846ca68bU; x ^= x >> 16;
+    return x;
+}
+
+typedef struct { int w, h; unsigned char *px; } Image;      /* RGB, 3 bytes per pixel, row-major */
+Image img_new(int w, int h) { Image im = {w, h, calloc((size_t)w * h * 3, 1)}; return im; }
+void img_free(Image *im) { free(im->px); im->px = NULL; }
+void img_fill(Image *im, int r, int g, int b) {
+    for (size_t i = 0, n = (size_t)im->w * im->h; i < n; i++) {
+        im->px[3 * i] = (unsigned char)r; im->px[3 * i + 1] = (unsigned char)g; im->px[3 * i + 2] = (unsigned char)b;
+    }
+}
+void img_set(Image *im, int x, int y, int r, int g, int b) {   /* ignores pixels outside the image */
+    if (x < 0 || y < 0 || x >= im->w || y >= im->h) return;
+    unsigned char *p = im->px + ((size_t)y * im->w + x) * 3;
+    p[0] = (unsigned char)r; p[1] = (unsigned char)g; p[2] = (unsigned char)b;
+}
+void img_line(Image *im, int x0, int y0, int x1, int y1, int r, int g, int b) {   /* Bresenham */
+    int dx = abs(x1 - x0), sx = x0 < x1 ? 1 : -1, dy = -abs(y1 - y0), sy = y0 < y1 ? 1 : -1, err = dx + dy;
+    for (;;) {
+        img_set(im, x0, y0, r, g, b);
+        if (x0 == x1 && y0 == y1) break;
+        int e2 = 2 * err;
+        if (e2 >= dy) { err += dy; x0 += sx; }
+        if (e2 <= dx) { err += dx; y0 += sy; }
+    }
+}
+void img_write_ppm(const Image *im) {                       /* ASCII P3 to stdout: the site draws it */
+    printf("P3\n%d %d\n255\n", im->w, im->h);
+    for (int y = 0; y < im->h; y++) {
+        const unsigned char *p = im->px + (size_t)y * im->w * 3;
+        for (int x = 0; x < im->w * 3; x++) printf("%d%c", p[x], x + 1 < im->w * 3 ? ' ' : '\n');
+    }
+}
+
+/* ===== This chapter: an L-system is one successor string per symbol (NULL: the symbol stays) ===== */
+
+typedef struct { const char *rule[128]; } LSystem;
+
+uint64_t sat_add(uint64_t a, uint64_t b) { return a > UINT64_MAX - b ? UINT64_MAX : a + b; }
+
+uint64_t ls_length(const LSystem *ls, const char *axiom, int n) {
+    uint64_t len[128], next[128];
+    for (int c = 0; c < 128; c++) len[c] = 1;
+    for (int g = 0; g < n; g++) {
+        for (int c = 0; c < 128; c++) {
+            const char *r = ls->rule[c];
+            if (!r) { next[c] = 1; continue; }
+            uint64_t sum = 0;
+            for (const char *p = r; *p; p++) sum = sat_add(sum, len[(unsigned char)*p]);
+            next[c] = sum;
+        }
+        memcpy(len, next, sizeof len);
+    }
+    uint64_t total = 0;
+    for (const char *p = axiom; *p; p++) total = sat_add(total, len[(unsigned char)*p]);
+    return total;
+}
+
+char *ls_expand(const LSystem *ls, const char *axiom, int n, size_t *out_len) {
+    uint64_t maxlen = 0;
+    for (int g = 0; g <= n; g++) {
+        uint64_t l = ls_length(ls, axiom, g);
+        if (l > maxlen) maxlen = l;
+    }
+    if (maxlen > (1u << 28)) return NULL;
+    size_t rlen[128];
+    for (int c = 0; c < 128; c++) rlen[c] = ls->rule[c] ? strlen(ls->rule[c]) : 0;
+    char *cur = malloc(maxlen + 1), *nxt = malloc(maxlen + 1);
+    size_t len = strlen(axiom);
+    memcpy(cur, axiom, len + 1);
+    for (int g = 0; g < n; g++) {
+        size_t w = 0;
+        for (size_t i = 0; i < len; i++) {
+            unsigned char c = (unsigned char)cur[i];
+            const char *r = ls->rule[c];
+            if (r) { memcpy(nxt + w, r, rlen[c]); w += rlen[c]; }
+            else nxt[w++] = (char)c;
+        }
+        nxt[w] = '\0';
+        char *t = cur; cur = nxt; nxt = t;
+        len = w;
+    }
+    free(nxt);
+    *out_len = len;
+    return cur;
+}
+
+typedef struct { float x0, y0, x1, y1; int depth; } Seg;
+
+#define TURTLE_STACK 64
+
+int turtle2d(const char *s, float step, float angle_deg, float heading_deg, Seg *out, int cap) {
+    const float rad = 3.14159265358979f / 180;
+    float c = cosf(angle_deg * rad), sn = sinf(angle_deg * rad);
+    float x = 0, y = 0, dx = cosf(heading_deg * rad), dy = sinf(heading_deg * rad);
+    float stack[TURTLE_STACK][4];
+    int sp = 0, count = 0;
+    for (const char *p = s; *p; p++) {
+        float t;
+        switch (*p) {
+        case 'F': case 'G':
+            if (count < cap) {
+                Seg sg = {x, y, x + dx * step, y + dy * step, sp};
+                out[count] = sg;
+            }
+            count++;
+            x += dx * step; y += dy * step;
+            break;
+        case 'f': x += dx * step; y += dy * step; break;
+        case '+': t = dx * c - dy * sn; dy = dx * sn + dy * c; dx = t; break;
+        case '-': t = dx * c + dy * sn; dy = -dx * sn + dy * c; dx = t; break;
+        case '|': dx = -dx; dy = -dy; break;
+        case '[':
+            if (sp == TURTLE_STACK) return -1;
+            stack[sp][0] = x; stack[sp][1] = y; stack[sp][2] = dx; stack[sp][3] = dy; sp++;
+            break;
+        case ']':
+            if (sp == 0) return -1;
+            sp--; x = stack[sp][0]; y = stack[sp][1]; dx = stack[sp][2]; dy = stack[sp][3];
+            break;
+        default: break;
+        }
+    }
+    return count;
+}
+
+void seg_bounds(const Seg *s, int n, float *minx, float *miny, float *maxx, float *maxy) {
+    if (n <= 0) { *minx = *miny = *maxx = *maxy = 0; return; }
+    float a = s[0].x0, b = s[0].y0, c = s[0].x0, d = s[0].y0;
+    for (int i = 0; i < n; i++) {
+        a = fminf(a, fminf(s[i].x0, s[i].x1)); c = fmaxf(c, fmaxf(s[i].x0, s[i].x1));
+        b = fminf(b, fminf(s[i].y0, s[i].y1)); d = fmaxf(d, fmaxf(s[i].y0, s[i].y1));
+    }
+    *minx = a; *miny = b; *maxx = c; *maxy = d;
+}
+
+void draw_segments(Image *im, const Seg *s, int n, int margin, int r, int g, int b) {
+    float minx, miny, maxx, maxy;
+    seg_bounds(s, n, &minx, &miny, &maxx, &maxy);
+    float aw = (float)(im->w - 1 - 2 * margin), ah = (float)(im->h - 1 - 2 * margin);
+    float bw = maxx - minx, bh = maxy - miny, scale;
+    if (bw > 0 && bh > 0) scale = fminf(aw / bw, ah / bh);
+    else if (bw > 0) scale = aw / bw;
+    else if (bh > 0) scale = ah / bh;
+    else scale = 1;
+    float ox = margin + (aw - bw * scale) / 2, oy = margin + (ah - bh * scale) / 2;
+    for (int i = 0; i < n; i++) {
+        int x0 = (int)floorf(ox + (s[i].x0 - minx) * scale + 0.5f);
+        int y0 = im->h - 1 - (int)floorf(oy + (s[i].y0 - miny) * scale + 0.5f);
+        int x1 = (int)floorf(ox + (s[i].x1 - minx) * scale + 0.5f);
+        int y1 = im->h - 1 - (int)floorf(oy + (s[i].y1 - miny) * scale + 0.5f);
+        img_line(im, x0, y0, x1, y1, r, g, b);
+    }
+}
+
+uint32_t rng_next(uint32_t *state) {
+    *state = *state * 1664525u + 1013904223u;
+    return hash32(*state);
+}
+
+typedef struct { const char *succ; int weight; } Choice;
+typedef struct { Choice choice[128][4]; int count[128]; } StochLSystem;
+
+/* one generation; out == NULL only counts. Returns the new length. */
+size_t stoch_pass(const StochLSystem *ls, const size_t rlen[128][4], const int total[128],
+                  const char *cur, size_t len, uint32_t *state, char *out) {
+    size_t w = 0;
+    for (size_t i = 0; i < len; i++) {
+        unsigned char c = (unsigned char)cur[i];
+        int k = 0;
+        if (ls->count[c] == 0) {
+            if (out) out[w] = (char)c;
+            w++;
+            continue;
+        }
+        if (ls->count[c] >= 2) {
+            int r = (int)(rng_next(state) % (uint32_t)total[c]), acc = 0;
+            for (k = 0; k < ls->count[c] - 1; k++) {
+                acc += ls->choice[c][k].weight;
+                if (acc > r) break;
+            }
+        }
+        if (out) memcpy(out + w, ls->choice[c][k].succ, rlen[c][k]);
+        w += rlen[c][k];
+    }
+    return w;
+}
+
+char *ls_expand_stochastic(const StochLSystem *ls, const char *axiom, int n, uint32_t seed, size_t *out_len) {
+    size_t rlen[128][4];
+    int total[128];
+    for (int c = 0; c < 128; c++) {
+        total[c] = 0;
+        for (int k = 0; k < ls->count[c]; k++) {
+            rlen[c][k] = strlen(ls->choice[c][k].succ);
+            total[c] += ls->choice[c][k].weight;
+        }
+    }
+    size_t len = strlen(axiom), cap_cur = len + 1, cap_nxt = len + 1;
+    char *cur = malloc(cap_cur), *nxt = malloc(cap_nxt);
+    memcpy(cur, axiom, len + 1);
+    uint32_t state = seed;
+    for (int g = 0; g < n; g++) {
+        uint32_t probe = state;
+        size_t need = stoch_pass(ls, rlen, total, cur, len, &probe, NULL);
+        if (need + 1 > cap_nxt) {
+            size_t nc = cap_nxt * 2 > need + 1 ? cap_nxt * 2 : need + 1;
+            free(nxt);
+            nxt = malloc(nc);
+            cap_nxt = nc;
+        }
+        len = stoch_pass(ls, rlen, total, cur, len, &state, nxt);
+        nxt[len] = '\0';
+        char *t = cur; cur = nxt; nxt = t;
+        size_t tc = cap_cur; cap_cur = cap_nxt; cap_nxt = tc;
+    }
+    free(nxt);
+    *out_len = len;
+    return cur;
+}
+
+typedef struct { char sym; float p; } Module;
+typedef struct { char sym; float mul, add; } PSucc;
+typedef struct { const PSucc *succ[128]; int n[128]; } PLSystem;
+
+int pls_expand(const PLSystem *ls, const Module *axiom, int na, int iterations, Module **out) {
+    *out = NULL;
+    uint64_t len[128], next[128], maxlen = (uint64_t)na;
+    for (int c = 0; c < 128; c++) len[c] = 1;
+    for (int g = 0; g < iterations; g++) {
+        for (int c = 0; c < 128; c++) {
+            if (ls->n[c] == 0) { next[c] = 1; continue; }
+            uint64_t s = 0;
+            for (int k = 0; k < ls->n[c]; k++) s = sat_add(s, len[(unsigned char)ls->succ[c][k].sym]);
+            next[c] = s;
+        }
+        memcpy(len, next, sizeof len);
+        uint64_t total = 0;
+        for (int i = 0; i < na; i++) total = sat_add(total, len[(unsigned char)axiom[i].sym]);
+        if (total > maxlen) maxlen = total;
+    }
+    if (maxlen > (1u << 24)) return -1;
+    Module *cur = malloc(sizeof(Module) * (maxlen ? maxlen : 1)), *nxt = malloc(sizeof(Module) * (maxlen ? maxlen : 1));
+    memcpy(cur, axiom, sizeof(Module) * na);
+    size_t count = (size_t)na;
+    for (int g = 0; g < iterations; g++) {
+        size_t w = 0;
+        for (size_t i = 0; i < count; i++) {
+            unsigned char c = (unsigned char)cur[i].sym;
+            if (ls->n[c] == 0) { nxt[w++] = cur[i]; continue; }
+            for (int k = 0; k < ls->n[c]; k++) {
+                const PSucc *ps = &ls->succ[c][k];
+                nxt[w].sym = ps->sym;
+                nxt[w].p = cur[i].p * ps->mul + ps->add;
+                w++;
+            }
+        }
+        Module *t = cur; cur = nxt; nxt = t;
+        count = w;
+    }
+    free(nxt);
+    *out = cur;
+    return (int)count;
+}
+
+typedef struct { Vec3 a, b, h, l, u; float r; int depth; } Branch;
+typedef struct { Vec3 pos, h, l, u; float size; } Leaf;
+
+void turtle3d_count(const Module *m, int n, int *nbranches, int *nleaves) {
+    int b = 0, l = 0;
+    for (int i = 0; i < n; i++) { b += m[i].sym == 'F'; l += m[i].sym == 'L'; }
+    *nbranches = b; *nleaves = l;
+}
+
+typedef struct { Vec3 p, h, l, u; float w; } Turtle3;
+
+/* rotate the pair (x, y) by angle a: x' = x c + y s, y' = y c - x s */
+void rot_pair(Vec3 *x, Vec3 *y, float a_deg) {
+    float a = a_deg * 3.14159265358979f / 180, c = cosf(a), s = sinf(a);
+    Vec3 nx = v3_add(v3_scale(*x, c), v3_scale(*y, s));
+    Vec3 ny = v3_sub(v3_scale(*y, c), v3_scale(*x, s));
+    *x = nx; *y = ny;
+}
+
+int turtle3d(const Module *m, int n, float width0, Branch *br, Leaf *lf) {
+    Turtle3 t = {v3(0, 0, 0), v3(0, 0, 1), v3(-1, 0, 0), v3(0, -1, 0), width0}, stack[64];
+    int sp = 0, nb = 0, nl = 0;
+    for (int i = 0; i < n; i++) {
+        float a = m[i].p;
+        Vec3 nu;
+        switch (m[i].sym) {
+        case 'F': {
+            Vec3 end = v3_add(t.p, v3_scale(t.h, a));
+            Branch b = {t.p, end, t.h, t.l, t.u, t.w / 2, sp};
+            br[nb++] = b;
+            t.p = end;
+            break;
+        }
+        case 'f': t.p = v3_add(t.p, v3_scale(t.h, a)); break;
+        case '+': rot_pair(&t.h, &t.l, a); break;
+        case '-': rot_pair(&t.h, &t.l, -a); break;
+        case '&': nu = v3_scale(t.u, -1); rot_pair(&t.h, &nu, a); t.u = v3_scale(nu, -1); break;
+        case '^': nu = v3_scale(t.u, -1); rot_pair(&t.h, &nu, -a); t.u = v3_scale(nu, -1); break;
+        case '\\': nu = v3_scale(t.u, -1); rot_pair(&t.l, &nu, a); t.u = v3_scale(nu, -1); break;
+        case '/': nu = v3_scale(t.u, -1); rot_pair(&t.l, &nu, -a); t.u = v3_scale(nu, -1); break;
+        case '|': t.h = v3_scale(t.h, -1); t.l = v3_scale(t.l, -1); break;
+        case '!': t.w = a; break;
+        case 'L': {
+            Leaf l = {t.p, t.h, t.l, t.u, a};
+            lf[nl++] = l;
+            break;
+        }
+        case '[':
+            if (sp == 64) return -1;
+            stack[sp++] = t;
+            break;
+        case ']':
+            if (sp == 0) return -1;
+            t = stack[--sp];
+            break;
+        default: break;
+        }
+    }
+    return 0;
+}
+
+typedef struct { int nverts, ntris; float *pos, *nrm; unsigned char *col; uint32_t *idx; } Mesh;
+
+int mesh_alloc(Mesh *m, int nverts, int ntris) {
+    m->nverts = nverts; m->ntris = ntris;
+    m->pos = malloc(sizeof(float) * 3 * (size_t)(nverts ? nverts : 1));
+    m->nrm = malloc(sizeof(float) * 3 * (size_t)(nverts ? nverts : 1));
+    m->col = malloc(3 * (size_t)(nverts ? nverts : 1));
+    m->idx = malloc(sizeof(uint32_t) * 3 * (size_t)(ntris ? ntris : 1));
+    if (!m->pos || !m->nrm || !m->col || !m->idx) {
+        free(m->pos); free(m->nrm); free(m->col); free(m->idx);
+        memset(m, 0, sizeof *m);
+        return 0;
+    }
+    return 1;
+}
+
+void mesh_free(Mesh *m) {
+    free(m->pos); free(m->nrm); free(m->col); free(m->idx);
+    memset(m, 0, sizeof *m);
+}
+
+void mesh_set_vertex(Mesh *m, int v, Vec3 p, Vec3 n, int r, int g, int b) {
+    m->pos[3 * v] = p.x; m->pos[3 * v + 1] = p.y; m->pos[3 * v + 2] = p.z;
+    m->nrm[3 * v] = n.x; m->nrm[3 * v + 1] = n.y; m->nrm[3 * v + 2] = n.z;
+    m->col[3 * v] = (unsigned char)r; m->col[3 * v + 1] = (unsigned char)g; m->col[3 * v + 2] = (unsigned char)b;
+}
+
+/* writes branches starting at vertex 0 / triangle 0 of an already allocated mesh */
+void branch_mesh_into(const Branch *br, int n, int sides, Mesh *out) {
+    for (int k = 0; k < n; k++) {
+        int p = 2 * sides * k, q = p + sides;
+        for (int j = 0; j < sides; j++) {
+            float th = 6.28318530718f * j / sides;
+            Vec3 d = v3_add(v3_scale(br[k].l, cosf(th)), v3_scale(br[k].u, sinf(th)));
+            mesh_set_vertex(out, p + j, v3_add(br[k].a, v3_scale(d, br[k].r)), d, 110, 80, 50);
+            mesh_set_vertex(out, q + j, v3_add(br[k].b, v3_scale(d, br[k].r)), d, 110, 80, 50);
+            int j1 = (j + 1) % sides;
+            uint32_t *t = out->idx + 3 * (size_t)(2 * sides * k + 2 * j);
+            t[0] = (uint32_t)(p + j); t[1] = (uint32_t)(p + j1); t[2] = (uint32_t)(q + j1);
+            t[3] = (uint32_t)(p + j); t[4] = (uint32_t)(q + j1); t[5] = (uint32_t)(q + j);
+        }
+    }
+}
+
+int branch_mesh(const Branch *br, int n, int sides, Mesh *out) {
+    if (!mesh_alloc(out, 2 * sides * n, 2 * sides * n)) return 0;
+    branch_mesh_into(br, n, sides, out);
+    return 1;
+}
+
+static const PSucc TT_A[] = {
+    {'!', 0, 1.732f}, {'F', 0, 50}, {'[', 0, 0}, {'&', 0, 18.95f}, {'F', 0, 50}, {'A', 0, 0}, {']', 0, 0},
+    {'/', 0, 94.74f}, {'[', 0, 0}, {'&', 0, 18.95f}, {'F', 0, 50}, {'A', 0, 0}, {']', 0, 0},
+    {'/', 0, 132.63f}, {'[', 0, 0}, {'&', 0, 18.95f}, {'F', 0, 50}, {'A', 0, 0}, {']', 0, 0}};
+static const PSucc TT_F[] = {{'F', 1.109f, 0}};
+static const PSucc TT_W[] = {{'!', 1.732f, 0}};
+
+int main(void) {
+    /* the tree's cylinder mesh as a point cloud seen from the front, shaded by normal.y */
+    PLSystem tt = {.succ = {['A'] = TT_A, ['F'] = TT_F, ['!'] = TT_W}, .n = {['A'] = 19, ['F'] = 1, ['!'] = 1}};
+    Module axiom[] = {{'!', 1}, {'F', 200}, {'/', 45}, {'A', 0}};
+    Module *m;
+    int n = pls_expand(&tt, axiom, 4, 5, &m), nb, nl;
+    turtle3d_count(m, n, &nb, &nl);
+    Branch *br = malloc(sizeof(Branch) * nb);
+    turtle3d(m, n, 1, br, NULL);
+    Mesh me;
+    branch_mesh(br, nb, 8, &me);
+    Image im = img_new(128, 128);
+    img_fill(&im, 244, 242, 234);
+    for (int v = 0; v < me.nverts; v++) {
+        int x = 64 + (int)(me.pos[3 * v] * 0.11f), y = 124 - (int)(me.pos[3 * v + 2] * 0.11f);
+        int c = (int)(90 + 80 * -me.nrm[3 * v + 1]);
+        img_set(&im, x, y, c, c * 3 / 4, c / 2);
+    }
+    img_write_ppm(&im);
+    mesh_free(&me); free(br); free(m); img_free(&im);
+    return 0;
+}
+
+--- hint
+`Vec3 d = v3_add(v3_scale(l, cosf(th)), v3_scale(u, sinf(th)));` then the two vertices are `a + r d` and `b + r d`.
+
+--- hint
+Write the vertex and triangle loops so that `branch_mesh` itself only allocates and calls a function that fills a mesh from vertex 0; step 9 reuses that function for a combined mesh.
+
+--- harness
+int main(void) {
+    Mesh m;
+    CHECK_INT(mesh_alloc(&m, 5, 2), 1);
+    CHECK(m.nverts == 5 && m.ntris == 2 && m.pos && m.nrm && m.col && m.idx);
+    m.idx[5] = 7; m.col[14] = 1; m.pos[14] = 1; m.nrm[14] = 1;
+    mesh_free(&m);
+    CHECK(m.pos == NULL && m.idx == NULL && m.nverts == 0);
+
+    Branch b = {v3(1, 2, 3), v3(1, 2, 5), v3(0, 0, 1), v3(-1, 0, 0), v3(0, -1, 0), 0.5f, 0};
+    CHECK_INT(branch_mesh(&b, 1, 4, &m), 1);
+    CHECK_INT(m.nverts, 8);
+    CHECK_INT(m.ntris, 8);
+    if (m.nverts == 8) {
+        CHECK(fabsf(m.pos[0] - 0.5f) < 1e-5f && fabsf(m.pos[1] - 2) < 1e-5f && fabsf(m.pos[2] - 3) < 1e-5f);
+        CHECK(fabsf(m.pos[3] - 1) < 1e-5f && fabsf(m.pos[4] - 1.5f) < 1e-5f && fabsf(m.pos[5] - 3) < 1e-5f);
+        CHECK(fabsf(m.pos[3 * 6] - 1.5f) < 1e-5f && fabsf(m.pos[3 * 6 + 2] - 5) < 1e-5f);
+        CHECK(fabsf(m.nrm[3 * 5] - 0) < 1e-5f && fabsf(m.nrm[3 * 5 + 1] + 1) < 1e-5f);
+        CHECK(m.col[0] == 110 && m.col[1] == 80 && m.col[2] == 50 && m.col[23] == 50);
+        uint32_t want[24] = {0, 1, 5, 0, 5, 4, 1, 2, 6, 1, 6, 5, 2, 3, 7, 2, 7, 6, 3, 0, 4, 3, 4, 7};
+        int ok = 1;
+        for (int i = 0; i < 24; i++) if (m.idx[i] != want[i]) ok = 0;
+        CHECK(ok);
+    }
+    mesh_free(&m);
+
+    /* tilted branches from the turtle: every vertex at distance r from the axis, normals unit and radial, outward winding */
+    Module mods[] = {{'!', 2}, {'F', 3}, {'[', 0}, {'&', 40}, {'+', 25}, {'!', 1}, {'F', 2}, {']', 0}, {'/', 70}, {'^', 30}, {'F', 1.5f}};
+    int nb, nl;
+    turtle3d_count(mods, 11, &nb, &nl);
+    Branch br[3];
+    turtle3d(mods, 11, 1, br, NULL);
+    CHECK_INT(branch_mesh(br, nb, 7, &m), 1);
+    CHECK_INT(m.nverts, 2 * 7 * 3);
+    CHECK_INT(m.ntris, 2 * 7 * 3);
+    int ok = 1;
+    for (int k = 0; k < 3 && m.nverts == 42; k++) {
+        for (int j = 0; j < 14; j++) {
+            int v = 14 * k + j;
+            Vec3 p = v3(m.pos[3 * v], m.pos[3 * v + 1], m.pos[3 * v + 2]), nn = v3(m.nrm[3 * v], m.nrm[3 * v + 1], m.nrm[3 * v + 2]);
+            Vec3 rel = v3_sub(p, br[k].a);
+            Vec3 radial = v3_sub(rel, v3_scale(br[k].h, v3_dot(rel, br[k].h)));
+            if (fabsf(v3_len(radial) - br[k].r) > 1e-4f) ok = 0;
+            if (fabsf(v3_len(nn) - 1) > 1e-4f || fabsf(v3_dot(nn, br[k].h)) > 1e-4f) ok = 0;
+            if (v3_dot(nn, radial) < 0.999f * br[k].r) ok = 0;
+        }
+        for (int t = 0; t < 14; t++) {
+            const uint32_t *ti = m.idx + 3 * (14 * k + t);
+            Vec3 p0 = v3(m.pos[3 * ti[0]], m.pos[3 * ti[0] + 1], m.pos[3 * ti[0] + 2]);
+            Vec3 p1 = v3(m.pos[3 * ti[1]], m.pos[3 * ti[1] + 1], m.pos[3 * ti[1] + 2]);
+            Vec3 p2 = v3(m.pos[3 * ti[2]], m.pos[3 * ti[2] + 1], m.pos[3 * ti[2] + 2]);
+            Vec3 fn = v3_cross(v3_sub(p1, p0), v3_sub(p2, p0));
+            Vec3 c = v3_scale(v3_add(v3_add(p0, p1), p2), 1.0f / 3);
+            Vec3 rel = v3_sub(c, br[k].a);
+            Vec3 radial = v3_sub(rel, v3_scale(br[k].h, v3_dot(rel, br[k].h)));
+            if (v3_dot(fn, radial) <= 0) ok = 0;
+            if (ti[0] < (uint32_t)(14 * k) || ti[0] >= (uint32_t)(14 * k + 14)) ok = 0;
+        }
+    }
+    CHECK(ok);
+    CHECK(fabsf(br[1].r - 0.5f) < 1e-6f && fabsf(br[0].r - 1) < 1e-6f);
+    mesh_free(&m);
+
+    CHECK_INT(branch_mesh(br, 0, 6, &m), 1);
+    CHECK_INT(m.nverts, 0);
+    mesh_free(&m);
+    return TEST_END();
+}
+
+=== exercise ls_tree
+title: L-systems 9: leaves and one combined tree mesh
+continues: ls_branches
+--- prompt
+Add leaves and produce the whole tree as **one** mesh (one vertex buffer, one index buffer, one draw call):
+
+```c
+int tree_mesh(const Branch *br, int nb, const Leaf *lf, int nl, int sides, Mesh *out);
+```
+
+Allocate once: `2 * sides * nb + 4 * nl` vertices and `2 * sides * nb + 2 * nl` triangles. Branches come first, exactly as in step 8. Then leaf `i`, with base vertex `v = 2 * sides * nb + 4 * i` and size `s`, is a diamond in its frame's H-L plane:
+
+| vertex | position |
+|---|---|
+| `v + 0` | `pos` |
+| `v + 1` | `pos + 0.5 s H + 0.3 s L` |
+| `v + 2` | `pos + s H` |
+| `v + 3` | `pos + 0.5 s H - 0.3 s L` |
+
+All four have normal `U` and color `(60 + h % 40, 130 + h / 40 % 50, 40)` with `h = hash32(i) % 2000`: a little per-leaf variation, deterministic. Its triangles (at triangle index `2 * sides * nb + 2 * i` and `+ 1`) are `(v, v + 3, v + 2)` and `(v, v + 2, v + 1)`.
+
+**Run** grows ABOP's ternary tree with a leaf `L(40)` at the tip of every new branch and prints how big the mesh is; step 10 draws it.
+
+--- stubs
+int tree_mesh(const Branch *br, int nb, const Leaf *lf, int nl, int sides, Mesh *out) {
+    (void)br; (void)nb; (void)lf; (void)nl; (void)sides;
+    memset(out, 0, sizeof *out);
+    return 0;
+}
+
+/* the ternary tree with a leaf at every new branch tip */
+static const PSucc TREE_A[] = {
+    {'!', 0, 1.732f}, {'F', 0, 50}, {'[', 0, 0}, {'&', 0, 18.95f}, {'F', 0, 50}, {'L', 0, 40}, {'A', 0, 0}, {']', 0, 0},
+    {'/', 0, 94.74f}, {'[', 0, 0}, {'&', 0, 18.95f}, {'F', 0, 50}, {'L', 0, 40}, {'A', 0, 0}, {']', 0, 0},
+    {'/', 0, 132.63f}, {'[', 0, 0}, {'&', 0, 18.95f}, {'F', 0, 50}, {'L', 0, 40}, {'A', 0, 0}, {']', 0, 0}};
+static const PSucc TREE_F[] = {{'F', 1.109f, 0}};
+static const PSucc TREE_W[] = {{'!', 1.732f, 0}};
+
+int build_tree(int generations, int sides, Mesh *out) {
+    PLSystem tt = {.succ = {['A'] = TREE_A, ['F'] = TREE_F, ['!'] = TREE_W}, .n = {['A'] = 22, ['F'] = 1, ['!'] = 1}};
+    Module axiom[] = {{'!', 1}, {'F', 200}, {'/', 45}, {'A', 0}};
+    Module *m;
+    int n = pls_expand(&tt, axiom, 4, generations, &m), nb, nl;
+    if (n < 0) return 0;
+    turtle3d_count(m, n, &nb, &nl);
+    Branch *br = malloc(sizeof(Branch) * (nb ? nb : 1));
+    Leaf *lf = malloc(sizeof(Leaf) * (nl ? nl : 1));
+    int ok = turtle3d(m, n, 1, br, lf) == 0 && tree_mesh(br, nb, lf, nl, sides, out);
+    free(br); free(lf); free(m);
+    return ok;
+}
+
+--- solution
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdint.h>
+#include <math.h>
+
+/* ===== From earlier chapters: vectors, hashing, images, line drawing ===== */
+
+typedef struct { float x, y, z; } Vec3;
+Vec3 v3(float x, float y, float z) { Vec3 r = {x, y, z}; return r; }
+Vec3 v3_add(Vec3 a, Vec3 b) { return v3(a.x + b.x, a.y + b.y, a.z + b.z); }
+Vec3 v3_sub(Vec3 a, Vec3 b) { return v3(a.x - b.x, a.y - b.y, a.z - b.z); }
+Vec3 v3_scale(Vec3 a, float s) { return v3(a.x * s, a.y * s, a.z * s); }
+float v3_dot(Vec3 a, Vec3 b) { return a.x * b.x + a.y * b.y + a.z * b.z; }
+Vec3 v3_cross(Vec3 a, Vec3 b) { return v3(a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x); }
+float v3_len(Vec3 a) { return sqrtf(v3_dot(a, a)); }
+Vec3 v3_norm(Vec3 a) { float l = v3_len(a); return l > 0 ? v3_scale(a, 1.0f / l) : a; }
+
+uint32_t hash32(uint32_t x) {            /* lowbias32 (Chris Wellons) */
+    x ^= x >> 16; x *= 0x7feb352dU; x ^= x >> 15; x *= 0x846ca68bU; x ^= x >> 16;
+    return x;
+}
+
+typedef struct { int w, h; unsigned char *px; } Image;      /* RGB, 3 bytes per pixel, row-major */
+Image img_new(int w, int h) { Image im = {w, h, calloc((size_t)w * h * 3, 1)}; return im; }
+void img_free(Image *im) { free(im->px); im->px = NULL; }
+void img_fill(Image *im, int r, int g, int b) {
+    for (size_t i = 0, n = (size_t)im->w * im->h; i < n; i++) {
+        im->px[3 * i] = (unsigned char)r; im->px[3 * i + 1] = (unsigned char)g; im->px[3 * i + 2] = (unsigned char)b;
+    }
+}
+void img_set(Image *im, int x, int y, int r, int g, int b) {   /* ignores pixels outside the image */
+    if (x < 0 || y < 0 || x >= im->w || y >= im->h) return;
+    unsigned char *p = im->px + ((size_t)y * im->w + x) * 3;
+    p[0] = (unsigned char)r; p[1] = (unsigned char)g; p[2] = (unsigned char)b;
+}
+void img_line(Image *im, int x0, int y0, int x1, int y1, int r, int g, int b) {   /* Bresenham */
+    int dx = abs(x1 - x0), sx = x0 < x1 ? 1 : -1, dy = -abs(y1 - y0), sy = y0 < y1 ? 1 : -1, err = dx + dy;
+    for (;;) {
+        img_set(im, x0, y0, r, g, b);
+        if (x0 == x1 && y0 == y1) break;
+        int e2 = 2 * err;
+        if (e2 >= dy) { err += dy; x0 += sx; }
+        if (e2 <= dx) { err += dx; y0 += sy; }
+    }
+}
+void img_write_ppm(const Image *im) {                       /* ASCII P3 to stdout: the site draws it */
+    printf("P3\n%d %d\n255\n", im->w, im->h);
+    for (int y = 0; y < im->h; y++) {
+        const unsigned char *p = im->px + (size_t)y * im->w * 3;
+        for (int x = 0; x < im->w * 3; x++) printf("%d%c", p[x], x + 1 < im->w * 3 ? ' ' : '\n');
+    }
+}
+
+/* ===== This chapter: an L-system is one successor string per symbol (NULL: the symbol stays) ===== */
+
+typedef struct { const char *rule[128]; } LSystem;
+
+uint64_t sat_add(uint64_t a, uint64_t b) { return a > UINT64_MAX - b ? UINT64_MAX : a + b; }
+
+uint64_t ls_length(const LSystem *ls, const char *axiom, int n) {
+    uint64_t len[128], next[128];
+    for (int c = 0; c < 128; c++) len[c] = 1;
+    for (int g = 0; g < n; g++) {
+        for (int c = 0; c < 128; c++) {
+            const char *r = ls->rule[c];
+            if (!r) { next[c] = 1; continue; }
+            uint64_t sum = 0;
+            for (const char *p = r; *p; p++) sum = sat_add(sum, len[(unsigned char)*p]);
+            next[c] = sum;
+        }
+        memcpy(len, next, sizeof len);
+    }
+    uint64_t total = 0;
+    for (const char *p = axiom; *p; p++) total = sat_add(total, len[(unsigned char)*p]);
+    return total;
+}
+
+char *ls_expand(const LSystem *ls, const char *axiom, int n, size_t *out_len) {
+    uint64_t maxlen = 0;
+    for (int g = 0; g <= n; g++) {
+        uint64_t l = ls_length(ls, axiom, g);
+        if (l > maxlen) maxlen = l;
+    }
+    if (maxlen > (1u << 28)) return NULL;
+    size_t rlen[128];
+    for (int c = 0; c < 128; c++) rlen[c] = ls->rule[c] ? strlen(ls->rule[c]) : 0;
+    char *cur = malloc(maxlen + 1), *nxt = malloc(maxlen + 1);
+    size_t len = strlen(axiom);
+    memcpy(cur, axiom, len + 1);
+    for (int g = 0; g < n; g++) {
+        size_t w = 0;
+        for (size_t i = 0; i < len; i++) {
+            unsigned char c = (unsigned char)cur[i];
+            const char *r = ls->rule[c];
+            if (r) { memcpy(nxt + w, r, rlen[c]); w += rlen[c]; }
+            else nxt[w++] = (char)c;
+        }
+        nxt[w] = '\0';
+        char *t = cur; cur = nxt; nxt = t;
+        len = w;
+    }
+    free(nxt);
+    *out_len = len;
+    return cur;
+}
+
+typedef struct { float x0, y0, x1, y1; int depth; } Seg;
+
+#define TURTLE_STACK 64
+
+int turtle2d(const char *s, float step, float angle_deg, float heading_deg, Seg *out, int cap) {
+    const float rad = 3.14159265358979f / 180;
+    float c = cosf(angle_deg * rad), sn = sinf(angle_deg * rad);
+    float x = 0, y = 0, dx = cosf(heading_deg * rad), dy = sinf(heading_deg * rad);
+    float stack[TURTLE_STACK][4];
+    int sp = 0, count = 0;
+    for (const char *p = s; *p; p++) {
+        float t;
+        switch (*p) {
+        case 'F': case 'G':
+            if (count < cap) {
+                Seg sg = {x, y, x + dx * step, y + dy * step, sp};
+                out[count] = sg;
+            }
+            count++;
+            x += dx * step; y += dy * step;
+            break;
+        case 'f': x += dx * step; y += dy * step; break;
+        case '+': t = dx * c - dy * sn; dy = dx * sn + dy * c; dx = t; break;
+        case '-': t = dx * c + dy * sn; dy = -dx * sn + dy * c; dx = t; break;
+        case '|': dx = -dx; dy = -dy; break;
+        case '[':
+            if (sp == TURTLE_STACK) return -1;
+            stack[sp][0] = x; stack[sp][1] = y; stack[sp][2] = dx; stack[sp][3] = dy; sp++;
+            break;
+        case ']':
+            if (sp == 0) return -1;
+            sp--; x = stack[sp][0]; y = stack[sp][1]; dx = stack[sp][2]; dy = stack[sp][3];
+            break;
+        default: break;
+        }
+    }
+    return count;
+}
+
+void seg_bounds(const Seg *s, int n, float *minx, float *miny, float *maxx, float *maxy) {
+    if (n <= 0) { *minx = *miny = *maxx = *maxy = 0; return; }
+    float a = s[0].x0, b = s[0].y0, c = s[0].x0, d = s[0].y0;
+    for (int i = 0; i < n; i++) {
+        a = fminf(a, fminf(s[i].x0, s[i].x1)); c = fmaxf(c, fmaxf(s[i].x0, s[i].x1));
+        b = fminf(b, fminf(s[i].y0, s[i].y1)); d = fmaxf(d, fmaxf(s[i].y0, s[i].y1));
+    }
+    *minx = a; *miny = b; *maxx = c; *maxy = d;
+}
+
+void draw_segments(Image *im, const Seg *s, int n, int margin, int r, int g, int b) {
+    float minx, miny, maxx, maxy;
+    seg_bounds(s, n, &minx, &miny, &maxx, &maxy);
+    float aw = (float)(im->w - 1 - 2 * margin), ah = (float)(im->h - 1 - 2 * margin);
+    float bw = maxx - minx, bh = maxy - miny, scale;
+    if (bw > 0 && bh > 0) scale = fminf(aw / bw, ah / bh);
+    else if (bw > 0) scale = aw / bw;
+    else if (bh > 0) scale = ah / bh;
+    else scale = 1;
+    float ox = margin + (aw - bw * scale) / 2, oy = margin + (ah - bh * scale) / 2;
+    for (int i = 0; i < n; i++) {
+        int x0 = (int)floorf(ox + (s[i].x0 - minx) * scale + 0.5f);
+        int y0 = im->h - 1 - (int)floorf(oy + (s[i].y0 - miny) * scale + 0.5f);
+        int x1 = (int)floorf(ox + (s[i].x1 - minx) * scale + 0.5f);
+        int y1 = im->h - 1 - (int)floorf(oy + (s[i].y1 - miny) * scale + 0.5f);
+        img_line(im, x0, y0, x1, y1, r, g, b);
+    }
+}
+
+uint32_t rng_next(uint32_t *state) {
+    *state = *state * 1664525u + 1013904223u;
+    return hash32(*state);
+}
+
+typedef struct { const char *succ; int weight; } Choice;
+typedef struct { Choice choice[128][4]; int count[128]; } StochLSystem;
+
+/* one generation; out == NULL only counts. Returns the new length. */
+size_t stoch_pass(const StochLSystem *ls, const size_t rlen[128][4], const int total[128],
+                  const char *cur, size_t len, uint32_t *state, char *out) {
+    size_t w = 0;
+    for (size_t i = 0; i < len; i++) {
+        unsigned char c = (unsigned char)cur[i];
+        int k = 0;
+        if (ls->count[c] == 0) {
+            if (out) out[w] = (char)c;
+            w++;
+            continue;
+        }
+        if (ls->count[c] >= 2) {
+            int r = (int)(rng_next(state) % (uint32_t)total[c]), acc = 0;
+            for (k = 0; k < ls->count[c] - 1; k++) {
+                acc += ls->choice[c][k].weight;
+                if (acc > r) break;
+            }
+        }
+        if (out) memcpy(out + w, ls->choice[c][k].succ, rlen[c][k]);
+        w += rlen[c][k];
+    }
+    return w;
+}
+
+char *ls_expand_stochastic(const StochLSystem *ls, const char *axiom, int n, uint32_t seed, size_t *out_len) {
+    size_t rlen[128][4];
+    int total[128];
+    for (int c = 0; c < 128; c++) {
+        total[c] = 0;
+        for (int k = 0; k < ls->count[c]; k++) {
+            rlen[c][k] = strlen(ls->choice[c][k].succ);
+            total[c] += ls->choice[c][k].weight;
+        }
+    }
+    size_t len = strlen(axiom), cap_cur = len + 1, cap_nxt = len + 1;
+    char *cur = malloc(cap_cur), *nxt = malloc(cap_nxt);
+    memcpy(cur, axiom, len + 1);
+    uint32_t state = seed;
+    for (int g = 0; g < n; g++) {
+        uint32_t probe = state;
+        size_t need = stoch_pass(ls, rlen, total, cur, len, &probe, NULL);
+        if (need + 1 > cap_nxt) {
+            size_t nc = cap_nxt * 2 > need + 1 ? cap_nxt * 2 : need + 1;
+            free(nxt);
+            nxt = malloc(nc);
+            cap_nxt = nc;
+        }
+        len = stoch_pass(ls, rlen, total, cur, len, &state, nxt);
+        nxt[len] = '\0';
+        char *t = cur; cur = nxt; nxt = t;
+        size_t tc = cap_cur; cap_cur = cap_nxt; cap_nxt = tc;
+    }
+    free(nxt);
+    *out_len = len;
+    return cur;
+}
+
+typedef struct { char sym; float p; } Module;
+typedef struct { char sym; float mul, add; } PSucc;
+typedef struct { const PSucc *succ[128]; int n[128]; } PLSystem;
+
+int pls_expand(const PLSystem *ls, const Module *axiom, int na, int iterations, Module **out) {
+    *out = NULL;
+    uint64_t len[128], next[128], maxlen = (uint64_t)na;
+    for (int c = 0; c < 128; c++) len[c] = 1;
+    for (int g = 0; g < iterations; g++) {
+        for (int c = 0; c < 128; c++) {
+            if (ls->n[c] == 0) { next[c] = 1; continue; }
+            uint64_t s = 0;
+            for (int k = 0; k < ls->n[c]; k++) s = sat_add(s, len[(unsigned char)ls->succ[c][k].sym]);
+            next[c] = s;
+        }
+        memcpy(len, next, sizeof len);
+        uint64_t total = 0;
+        for (int i = 0; i < na; i++) total = sat_add(total, len[(unsigned char)axiom[i].sym]);
+        if (total > maxlen) maxlen = total;
+    }
+    if (maxlen > (1u << 24)) return -1;
+    Module *cur = malloc(sizeof(Module) * (maxlen ? maxlen : 1)), *nxt = malloc(sizeof(Module) * (maxlen ? maxlen : 1));
+    memcpy(cur, axiom, sizeof(Module) * na);
+    size_t count = (size_t)na;
+    for (int g = 0; g < iterations; g++) {
+        size_t w = 0;
+        for (size_t i = 0; i < count; i++) {
+            unsigned char c = (unsigned char)cur[i].sym;
+            if (ls->n[c] == 0) { nxt[w++] = cur[i]; continue; }
+            for (int k = 0; k < ls->n[c]; k++) {
+                const PSucc *ps = &ls->succ[c][k];
+                nxt[w].sym = ps->sym;
+                nxt[w].p = cur[i].p * ps->mul + ps->add;
+                w++;
+            }
+        }
+        Module *t = cur; cur = nxt; nxt = t;
+        count = w;
+    }
+    free(nxt);
+    *out = cur;
+    return (int)count;
+}
+
+typedef struct { Vec3 a, b, h, l, u; float r; int depth; } Branch;
+typedef struct { Vec3 pos, h, l, u; float size; } Leaf;
+
+void turtle3d_count(const Module *m, int n, int *nbranches, int *nleaves) {
+    int b = 0, l = 0;
+    for (int i = 0; i < n; i++) { b += m[i].sym == 'F'; l += m[i].sym == 'L'; }
+    *nbranches = b; *nleaves = l;
+}
+
+typedef struct { Vec3 p, h, l, u; float w; } Turtle3;
+
+/* rotate the pair (x, y) by angle a: x' = x c + y s, y' = y c - x s */
+void rot_pair(Vec3 *x, Vec3 *y, float a_deg) {
+    float a = a_deg * 3.14159265358979f / 180, c = cosf(a), s = sinf(a);
+    Vec3 nx = v3_add(v3_scale(*x, c), v3_scale(*y, s));
+    Vec3 ny = v3_sub(v3_scale(*y, c), v3_scale(*x, s));
+    *x = nx; *y = ny;
+}
+
+int turtle3d(const Module *m, int n, float width0, Branch *br, Leaf *lf) {
+    Turtle3 t = {v3(0, 0, 0), v3(0, 0, 1), v3(-1, 0, 0), v3(0, -1, 0), width0}, stack[64];
+    int sp = 0, nb = 0, nl = 0;
+    for (int i = 0; i < n; i++) {
+        float a = m[i].p;
+        Vec3 nu;
+        switch (m[i].sym) {
+        case 'F': {
+            Vec3 end = v3_add(t.p, v3_scale(t.h, a));
+            Branch b = {t.p, end, t.h, t.l, t.u, t.w / 2, sp};
+            br[nb++] = b;
+            t.p = end;
+            break;
+        }
+        case 'f': t.p = v3_add(t.p, v3_scale(t.h, a)); break;
+        case '+': rot_pair(&t.h, &t.l, a); break;
+        case '-': rot_pair(&t.h, &t.l, -a); break;
+        case '&': nu = v3_scale(t.u, -1); rot_pair(&t.h, &nu, a); t.u = v3_scale(nu, -1); break;
+        case '^': nu = v3_scale(t.u, -1); rot_pair(&t.h, &nu, -a); t.u = v3_scale(nu, -1); break;
+        case '\\': nu = v3_scale(t.u, -1); rot_pair(&t.l, &nu, a); t.u = v3_scale(nu, -1); break;
+        case '/': nu = v3_scale(t.u, -1); rot_pair(&t.l, &nu, -a); t.u = v3_scale(nu, -1); break;
+        case '|': t.h = v3_scale(t.h, -1); t.l = v3_scale(t.l, -1); break;
+        case '!': t.w = a; break;
+        case 'L': {
+            Leaf l = {t.p, t.h, t.l, t.u, a};
+            lf[nl++] = l;
+            break;
+        }
+        case '[':
+            if (sp == 64) return -1;
+            stack[sp++] = t;
+            break;
+        case ']':
+            if (sp == 0) return -1;
+            t = stack[--sp];
+            break;
+        default: break;
+        }
+    }
+    return 0;
+}
+
+typedef struct { int nverts, ntris; float *pos, *nrm; unsigned char *col; uint32_t *idx; } Mesh;
+
+int mesh_alloc(Mesh *m, int nverts, int ntris) {
+    m->nverts = nverts; m->ntris = ntris;
+    m->pos = malloc(sizeof(float) * 3 * (size_t)(nverts ? nverts : 1));
+    m->nrm = malloc(sizeof(float) * 3 * (size_t)(nverts ? nverts : 1));
+    m->col = malloc(3 * (size_t)(nverts ? nverts : 1));
+    m->idx = malloc(sizeof(uint32_t) * 3 * (size_t)(ntris ? ntris : 1));
+    if (!m->pos || !m->nrm || !m->col || !m->idx) {
+        free(m->pos); free(m->nrm); free(m->col); free(m->idx);
+        memset(m, 0, sizeof *m);
+        return 0;
+    }
+    return 1;
+}
+
+void mesh_free(Mesh *m) {
+    free(m->pos); free(m->nrm); free(m->col); free(m->idx);
+    memset(m, 0, sizeof *m);
+}
+
+void mesh_set_vertex(Mesh *m, int v, Vec3 p, Vec3 n, int r, int g, int b) {
+    m->pos[3 * v] = p.x; m->pos[3 * v + 1] = p.y; m->pos[3 * v + 2] = p.z;
+    m->nrm[3 * v] = n.x; m->nrm[3 * v + 1] = n.y; m->nrm[3 * v + 2] = n.z;
+    m->col[3 * v] = (unsigned char)r; m->col[3 * v + 1] = (unsigned char)g; m->col[3 * v + 2] = (unsigned char)b;
+}
+
+/* writes branches starting at vertex 0 / triangle 0 of an already allocated mesh */
+void branch_mesh_into(const Branch *br, int n, int sides, Mesh *out) {
+    for (int k = 0; k < n; k++) {
+        int p = 2 * sides * k, q = p + sides;
+        for (int j = 0; j < sides; j++) {
+            float th = 6.28318530718f * j / sides;
+            Vec3 d = v3_add(v3_scale(br[k].l, cosf(th)), v3_scale(br[k].u, sinf(th)));
+            mesh_set_vertex(out, p + j, v3_add(br[k].a, v3_scale(d, br[k].r)), d, 110, 80, 50);
+            mesh_set_vertex(out, q + j, v3_add(br[k].b, v3_scale(d, br[k].r)), d, 110, 80, 50);
+            int j1 = (j + 1) % sides;
+            uint32_t *t = out->idx + 3 * (size_t)(2 * sides * k + 2 * j);
+            t[0] = (uint32_t)(p + j); t[1] = (uint32_t)(p + j1); t[2] = (uint32_t)(q + j1);
+            t[3] = (uint32_t)(p + j); t[4] = (uint32_t)(q + j1); t[5] = (uint32_t)(q + j);
+        }
+    }
+}
+
+int branch_mesh(const Branch *br, int n, int sides, Mesh *out) {
+    if (!mesh_alloc(out, 2 * sides * n, 2 * sides * n)) return 0;
+    branch_mesh_into(br, n, sides, out);
+    return 1;
+}
+
+int tree_mesh(const Branch *br, int nb, const Leaf *lf, int nl, int sides, Mesh *out) {
+    int bv = 2 * sides * nb;
+    if (!mesh_alloc(out, bv + 4 * nl, bv + 2 * nl)) return 0;
+    branch_mesh_into(br, nb, sides, out);
+    for (int i = 0; i < nl; i++) {
+        int v = bv + 4 * i;
+        float s = lf[i].size;
+        uint32_t h = hash32((uint32_t)i) % 2000;
+        int r = 60 + (int)(h % 40), g = 130 + (int)(h / 40 % 50), b = 40;
+        Vec3 mid = v3_add(lf[i].pos, v3_scale(lf[i].h, 0.5f * s)), side = v3_scale(lf[i].l, 0.3f * s);
+        mesh_set_vertex(out, v, lf[i].pos, lf[i].u, r, g, b);
+        mesh_set_vertex(out, v + 1, v3_add(mid, side), lf[i].u, r, g, b);
+        mesh_set_vertex(out, v + 2, v3_add(lf[i].pos, v3_scale(lf[i].h, s)), lf[i].u, r, g, b);
+        mesh_set_vertex(out, v + 3, v3_sub(mid, side), lf[i].u, r, g, b);
+        uint32_t *t = out->idx + 3 * (size_t)(bv + 2 * i);
+        t[0] = (uint32_t)v; t[1] = (uint32_t)(v + 3); t[2] = (uint32_t)(v + 2);
+        t[3] = (uint32_t)v; t[4] = (uint32_t)(v + 2); t[5] = (uint32_t)(v + 1);
+    }
+    return 1;
+}
+
+/* the ternary tree with a leaf at every new branch tip */
+static const PSucc TREE_A[] = {
+    {'!', 0, 1.732f}, {'F', 0, 50}, {'[', 0, 0}, {'&', 0, 18.95f}, {'F', 0, 50}, {'L', 0, 40}, {'A', 0, 0}, {']', 0, 0},
+    {'/', 0, 94.74f}, {'[', 0, 0}, {'&', 0, 18.95f}, {'F', 0, 50}, {'L', 0, 40}, {'A', 0, 0}, {']', 0, 0},
+    {'/', 0, 132.63f}, {'[', 0, 0}, {'&', 0, 18.95f}, {'F', 0, 50}, {'L', 0, 40}, {'A', 0, 0}, {']', 0, 0}};
+static const PSucc TREE_F[] = {{'F', 1.109f, 0}};
+static const PSucc TREE_W[] = {{'!', 1.732f, 0}};
+
+int build_tree(int generations, int sides, Mesh *out) {
+    PLSystem tt = {.succ = {['A'] = TREE_A, ['F'] = TREE_F, ['!'] = TREE_W}, .n = {['A'] = 22, ['F'] = 1, ['!'] = 1}};
+    Module axiom[] = {{'!', 1}, {'F', 200}, {'/', 45}, {'A', 0}};
+    Module *m;
+    int n = pls_expand(&tt, axiom, 4, generations, &m), nb, nl;
+    if (n < 0) return 0;
+    turtle3d_count(m, n, &nb, &nl);
+    Branch *br = malloc(sizeof(Branch) * (nb ? nb : 1));
+    Leaf *lf = malloc(sizeof(Leaf) * (nl ? nl : 1));
+    int ok = turtle3d(m, n, 1, br, lf) == 0 && tree_mesh(br, nb, lf, nl, sides, out);
+    free(br); free(lf); free(m);
+    return ok;
+}
+
+int main(void) {
+    for (int g = 1; g <= 7; g++) {
+        Mesh me;
+        build_tree(g, 6, &me);
+        printf("generations %d: %7d vertices %7d triangles %8zu bytes\n", g, me.nverts, me.ntris,
+               (size_t)me.nverts * (24 + 3) + (size_t)me.ntris * 12);
+        mesh_free(&me);
+    }
+    return 0;
+}
+
+--- hint
+Reuse the branch filler from step 8 for the first part; the leaves only need their own short loop with a base vertex offset.
+
+--- harness
+int main(void) {
+    Branch b = {v3(0, 0, 0), v3(0, 0, 1), v3(0, 0, 1), v3(-1, 0, 0), v3(0, -1, 0), 0.1f, 0};
+    Leaf l[2] = {{v3(0, 0, 1), v3(0, 0, 1), v3(-1, 0, 0), v3(0, -1, 0), 2.0f},
+                 {v3(1, 1, 1), v3(1, 0, 0), v3(0, 1, 0), v3(0, 0, 1), 1.0f}};
+    Mesh m;
+    CHECK_INT(tree_mesh(&b, 1, l, 2, 3, &m), 1);
+    CHECK_INT(m.nverts, 6 + 8);
+    CHECK_INT(m.ntris, 6 + 4);
+    if (m.nverts == 14 && m.ntris == 10) {
+        CHECK(fabsf(m.pos[0] + 0.1f) < 1e-6f);
+        float *p = m.pos + 3 * 6;
+        CHECK(fabsf(p[0]) < 1e-6f && fabsf(p[1]) < 1e-6f && fabsf(p[2] - 1) < 1e-6f);
+        CHECK(fabsf(p[3] + 0.6f) < 1e-6f && fabsf(p[4]) < 1e-6f && fabsf(p[5] - 2) < 1e-6f);
+        CHECK(fabsf(p[6]) < 1e-6f && fabsf(p[8] - 3) < 1e-6f);
+        CHECK(fabsf(p[9] - 0.6f) < 1e-6f && fabsf(p[11] - 2) < 1e-6f);
+        p = m.pos + 3 * 10;
+        CHECK(fabsf(p[0] - 1) < 1e-6f && fabsf(p[3] - 1.5f) < 1e-6f && fabsf(p[4] - 1.3f) < 1e-6f && fabsf(p[9] - 1.5f) < 1e-6f && fabsf(p[10] - 0.7f) < 1e-6f);
+        CHECK(fabsf(m.nrm[3 * 6 + 1] + 1) < 1e-6f && fabsf(m.nrm[3 * 13 + 2] - 1) < 1e-6f);
+        uint32_t h0 = hash32(0) % 2000, h1 = hash32(1) % 2000;
+        CHECK(m.col[3 * 6] == 60 + h0 % 40 && m.col[3 * 6 + 1] == 130 + h0 / 40 % 50 && m.col[3 * 6 + 2] == 40);
+        CHECK(m.col[3 * 13] == 60 + h1 % 40 && m.col[3 * 13 + 1] == 130 + h1 / 40 % 50);
+        CHECK(m.col[0] == 110);
+        uint32_t want[12] = {6, 9, 8, 6, 8, 7, 10, 13, 12, 10, 12, 11};
+        int ok = 1;
+        for (int i = 0; i < 12; i++) if (m.idx[18 + i] != want[i]) ok = 0;
+        CHECK(ok);
+        CHECK(m.idx[0] == 0 && m.idx[1] == 1 && m.idx[2] == 4);
+    }
+    mesh_free(&m);
+
+    CHECK_INT(tree_mesh(NULL, 0, l, 1, 5, &m), 1);
+    CHECK_INT(m.nverts, 4);
+    if (m.ntris == 2) CHECK(m.idx[0] == 0 && m.idx[1] == 3 && m.idx[2] == 2);
+    mesh_free(&m);
+
+    Mesh t;
+    CHECK_INT(build_tree(6, 6, &t), 1);
+    CHECK_INT(t.nverts, 12 * (1 + 4 * 364) + 4 * 1092);
+    CHECK_INT(t.ntris, 12 * (1 + 4 * 364) + 2 * 1092);
+    unsigned long long isum = 0;
+    for (int i = 0; i < 3 * t.ntris; i++) isum += t.idx[i];
+    int inrange = 1;
+    for (int i = 0; i < 3 * t.ntris; i++) if (t.idx[i] >= (uint32_t)t.nverts) inrange = 0;
+    CHECK(inrange);
+    CHECK(isum > 0);
+    mesh_free(&t);
+    return TEST_END();
+}
+
+=== exercise ls_render
+title: L-systems 10: rendering the tree
+continues: ls_tree
+--- prompt
+Draw the mesh with a z-buffer. The view is orthographic, from the front, after spinning the tree by `yaw` degrees around the vertical axis:
+
+```c
+void render_mesh(const Mesh *me, float yaw_deg, Image *im);
+```
+
+1. Transform every vertex once into a temporary array (allocate one array for the whole call, not per triangle): `x' = x cos(yaw) - y sin(yaw)`, `depth = x sin(yaw) + y cos(yaw)`, `z' = z`. Rotate the normals the same way (`nz` unchanged).
+2. Fit like step 4: bounds of `(x', z')` over all vertices, `margin = 2`, `aw = W - 1 - 2 margin`, `ah = H - 1 - 2 margin`, `scale = min(aw / bw, ah / bh)` (with the same zero-extent rules), `ox = margin + (aw - bw scale) / 2`, `oy = margin + (ah - bh scale) / 2`; screen `sx = ox + (x' - minx) scale`, `sy = H - 1 - (oy + (z' - minz) scale)` (floats, no rounding).
+3. Clear the image to (235, 240, 245) and a `float` z-buffer to `FLT_MAX` (or `INFINITY`).
+4. For each triangle, loop over the pixels of its screen bounding box (clamped to the image); a pixel `(px, py)` is covered if its center `(px + 0.5, py + 0.5)` has **edge functions** all `>= 0` or all `<= 0` (either winding: the tree is seen from both sides). Interpolate the depth with the barycentric weights; draw if it is **smaller** than the z-buffer value (smaller depth = nearer the viewer), and store it.
+5. Color: average the triangle's 3 rotated vertex normals, normalize, `lit = 0.35 + 0.65 * |n · L|` with `L = normalize(-0.4, -0.6, 0.7)` (two-sided lighting), times the first vertex's color, `(int)(c * lit + 0.5f)`.
+
+Skip degenerate triangles (zero area on screen). This is the core of every software rasterizer and of what GPUs do in hardware: bounding box, edge functions, barycentric interpolation, depth test.
+
+**Run** renders the leafy tree. It is the end of this chapter's project: string rewriting to a lit 3D model in a few hundred lines of C.
+
+--- stubs
+void render_mesh(const Mesh *me, float yaw_deg, Image *im) {
+    (void)me; (void)yaw_deg;
+    img_fill(im, 0, 0, 0);
+}
+
+--- solution
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdint.h>
+#include <math.h>
+
+/* ===== From earlier chapters: vectors, hashing, images, line drawing ===== */
+
+typedef struct { float x, y, z; } Vec3;
+Vec3 v3(float x, float y, float z) { Vec3 r = {x, y, z}; return r; }
+Vec3 v3_add(Vec3 a, Vec3 b) { return v3(a.x + b.x, a.y + b.y, a.z + b.z); }
+Vec3 v3_sub(Vec3 a, Vec3 b) { return v3(a.x - b.x, a.y - b.y, a.z - b.z); }
+Vec3 v3_scale(Vec3 a, float s) { return v3(a.x * s, a.y * s, a.z * s); }
+float v3_dot(Vec3 a, Vec3 b) { return a.x * b.x + a.y * b.y + a.z * b.z; }
+Vec3 v3_cross(Vec3 a, Vec3 b) { return v3(a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x); }
+float v3_len(Vec3 a) { return sqrtf(v3_dot(a, a)); }
+Vec3 v3_norm(Vec3 a) { float l = v3_len(a); return l > 0 ? v3_scale(a, 1.0f / l) : a; }
+
+uint32_t hash32(uint32_t x) {            /* lowbias32 (Chris Wellons) */
+    x ^= x >> 16; x *= 0x7feb352dU; x ^= x >> 15; x *= 0x846ca68bU; x ^= x >> 16;
+    return x;
+}
+
+typedef struct { int w, h; unsigned char *px; } Image;      /* RGB, 3 bytes per pixel, row-major */
+Image img_new(int w, int h) { Image im = {w, h, calloc((size_t)w * h * 3, 1)}; return im; }
+void img_free(Image *im) { free(im->px); im->px = NULL; }
+void img_fill(Image *im, int r, int g, int b) {
+    for (size_t i = 0, n = (size_t)im->w * im->h; i < n; i++) {
+        im->px[3 * i] = (unsigned char)r; im->px[3 * i + 1] = (unsigned char)g; im->px[3 * i + 2] = (unsigned char)b;
+    }
+}
+void img_set(Image *im, int x, int y, int r, int g, int b) {   /* ignores pixels outside the image */
+    if (x < 0 || y < 0 || x >= im->w || y >= im->h) return;
+    unsigned char *p = im->px + ((size_t)y * im->w + x) * 3;
+    p[0] = (unsigned char)r; p[1] = (unsigned char)g; p[2] = (unsigned char)b;
+}
+void img_line(Image *im, int x0, int y0, int x1, int y1, int r, int g, int b) {   /* Bresenham */
+    int dx = abs(x1 - x0), sx = x0 < x1 ? 1 : -1, dy = -abs(y1 - y0), sy = y0 < y1 ? 1 : -1, err = dx + dy;
+    for (;;) {
+        img_set(im, x0, y0, r, g, b);
+        if (x0 == x1 && y0 == y1) break;
+        int e2 = 2 * err;
+        if (e2 >= dy) { err += dy; x0 += sx; }
+        if (e2 <= dx) { err += dx; y0 += sy; }
+    }
+}
+void img_write_ppm(const Image *im) {                       /* ASCII P3 to stdout: the site draws it */
+    printf("P3\n%d %d\n255\n", im->w, im->h);
+    for (int y = 0; y < im->h; y++) {
+        const unsigned char *p = im->px + (size_t)y * im->w * 3;
+        for (int x = 0; x < im->w * 3; x++) printf("%d%c", p[x], x + 1 < im->w * 3 ? ' ' : '\n');
+    }
+}
+
+/* ===== This chapter: an L-system is one successor string per symbol (NULL: the symbol stays) ===== */
+
+typedef struct { const char *rule[128]; } LSystem;
+
+uint64_t sat_add(uint64_t a, uint64_t b) { return a > UINT64_MAX - b ? UINT64_MAX : a + b; }
+
+uint64_t ls_length(const LSystem *ls, const char *axiom, int n) {
+    uint64_t len[128], next[128];
+    for (int c = 0; c < 128; c++) len[c] = 1;
+    for (int g = 0; g < n; g++) {
+        for (int c = 0; c < 128; c++) {
+            const char *r = ls->rule[c];
+            if (!r) { next[c] = 1; continue; }
+            uint64_t sum = 0;
+            for (const char *p = r; *p; p++) sum = sat_add(sum, len[(unsigned char)*p]);
+            next[c] = sum;
+        }
+        memcpy(len, next, sizeof len);
+    }
+    uint64_t total = 0;
+    for (const char *p = axiom; *p; p++) total = sat_add(total, len[(unsigned char)*p]);
+    return total;
+}
+
+char *ls_expand(const LSystem *ls, const char *axiom, int n, size_t *out_len) {
+    uint64_t maxlen = 0;
+    for (int g = 0; g <= n; g++) {
+        uint64_t l = ls_length(ls, axiom, g);
+        if (l > maxlen) maxlen = l;
+    }
+    if (maxlen > (1u << 28)) return NULL;
+    size_t rlen[128];
+    for (int c = 0; c < 128; c++) rlen[c] = ls->rule[c] ? strlen(ls->rule[c]) : 0;
+    char *cur = malloc(maxlen + 1), *nxt = malloc(maxlen + 1);
+    size_t len = strlen(axiom);
+    memcpy(cur, axiom, len + 1);
+    for (int g = 0; g < n; g++) {
+        size_t w = 0;
+        for (size_t i = 0; i < len; i++) {
+            unsigned char c = (unsigned char)cur[i];
+            const char *r = ls->rule[c];
+            if (r) { memcpy(nxt + w, r, rlen[c]); w += rlen[c]; }
+            else nxt[w++] = (char)c;
+        }
+        nxt[w] = '\0';
+        char *t = cur; cur = nxt; nxt = t;
+        len = w;
+    }
+    free(nxt);
+    *out_len = len;
+    return cur;
+}
+
+typedef struct { float x0, y0, x1, y1; int depth; } Seg;
+
+#define TURTLE_STACK 64
+
+int turtle2d(const char *s, float step, float angle_deg, float heading_deg, Seg *out, int cap) {
+    const float rad = 3.14159265358979f / 180;
+    float c = cosf(angle_deg * rad), sn = sinf(angle_deg * rad);
+    float x = 0, y = 0, dx = cosf(heading_deg * rad), dy = sinf(heading_deg * rad);
+    float stack[TURTLE_STACK][4];
+    int sp = 0, count = 0;
+    for (const char *p = s; *p; p++) {
+        float t;
+        switch (*p) {
+        case 'F': case 'G':
+            if (count < cap) {
+                Seg sg = {x, y, x + dx * step, y + dy * step, sp};
+                out[count] = sg;
+            }
+            count++;
+            x += dx * step; y += dy * step;
+            break;
+        case 'f': x += dx * step; y += dy * step; break;
+        case '+': t = dx * c - dy * sn; dy = dx * sn + dy * c; dx = t; break;
+        case '-': t = dx * c + dy * sn; dy = -dx * sn + dy * c; dx = t; break;
+        case '|': dx = -dx; dy = -dy; break;
+        case '[':
+            if (sp == TURTLE_STACK) return -1;
+            stack[sp][0] = x; stack[sp][1] = y; stack[sp][2] = dx; stack[sp][3] = dy; sp++;
+            break;
+        case ']':
+            if (sp == 0) return -1;
+            sp--; x = stack[sp][0]; y = stack[sp][1]; dx = stack[sp][2]; dy = stack[sp][3];
+            break;
+        default: break;
+        }
+    }
+    return count;
+}
+
+void seg_bounds(const Seg *s, int n, float *minx, float *miny, float *maxx, float *maxy) {
+    if (n <= 0) { *minx = *miny = *maxx = *maxy = 0; return; }
+    float a = s[0].x0, b = s[0].y0, c = s[0].x0, d = s[0].y0;
+    for (int i = 0; i < n; i++) {
+        a = fminf(a, fminf(s[i].x0, s[i].x1)); c = fmaxf(c, fmaxf(s[i].x0, s[i].x1));
+        b = fminf(b, fminf(s[i].y0, s[i].y1)); d = fmaxf(d, fmaxf(s[i].y0, s[i].y1));
+    }
+    *minx = a; *miny = b; *maxx = c; *maxy = d;
+}
+
+void draw_segments(Image *im, const Seg *s, int n, int margin, int r, int g, int b) {
+    float minx, miny, maxx, maxy;
+    seg_bounds(s, n, &minx, &miny, &maxx, &maxy);
+    float aw = (float)(im->w - 1 - 2 * margin), ah = (float)(im->h - 1 - 2 * margin);
+    float bw = maxx - minx, bh = maxy - miny, scale;
+    if (bw > 0 && bh > 0) scale = fminf(aw / bw, ah / bh);
+    else if (bw > 0) scale = aw / bw;
+    else if (bh > 0) scale = ah / bh;
+    else scale = 1;
+    float ox = margin + (aw - bw * scale) / 2, oy = margin + (ah - bh * scale) / 2;
+    for (int i = 0; i < n; i++) {
+        int x0 = (int)floorf(ox + (s[i].x0 - minx) * scale + 0.5f);
+        int y0 = im->h - 1 - (int)floorf(oy + (s[i].y0 - miny) * scale + 0.5f);
+        int x1 = (int)floorf(ox + (s[i].x1 - minx) * scale + 0.5f);
+        int y1 = im->h - 1 - (int)floorf(oy + (s[i].y1 - miny) * scale + 0.5f);
+        img_line(im, x0, y0, x1, y1, r, g, b);
+    }
+}
+
+uint32_t rng_next(uint32_t *state) {
+    *state = *state * 1664525u + 1013904223u;
+    return hash32(*state);
+}
+
+typedef struct { const char *succ; int weight; } Choice;
+typedef struct { Choice choice[128][4]; int count[128]; } StochLSystem;
+
+/* one generation; out == NULL only counts. Returns the new length. */
+size_t stoch_pass(const StochLSystem *ls, const size_t rlen[128][4], const int total[128],
+                  const char *cur, size_t len, uint32_t *state, char *out) {
+    size_t w = 0;
+    for (size_t i = 0; i < len; i++) {
+        unsigned char c = (unsigned char)cur[i];
+        int k = 0;
+        if (ls->count[c] == 0) {
+            if (out) out[w] = (char)c;
+            w++;
+            continue;
+        }
+        if (ls->count[c] >= 2) {
+            int r = (int)(rng_next(state) % (uint32_t)total[c]), acc = 0;
+            for (k = 0; k < ls->count[c] - 1; k++) {
+                acc += ls->choice[c][k].weight;
+                if (acc > r) break;
+            }
+        }
+        if (out) memcpy(out + w, ls->choice[c][k].succ, rlen[c][k]);
+        w += rlen[c][k];
+    }
+    return w;
+}
+
+char *ls_expand_stochastic(const StochLSystem *ls, const char *axiom, int n, uint32_t seed, size_t *out_len) {
+    size_t rlen[128][4];
+    int total[128];
+    for (int c = 0; c < 128; c++) {
+        total[c] = 0;
+        for (int k = 0; k < ls->count[c]; k++) {
+            rlen[c][k] = strlen(ls->choice[c][k].succ);
+            total[c] += ls->choice[c][k].weight;
+        }
+    }
+    size_t len = strlen(axiom), cap_cur = len + 1, cap_nxt = len + 1;
+    char *cur = malloc(cap_cur), *nxt = malloc(cap_nxt);
+    memcpy(cur, axiom, len + 1);
+    uint32_t state = seed;
+    for (int g = 0; g < n; g++) {
+        uint32_t probe = state;
+        size_t need = stoch_pass(ls, rlen, total, cur, len, &probe, NULL);
+        if (need + 1 > cap_nxt) {
+            size_t nc = cap_nxt * 2 > need + 1 ? cap_nxt * 2 : need + 1;
+            free(nxt);
+            nxt = malloc(nc);
+            cap_nxt = nc;
+        }
+        len = stoch_pass(ls, rlen, total, cur, len, &state, nxt);
+        nxt[len] = '\0';
+        char *t = cur; cur = nxt; nxt = t;
+        size_t tc = cap_cur; cap_cur = cap_nxt; cap_nxt = tc;
+    }
+    free(nxt);
+    *out_len = len;
+    return cur;
+}
+
+typedef struct { char sym; float p; } Module;
+typedef struct { char sym; float mul, add; } PSucc;
+typedef struct { const PSucc *succ[128]; int n[128]; } PLSystem;
+
+int pls_expand(const PLSystem *ls, const Module *axiom, int na, int iterations, Module **out) {
+    *out = NULL;
+    uint64_t len[128], next[128], maxlen = (uint64_t)na;
+    for (int c = 0; c < 128; c++) len[c] = 1;
+    for (int g = 0; g < iterations; g++) {
+        for (int c = 0; c < 128; c++) {
+            if (ls->n[c] == 0) { next[c] = 1; continue; }
+            uint64_t s = 0;
+            for (int k = 0; k < ls->n[c]; k++) s = sat_add(s, len[(unsigned char)ls->succ[c][k].sym]);
+            next[c] = s;
+        }
+        memcpy(len, next, sizeof len);
+        uint64_t total = 0;
+        for (int i = 0; i < na; i++) total = sat_add(total, len[(unsigned char)axiom[i].sym]);
+        if (total > maxlen) maxlen = total;
+    }
+    if (maxlen > (1u << 24)) return -1;
+    Module *cur = malloc(sizeof(Module) * (maxlen ? maxlen : 1)), *nxt = malloc(sizeof(Module) * (maxlen ? maxlen : 1));
+    memcpy(cur, axiom, sizeof(Module) * na);
+    size_t count = (size_t)na;
+    for (int g = 0; g < iterations; g++) {
+        size_t w = 0;
+        for (size_t i = 0; i < count; i++) {
+            unsigned char c = (unsigned char)cur[i].sym;
+            if (ls->n[c] == 0) { nxt[w++] = cur[i]; continue; }
+            for (int k = 0; k < ls->n[c]; k++) {
+                const PSucc *ps = &ls->succ[c][k];
+                nxt[w].sym = ps->sym;
+                nxt[w].p = cur[i].p * ps->mul + ps->add;
+                w++;
+            }
+        }
+        Module *t = cur; cur = nxt; nxt = t;
+        count = w;
+    }
+    free(nxt);
+    *out = cur;
+    return (int)count;
+}
+
+typedef struct { Vec3 a, b, h, l, u; float r; int depth; } Branch;
+typedef struct { Vec3 pos, h, l, u; float size; } Leaf;
+
+void turtle3d_count(const Module *m, int n, int *nbranches, int *nleaves) {
+    int b = 0, l = 0;
+    for (int i = 0; i < n; i++) { b += m[i].sym == 'F'; l += m[i].sym == 'L'; }
+    *nbranches = b; *nleaves = l;
+}
+
+typedef struct { Vec3 p, h, l, u; float w; } Turtle3;
+
+/* rotate the pair (x, y) by angle a: x' = x c + y s, y' = y c - x s */
+void rot_pair(Vec3 *x, Vec3 *y, float a_deg) {
+    float a = a_deg * 3.14159265358979f / 180, c = cosf(a), s = sinf(a);
+    Vec3 nx = v3_add(v3_scale(*x, c), v3_scale(*y, s));
+    Vec3 ny = v3_sub(v3_scale(*y, c), v3_scale(*x, s));
+    *x = nx; *y = ny;
+}
+
+int turtle3d(const Module *m, int n, float width0, Branch *br, Leaf *lf) {
+    Turtle3 t = {v3(0, 0, 0), v3(0, 0, 1), v3(-1, 0, 0), v3(0, -1, 0), width0}, stack[64];
+    int sp = 0, nb = 0, nl = 0;
+    for (int i = 0; i < n; i++) {
+        float a = m[i].p;
+        Vec3 nu;
+        switch (m[i].sym) {
+        case 'F': {
+            Vec3 end = v3_add(t.p, v3_scale(t.h, a));
+            Branch b = {t.p, end, t.h, t.l, t.u, t.w / 2, sp};
+            br[nb++] = b;
+            t.p = end;
+            break;
+        }
+        case 'f': t.p = v3_add(t.p, v3_scale(t.h, a)); break;
+        case '+': rot_pair(&t.h, &t.l, a); break;
+        case '-': rot_pair(&t.h, &t.l, -a); break;
+        case '&': nu = v3_scale(t.u, -1); rot_pair(&t.h, &nu, a); t.u = v3_scale(nu, -1); break;
+        case '^': nu = v3_scale(t.u, -1); rot_pair(&t.h, &nu, -a); t.u = v3_scale(nu, -1); break;
+        case '\\': nu = v3_scale(t.u, -1); rot_pair(&t.l, &nu, a); t.u = v3_scale(nu, -1); break;
+        case '/': nu = v3_scale(t.u, -1); rot_pair(&t.l, &nu, -a); t.u = v3_scale(nu, -1); break;
+        case '|': t.h = v3_scale(t.h, -1); t.l = v3_scale(t.l, -1); break;
+        case '!': t.w = a; break;
+        case 'L': {
+            Leaf l = {t.p, t.h, t.l, t.u, a};
+            lf[nl++] = l;
+            break;
+        }
+        case '[':
+            if (sp == 64) return -1;
+            stack[sp++] = t;
+            break;
+        case ']':
+            if (sp == 0) return -1;
+            t = stack[--sp];
+            break;
+        default: break;
+        }
+    }
+    return 0;
+}
+
+typedef struct { int nverts, ntris; float *pos, *nrm; unsigned char *col; uint32_t *idx; } Mesh;
+
+int mesh_alloc(Mesh *m, int nverts, int ntris) {
+    m->nverts = nverts; m->ntris = ntris;
+    m->pos = malloc(sizeof(float) * 3 * (size_t)(nverts ? nverts : 1));
+    m->nrm = malloc(sizeof(float) * 3 * (size_t)(nverts ? nverts : 1));
+    m->col = malloc(3 * (size_t)(nverts ? nverts : 1));
+    m->idx = malloc(sizeof(uint32_t) * 3 * (size_t)(ntris ? ntris : 1));
+    if (!m->pos || !m->nrm || !m->col || !m->idx) {
+        free(m->pos); free(m->nrm); free(m->col); free(m->idx);
+        memset(m, 0, sizeof *m);
+        return 0;
+    }
+    return 1;
+}
+
+void mesh_free(Mesh *m) {
+    free(m->pos); free(m->nrm); free(m->col); free(m->idx);
+    memset(m, 0, sizeof *m);
+}
+
+void mesh_set_vertex(Mesh *m, int v, Vec3 p, Vec3 n, int r, int g, int b) {
+    m->pos[3 * v] = p.x; m->pos[3 * v + 1] = p.y; m->pos[3 * v + 2] = p.z;
+    m->nrm[3 * v] = n.x; m->nrm[3 * v + 1] = n.y; m->nrm[3 * v + 2] = n.z;
+    m->col[3 * v] = (unsigned char)r; m->col[3 * v + 1] = (unsigned char)g; m->col[3 * v + 2] = (unsigned char)b;
+}
+
+/* writes branches starting at vertex 0 / triangle 0 of an already allocated mesh */
+void branch_mesh_into(const Branch *br, int n, int sides, Mesh *out) {
+    for (int k = 0; k < n; k++) {
+        int p = 2 * sides * k, q = p + sides;
+        for (int j = 0; j < sides; j++) {
+            float th = 6.28318530718f * j / sides;
+            Vec3 d = v3_add(v3_scale(br[k].l, cosf(th)), v3_scale(br[k].u, sinf(th)));
+            mesh_set_vertex(out, p + j, v3_add(br[k].a, v3_scale(d, br[k].r)), d, 110, 80, 50);
+            mesh_set_vertex(out, q + j, v3_add(br[k].b, v3_scale(d, br[k].r)), d, 110, 80, 50);
+            int j1 = (j + 1) % sides;
+            uint32_t *t = out->idx + 3 * (size_t)(2 * sides * k + 2 * j);
+            t[0] = (uint32_t)(p + j); t[1] = (uint32_t)(p + j1); t[2] = (uint32_t)(q + j1);
+            t[3] = (uint32_t)(p + j); t[4] = (uint32_t)(q + j1); t[5] = (uint32_t)(q + j);
+        }
+    }
+}
+
+int branch_mesh(const Branch *br, int n, int sides, Mesh *out) {
+    if (!mesh_alloc(out, 2 * sides * n, 2 * sides * n)) return 0;
+    branch_mesh_into(br, n, sides, out);
+    return 1;
+}
+
+int tree_mesh(const Branch *br, int nb, const Leaf *lf, int nl, int sides, Mesh *out) {
+    int bv = 2 * sides * nb;
+    if (!mesh_alloc(out, bv + 4 * nl, bv + 2 * nl)) return 0;
+    branch_mesh_into(br, nb, sides, out);
+    for (int i = 0; i < nl; i++) {
+        int v = bv + 4 * i;
+        float s = lf[i].size;
+        uint32_t h = hash32((uint32_t)i) % 2000;
+        int r = 60 + (int)(h % 40), g = 130 + (int)(h / 40 % 50), b = 40;
+        Vec3 mid = v3_add(lf[i].pos, v3_scale(lf[i].h, 0.5f * s)), side = v3_scale(lf[i].l, 0.3f * s);
+        mesh_set_vertex(out, v, lf[i].pos, lf[i].u, r, g, b);
+        mesh_set_vertex(out, v + 1, v3_add(mid, side), lf[i].u, r, g, b);
+        mesh_set_vertex(out, v + 2, v3_add(lf[i].pos, v3_scale(lf[i].h, s)), lf[i].u, r, g, b);
+        mesh_set_vertex(out, v + 3, v3_sub(mid, side), lf[i].u, r, g, b);
+        uint32_t *t = out->idx + 3 * (size_t)(bv + 2 * i);
+        t[0] = (uint32_t)v; t[1] = (uint32_t)(v + 3); t[2] = (uint32_t)(v + 2);
+        t[3] = (uint32_t)v; t[4] = (uint32_t)(v + 2); t[5] = (uint32_t)(v + 1);
+    }
+    return 1;
+}
+
+/* the ternary tree with a leaf at every new branch tip */
+static const PSucc TREE_A[] = {
+    {'!', 0, 1.732f}, {'F', 0, 50}, {'[', 0, 0}, {'&', 0, 18.95f}, {'F', 0, 50}, {'L', 0, 40}, {'A', 0, 0}, {']', 0, 0},
+    {'/', 0, 94.74f}, {'[', 0, 0}, {'&', 0, 18.95f}, {'F', 0, 50}, {'L', 0, 40}, {'A', 0, 0}, {']', 0, 0},
+    {'/', 0, 132.63f}, {'[', 0, 0}, {'&', 0, 18.95f}, {'F', 0, 50}, {'L', 0, 40}, {'A', 0, 0}, {']', 0, 0}};
+static const PSucc TREE_F[] = {{'F', 1.109f, 0}};
+static const PSucc TREE_W[] = {{'!', 1.732f, 0}};
+
+int build_tree(int generations, int sides, Mesh *out) {
+    PLSystem tt = {.succ = {['A'] = TREE_A, ['F'] = TREE_F, ['!'] = TREE_W}, .n = {['A'] = 22, ['F'] = 1, ['!'] = 1}};
+    Module axiom[] = {{'!', 1}, {'F', 200}, {'/', 45}, {'A', 0}};
+    Module *m;
+    int n = pls_expand(&tt, axiom, 4, generations, &m), nb, nl;
+    if (n < 0) return 0;
+    turtle3d_count(m, n, &nb, &nl);
+    Branch *br = malloc(sizeof(Branch) * (nb ? nb : 1));
+    Leaf *lf = malloc(sizeof(Leaf) * (nl ? nl : 1));
+    int ok = turtle3d(m, n, 1, br, lf) == 0 && tree_mesh(br, nb, lf, nl, sides, out);
+    free(br); free(lf); free(m);
+    return ok;
+}
+
+#include <float.h>
+
+float edge_fn(float ax, float ay, float bx, float by, float px, float py) {
+    return (bx - ax) * (py - ay) - (by - ay) * (px - ax);
+}
+
+void render_mesh(const Mesh *me, float yaw_deg, Image *im) {
+    int W = im->w, H = im->h;
+    img_fill(im, 235, 240, 245);
+    if (me->nverts == 0) return;
+    float a = yaw_deg * 3.14159265358979f / 180, c = cosf(a), s = sinf(a);
+    float *tv = malloc(sizeof(float) * 6 * (size_t)me->nverts);   /* x', depth, z', nx', ny', nz */
+    float *zb = malloc(sizeof(float) * (size_t)W * H);
+    float minx = FLT_MAX, maxx = -FLT_MAX, minz = FLT_MAX, maxz = -FLT_MAX;
+    for (int v = 0; v < me->nverts; v++) {
+        const float *p = me->pos + 3 * v, *n = me->nrm + 3 * v;
+        float *o = tv + 6 * v;
+        o[0] = p[0] * c - p[1] * s; o[1] = p[0] * s + p[1] * c; o[2] = p[2];
+        o[3] = n[0] * c - n[1] * s; o[4] = n[0] * s + n[1] * c; o[5] = n[2];
+        minx = fminf(minx, o[0]); maxx = fmaxf(maxx, o[0]);
+        minz = fminf(minz, o[2]); maxz = fmaxf(maxz, o[2]);
+    }
+    float aw = (float)(W - 5), ah = (float)(H - 5), bw = maxx - minx, bh = maxz - minz, scale;
+    if (bw > 0 && bh > 0) scale = fminf(aw / bw, ah / bh);
+    else if (bw > 0) scale = aw / bw;
+    else if (bh > 0) scale = ah / bh;
+    else scale = 1;
+    float ox = 2 + (aw - bw * scale) / 2, oy = 2 + (ah - bh * scale) / 2;
+    for (int v = 0; v < me->nverts; v++) {
+        float *o = tv + 6 * v;
+        o[0] = ox + (o[0] - minx) * scale;
+        o[2] = H - 1 - (oy + (o[2] - minz) * scale);
+    }
+    for (int i = 0; i < W * H; i++) zb[i] = FLT_MAX;
+    Vec3 L = v3_norm(v3(-0.4f, -0.6f, 0.7f));
+    for (int t = 0; t < me->ntris; t++) {
+        const uint32_t *ti = me->idx + 3 * (size_t)t;
+        const float *A = tv + 6 * ti[0], *B = tv + 6 * ti[1], *C = tv + 6 * ti[2];
+        float area = edge_fn(A[0], A[2], B[0], B[2], C[0], C[2]);
+        if (area == 0) continue;
+        int x0 = (int)floorf(fminf(A[0], fminf(B[0], C[0]))), x1 = (int)ceilf(fmaxf(A[0], fmaxf(B[0], C[0])));
+        int y0 = (int)floorf(fminf(A[2], fminf(B[2], C[2]))), y1 = (int)ceilf(fmaxf(A[2], fmaxf(B[2], C[2])));
+        if (x0 < 0) x0 = 0;
+        if (y0 < 0) y0 = 0;
+        if (x1 > W - 1) x1 = W - 1;
+        if (y1 > H - 1) y1 = H - 1;
+        Vec3 n = v3_norm(v3(A[3] + B[3] + C[3], A[4] + B[4] + C[4], A[5] + B[5] + C[5]));
+        float lit = 0.35f + 0.65f * fabsf(v3_dot(n, L));
+        const unsigned char *col = me->col + 3 * ti[0];
+        int r = (int)(col[0] * lit + 0.5f), g = (int)(col[1] * lit + 0.5f), b = (int)(col[2] * lit + 0.5f);
+        float inv = 1.0f / area;
+        for (int py = y0; py <= y1; py++)
+            for (int px = x0; px <= x1; px++) {
+                float cx = px + 0.5f, cy = py + 0.5f;
+                float w0 = edge_fn(B[0], B[2], C[0], C[2], cx, cy);
+                float w1 = edge_fn(C[0], C[2], A[0], A[2], cx, cy);
+                float w2 = edge_fn(A[0], A[2], B[0], B[2], cx, cy);
+                if (!((w0 >= 0 && w1 >= 0 && w2 >= 0) || (w0 <= 0 && w1 <= 0 && w2 <= 0))) continue;
+                float d = (w0 * A[1] + w1 * B[1] + w2 * C[1]) * inv;
+                float *z = zb + (size_t)py * W + px;
+                if (d >= *z) continue;
+                *z = d;
+                unsigned char *o = im->px + 3 * ((size_t)py * W + px);
+                o[0] = (unsigned char)r; o[1] = (unsigned char)g; o[2] = (unsigned char)b;
+            }
+    }
+    free(tv); free(zb);
+}
+
+int main(void) {
+    Mesh me;
+    build_tree(6, 6, &me);
+    Image im = img_new(128, 128);
+    render_mesh(&me, 30, &im);
+    img_write_ppm(&im);
+    mesh_free(&me);
+    img_free(&im);
+    return 0;
+}
+
+--- hint
+With `area = edge(A, B, C)`, the barycentric weights are `w0 / area`, `w1 / area`, `w2 / area` where `w0 = edge(B, C, P)`, `w1 = edge(C, A, P)`, `w2 = edge(A, B, P)`; they sum to 1, so `depth = (w0 dA + w1 dB + w2 dC) / area` works for either winding.
+
+--- hint
+Transform and fit all vertices before the triangle loop: a vertex is shared by up to six triangles, so transforming per triangle repeats the work.
+
+--- harness
+static void ref_render(const Mesh *me, float yaw, Image *im) {
+    int W = im->w, H = im->h;
+    img_fill(im, 235, 240, 245);
+    float a = yaw * 3.14159265358979f / 180, c = cosf(a), s = sinf(a);
+    float *sx = malloc(sizeof(float) * me->nverts * 3), *zb = malloc(sizeof(float) * W * H);
+    float mnx = 1e30f, mxx = -1e30f, mnz = 1e30f, mxz = -1e30f;
+    for (int v = 0; v < me->nverts; v++) {
+        float x = me->pos[3 * v] * c - me->pos[3 * v + 1] * s, z = me->pos[3 * v + 2];
+        sx[3 * v] = x; sx[3 * v + 1] = me->pos[3 * v] * s + me->pos[3 * v + 1] * c; sx[3 * v + 2] = z;
+        mnx = fminf(mnx, x); mxx = fmaxf(mxx, x); mnz = fminf(mnz, z); mxz = fmaxf(mxz, z);
+    }
+    float aw = W - 5.0f, ah = H - 5.0f, bw = mxx - mnx, bh = mxz - mnz;
+    float sc = bw > 0 && bh > 0 ? fminf(aw / bw, ah / bh) : bw > 0 ? aw / bw : bh > 0 ? ah / bh : 1;
+    float ox = 2 + (aw - bw * sc) / 2, oy = 2 + (ah - bh * sc) / 2;
+    for (int v = 0; v < me->nverts; v++) { sx[3 * v] = ox + (sx[3 * v] - mnx) * sc; sx[3 * v + 2] = H - 1 - (oy + (sx[3 * v + 2] - mnz) * sc); }
+    for (int i = 0; i < W * H; i++) zb[i] = 1e30f;
+    float ll = sqrtf(0.16f + 0.36f + 0.49f), Lx = -0.4f / ll, Ly = -0.6f / ll, Lz = 0.7f / ll;
+    for (int t = 0; t < me->ntris; t++) {
+        const float *P[3]; float n[3] = {0, 0, 0};
+        for (int k = 0; k < 3; k++) {
+            int v = (int)me->idx[3 * t + k]; P[k] = sx + 3 * v;
+            n[0] += me->nrm[3 * v] * c - me->nrm[3 * v + 1] * s; n[1] += me->nrm[3 * v] * s + me->nrm[3 * v + 1] * c; n[2] += me->nrm[3 * v + 2];
+        }
+        float nl = sqrtf(n[0] * n[0] + n[1] * n[1] + n[2] * n[2]);
+        float lit = 0.35f + 0.65f * (nl > 0 ? fabsf(n[0] * Lx + n[1] * Ly + n[2] * Lz) / nl : 0);
+        const unsigned char *col = me->col + 3 * me->idx[3 * t];
+        float ar = (P[1][0] - P[0][0]) * (P[2][2] - P[0][2]) - (P[1][2] - P[0][2]) * (P[2][0] - P[0][0]);
+        if (ar == 0) continue;
+        for (int py = 0; py < H; py++) for (int px = 0; px < W; px++) {
+            float cx = px + 0.5f, cy = py + 0.5f, w[3];
+            for (int k = 0; k < 3; k++) {
+                const float *A = P[(k + 1) % 3], *B = P[(k + 2) % 3];
+                w[k] = (B[0] - A[0]) * (cy - A[2]) - (B[2] - A[2]) * (cx - A[0]);
+            }
+            if (!((w[0] >= 0 && w[1] >= 0 && w[2] >= 0) || (w[0] <= 0 && w[1] <= 0 && w[2] <= 0))) continue;
+            float d = (w[0] * P[0][1] + w[1] * P[1][1] + w[2] * P[2][1]) / ar;
+            if (d >= zb[py * W + px]) continue;
+            zb[py * W + px] = d;
+            unsigned char *o = im->px + 3 * (py * W + px);
+            o[0] = (unsigned char)(int)(col[0] * lit + 0.5f); o[1] = (unsigned char)(int)(col[1] * lit + 0.5f); o[2] = (unsigned char)(int)(col[2] * lit + 0.5f);
+        }
+    }
+    free(sx); free(zb);
+}
+static int img_match(const Image *a, const Image *b) {
+    int n = 0;
+    for (int i = 0; i < a->w * a->h; i++) n += abs(a->px[3 * i] - b->px[3 * i]) <= 1 && abs(a->px[3 * i + 1] - b->px[3 * i + 1]) <= 1 && abs(a->px[3 * i + 2] - b->px[3 * i + 2]) <= 1;
+    return n;
+}
+int main(void) {
+    /* two overlapping squares facing the viewer (normal -y): the nearer one (smaller y) wins, whatever the order */
+    Mesh m;
+    mesh_alloc(&m, 8, 4);
+    float P[8][3] = {{0, 5, 0}, {4, 5, 0}, {4, 5, 4}, {0, 5, 4}, {2, 1, 2}, {6, 1, 2}, {6, 1, 6}, {2, 1, 6}};
+    for (int v = 0; v < 8; v++) mesh_set_vertex(&m, v, v3(P[v][0], P[v][1], P[v][2]), v3(0, -1, 0), v < 4 ? 200 : 20, v < 4 ? 20 : 200, 20);
+    uint32_t I[12] = {0, 1, 2, 0, 2, 3, 4, 5, 6, 4, 6, 7};
+    memcpy(m.idx, I, sizeof I);
+    Image im = img_new(32, 32), ref = img_new(32, 32);
+    render_mesh(&m, 0, &im);
+    ref_render(&m, 0, &ref);
+    CHECK_INT(img_match(&im, &ref), 32 * 32);
+    /* scale 27/6 = 4.5, centered: x 2..29, z rows */
+    const unsigned char *px = im.px + 3 * (25 * 32 + 6);
+    CHECK(px[0] > 100 && px[1] < 50);
+    px = im.px + 3 * (15 * 32 + 15);
+    CHECK(px[1] > 100 && px[0] < 50);
+    px = im.px + 3 * (5 * 32 + 25);
+    CHECK(px[1] > 100);
+    px = im.px + 3 * (4 * 32 + 6);
+    CHECK(px[0] == 235 && px[1] == 240 && px[2] == 245);
+    int lit = (int)(200 * (0.35f + 0.65f * 0.6f / sqrtf(1.01f)) + 0.5f);
+    CHECK(abs(im.px[3 * (25 * 32 + 6)] - lit) <= 1);
+    uint32_t I2[12] = {4, 5, 6, 4, 6, 7, 0, 1, 2, 0, 2, 3};
+    memcpy(m.idx, I2, sizeof I2);
+    Image im2 = img_new(32, 32);
+    render_mesh(&m, 0, &im2);
+    CHECK(memcmp(im.px, im2.px, 32 * 32 * 3) == 0);
+    /* turned 180 degrees: the other square is in front */
+    render_mesh(&m, 180, &im2);
+    px = im2.px + 3 * (15 * 32 + 15);
+    CHECK(px[0] > 100 && px[1] < 50);
+    img_free(&im2);
+    mesh_free(&m);
+
+    /* the real tree against the reference, from two angles */
+    Mesh t;
+    build_tree(4, 5, &t);
+    for (int k = 0; k < 2; k++) {
+        float yaw = k ? 77.0f : 0.0f;
+        render_mesh(&t, yaw, &im);
+        ref_render(&t, yaw, &ref);
+        CHECK(img_match(&im, &ref) >= 32 * 32 * 99 / 100);
+    }
+    Image big = img_new(96, 80), bref = img_new(96, 80);
+    render_mesh(&t, 20, &big);
+    ref_render(&t, 20, &bref);
+    CHECK(img_match(&big, &bref) >= 96 * 80 * 99 / 100);
+    int bg = 0;
+    for (int i = 0; i < 96 * 80; i++) bg += big.px[3 * i] == 235 && big.px[3 * i + 1] == 240;
+    CHECK(bg > 96 * 80 / 2 && bg < 96 * 80 - 150);
+    img_free(&big); img_free(&bref);
+    mesh_free(&t);
+
+    Mesh empty;
+    mesh_alloc(&empty, 0, 0);
+    render_mesh(&empty, 0, &im);
+    CHECK(im.px[0] == 235);
+    mesh_free(&empty);
+    img_free(&im); img_free(&ref);
+    return TEST_END();
+}
+
+=== quiz
+--- q
+An L-system's rule for `F` has 5 symbols, 3 of them `F`. Starting from `F`, roughly how many `F`s are there after 12 generations?
+
+--- choice
+60
+
+--- choice
+`5^12`, about 244 million
+
+--- answer
+`3^12`, about 531 thousand
+
+--- choice
+`12 * 3 = 36`
+
+--- explain
+Each `F` becomes 3 `F`s (plus 2 constants), every generation: `3^n`. Exponential growth is why you compute lengths with the dynamic program and allocate once.
+
+=== quiz
+--- q
+Why does building the expanded string with `strcat(out, successor)` time out for large L-systems?
+
+--- choice
+`strcat` allocates memory on every call.
+
+--- answer
+`strcat` scans `out` from the start to find its end on every call, so appending `n` pieces to a growing string costs O(n²).
+
+--- choice
+`strcat` is not allowed on strings longer than 64 KB.
+
+--- choice
+`strcat` copies the successor twice.
+
+--- explain
+C strings do not store their length. Keep the length yourself (a write cursor) and `memcpy` to `out + len`.
+
+=== quiz
+--- q
+In a stochastic L-system, why does the PRNG have to be consumed in a fixed order (left to right, generation by generation) rather than, say, from several threads?
+
+--- answer
+So that the same seed always produces the same plant: the *k*-th random number must always be used for the same symbol occurrence.
+
+--- choice
+Because PRNGs are not thread-safe in C.
+
+--- choice
+Because otherwise the probabilities would be wrong.
+
+--- choice
+It does not matter; any order gives the same plant.
+
+--- explain
+Any order gives *valid* plants with the right statistics, but not the *same* plant per seed. Reproducibility is what lets you store a forest as seeds and regenerate it. (A hash of position and generation would also be reproducible and order-independent, like the terrain chapter's diamond-square.)
+
+=== quiz
+run: yes
+--- q
+What does this print? (A 2D turtle with 90° turns, starting at the origin facing +x.)
+
+--- code
+#include <stdio.h>
+
+int main(void) {
+    const char *s = "F[+FF]-F";
+    int x = 0, y = 0, dx = 1, dy = 0, sp = 0, st[8][4];
+    for (const char *p = s; *p; p++) {
+        int t;
+        switch (*p) {
+        case 'F': x += dx; y += dy; break;
+        case '+': t = dx; dx = -dy; dy = t; break;
+        case '-': t = dx; dx = dy; dy = -t; break;
+        case '[': st[sp][0] = x; st[sp][1] = y; st[sp][2] = dx; st[sp][3] = dy; sp++; break;
+        case ']': sp--; x = st[sp][0]; y = st[sp][1]; dx = st[sp][2]; dy = st[sp][3]; break;
+        }
+    }
+    printf("%d %d\n", x, y);
+    return 0;
+}
+
+--- choice
+1 2
+
+--- choice
+2 0
+
+--- answer
+1 -1
+
+--- choice
+-1 1
+
+--- explain
+`F` to (1, 0); the branch `[+FF]` goes up to (1, 2) and the `]` jumps back to (1, 0) facing +x; `-` turns right (to -y) and `F` ends at (1, -1).
+
+=== quiz
+--- q
+The 3D turtle keeps H, L, U. Why store the whole frame instead of just the heading H?
+
+--- choice
+H alone cannot be rotated in 3D.
+
+--- answer
+Roll and pitch need to know which way "left" and "up" are for the turtle, and the frame also orients each branch's cylinder ring without twisting.
+
+--- choice
+It uses less memory than storing angles.
+
+--- choice
+Because OpenGL requires three vectors per vertex.
+
+--- explain
+With only H, "pitch down" is undefined: down relative to what? The frame makes every rotation well defined, and L and U are exactly the two axes the cylinder's ring of vertices is built from.

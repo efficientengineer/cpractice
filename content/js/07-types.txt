@@ -269,7 +269,7 @@ function assert(cond, message, ErrorType = TypeError) {
   if (!cond) throw new ErrorType(message);
 }
 function createTexture(width, height) {
-  assert(Number.isInteger(width) && Number.isInteger(height), `size must be integers, got ${typeof width}`);
+  assert(Number.isInteger(width) && Number.isInteger(height), `size must be integers, got ${typeof width} and ${typeof height}`);
   assert(width > 0 && height > 0 && width <= 8192 && height <= 8192, 'size out of range', RangeError);
   return { width, height, data: new Float32Array(width * height) };
 }

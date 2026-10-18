@@ -831,6 +831,9 @@ class AsyncQueue {
   push(item) { this.items.push(item); }
   close() {}
   get size() { return this.items.length; }
+  [Symbol.asyncIterator]() {
+    return { next: async () => ({ value: undefined, done: true }) };
+  }
 }
 --- solution
 class AsyncQueue {

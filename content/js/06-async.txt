@@ -1,0 +1,1056 @@
+=== chapter async
+title: Async: the event loop, promises and await
+blurb: The call stack, tasks and microtasks, callbacks, promises, async/await, combinators, sleep/timeout/retry/concurrency limits, AbortController, async iterators, and render loops with requestAnimationFrame and fixed timesteps.
+--- body
+## One thread, one loop
+
+JavaScript runs your code on **one thread**. There are no locks, no `lock` statements, no data races between two pieces of JavaScript: a function always runs to completion before anything else runs. Concurrency comes from the **event loop** instead of threads. (Real parallelism exists, in Web Workers, which share nothing by default and talk by messages. This site runs your code in one.)
+
+The model, slightly simplified:
+
+1. **Call stack**: the functions currently executing. Synchronous code runs until the stack is empty.
+2. **Task queue** (macrotasks): timers (`setTimeout`, `setInterval`), I/O completions, messages, UI events. The loop takes **one** task, runs it to completion.
+3. **Microtask queue**: promise reactions (`.then` callbacks, the continuation after an `await`) and `queueMicrotask`. After every task, and whenever the stack empties, the loop drains **all** microtasks, including ones queued by microtasks, before doing anything else.
+4. **Rendering** (in a page or a worker with a canvas): between tasks, roughly once per display refresh, the browser runs `requestAnimationFrame` callbacks and paints.
+
+```js
+console.log('1 sync');
+setTimeout(() => console.log('6 timeout (task)'), 0);
+Promise.resolve().then(() => console.log('4 then (microtask)'));
+queueMicrotask(() => console.log('5 queueMicrotask'));
+(async () => {
+  console.log('2 async fn body runs synchronously until the first await');
+  await null;
+  console.log('5b after await (microtask)');
+})();
+console.log('3 sync again');
+
+await new Promise(r => setTimeout(r, 10));   // keep the program alive until the timer fires
+```
+
+The order is: all synchronous code, then every microtask (in the order queued), then the next task. `setTimeout(fn, 0)` means "as a new task, after at least 0 ms", which always comes after the current microtasks. This is the same idea as C#'s `SynchronizationContext` posting continuations, except that it's the only model there is.
+
+Remember the rule from the first chapter: on this site a program's result is what it prints before its body finishes. Examples that schedule timers end with an `await` that outlasts them.
+
+> **Performance:** a long synchronous computation blocks *everything*: no timers fire, no frames render, no input is handled. Generating a 4096x4096 texture in one go freezes the page for as long as it takes. Either slice the work (a generator that yields per tile, from the collections chapter), or move it to a Worker. Microtasks don't help: an endless chain of promise callbacks also starves rendering, because the microtask queue is drained completely before the browser may paint.
+
+## Callbacks, and why promises exist
+
+The original async style passes a function to be called later. It works for one step; for sequences it nests ("callback hell"), error handling is manual at every level, and nothing stops a buggy API from calling you twice or never.
+
+```js
+function loadImageCb(name, cb) {
+  setTimeout(() => (name.endsWith('.png') ? cb(null, { name, w: 256 }) : cb(new Error('bad format: ' + name))), 5);
+}
+loadImageCb('albedo.png', (err, a) => {
+  if (err) return console.log('failed', err.message);
+  loadImageCb('normal.tga', (err, b) => {
+    if (err) return console.log('failed', err.message);     // ...and so on, one level per step
+    console.log(a, b);
+  });
+});
+await new Promise(r => setTimeout(r, 30));
+```
+
+## Promises
+
+A **promise** is an object representing a value that will exist later: C#'s `Task<T>`. It's *pending*, then settles once, either *fulfilled* with a value or *rejected* with a reason (usually an `Error`), and never changes after that.
+
+```js
+function loadImage(name, ms = 5) {
+  return new Promise((resolve, reject) => {
+    // the executor runs synchronously, right now
+    setTimeout(() => (name.endsWith('.png') ? resolve({ name, w: 256 }) : reject(new Error('bad format: ' + name))), ms);
+  });
+}
+
+loadImage('albedo.png')
+  .then(img => { console.log('got', img.name); return loadImage('normal.png'); })  // returning a promise chains it
+  .then(img => img.w * 2)                                                          // returning a value wraps it
+  .then(w => { console.log('width x2', w); throw new Error('oops'); })              // throwing rejects
+  .catch(e => { console.log('caught', e.message); return 'recovered'; })            // catch can recover
+  .finally(() => console.log('finally runs either way'))
+  .then(v => console.log('then after catch:', v));
+
+await new Promise(r => setTimeout(r, 40));
+```
+
+Rules worth memorizing:
+
+- `then` returns a **new** promise. What its callback returns (a value, or another promise, which is unwrapped) becomes the next link's value. A throw becomes a rejection.
+- A rejection skips `then` callbacks until a `catch` (or `then(_, onRejected)`).
+- `Promise.resolve(x)` and `Promise.reject(e)` make settled promises. `Promise.withResolvers()` returns `{ promise, resolve, reject }` for when the code that settles it lives elsewhere (C#'s `TaskCompletionSource`).
+- A rejection nobody handles is reported as an *unhandled rejection* (on this site, on the error stream).
+- `then` callbacks always run asynchronously, as microtasks, even if the promise is already settled.
+
+## async and await
+
+`async`/`await` is syntax over promises, and reads like C#. An `async` function always returns a promise; `await` pauses the function (not the thread) until the promise settles, then resumes it as a microtask with the value, or throws the rejection reason.
+
+```js
+function loadImage(name, ms = 5) {
+  return new Promise((res, rej) => setTimeout(() => (name.endsWith('.png') ? res({ name, w: 256 }) : rej(new Error('bad: ' + name))), ms));
+}
+
+async function loadMaterial(base) {
+  const albedo = await loadImage(base + '_albedo.png');
+  try {
+    const normal = await loadImage(base + '_normal.tga');
+    return { albedo, normal };
+  } catch (e) {
+    console.log('no normal map:', e.message);
+    return { albedo, normal: null };
+  }
+}
+
+const mat = await loadMaterial('bark');
+console.log(mat.albedo.name, mat.normal);
+console.log(loadMaterial('x') instanceof Promise);
+await new Promise(r => setTimeout(r, 30));
+```
+
+### Sequential versus parallel: the classic slowdown
+
+Each `await` waits before the next line starts. Independent operations should be **started** first and awaited together:
+
+```js
+const delay = (ms, v) => new Promise(r => setTimeout(() => r(v), ms));
+let t = performance.now();
+const a = await delay(50, 'a');
+const b = await delay(50, 'b');                       // starts only after a is done
+console.log('sequential', a + b, Math.round((performance.now() - t) / 50) * 50, 'ms');
+
+t = performance.now();
+const [c, d] = await Promise.all([delay(50, 'c'), delay(50, 'd')]);   // both running at once
+console.log('parallel', c + d, Math.round((performance.now() - t) / 50) * 50, 'ms');
+```
+
+Two more traps:
+
+- **`forEach` with an async callback doesn't wait.** `items.forEach(async x => await save(x))` fires them all and returns immediately; the rejections go unhandled. Use `for...of` with `await` (sequential) or `await Promise.all(items.map(...))` (parallel).
+- **A missing `await`** gives you a promise where you expected a value: `const img = loadImage(...)` then `img.w` is `undefined`. Same as forgetting `await` on a `Task` in C#, minus the compiler warning.
+
+## Combinators
+
+| JavaScript | Settles when | Result | C# |
+|---|---|---|---|
+| `Promise.all(ps)` | all fulfil, or the first rejects | array of values, in input order | `Task.WhenAll` |
+| `Promise.allSettled(ps)` | all settle | `[{ status: 'fulfilled', value } or { status: 'rejected', reason }]` | `WhenAll` + inspect each |
+| `Promise.race(ps)` | the first settles (either way) | that value or reason | `Task.WhenAny` |
+| `Promise.any(ps)` | the first fulfils; rejects only if all reject (`AggregateError`) | first value | |
+
+```js
+const delay = (ms, v, fail = false) => new Promise((res, rej) => setTimeout(() => (fail ? rej(new Error(v)) : res(v)), ms));
+const textures = [delay(30, 'rock.png'), delay(10, 'moss.png'), delay(20, 'bad.tga', true)];
+
+try { await Promise.all(textures); } catch (e) { console.log('all:', e.message); }
+const settled = await Promise.allSettled(textures);
+console.log(settled.map(s => s.status === 'fulfilled' ? s.value : 'FAILED ' + s.reason.message));
+console.log('race:', await Promise.race([delay(30, 'rock.png'), delay(10, 'moss.png')]));   // fresh promises: the old ones have all settled
+console.log('any:', await Promise.any([delay(5, 'x', true), delay(15, 'mirror B'), delay(10, 'mirror A')]));
+try { await Promise.any([delay(1, 'p', true), delay(2, 'q', true)]); } catch (e) { console.log(e.name, e.errors.map(x => x.message)); }
+```
+
+None of these *cancel* the losers: a promise is a result, not a handle on the operation. `Promise.all` rejecting early leaves the other loads running. Cancellation is a separate mechanism (below).
+
+## Building blocks: sleep, timeout, retry, limited concurrency
+
+```js
+const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+
+function withTimeout(promise, ms) {
+  let timer;
+  const timeout = new Promise((_, reject) => { timer = setTimeout(() => reject(new Error(`timed out after ${ms} ms`)), ms); });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));   // don't leave the timer running
+}
+
+async function retry(fn, { retries = 3, delay = 10 } = {}) {
+  for (let attempt = 0; ; attempt++) {
+    try { return await fn(attempt); }                   // return await: so the catch sees the rejection
+    catch (e) {
+      if (attempt >= retries) throw e;
+      await sleep(delay * 2 ** attempt);                 // exponential backoff
+    }
+  }
+}
+
+let calls = 0;
+const flaky = async () => { calls++; if (calls < 3) throw new Error('network'); return 'tile data'; };
+console.log(await retry(flaky), 'after', calls, 'calls');
+try { await withTimeout(sleep(100), 20); } catch (e) { console.log(e.message); }
+console.log(await withTimeout(sleep(5).then(() => 'fast enough'), 50));
+```
+
+Note `return await` inside `try`: `return fn()` would return the promise before it settles, and a later rejection would bypass the `catch`.
+
+**Concurrency limits.** `Promise.all(urls.map(load))` starts *everything* at once. For 2,000 terrain tiles that floods the network and the decoder, and you get nothing until the end. A worker pool runs at most `limit` at a time; you'll write `mapLimit` in the exercises.
+
+> **Performance:** every `await` costs at least one microtask hop. That's negligible per asset and terrible per pixel: an `async` function called a million times in a loop, or `await` inside a per-vertex loop, turns a 5 ms computation into a 500 ms one. Keep `await` at the coarse boundaries (per file, per tile, per frame) and keep inner loops synchronous.
+
+## Cancellation with AbortController
+
+`AbortController` is JavaScript's `CancellationTokenSource`: the controller cancels, its `signal` (the token) is passed to the operation. `fetch`, `addEventListener` and many APIs accept a `signal`; your own functions should too.
+
+```js
+function sleep(ms, signal) {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) return reject(signal.reason);
+    const t = setTimeout(() => { signal?.removeEventListener('abort', onAbort); resolve(); }, ms);
+    function onAbort() { clearTimeout(t); reject(signal.reason); }
+    signal?.addEventListener('abort', onAbort, { once: true });
+  });
+}
+
+async function generateTerrain(size, signal) {
+  for (let row = 0; row < size; row += 64) {
+    signal?.throwIfAborted();              // check between slices
+    await sleep(5, signal);                // stand-in for a slice of real work
+  }
+  return `terrain ${size}`;
+}
+
+const ctl = new AbortController();
+const job = generateTerrain(1024, ctl.signal);
+setTimeout(() => ctl.abort(), 12);         // e.g. the user moved a slider: this result is stale
+try { await job; } catch (e) { console.log(e.name, e.message); }
+
+try { await generateTerrain(4096, AbortSignal.timeout(15)); } catch (e) { console.log(e.name); }
+console.log(await generateTerrain(128));
+```
+
+`abort()` rejects with an `AbortError` `DOMException` by default (or whatever reason you pass); `AbortSignal.timeout(ms)` aborts with a `TimeoutError`; `AbortSignal.any([a, b])` combines signals. Cancellation is cooperative: an operation that never checks its signal can't be stopped.
+
+## Async iterators and for await
+
+An **async iterable** is like an iterable whose `next()` returns a promise. `async function*` generators produce them; `for await...of` consumes them (also plain iterables of promises). C# has the same: `IAsyncEnumerable<T>` and `await foreach`. They fit streams: tiles arriving from a generator, chunks of a file, messages.
+
+```js
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+async function* terrainTiles(count) {
+  for (let i = 0; i < count; i++) {
+    await sleep(5);                                  // generating or loading one tile
+    yield { id: i, heights: new Float32Array(4).fill(i / 10) };
+  }
+}
+
+let total = 0;
+for await (const tile of terrainTiles(4)) {
+  total += tile.heights.length;
+  console.log('tile', tile.id, 'ready; upload it now, before the rest are done');
+}
+console.log('samples', total);
+
+for await (const v of [sleep(10).then(() => 'a'), 'b', Promise.resolve('c')]) console.log(v);
+```
+
+`break` in a `for await` calls the generator's `return()`, so its `finally` blocks run, just as with sync generators. `Array.fromAsync(asyncIterable)` collects everything into an array.
+
+## Render loops: requestAnimationFrame and fixed timesteps
+
+An animation or interactive renderer needs to do work once per displayed frame. The tempting version:
+
+```text
+setInterval(() => { update(); render(); }, 16);   // don't
+```
+
+Why it's wrong:
+
+- **It isn't synchronized with the display.** The screen refreshes at 60, 120 or 144 Hz; a 16 ms timer drifts against that, so some frames get two updates and some none: visible stutter. `requestAnimationFrame(cb)` calls you right before the next paint, once per refresh, at whatever rate the display runs.
+- **Timers are imprecise and clamped.** Nested timers are clamped to at least 4 ms, the callback runs late whenever the main thread is busy, and late callbacks pile up behind each other.
+- **Background tabs.** Browsers throttle timers in hidden tabs to once a second or less, but keep firing them; `requestAnimationFrame` simply pauses, saving battery and GPU.
+- rAF passes a high-resolution **timestamp**, so you measure the real elapsed time instead of assuming 16 ms.
+
+So rendering goes in rAF. But the *simulation* (physics, particles, erosion steps) should not depend on the frame rate either, or it behaves differently at 30 fps and 144 fps, and a long frame makes objects tunnel through walls. The standard answer is a **fixed timestep** with an accumulator ("Fix Your Timestep!", Glenn Fiedler):
+
+```js
+const STEP = 1 / 60;                 // simulate in fixed 1/60 s increments
+let acc = 0, simTime = 0, steps = 0;
+function update(dt) { simTime += dt; steps++; }
+function frame(frameDt) {            // called once per display frame with the real elapsed time
+  acc += Math.min(frameDt, 0.25);    // clamp: after a long stall, don't try to catch up forever
+  while (acc >= STEP - 1e-9) { update(STEP); acc -= STEP; }   // tolerance: 144 x (1/144) may sum to 0.99999...
+  const alpha = acc / STEP;          // how far between the last two sim states to draw (interpolation)
+  return alpha;
+}
+// a 144 Hz display, then a 30 Hz one: same simulation either way
+for (let i = 0; i < 144; i++) frame(1 / 144);
+for (let i = 0; i < 30; i++) frame(1 / 30);
+console.log(steps, simTime.toFixed(3));
+```
+
+The live version on this site, drawing into the canvas:
+
+```js
+const ctx = canvas.getContext('2d');
+const STEP = 1 / 60;
+let acc = 0, last = performance.now(), angle = 0, prevAngle = 0;
+function loop(now) {
+  acc += Math.min((now - last) / 1000, 0.25);
+  last = now;
+  while (acc >= STEP) { prevAngle = angle; angle += 1.5 * STEP; acc -= STEP; }
+  const a = prevAngle + (angle - prevAngle) * (acc / STEP);     // interpolate for smooth drawing
+  ctx.fillStyle = '#111'; ctx.fillRect(0, 0, canvas.width, canvas.height);
+  ctx.fillStyle = '#6cf';
+  ctx.fillRect(canvas.width / 2 + Math.cos(a) * 150 - 10, canvas.height / 2 + Math.sin(a) * 150 - 10, 20, 20);
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+console.log('running; the loop keeps going after the program body ends, until the next Run');
+```
+
+> **Performance:** the frame callback runs 60 to 144 times a second, so treat it as a hot path. Don't allocate in it (no new arrays for positions, no closures, no `{ ...state }` copies), don't `await` inside it (an `async` frame function delays its own work by microtask hops and makes its errors unhandled rejections), and don't start heavy synchronous work from it: a 50 ms generation step blows three frames. Slice the work across frames or move it to a Worker, and upload results to the GPU in one batch.
+
+=== exercise timeout
+title: sleep and withTimeout
+--- prompt
+Write two promise utilities:
+
+- `sleep(ms, signal)`: resolves with `undefined` after `ms` milliseconds. `signal` (an `AbortSignal`) is optional: if it is already aborted, reject immediately with `signal.reason`; if it aborts while waiting, clear the timer and reject with `signal.reason`.
+- `withTimeout(promise, ms)`: resolves or rejects like `promise` if it settles within `ms`; otherwise rejects with an `Error` whose `name` is `'TimeoutError'`. Either way the internal timer must be cleared once the outcome is known (tests check that no timer is left behind).
+
+The tests take a few hundred milliseconds of real time.
+--- starter
+function sleep(ms, signal) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function withTimeout(promise, ms) {
+  return promise;
+}
+--- solution
+function sleep(ms, signal) {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) return reject(signal.reason);
+    const onAbort = () => { clearTimeout(t); reject(signal.reason); };
+    const t = setTimeout(() => {
+      signal?.removeEventListener('abort', onAbort);
+      resolve();
+    }, ms);
+    signal?.addEventListener('abort', onAbort, { once: true });
+  });
+}
+
+function withTimeout(promise, ms) {
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => {
+      const e = new Error(`timed out after ${ms} ms`);
+      e.name = 'TimeoutError';
+      reject(e);
+    }, ms);
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
+--- hint
+For `withTimeout`, race the input against a promise that rejects from a `setTimeout`, and clear that timer in `.finally`.
+--- hint
+For `sleep`, register an `abort` listener that clears the timer and rejects; remove the listener when the timer fires so a long-lived signal doesn't collect stale listeners.
+--- harness
+{
+  let t0 = performance.now();
+  const v = await sleep(30);
+  const el = performance.now() - t0;
+  eq(v, undefined);
+  check(el >= 25 && el < 300, `sleep(30) took ${el.toFixed(0)} ms`);
+
+  const pre = new AbortController();
+  pre.abort(new Error('already'));
+  let msg = null;
+  try { await sleep(10, pre.signal); } catch (e) { msg = e.message; }
+  eq(msg, 'already', 'pre-aborted signal rejects with its reason');
+
+  const ctl = new AbortController();
+  t0 = performance.now();
+  const p = sleep(500, ctl.signal);
+  setTimeout(() => ctl.abort(), 20);
+  let name = null;
+  try { await p; } catch (e) { name = e.name; }
+  eq(name, 'AbortError', 'abort while waiting');
+  check(performance.now() - t0 < 300, 'abort rejects promptly');
+
+  eq(await withTimeout(sleep(10).then(() => 'tile'), 200), 'tile');
+  let tn = null;
+  t0 = performance.now();
+  try { await withTimeout(sleep(400), 30); } catch (e) { tn = e.name; }
+  eq(tn, 'TimeoutError');
+  check(performance.now() - t0 < 300, 'timeout fires on time');
+  let inner = null;
+  try { await withTimeout(Promise.reject(new Error('decode failed')), 100); } catch (e) { inner = e.message; }
+  eq(inner, 'decode failed', 'rejections pass through');
+
+  // timers must be cleared: count live timers via a patched setTimeout/clearTimeout
+  const live = new Set(), realSet = self.setTimeout, realClear = self.clearTimeout;
+  self.setTimeout = (fn, ms, ...a) => { const id = realSet(() => { live.delete(id); fn(...a); }, ms); live.add(id); return id; };
+  self.clearTimeout = id => { live.delete(id); realClear(id); };
+  try {
+    await withTimeout(Promise.resolve(1), 1000);
+    await withTimeout(Promise.reject(new Error('x')), 1000).catch(() => {});
+    eq(live.size, 0, 'withTimeout clears its timer');
+    const c2 = new AbortController();
+    const s2 = sleep(1000, c2.signal).catch(() => {});
+    c2.abort();
+    await s2;
+    eq(live.size, 0, 'aborted sleep clears its timer');
+  } finally {
+    self.setTimeout = realSet; self.clearTimeout = realClear;
+  }
+}
+
+=== exercise retry
+title: retry with backoff
+--- prompt
+Asset servers and GPU device creation occasionally fail transiently. Write `retry(fn, { retries = 3, delay = 10, factor = 2, shouldRetry = () => true } = {})`:
+
+- Calls `fn(attempt)` (attempt counts from 0) and resolves with its result. `fn` may return a value or a promise, or throw synchronously.
+- On failure, if attempts remain (`attempt < retries`) and `shouldRetry(error)` is true, waits `delay * factor ** attempt` ms and tries again. So with the defaults the waits are 10, 20, 40 ms and `fn` runs at most 4 times.
+- Otherwise rejects with the **last** error.
+
+Tests measure the total waiting time, so use real timers.
+--- starter
+async function retry(fn, opts) {
+  try {
+    return fn(0);
+  } catch (e) {
+    return fn(1);
+  }
+}
+--- solution
+async function retry(fn, { retries = 3, delay = 10, factor = 2, shouldRetry = () => true } = {}) {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      return await fn(attempt);
+    } catch (e) {
+      if (attempt >= retries || !shouldRetry(e)) throw e;
+      await new Promise(r => setTimeout(r, delay * factor ** attempt));
+    }
+  }
+}
+--- hint
+A `for` loop with `try { return await fn(attempt); } catch (e) { ... }`. Without the `await`, a rejected promise escapes the `catch`.
+--- hint
+Rethrow when `attempt >= retries` or `!shouldRetry(e)`; otherwise sleep and loop.
+--- harness
+{
+  let n = 0;
+  eq(await retry(async a => { n++; if (a < 2) throw new Error('flaky ' + a); return 'ok@' + a; }, { delay: 5 }), 'ok@2');
+  eq(n, 3);
+
+  n = 0;
+  eq(await retry(a => { n++; if (a === 0) throw new Error('sync throw'); return 'plain value'; }, { delay: 1 }), 'plain value', 'sync throw and plain values');
+
+  n = 0;
+  let last = null;
+  const t0 = performance.now();
+  try { await retry(async a => { n++; throw new Error('fail ' + a); }); } catch (e) { last = e.message; }
+  const el = performance.now() - t0;
+  eq([n, last], [4, 'fail 3'], 'defaults: 4 attempts, last error');
+  check(el >= 65 && el < 400, `waits 10+20+40 ms, took ${el.toFixed(0)}`);
+
+  n = 0;
+  try { await retry(() => { n++; throw new TypeError('bug'); }, { shouldRetry: e => !(e instanceof TypeError) }); } catch (e) { last = e.name; }
+  eq([n, last], [1, 'TypeError'], 'shouldRetry false stops at once');
+
+  n = 0;
+  try { await retry(() => { n++; return Promise.reject(new Error('r')); }, { retries: 0 }); } catch (e) { last = e.message; }
+  eq([n, last], [1, 'r'], 'retries 0');
+
+  n = 0;
+  const t1 = performance.now();
+  await retry(async a => { n++; if (a < 2) throw new Error(); return 1; }, { delay: 20, factor: 1 });
+  const el2 = performance.now() - t1;
+  check(el2 >= 35 && el2 < 300, `factor 1: two waits of 20, took ${el2.toFixed(0)}`);
+}
+
+=== exercise mapLimit
+title: mapLimit: a bounded worker pool
+--- prompt
+Write `mapLimit(items, limit, fn)` that calls the async `fn(item, index)` for every item with **at most `limit` calls in flight** at once, and resolves with the results **in input order** (like `Promise.all(items.map(fn))`, but bounded). This is how you load 2,000 terrain tiles without opening 2,000 requests at once.
+
+- Start new calls as soon as earlier ones finish (don't work in fixed batches: one slow tile must not hold up a whole batch).
+- If any call rejects, `mapLimit` rejects with that error, and **no new calls are started** after the failure (calls already running may finish).
+- `items` may be empty. `limit` larger than the item count is fine.
+--- starter
+async function mapLimit(items, limit, fn) {
+  const out = [];
+  for (let i = 0; i < items.length; i += limit) {
+    out.push(...await Promise.all(items.slice(i, i + limit).map((x, j) => fn(x, i + j))));
+  }
+  return out;
+}
+--- solution
+async function mapLimit(items, limit, fn) {
+  const results = new Array(items.length);
+  let next = 0, failed = false;
+  async function worker() {
+    while (!failed && next < items.length) {
+      const i = next++;
+      try {
+        results[i] = await fn(items[i], i);
+      } catch (e) {
+        failed = true;
+        throw e;
+      }
+    }
+  }
+  const workers = Array.from({ length: Math.min(limit, items.length) }, worker);
+  await Promise.all(workers);
+  return results;
+}
+--- hint
+Start `limit` "workers": async loops that each take the next unclaimed index (`next++`), await it, and repeat. Since JavaScript is single-threaded, `next++` needs no lock.
+--- hint
+`Promise.all(workers)` rejects with the first error; a shared `failed` flag stops the other workers from claiming new items.
+--- harness
+{
+  const sleep = ms => new Promise(r => setTimeout(r, ms));
+  let active = 0, peak = 0;
+  const events = [];
+  const fn = async (x, i) => { events.push('start ' + i); active++; peak = Math.max(peak, active); await sleep(x); active--; events.push('end ' + i); return x * 10 + i; };
+  const delays = [60, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5];
+  const r = await mapLimit(delays, 3, fn);
+  eq(r, delays.map((x, i) => x * 10 + i), 'results in input order');
+  eq(peak, 3, 'never more than limit in flight');
+  check(events.indexOf('start 5') < events.indexOf('end 0'), 'no fixed batches: item 5 starts while the slow item 0 is still running');
+  events.length = 0;
+
+  eq(await mapLimit([], 4, fn), []);
+  peak = 0;
+  eq(await mapLimit([1, 2], 10, fn), [10, 21]);
+  eq(peak, 2);
+
+  const started = [];
+  let err = null;
+  try {
+    await mapLimit([0, 1, 2, 3, 4, 5, 6, 7], 2, async (x) => {
+      started.push(x);
+      await sleep(5);
+      if (x === 1) throw new Error('tile 1 corrupt');
+      await sleep(20);
+      return x;
+    });
+  } catch (e) { err = e.message; }
+  eq(err, 'tile 1 corrupt');
+  await sleep(60);
+  check(started.length <= 3, `no new calls after a failure (started ${started})`);
+
+  peak = 0; active = 0;
+  await mapLimit(Array(20).fill(2), 1, fn);
+  eq(peak, 1, 'limit 1 is sequential');
+}
+
+=== exercise assetCache
+title: An asset cache with request coalescing
+--- prompt
+Write `class AssetCache` with `constructor(loader)`, where `loader(url)` returns a promise (a texture, a mesh). Methods:
+
+- `load(url)`: returns a promise of the asset. The first call for a URL calls `loader`; **concurrent** calls for the same URL while it's loading must share the same in-flight promise (one network request, not five), and later calls get the cached result without calling `loader` again.
+- A **failed** load must not be cached: every caller waiting on it gets the rejection, but the next `load` of that URL tries again.
+- `has(url)`: true only once the asset has loaded successfully.
+- `get size()`: number of successfully loaded assets.
+- `loadAll(urls)`: loads them all in parallel and resolves with `{ assets, failed }`: `assets` is a `Map` from URL to asset for the successes, `failed` an array of the URLs that failed, in input order. It never rejects.
+--- starter
+class AssetCache {
+  constructor(loader) { this.loader = loader; }
+  load(url) { return this.loader(url); }
+  has(url) { return false; }
+  get size() { return 0; }
+  async loadAll(urls) { return { assets: new Map(), failed: [] }; }
+}
+--- solution
+class AssetCache {
+  #loader;
+  #pending = new Map();
+  #done = new Map();
+
+  constructor(loader) { this.#loader = loader; }
+
+  load(url) {
+    if (this.#done.has(url)) return Promise.resolve(this.#done.get(url));
+    let p = this.#pending.get(url);
+    if (!p) {
+      p = Promise.resolve()
+        .then(() => this.#loader(url))
+        .then(asset => { this.#done.set(url, asset); return asset; })
+        .finally(() => this.#pending.delete(url));
+      this.#pending.set(url, p);
+    }
+    return p;
+  }
+
+  has(url) { return this.#done.has(url); }
+  get size() { return this.#done.size; }
+
+  async loadAll(urls) {
+    const results = await Promise.allSettled(urls.map(u => this.load(u)));
+    const assets = new Map(), failed = [];
+    results.forEach((r, i) => (r.status === 'fulfilled' ? assets.set(urls[i], r.value) : failed.push(urls[i])));
+    return { assets, failed };
+  }
+}
+--- hint
+Keep two maps: in-flight promises and finished assets. Store the promise *before* it settles, so the second concurrent caller finds it.
+--- hint
+Remove the pending entry in `.finally`; only the success path writes to the finished map, so failures are retried next time. `Promise.allSettled` makes `loadAll` easy.
+--- harness
+{
+  const sleep = ms => new Promise(r => setTimeout(r, ms));
+  const calls = [];
+  let failNext = new Set(['bad.png']);
+  const loader = async (url) => {
+    calls.push(url);
+    await sleep(10);
+    if (failNext.has(url)) throw new Error('404 ' + url);
+    return { url, pixels: url.length };
+  };
+  const cache = new AssetCache(loader);
+  const [a, b, c] = await Promise.all([cache.load('rock.png'), cache.load('rock.png'), cache.load('moss.png')]);
+  check(a === b, 'concurrent loads share one result');
+  eq(calls, ['rock.png', 'moss.png'], 'one loader call per URL');
+  check(cache.has('rock.png') && !cache.has('nope.png'), 'has');
+  eq(cache.size, 2);
+  check(await cache.load('rock.png') === a, 'cached afterwards');
+  eq(calls.length, 2, 'no loader call for cached asset');
+  check(cache.load('rock.png') instanceof Promise, 'load always returns a promise');
+
+  const results = await Promise.allSettled([cache.load('bad.png'), cache.load('bad.png')]);
+  eq(results.map(r => r.status), ['rejected', 'rejected'], 'both waiters see the failure');
+  eq(calls.filter(u => u === 'bad.png').length, 1, 'failure was coalesced too');
+  check(!cache.has('bad.png'), 'failure not cached');
+  failNext = new Set();
+  eq((await cache.load('bad.png')).url, 'bad.png', 'retried after failure');
+  eq(calls.filter(u => u === 'bad.png').length, 2);
+
+  failNext = new Set(['x.tga']);
+  const all = await cache.loadAll(['rock.png', 'x.tga', 'leaf.png', 'x.tga']);
+  check(all.assets instanceof Map, 'assets is a Map');
+  eq([...all.assets.keys()], ['rock.png', 'leaf.png']);
+  eq(all.failed, ['x.tga', 'x.tga']);
+  eq(cache.size, 4);
+
+  const syncThrow = new AssetCache(() => { throw new Error('sync'); });
+  let m = null;
+  try { await syncThrow.load('q'); } catch (e) { m = e.message; }
+  eq(m, 'sync', 'a loader that throws synchronously still gives a rejected promise');
+}
+
+=== exercise fixedStep
+title: A fixed-timestep driver
+--- prompt
+Write `createFixedStep(step, update, maxSteps = 5)` returning a function `advance(frameDt)` for a render loop:
+
+- Add `frameDt` (seconds since the last frame) to an internal accumulator.
+- Call `update(step)` once for every whole `step` in the accumulator, subtracting `step` each time, but **at most `maxSteps` times per call**. If the accumulator still holds a whole step after that (the machine can't keep up: catching up would make the next frame even slower, the "spiral of death"), discard the backlog by setting the accumulator to `0`.
+- Return `alpha = accumulator / step`, in `[0, 1)`, for interpolating between the last two simulation states.
+
+Floating point: treat an accumulator within `1e-9` below a whole step as a whole step (so ten frames of `0.1` with `step = 0.1` give exactly ten updates, not nine).
+
+`advance` is called every frame, so it must not allocate.
+--- starter
+function createFixedStep(step, update, maxSteps = 5) {
+  return (frameDt) => {
+    update(frameDt);
+    return 0;
+  };
+}
+--- solution
+function createFixedStep(step, update, maxSteps = 5) {
+  let acc = 0;
+  return function advance(frameDt) {
+    acc += frameDt;
+    let n = 0;
+    while (acc >= step - 1e-9 && n < maxSteps) {
+      update(step);
+      acc -= step;
+      n++;
+    }
+    if (acc >= step - 1e-9 || acc < 0) acc = 0;
+    return acc / step;
+  };
+}
+--- hint
+A closure holds `acc`. Loop `while (acc >= step - 1e-9 && n < maxSteps)`.
+--- hint
+After the loop, if a whole step is still left, drop the backlog: `acc = 0`. Clamp tiny negative leftovers from the tolerance to `0` as well.
+--- harness
+{
+  let steps = 0;
+  const adv = createFixedStep(1 / 60, dt => { steps++; near(dt, 1 / 60, 1e-12, 'update receives step'); });
+  for (let i = 0; i < 144; i++) adv(1 / 144);
+  check(steps === 59 || steps === 60, `144 frames at 144 Hz = 1 s = 60 steps (got ${steps})`);
+  steps = 0;
+  const adv2 = createFixedStep(0.1, () => steps++);
+  for (let i = 0; i < 10; i++) adv2(0.1);
+  eq(steps, 10, 'float tolerance');
+  steps = 0;
+  const adv3 = createFixedStep(0.1, () => steps++);
+  near(adv3(0.25), 0.5, 1e-9, 'alpha after 2 steps with 0.05 left');
+  eq(steps, 2);
+  near(adv3(0.04), 0.9, 1e-9, 'accumulates');
+  eq(steps, 2);
+  near(adv3(0.01), 0, 1e-6);
+  eq(steps, 3);
+
+  steps = 0;
+  const adv4 = createFixedStep(0.01, () => steps++, 5);
+  const alpha = adv4(1.0);
+  eq(steps, 5, 'at most maxSteps per frame');
+  eq(alpha, 0, 'backlog discarded');
+  adv4(0.01);
+  eq(steps, 6, 'no backlog carried over');
+
+  steps = 0;
+  const adv5 = createFixedStep(1 / 30, () => steps++);
+  eq(adv5(0), 0);
+  eq(steps, 0);
+}
+
+=== exercise asCompleted
+title: Results as they complete
+--- prompt
+`Promise.all` gives you nothing until everything is done. To upload each generated tile the moment it's ready, write an async generator `asCompleted(promises)` that yields the **values** of the given promises **in the order they settle**, not input order.
+
+- If a promise rejects, the generator throws that error when it reaches it (the consumer's `for await` sees the exception at that point); results that settled earlier have already been yielded.
+- Each value is yielded once. An empty input yields nothing.
+- Don't poll with timers; react to the promises settling.
+--- starter
+async function* asCompleted(promises) {
+  for (const p of promises) yield await p;
+}
+--- solution
+async function* asCompleted(promises) {
+  const pending = new Map(promises.map((p, i) => [i, Promise.resolve(p).then(
+    value => ({ i, ok: true, value }),
+    error => ({ i, ok: false, error }),
+  )]));
+  while (pending.size) {
+    const r = await Promise.race(pending.values());
+    pending.delete(r.i);
+    if (!r.ok) throw r.error;
+    yield r.value;
+  }
+}
+--- hint
+Wrap each promise so it always fulfils with `{ i, ok, value | error }`, then repeatedly `Promise.race` the ones still pending and remove the winner.
+--- hint
+A `Map` from index to wrapped promise makes removal easy; `Promise.resolve(p)` lets plain values through too.
+--- harness
+{
+  const later = (ms, v, fail) => new Promise((res, rej) => setTimeout(() => (fail ? rej(new Error(v)) : res(v)), ms));
+  const out = [];
+  for await (const v of asCompleted([later(40, 'slow'), later(5, 'fast'), later(20, 'mid')])) out.push(v);
+  eq(out, ['fast', 'mid', 'slow']);
+  const none = [];
+  for await (const v of asCompleted([])) none.push(v);
+  eq(none, []);
+  const seen = [];
+  let err = null;
+  try {
+    for await (const v of asCompleted([later(30, 'c'), later(5, 'a'), later(15, 'boom', true)])) seen.push(v);
+  } catch (e) { err = e.message; }
+  eq([seen, err], [['a'], 'boom'], 'earlier values yielded, then the error');
+  const mixed = [];
+  for await (const v of asCompleted([later(10, 'p'), 'plain'])) mixed.push(v);
+  eq(mixed, ['plain', 'p'], 'plain values settle first');
+  const t0 = performance.now(), first = [];
+  for await (const v of asCompleted([later(200, 'late'), later(10, 'early')])) { first.push(v); break; }
+  eq(first, ['early']);
+  check(performance.now() - t0 < 150, 'first result arrives without waiting for the rest');
+}
+
+=== exercise latest
+title: Cancel stale work
+--- prompt
+A texture regenerates whenever a slider moves. If the user drags quickly, earlier generations are stale and should be cancelled. Write `latestOnly(fn)` where `fn(signal, ...args)` is an async function that honours an `AbortSignal`. It returns a function `run(...args)` that:
+
+- aborts the previous call's signal (if that call is still running), then
+- calls `fn` with a fresh signal and the arguments, and returns its promise.
+
+So only the most recent call can complete; superseded calls reject with an `AbortError` (as long as `fn` respects its signal, which the test functions do). A call that already finished is unaffected by later calls.
+--- starter
+function latestOnly(fn) {
+  return (...args) => fn(new AbortController().signal, ...args);
+}
+--- solution
+function latestOnly(fn) {
+  let current = null;
+  return (...args) => {
+    current?.abort();
+    const ctl = new AbortController();
+    current = ctl;
+    return fn(ctl.signal, ...args).finally(() => {
+      if (current === ctl) current = null;
+    });
+  };
+}
+--- hint
+Keep the latest `AbortController` in the closure. Each call aborts it (if any) and makes a new one.
+--- hint
+Clear the stored controller when its call finishes, so a later call doesn't abort a promise that has already settled (harmless, but tidy).
+--- harness
+{
+  const work = (signal, label, ms) => new Promise((resolve, reject) => {
+    if (signal.aborted) return reject(signal.reason);
+    const t = setTimeout(() => resolve(label), ms);
+    signal.addEventListener('abort', () => { clearTimeout(t); reject(signal.reason); }, { once: true });
+  });
+  const regen = latestOnly(work);
+  const p1 = regen('r=0.1', 50), p2 = regen('r=0.2', 50), p3 = regen('r=0.3', 50);
+  const rs = await Promise.allSettled([p1, p2, p3]);
+  eq(rs.map(r => r.status), ['rejected', 'rejected', 'fulfilled']);
+  eq(rs[0].reason?.name, 'AbortError');
+  eq(rs[2].value, 'r=0.3');
+
+  const done = await regen('a', 5);
+  eq(done, 'a');
+  eq(await regen('b', 5), 'b', 'finished calls are unaffected');
+
+  let sawSignal = null;
+  const spy = latestOnly(async (signal, x) => { sawSignal = signal; return x * 2; });
+  eq(await spy(21), 42, 'arguments are passed after the signal');
+  check(sawSignal instanceof AbortSignal && !sawSignal.aborted, 'gets a fresh signal');
+
+  const two = latestOnly(work), other = latestOnly(work);
+  const q1 = two('x', 30), q2 = other('y', 30);
+  eq(await Promise.all([q1, q2]), ['x', 'y'], 'separate wrappers are independent');
+}
+
+=== quiz
+run: yes
+--- q
+What does this print?
+--- code
+console.log('A');
+setTimeout(() => console.log('B'), 0);
+Promise.resolve().then(() => console.log('C'));
+queueMicrotask(() => console.log('D'));
+console.log('E');
+await new Promise(r => setTimeout(r, 10));
+--- choice
+A
+B
+C
+D
+E
+--- choice
+A
+E
+B
+C
+D
+--- answer
+A
+E
+C
+D
+B
+--- choice
+A
+C
+D
+E
+B
+--- explain
+Synchronous code first (`A`, `E`). Then the microtask queue is drained in order (`C`, `D`). Only then does the event loop take the next task, the timer (`B`).
+
+=== quiz
+run: yes
+--- q
+What does this print?
+--- code
+async function f() {
+  console.log('f start');
+  await null;
+  console.log('f end');
+}
+console.log('before');
+const p = f();
+console.log('after');
+await p;
+--- choice
+before
+f start
+f end
+after
+--- answer
+before
+f start
+after
+f end
+--- choice
+before
+after
+f start
+f end
+--- choice
+f start
+before
+after
+f end
+--- explain
+An async function runs synchronously up to its first `await`. `await null` still yields: the rest of `f` becomes a microtask, which runs after the current synchronous code (`after`).
+
+=== quiz
+run: yes
+--- q
+What does this print?
+--- code
+setTimeout(() => console.log('timeout'), 0);
+Promise.resolve()
+  .then(() => { console.log('then 1'); setTimeout(() => console.log('timeout 2'), 0); })
+  .then(() => console.log('then 2'));
+queueMicrotask(() => {
+  console.log('micro');
+  queueMicrotask(() => console.log('nested micro'));
+});
+await new Promise(r => setTimeout(r, 20));
+--- choice
+then 1
+micro
+then 2
+nested micro
+timeout 2
+timeout
+--- answer
+then 1
+micro
+then 2
+nested micro
+timeout
+timeout 2
+--- choice
+then 1
+then 2
+micro
+nested micro
+timeout
+timeout 2
+--- choice
+timeout
+then 1
+micro
+then 2
+nested micro
+timeout 2
+--- explain
+Microtasks run in queue order: `then 1` and `micro` were queued first; each queues another microtask (`then 2`, `nested micro`), and those also run before any task. Tasks then run in the order they were scheduled: the first timer, then the one created inside `then 1`.
+
+=== quiz
+run: yes
+--- q
+What does this print?
+--- code
+const p = new Promise(resolve => {
+  console.log('executor');
+  resolve('first');
+  resolve('second');
+  console.log('still running');
+});
+p.then(v => console.log('then', v));
+console.log('sync end');
+await p;
+--- choice
+executor
+then first
+still running
+sync end
+--- answer
+executor
+still running
+sync end
+then first
+--- choice
+executor
+still running
+sync end
+then second
+--- choice
+sync end
+executor
+still running
+then first
+--- explain
+The executor runs synchronously inside `new Promise`. A promise settles only once, so the second `resolve` is ignored. `resolve` doesn't stop the executor. The `then` callback is a microtask, so it runs after the synchronous code.
+
+=== quiz
+run: yes
+--- q
+What does this print?
+--- code
+const sleep = (ms, v) => new Promise(r => setTimeout(() => r(v), ms));
+const log = [];
+[30, 10, 20].forEach(async ms => { await sleep(ms); log.push(ms); });
+log.push('loop done');
+await sleep(50);
+const results = await Promise.all([sleep(30, 'a'), sleep(10, 'b'), 'c']);
+console.log(log, results);
+--- choice
+[ 30, 10, 20, 'loop done' ] [ 'b', 'a', 'c' ]
+--- answer
+[ 'loop done', 10, 20, 30 ] [ 'a', 'b', 'c' ]
+--- choice
+[ 'loop done', 30, 10, 20 ] [ 'a', 'b', 'c' ]
+--- choice
+[ 10, 20, 30, 'loop done' ] [ 'b', 'a', 'c' ]
+--- explain
+`forEach` doesn't wait for async callbacks: the loop finishes immediately, and the callbacks complete later in timer order. `Promise.all` returns values in *input* order regardless of completion order, and plain values pass through.
+
+=== quiz
+run: yes
+--- q
+What does this print?
+--- code
+async function load() { throw new Error('missing.png'); }
+async function a() { try { return load(); } catch { return 'caught in a'; } }
+async function b() { try { return await load(); } catch { return 'caught in b'; } }
+console.log(await a().catch(e => 'escaped a: ' + e.message));
+console.log(await b().catch(e => 'escaped b: ' + e.message));
+--- choice
+caught in a
+caught in b
+--- answer
+escaped a: missing.png
+caught in b
+--- choice
+escaped a: missing.png
+escaped b: missing.png
+--- choice
+caught in a
+escaped b: missing.png
+--- explain
+Calling an async function never throws synchronously; it returns a rejected promise. In `a`, `return load()` hands that promise out of the `try` block, so the rejection happens outside it. In `b`, `await` turns the rejection into a throw *inside* the `try`.
+
+=== quiz
+run: yes
+--- q
+What does this print?
+--- code
+const sleep = (ms, v, fail) => new Promise((res, rej) => setTimeout(() => (fail ? rej(new Error(v)) : res(v)), ms));
+const r1 = await Promise.race([sleep(20, 'tex'), sleep(10, 'err', true)]).catch(e => 'race: ' + e.message);
+const r2 = await Promise.any([sleep(20, 'tex'), sleep(10, 'err', true)]);
+const r3 = await Promise.allSettled([sleep(5, 'ok'), sleep(1, 'bad', true)]);
+console.log(r1, r2, r3.map(r => r.status));
+--- choice
+tex tex [ 'fulfilled', 'rejected' ]
+--- answer
+race: err tex [ 'fulfilled', 'rejected' ]
+--- choice
+race: err race: err [ 'rejected', 'fulfilled' ]
+--- choice
+race: err tex [ 'rejected', 'fulfilled' ]
+--- explain
+`race` settles with whichever settles first, even a rejection. `any` ignores rejections until one fulfils. `allSettled` reports in input order, not completion order.
+
+=== quiz
+--- q
+Why do render loops use `requestAnimationFrame` plus a fixed simulation timestep rather than `setInterval(tick, 16)`?
+--- choice
+`setInterval` can't call functions that draw to a canvas.
+--- answer
+rAF runs once per display refresh right before painting (and pauses in hidden tabs), while timers drift against the display and fire late; a fixed timestep keeps the simulation identical at any frame rate.
+--- choice
+`setInterval` runs on a separate thread, which causes data races.
+--- choice
+rAF guarantees exactly 60 calls per second on every display.
+--- explain
+Timers are neither synchronized with the display nor precise, which shows as stutter, and they keep firing in background tabs. rAF matches the actual refresh rate (60, 120, 144 Hz...), so the simulation must not assume a frame length: accumulate real time and step the simulation in fixed increments.

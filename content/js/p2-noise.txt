@@ -1,0 +1,3447 @@
+=== chapter p2-noise
+title: Noise
+blurb: Seeded PRNGs and integer hashes, value noise, Perlin gradient noise in 2D and 3D, simplex noise, fBm, turbulence and ridged multifractals, domain warping, animated and tileable noise, and analytic derivatives.
+--- body
+## Randomness you can reproduce
+
+Procedural generation is the art of making a lot of content from a little data, and the most important piece of data is the **seed**. Same seed, same world: that is what lets you ship a planet in a few bytes, regenerate a terrain chunk the player walked away from, share a dungeon with a friend, and reproduce the bug report that says "seed 81723, the river runs uphill".
+
+`Math.random()` gives you none of that. It cannot be seeded, its algorithm differs between engines, and every call depends on every call before it, so adding one extra random call early in generation reshuffles everything after it. Use it for nothing that should be reproducible. You need two tools instead:
+
+- a **seeded generator** (a PRNG): a small state machine that produces a *sequence* of numbers. Use it when order is natural: shuffling a table, scattering 1,000 trees, rolling loot.
+- an **integer hash**: a function from coordinates (and a seed) to random bits. Use it when you need *random access*: "what is the random value of lattice point (812, -44)?" without generating the 811 before it. Noise, infinite worlds, chunked generation and anything on the GPU (every pixel is computed independently) are built on hashes.
+
+## Seeded generators: mulberry32 and sfc32
+
+You met **mulberry32** in the binary-data chapter: 32 bits of state, an increment by an odd constant (a Weyl sequence), then a few multiply-xorshift steps to scramble it. It is tiny, fast and good enough for games, but with only 2^32 states it cycles after 4 billion outputs and can produce each 32-bit value at most once per cycle. **sfc32** (Chris Doty-Humphrey's "small fast chaotic" generator, from the PractRand test suite) keeps 128 bits of state and passes much stronger statistical tests:
+
+```js
+function sfc32(a, b, c, d) {
+  a |= 0; b |= 0; c |= 0; d |= 0;
+  return function () {
+    const t = ((a + b) | 0) + d | 0;
+    d = (d + 1) | 0;                       // a counter guarantees a long minimum cycle
+    a = b ^ (b >>> 9);
+    b = (c + (c << 3)) | 0;
+    c = (c << 21) | (c >>> 11);            // rotate
+    c = (c + t) | 0;
+    return (t >>> 0) / 4294967296;         // [0, 1)
+  };
+}
+const raw = sfc32(1, 2, 3, 4);
+console.log([raw(), raw(), raw()].map(v => v.toExponential(2)));   // tiny: the state is still mostly zeros
+const warm = sfc32(1, 2, 3, 4);
+for (let i = 0; i < 15; i++) warm();                               // discard a few outputs
+console.log([warm(), warm(), warm()].map(v => v.toFixed(4)));
+```
+
+Two habits follow from that output. Seed a chaotic generator with well-mixed words (from a hash, or from another generator) and **discard its first dozen outputs**, because simple seeds like 1, 2, 3, 4 start it in a low-entropy state. And keep generators *local*: create one per purpose (`const treeRng = mulberry32(seed ^ 0x5eed7ee5)`) so that adding a new random call in one system does not shift the sequence of another.
+
+> **Performance:** all of these are a handful of 32-bit integer operations, and `Math.imul` is the key: `a * b` on two large 32-bit values exceeds 2^53 and loses the low bits that a hash depends on, while `Math.imul(a, b)` is a true 32-bit multiply (one instruction). Generators are closures here for readability; in the hottest loops you can keep the state in a local variable instead. Never call `Math.random` and never allocate inside a generator.
+
+## Hashing coordinates
+
+A good integer hash has **avalanche**: flipping any input bit flips each output bit with probability one half, so neighboring coordinates get unrelated values. The standard recipe mixes each input in with a multiplication by a large odd constant, then runs a **finalizer**: alternating xor-shifts and multiplies, like MurmurHash3's `fmix32` (Austin Appleby). The constants are not magic; they were found by search for good avalanche.
+
+```js
+function hash2(x, y, seed) {
+  let h = (Math.imul(seed | 0, 0x9e3779b9) + 0x632be5ab) | 0;
+  h = Math.imul(h ^ Math.imul(x | 0, 0x27d4eb2d), 0x85ebca6b);
+  h ^= h >>> 15;
+  h = Math.imul(h ^ Math.imul(y | 0, 0x165667b1), 0xc2b2ae35);
+  h ^= h >>> 13;
+  h = Math.imul(h, 0x846ca68b);
+  return (h ^ (h >>> 16)) >>> 0;
+}
+const popcount = n => { let c = 0; while (n) { n &= n - 1; c++; } return c; };
+let flips = 0;
+for (let x = 0; x < 1000; x++) flips += popcount(hash2(x, 5, 1) ^ hash2(x + 1, 5, 1));
+console.log('average bits that change between neighbors:', flips / 1000, '(ideal 16)');
+console.log((x => (x * 0x27d4eb2d) % 2 ** 32)(123456789), Math.imul(123456789, 0x27d4eb2d) >>> 0, '(the * version is wrong)');
+```
+
+A weak hash shows up as visible structure: diagonal stripes, repeating tiles, or a grid. That is why Run on the hash exercise draws one hash per pixel: your eye is an excellent hash tester. Dividing by 2^32 turns the 32 bits into a float in [0, 1).
+
+## Value noise
+
+White noise (a hash per pixel) has no structure at any scale. Natural textures have features of a characteristic size: blotches, ripples, grains. **Lattice noise** gets that by putting random values only at integer points and interpolating between them; scale the input coordinates and you scale the features.
+
+**Value noise** hashes a random *value* at each of the four corners of the cell containing `(x, y)` and blends them bilinearly. Plain linear blending leaves creases along the grid lines (the slope jumps), and the classic cubic `3t² - 2t³` leaves a jump in the second derivative, which shows up as faceted lighting once you use the noise as a height field. Ken Perlin's 2002 "Improving Noise" paper switched to the **quintic fade** `6t⁵ - 15t⁴ + 10t³`, whose first *and* second derivatives are zero at both ends, so noise is smooth (C2) across cell borders.
+
+```js
+const fade = t => t * t * t * (t * (t * 6 - 15) + 10);
+console.log([0, 0.25, 0.5, 0.75, 1].map(fade));
+// Slope at the ends: the quintic is flat, so cells join without a crease.
+const slope = (f, t, e = 1e-4) => (f(t + e) - f(t - e)) / (2 * e);
+console.log('quintic slope at 0:', slope(fade, 1e-4).toFixed(6), ' smoothstep second derivative jump:', 6);
+```
+
+Value noise is cheap but looks blocky: its features line up with the axes, because the extremes sit exactly on lattice points.
+
+## Perlin gradient noise
+
+Ken Perlin's noise (1985, "An Image Synthesizer"; he won an Academy Award for it in 1997) puts a random **gradient** at each lattice point instead of a value. Each corner contributes the dot product of its gradient with the offset from the corner to the sample point: a little linear ramp, zero at the corner itself. The four ramps are blended with the fade curve. Consequences: noise is exactly 0 at every lattice point, the extremes fall *between* lattice points, and the result has a much more uniform, organic feature size than value noise.
+
+The hash in Perlin's reference implementation is a **permutation table**: the numbers 0 to 255 shuffled, stored twice (512 entries) so that `p[X + 1]` and `p[A + 1]` never need wrapping. Corner `(X + i, Y + j)` gets the hash `p[p[X + i] + Y + j]`, and its low bits pick a gradient from a small fixed set. The improved (2002) version for 3D:
+
+```js
+// Ken Perlin's reference (improved) noise, 3D. p is the 512-entry permutation table.
+function grad3(hash, x, y, z) {
+  const h = hash & 15;                             // 12 cube-edge directions (+4 repeats)
+  const u = h < 8 ? x : y;
+  const v = h < 4 ? y : h === 12 || h === 14 ? x : z;
+  return ((h & 1) === 0 ? u : -u) + ((h & 2) === 0 ? v : -v);
+}
+const fade = t => t * t * t * (t * (t * 6 - 15) + 10), lerp = (a, b, t) => a + (b - a) * t;
+function perlin3(p, x, y, z) {
+  const xf = Math.floor(x), yf = Math.floor(y), zf = Math.floor(z);
+  const X = xf & 255, Y = yf & 255, Z = zf & 255;
+  x -= xf; y -= yf; z -= zf;
+  const u = fade(x), v = fade(y), w = fade(z);
+  const A = p[X] + Y, AA = p[A] + Z, AB = p[A + 1] + Z;
+  const B = p[X + 1] + Y, BA = p[B] + Z, BB = p[B + 1] + Z;
+  return lerp(
+    lerp(lerp(grad3(p[AA], x, y, z), grad3(p[BA], x - 1, y, z), u),
+         lerp(grad3(p[AB], x, y - 1, z), grad3(p[BB], x - 1, y - 1, z), u), v),
+    lerp(lerp(grad3(p[AA + 1], x, y, z - 1), grad3(p[BA + 1], x - 1, y, z - 1), u),
+         lerp(grad3(p[AB + 1], x, y - 1, z - 1), grad3(p[BB + 1], x - 1, y - 1, z - 1), u), v), w);
+}
+const p = new Uint8Array(512);
+for (let i = 0; i < 256; i++) p[i] = i;
+let s = 12345;
+for (let i = 255; i > 0; i--) {                     // seeded Fisher-Yates (a tiny LCG for brevity)
+  s = (Math.imul(s, 1664525) + 1013904223) | 0;
+  const j = (s >>> 8) % (i + 1), t = p[i]; p[i] = p[j]; p[j] = t;
+}
+p.copyWithin(256, 0, 256);
+console.log(perlin3(p, 1, 2, 3), perlin3(p, 1.5, 2.25, 3.75).toFixed(5), perlin3(p, 0.1, 0.1, 0.1).toFixed(5));
+```
+
+Why the fixed gradient set? Perlin's original used 256 random unit vectors in a table, which costs a lookup and gives clumpy directional bias. The 12 directions to the edges of a cube are evenly spread, need no normalization, and the dot products become two additions. In 2D we use the 8 directions `(±1, ±1)`, `(±1, 0)`, `(0, ±1)`.
+
+> **Performance:** the permutation table is built **once per seed** (a shuffle of 256 bytes) and passed in. Building it inside the noise function, or inside the loop over pixels, turns a 30-nanosecond function into a several-microsecond one: a 1024×1024 grid goes from 25 ms to several seconds, and the exercise's large-grid test fails exactly that way. Likewise no arrays or objects per sample (`const g = [gx, gy]`, `return { value, dx }`): return a number, or write into an `out` array you allocated once. The table is a `Uint8Array`, so it is 512 contiguous bytes that stay in L1 cache.
+
+## Simplex noise
+
+Ken Perlin's 2001 **simplex noise** fixes three weaknesses of the classic version: in `n` dimensions classic noise blends `2ⁿ` corners (4 in 2D, 8 in 3D, 16 in 4D) while simplex uses the `n + 1` corners of a simplex (a triangle in 2D, a tetrahedron in 3D); it has no visible grid alignment; and its derivatives are cheap. The trick is to **skew** the plane so the triangular lattice becomes a square grid, find the square, then pick the triangle by comparing `x0 > y0`. Each corner contributes `(0.5 - r²)⁴ · (gradient · offset)` where `r` is the distance to the corner, a radial falloff instead of a fade-and-lerp, and the sum is scaled by 70 to reach about ±1. The clearest write-up is Stefan Gustavson's "Simplex noise demystified" (2005), which the exercise follows. (Perlin's patent on 3D-and-up simplex noise expired in 2022; OpenSimplex was the popular workaround before that.)
+
+```text
+skew:    F2 = (sqrt(3) - 1) / 2      s = (x + y) F2        i = floor(x + s), j = floor(y + s)
+unskew:  G2 = (3 - sqrt(3)) / 6      t = (i + j) G2        x0 = x - (i - t), y0 = y - (j - t)
+corners: (0, 0), (1, 0) or (0, 1) depending on x0 > y0, and (1, 1)
+```
+
+## Fractal sums: fBm, turbulence, ridged
+
+One octave of noise is a soft, featureless blob. Nature has detail at every scale: mountains have ridges, ridges have rocks, rocks have grain. **Fractional Brownian motion** (fBm, named after Mandelbrot and van Ness; the noise formulation is F. Kenton Musgrave's, in *Texturing and Modeling: A Procedural Approach* by Ebert, Musgrave, Peachey, Perlin and Worley) adds octaves of noise, each at a higher frequency and a lower amplitude:
+
+```text
+fbm(p) = Σ  gain^o · noise(lacunarity^o · p)        o = 0 .. octaves-1
+```
+
+- **lacunarity** (usually 2): how much the frequency grows per octave.
+- **gain** (usually 0.5, also called persistence; Musgrave writes it as `lacunarity^-H` with the Hurst exponent `H`): how much the amplitude shrinks. Lower gain is smoother, higher is rougher.
+- **octaves**: stop when the next one would be smaller than a pixel; more octaves past that add only aliasing and cost.
+
+Dividing by the sum of the amplitudes keeps the range comparable as you change the octave count. Variations change what is summed: **turbulence** sums `|noise|`, which creases each octave at its zero crossings (Perlin's 1985 marble and fire); the **ridged multifractal** sums `(1 - |noise|)²`, turning those creases into sharp ridges, and *weights each octave by the previous one*, so detail accumulates on ridges and valleys stay smooth: it is Musgrave's classic mountain generator. Shifting each octave by a constant offset stops all octaves from being exactly 0 at the origin, where their lattices coincide.
+
+```js
+const w = canvas.width, h = canvas.height, image = new ImageData(w, h), px = new Uint32Array(image.data.buffer);
+// value noise on a hashed lattice, then three fractal sums of it, one per band
+const hash = (x, y) => { let k = Math.imul(x, 0x27d4eb2d) ^ Math.imul(y, 0x165667b1); k = Math.imul(k ^ k >>> 15, 0x85ebca6b); k = Math.imul(k ^ k >>> 13, 0xc2b2ae35); return ((k ^ k >>> 16) >>> 0) / 4294967296; };
+const fade = t => t * t * t * (t * (t * 6 - 15) + 10);
+function vnoise(x, y) {
+  const xi = Math.floor(x), yi = Math.floor(y), u = fade(x - xi), v = fade(y - yi);
+  const a = hash(xi, yi), b = hash(xi + 1, yi), c = hash(xi, yi + 1), d = hash(xi + 1, yi + 1);
+  return 2 * (a + (b - a) * u + (c - a) * v + (a - b - c + d) * u * v) - 1;   // [-1, 1]
+}
+function fractal(x, y, kind) {
+  let sum = 0, amp = 1, norm = 0, f = 1, weight = 1;
+  for (let o = 0; o < 7; o++) {
+    const n = vnoise(x * f + o * 19.19, y * f + o * 19.19);
+    let s = kind === 0 ? n : kind === 1 ? Math.abs(n) : (1 - Math.abs(n)) ** 2 * weight;
+    if (kind === 2) weight = Math.min(1, s * 2);
+    sum += amp * s; norm += amp; amp *= 0.5; f *= 2;
+  }
+  return sum / norm;
+}
+for (let y = 0; y < h; y++) {
+  const kind = Math.floor(y * 3 / h);
+  for (let x = 0; x < w; x++) {
+    let v = fractal(x / 90, y / 90, kind);
+    v = kind === 0 ? 0.5 + 0.5 * v : kind === 1 ? v * 1.5 : v;
+    const c = Math.max(0, Math.min(255, v * 255)) | 0;
+    px[y * w + x] = (255 << 24 | (c >> 1) << 16 | c << 8 | c) >>> 0;
+  }
+}
+canvas.getContext('2d').putImageData(image, 0, 0);
+```
+
+## Domain warping
+
+Inigo Quilez's "domain warping" article is one of the most-copied ideas in procedural texturing: instead of evaluating `f(p)`, evaluate `f(p + h(p))`, where `h` is itself noise. Do it twice and you get the look of marbled paper, smoke, satellite photos of river deltas and oil on water:
+
+```text
+q = ( fbm(p),             fbm(p + (5.2, 1.3)) )
+r = ( fbm(p + 4q + (1.7, 9.2)),  fbm(p + 4q + (8.3, 2.8)) )
+f = fbm(p + 4r)
+```
+
+The offsets just make the components independent (different regions of the same noise). The factor 4 is the warp strength. Coloring by `q` and `r` as well as `f`, as Quilez does, brings out the folded structure. It costs five fBm evaluations per pixel, which is why the final exercise of this chapter renders at 256×256 and scales up; on the GPU it runs at full resolution at 60 fps.
+
+## Animated noise
+
+To animate noise, do not move the 2D field (that just slides it) and do not interpolate between two random fields (that pulses). Use **3D noise and treat time as the third coordinate**: `noise(x, y, t · speed)`. Each frame is a slice through a 3D volume, so features appear, morph and dissolve smoothly. 4D noise does the same for animating a 3D volume (clouds you can fly through). Perlin and Neyret's "flow noise" (2001) rotates the gradients over time instead, for swirling motion.
+
+## Tileable noise
+
+A texture that repeats must match at its edges. The clean way is to make the lattice itself periodic: when looking up corner hashes, wrap the lattice coordinates modulo a period `P`, so lattice point `P` *is* lattice point 0. Sampling the noise over `[0, P)` then tiles exactly. For fBm, each octave doubles the frequency, so its period in its own coordinates doubles too (`P · 2^o`), and the sum still tiles with period `P`. (The permutation table gives every noise a period of 256 for free; wrapping just picks a smaller one.)
+
+The alternatives are worse: cross-fading a texture with a shifted copy of itself blurs contrast in the blend zone, and mapping a 2D tile onto a 4D torus (two circles) is seamless but costs 4D noise and distorts feature shapes.
+
+## Analytic derivatives
+
+Height fields need normals for lighting, and finite differences cost two or three extra noise evaluations per pixel and are noisy themselves. Lattice noise is a polynomial inside each cell, so its exact derivative is cheap to compute alongside the value. For value noise with corners `a, b, c, d`:
+
+```text
+n  = a + (b - a) u + (c - a) v + (a - b - c + d) u v          u = fade(fx), v = fade(fy)
+dn/dx = u'(fx) · ((b - a) + (a - b - c + d) v)                u'(t) = 30 t² (t - 1)²
+dn/dy = v'(fy) · ((c - a) + (a - b - c + d) u)
+```
+
+Quilez's "value noise derivatives" article then uses the running derivative inside fBm: each octave is divided by `1 + |∇|²` of the sum so far, so steep slopes stay smooth while flats and ridges collect detail. It looks strikingly like eroded terrain for almost no extra cost. You will build it, and light it, in the exercises.
+
+## The project
+
+The exercises grow one noise library that the textures chapter, and later the GPU track, reuse: generators and a shuffle, coordinate hashes, value noise, Perlin 2D/3D with a seeded permutation table, simplex 2D, fBm/turbulence/ridged, domain warping, periodic (tileable) noise, analytic derivatives with eroded fBm, and an animated domain-warped field. The first step's starter brings forward the color and pixel tools from the Pixels chapter (`packRGBA`, the sRGB table and `floatToRGBA`, cosine palettes) plus a `showField` helper that draws a scalar field through a palette. As before, each step ends with `setTimeout(demo)` and adds a new `demo`: click Run after each one.
+
+=== exercise rng
+title: Seeded generators
+--- prompt
+The starter carries forward your Pixels toolkit (packing, sRGB, palettes) and a new `showField` helper. Below it, start the noise library with generators:
+
+- `mulberry32(seed)`: returns a function producing floats in [0, 1). Use the exact algorithm from the binary-data chapter: state `a = seed | 0`; per call `a = (a + 0x6D2B79F5) | 0`, `t = Math.imul(a ^ (a >>> 15), 1 | a)`, `t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t`, return `((t ^ (t >>> 14)) >>> 0) / 4294967296`.
+- `sfc32(a, b, c, d)`: returns a function producing floats in [0, 1), exactly as in the chapter. Do not warm it up inside; the caller decides.
+- `shuffle(arr, rng)`: Fisher-Yates in place, for `i` from `length - 1` down to 1: `j = Math.floor(rng() * (i + 1))`, swap `arr[i]` and `arr[j]`. Return `arr`. It must work on plain arrays and on typed arrays (including a `subarray` view), because the permutation table will be shuffled through one.
+
+Every generator owns its state in its closure: two generators with the same seed produce the same sequence, independently of each other and of anything else in the program. That independence is the property `Math.random` lacks.
+--- starter
+// ===== From the Pixels chapter =====
+function packRGBA(r, g, b, a = 255) {
+  return ((a & 255) << 24 | (b & 255) << 16 | (g & 255) << 8 | (r & 255)) >>> 0;
+}
+
+function srgbToLinear(c) {
+  return c <= 0.04045 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4);
+}
+
+function linearToSrgb(c) {
+  return c <= 0.0031308 ? c * 12.92 : 1.055 * Math.pow(c, 1 / 2.4) - 0.055;
+}
+
+function makeSrgbLUT() {
+  const lut = new Uint8Array(4097);
+  for (let i = 0; i <= 4096; i++) lut[i] = Math.round(255 * linearToSrgb(i / 4096));
+  return lut;
+}
+
+function floatToRGBA(src, dst, n, lut) {
+  for (let i = 0, j = 0; i < n; i++, j += 3) {
+    let r = src[j], g = src[j + 1], b = src[j + 2];
+    r = r > 0 ? (r < 1 ? r : 1) : 0;
+    g = g > 0 ? (g < 1 ? g : 1) : 0;
+    b = b > 0 ? (b < 1 ? b : 1) : 0;
+    dst[i] = (0xFF000000 | lut[(b * 4096 + 0.5) | 0] << 16 | lut[(g * 4096 + 0.5) | 0] << 8 | lut[(r * 4096 + 0.5) | 0]) >>> 0;
+  }
+}
+
+function cosinePalette(t, a, b, c, d, out) {
+  const TAU = 6.283185307179586;
+  out[0] = a[0] + b[0] * Math.cos(TAU * (c[0] * t + d[0]));
+  out[1] = a[1] + b[1] * Math.cos(TAU * (c[1] * t + d[1]));
+  out[2] = a[2] + b[2] * Math.cos(TAU * (c[2] * t + d[2]));
+  return out;
+}
+
+function makePaletteLUT(n, a, b, c, d) {
+  const lut = new Uint32Array(n), col = new Float64Array(3);
+  for (let i = 0; i < n; i++) {
+    cosinePalette(n > 1 ? i / (n - 1) : 0, a, b, c, d, col);
+    const r = Math.round(255 * Math.min(1, Math.max(0, col[0])));
+    const g = Math.round(255 * Math.min(1, Math.max(0, col[1])));
+    const bl = Math.round(255 * Math.min(1, Math.max(0, col[2])));
+    lut[i] = packRGBA(r, g, bl, 255);
+  }
+  return lut;
+}
+
+// New helper: show a scalar field (values in [0, 1], one float per pixel) through a 256-color LUT.
+function showField(field, w, h, lut) {
+  const image = new ImageData(w, h), px = new Uint32Array(image.data.buffer);
+  for (let i = 0; i < w * h; i++) {
+    const v = field[i] > 0 ? (field[i] < 1 ? field[i] : 1) : 0;
+    px[i] = lut[(v * 255 + 0.5) | 0];
+  }
+  canvas.getContext('2d').putImageData(image, 0, 0);
+}
+
+const GRAY = Uint32Array.from({ length: 256 }, (_, i) => packRGBA(i, i, i));
+// ===== Noise =====
+
+function mulberry32(seed) {
+  return () => 0.5;
+}
+
+function sfc32(a, b, c, d) {
+  return () => 0.5;
+}
+
+function shuffle(arr, rng) {
+  return arr;
+}
+
+// Run: 4000 stars placed by mulberry32(2024): the same sky on every Run. Change the seed.
+function demo() {
+  const w = canvas.width, h = canvas.height, rng = mulberry32(2024);
+  const ctx = canvas.getContext('2d');
+  ctx.fillStyle = '#05060f'; ctx.fillRect(0, 0, w, h);
+  for (let i = 0; i < 4000; i++) {
+    const x = rng() * w, y = rng() * h, b = rng() ** 4;
+    ctx.fillStyle = `rgba(${200 + 55 * rng() | 0}, ${210 + 45 * rng() | 0}, 255, ${0.3 + 0.7 * b})`;
+    ctx.fillRect(x, y, 1 + b * 2, 1 + b * 2);
+  }
+}
+
+setTimeout(demo);
+--- solution
+// ===== From the Pixels chapter =====
+function packRGBA(r, g, b, a = 255) {
+  return ((a & 255) << 24 | (b & 255) << 16 | (g & 255) << 8 | (r & 255)) >>> 0;
+}
+
+function srgbToLinear(c) {
+  return c <= 0.04045 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4);
+}
+
+function linearToSrgb(c) {
+  return c <= 0.0031308 ? c * 12.92 : 1.055 * Math.pow(c, 1 / 2.4) - 0.055;
+}
+
+function makeSrgbLUT() {
+  const lut = new Uint8Array(4097);
+  for (let i = 0; i <= 4096; i++) lut[i] = Math.round(255 * linearToSrgb(i / 4096));
+  return lut;
+}
+
+function floatToRGBA(src, dst, n, lut) {
+  for (let i = 0, j = 0; i < n; i++, j += 3) {
+    let r = src[j], g = src[j + 1], b = src[j + 2];
+    r = r > 0 ? (r < 1 ? r : 1) : 0;
+    g = g > 0 ? (g < 1 ? g : 1) : 0;
+    b = b > 0 ? (b < 1 ? b : 1) : 0;
+    dst[i] = (0xFF000000 | lut[(b * 4096 + 0.5) | 0] << 16 | lut[(g * 4096 + 0.5) | 0] << 8 | lut[(r * 4096 + 0.5) | 0]) >>> 0;
+  }
+}
+
+function cosinePalette(t, a, b, c, d, out) {
+  const TAU = 6.283185307179586;
+  out[0] = a[0] + b[0] * Math.cos(TAU * (c[0] * t + d[0]));
+  out[1] = a[1] + b[1] * Math.cos(TAU * (c[1] * t + d[1]));
+  out[2] = a[2] + b[2] * Math.cos(TAU * (c[2] * t + d[2]));
+  return out;
+}
+
+function makePaletteLUT(n, a, b, c, d) {
+  const lut = new Uint32Array(n), col = new Float64Array(3);
+  for (let i = 0; i < n; i++) {
+    cosinePalette(n > 1 ? i / (n - 1) : 0, a, b, c, d, col);
+    const r = Math.round(255 * Math.min(1, Math.max(0, col[0])));
+    const g = Math.round(255 * Math.min(1, Math.max(0, col[1])));
+    const bl = Math.round(255 * Math.min(1, Math.max(0, col[2])));
+    lut[i] = packRGBA(r, g, bl, 255);
+  }
+  return lut;
+}
+
+// New helper: show a scalar field (values in [0, 1], one float per pixel) through a 256-color LUT.
+function showField(field, w, h, lut) {
+  const image = new ImageData(w, h), px = new Uint32Array(image.data.buffer);
+  for (let i = 0; i < w * h; i++) {
+    const v = field[i] > 0 ? (field[i] < 1 ? field[i] : 1) : 0;
+    px[i] = lut[(v * 255 + 0.5) | 0];
+  }
+  canvas.getContext('2d').putImageData(image, 0, 0);
+}
+
+const GRAY = Uint32Array.from({ length: 256 }, (_, i) => packRGBA(i, i, i));
+// ===== Noise =====
+
+// ---- seeded generators ----
+// mulberry32 (Tommy Ettinger): 32 bits of state, floats in [0, 1).
+function mulberry32(seed) {
+  let a = seed | 0;
+  return function () {
+    a = (a + 0x6D2B79F5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+// sfc32 (Chris Doty-Humphrey, PractRand): 128 bits of state, floats in [0, 1).
+function sfc32(a, b, c, d) {
+  a |= 0; b |= 0; c |= 0; d |= 0;
+  return function () {
+    const t = ((a + b) | 0) + d | 0;
+    d = (d + 1) | 0;
+    a = b ^ (b >>> 9);
+    b = (c + (c << 3)) | 0;
+    c = (c << 21) | (c >>> 11);
+    c = (c + t) | 0;
+    return (t >>> 0) / 4294967296;
+  };
+}
+
+// Fisher-Yates, in place, driven by any rng() in [0, 1).
+function shuffle(arr, rng) {
+  for (let i = arr.length - 1; i > 0; i--) {
+    const j = Math.floor(rng() * (i + 1));
+    const t = arr[i]; arr[i] = arr[j]; arr[j] = t;
+  }
+  return arr;
+}
+
+// Run: 4000 stars placed by mulberry32(2024): the same sky on every Run. Change the seed.
+function demo() {
+  const w = canvas.width, h = canvas.height, rng = mulberry32(2024);
+  const ctx = canvas.getContext('2d');
+  ctx.fillStyle = '#05060f'; ctx.fillRect(0, 0, w, h);
+  for (let i = 0; i < 4000; i++) {
+    const x = rng() * w, y = rng() * h, b = rng() ** 4;
+    ctx.fillStyle = `rgba(${200 + 55 * rng() | 0}, ${210 + 45 * rng() | 0}, 255, ${0.3 + 0.7 * b})`;
+    ctx.fillRect(x, y, 1 + b * 2, 1 + b * 2);
+  }
+}
+
+setTimeout(demo);
+--- hint
+`sfc32`: `const t = ((a + b) | 0) + d | 0; d = (d + 1) | 0; a = b ^ (b >>> 9); b = (c + (c << 3)) | 0; c = (c << 21) | (c >>> 11); c = (c + t) | 0; return (t >>> 0) / 4294967296;`
+--- hint
+`shuffle` only reads `arr.length` and indexes, so the same code handles arrays and typed arrays.
+--- harness
+{
+  const r = mulberry32(1);
+  near(r(), 0.6270739405881613, 1e-15, 'mulberry32(1) #1'); near(r(), 0.002735721180215478, 1e-15, '#2'); near(r(), 0.5274470399599522, 1e-15, '#3');
+  near(mulberry32(0)(), 0.26642920868471265, 1e-15, 'mulberry32(0)');
+  const a = mulberry32(99), b = mulberry32(99), c = mulberry32(100);
+  const sa = [a(), a(), a()], sb = [b(), b(), b()], sc = [c(), c(), c()];
+  eq(sa, sb, 'same seed, same sequence'); check(sa[0] !== sc[0], 'different seed, different sequence');
+  const x = mulberry32(5), y = mulberry32(5); x(); x();
+  near(y(), mulberry32(5)(), 0, 'generators are independent');
+  const s = sfc32(1, 2, 3, 4);
+  near(s(), 1.6298145055770874e-9, 1e-20, 'sfc32 #1 (tiny: un-warmed state)'); near(s(), 7.916241884231567e-9, 1e-20, 'sfc32 #2'); near(s(), 0.01318361610174179, 1e-15, 'sfc32 #3');
+  const g = sfc32(0x9e3779b9, 0x243f6a88, 0xb7e15162, 42);
+  for (let i = 0; i < 15; i++) g();
+  let sum = 0, lo = 1, hi = 0;
+  for (let i = 0; i < 100000; i++) { const v = g(); sum += v; lo = Math.min(lo, v); hi = Math.max(hi, v); }
+  near(sum / 100000, 0.5, 0.005, 'sfc32 mean'); check(lo >= 0 && hi < 1, 'sfc32 in [0, 1)');
+  let m = mulberry32(7), mlo = 1, mhi = 0, msum = 0;
+  for (let i = 0; i < 100000; i++) { const v = m(); msum += v; mlo = Math.min(mlo, v); mhi = Math.max(mhi, v); }
+  near(msum / 100000, 0.5, 0.005, 'mulberry32 mean'); check(mlo >= 0 && mhi < 1, 'mulberry32 in [0, 1)');
+  const arr = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9];
+  check(shuffle(arr, mulberry32(42)) === arr, 'shuffles in place and returns arr');
+  eq(arr, [0, 7, 3, 5, 2, 1, 8, 9, 4, 6], 'shuffle with mulberry32(42)');
+  const t8 = new Uint8Array(20);
+  for (let i = 0; i < 20; i++) t8[i] = i;
+  shuffle(t8.subarray(0, 10), mulberry32(42));
+  eq(Array.from(t8.subarray(0, 10)), [0, 7, 3, 5, 2, 1, 8, 9, 4, 6], 'works on a typed-array view');
+  eq(Array.from(t8.subarray(10)), [10, 11, 12, 13, 14, 15, 16, 17, 18, 19], 'and only that view');
+  eq(shuffle([], mulberry32(1)), [], 'empty'); eq(shuffle([7], mulberry32(1)), [7], 'single element');
+  const big = shuffle(Array.from({ length: 1000 }, (_, i) => i), mulberry32(3));
+  eq([...big].sort((p, q) => p - q), Array.from({ length: 1000 }, (_, i) => i), 'a permutation');
+}
+
+=== exercise hash
+title: Coordinate hashes
+continues: rng
+--- prompt
+Add random access: hash functions from integer coordinates to random bits.
+
+- `hash2(x, y, seed)`: exactly the recipe from the chapter (seed mixed with `0x9e3779b9` plus `0x632be5ab`; `x` mixed in with `0x27d4eb2d` then multiplied by `0x85ebca6b`, xor-shift 15; `y` mixed in with `0x165667b1` then multiplied by `0xc2b2ae35`, xor-shift 13; multiply by `0x846ca68b`, xor-shift 16) returning an **unsigned** 32-bit integer.
+- `hash3(x, y, z, seed)`: `hash2(x ^ Math.imul(z | 0, 0x1b873593), y, seed)`. Note that `z = 0` gives `hash2(x, y, seed)`.
+- `hash01(x, y, seed)`: `hash2(x, y, seed) / 4294967296`, a float in [0, 1).
+
+Every multiplication must be `Math.imul`: with `*`, the product of two 32-bit numbers can need 64 bits, a JavaScript number keeps only 53, and the low bits (the ones that survive `| 0`) are garbage. Coordinates are integers (they will be lattice points); `| 0` makes that explicit.
+
+Run draws white noise from your hash on the left: any stripe, grid or tile you can see is a bug in the hash.
+--- stubs
+function hash2(x, y, seed) {
+  return 0;
+}
+
+function hash3(x, y, z, seed) {
+  return 0;
+}
+
+function hash01(x, y, seed) {
+  return 0;
+}
+
+// Run: left, white noise (one hash per pixel); right, one random color per 32-px cell,
+// with no storage: the cell's color is a function of its coordinates.
+function demo() {
+  const w = canvas.width, h = canvas.height, image = new ImageData(w, h), px = new Uint32Array(image.data.buffer);
+  for (let y = 0; y < h; y++)
+    for (let x = 0; x < w; x++) {
+      if (x < w / 2) { const v = hash2(x, y, 1) >>> 24; px[y * w + x] = packRGBA(v, v, v); }
+      else px[y * w + x] = hash2(x >> 5, y >> 5, 7) | 0xFF000000;
+    }
+  canvas.getContext('2d').putImageData(image, 0, 0);
+}
+--- solution
+// ===== From the Pixels chapter =====
+function packRGBA(r, g, b, a = 255) {
+  return ((a & 255) << 24 | (b & 255) << 16 | (g & 255) << 8 | (r & 255)) >>> 0;
+}
+
+function srgbToLinear(c) {
+  return c <= 0.04045 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4);
+}
+
+function linearToSrgb(c) {
+  return c <= 0.0031308 ? c * 12.92 : 1.055 * Math.pow(c, 1 / 2.4) - 0.055;
+}
+
+function makeSrgbLUT() {
+  const lut = new Uint8Array(4097);
+  for (let i = 0; i <= 4096; i++) lut[i] = Math.round(255 * linearToSrgb(i / 4096));
+  return lut;
+}
+
+function floatToRGBA(src, dst, n, lut) {
+  for (let i = 0, j = 0; i < n; i++, j += 3) {
+    let r = src[j], g = src[j + 1], b = src[j + 2];
+    r = r > 0 ? (r < 1 ? r : 1) : 0;
+    g = g > 0 ? (g < 1 ? g : 1) : 0;
+    b = b > 0 ? (b < 1 ? b : 1) : 0;
+    dst[i] = (0xFF000000 | lut[(b * 4096 + 0.5) | 0] << 16 | lut[(g * 4096 + 0.5) | 0] << 8 | lut[(r * 4096 + 0.5) | 0]) >>> 0;
+  }
+}
+
+function cosinePalette(t, a, b, c, d, out) {
+  const TAU = 6.283185307179586;
+  out[0] = a[0] + b[0] * Math.cos(TAU * (c[0] * t + d[0]));
+  out[1] = a[1] + b[1] * Math.cos(TAU * (c[1] * t + d[1]));
+  out[2] = a[2] + b[2] * Math.cos(TAU * (c[2] * t + d[2]));
+  return out;
+}
+
+function makePaletteLUT(n, a, b, c, d) {
+  const lut = new Uint32Array(n), col = new Float64Array(3);
+  for (let i = 0; i < n; i++) {
+    cosinePalette(n > 1 ? i / (n - 1) : 0, a, b, c, d, col);
+    const r = Math.round(255 * Math.min(1, Math.max(0, col[0])));
+    const g = Math.round(255 * Math.min(1, Math.max(0, col[1])));
+    const bl = Math.round(255 * Math.min(1, Math.max(0, col[2])));
+    lut[i] = packRGBA(r, g, bl, 255);
+  }
+  return lut;
+}
+
+// New helper: show a scalar field (values in [0, 1], one float per pixel) through a 256-color LUT.
+function showField(field, w, h, lut) {
+  const image = new ImageData(w, h), px = new Uint32Array(image.data.buffer);
+  for (let i = 0; i < w * h; i++) {
+    const v = field[i] > 0 ? (field[i] < 1 ? field[i] : 1) : 0;
+    px[i] = lut[(v * 255 + 0.5) | 0];
+  }
+  canvas.getContext('2d').putImageData(image, 0, 0);
+}
+
+const GRAY = Uint32Array.from({ length: 256 }, (_, i) => packRGBA(i, i, i));
+// ===== Noise =====
+
+// ---- seeded generators ----
+// mulberry32 (Tommy Ettinger): 32 bits of state, floats in [0, 1).
+function mulberry32(seed) {
+  let a = seed | 0;
+  return function () {
+    a = (a + 0x6D2B79F5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+// sfc32 (Chris Doty-Humphrey, PractRand): 128 bits of state, floats in [0, 1).
+function sfc32(a, b, c, d) {
+  a |= 0; b |= 0; c |= 0; d |= 0;
+  return function () {
+    const t = ((a + b) | 0) + d | 0;
+    d = (d + 1) | 0;
+    a = b ^ (b >>> 9);
+    b = (c + (c << 3)) | 0;
+    c = (c << 21) | (c >>> 11);
+    c = (c + t) | 0;
+    return (t >>> 0) / 4294967296;
+  };
+}
+
+// Fisher-Yates, in place, driven by any rng() in [0, 1).
+function shuffle(arr, rng) {
+  for (let i = arr.length - 1; i > 0; i--) {
+    const j = Math.floor(rng() * (i + 1));
+    const t = arr[i]; arr[i] = arr[j]; arr[j] = t;
+  }
+  return arr;
+}
+
+// ---- integer hashing: random access instead of a sequence ----
+function hash2(x, y, seed) {
+  let h = (Math.imul(seed | 0, 0x9e3779b9) + 0x632be5ab) | 0;
+  h = Math.imul(h ^ Math.imul(x | 0, 0x27d4eb2d), 0x85ebca6b);
+  h ^= h >>> 15;
+  h = Math.imul(h ^ Math.imul(y | 0, 0x165667b1), 0xc2b2ae35);
+  h ^= h >>> 13;
+  h = Math.imul(h, 0x846ca68b);
+  return (h ^ (h >>> 16)) >>> 0;
+}
+
+function hash3(x, y, z, seed) {
+  return hash2(x ^ Math.imul(z | 0, 0x1b873593), y, seed);
+}
+
+function hash01(x, y, seed) {
+  return hash2(x, y, seed) / 4294967296;
+}
+
+// Run: left, white noise (one hash per pixel); right, one random color per 32-px cell,
+// with no storage: the cell's color is a function of its coordinates.
+function demo() {
+  const w = canvas.width, h = canvas.height, image = new ImageData(w, h), px = new Uint32Array(image.data.buffer);
+  for (let y = 0; y < h; y++)
+    for (let x = 0; x < w; x++) {
+      if (x < w / 2) { const v = hash2(x, y, 1) >>> 24; px[y * w + x] = packRGBA(v, v, v); }
+      else px[y * w + x] = hash2(x >> 5, y >> 5, 7) | 0xFF000000;
+    }
+  canvas.getContext('2d').putImageData(image, 0, 0);
+}
+
+setTimeout(demo);
+--- hint
+`let h = (Math.imul(seed | 0, 0x9e3779b9) + 0x632be5ab) | 0; h = Math.imul(h ^ Math.imul(x | 0, 0x27d4eb2d), 0x85ebca6b); h ^= h >>> 15;` and the same shape for `y`.
+--- harness
+{
+  eq(hash2(0, 0, 0), 3856176997); eq(hash2(1, 0, 0), 186252570); eq(hash2(0, 1, 0), 1557979791);
+  eq(hash2(-5, 7, 123), 4063559396, 'negative coordinates'); eq(hash2(1000000, -3, 99), 3509105436, 'large coordinates');
+  eq(hash3(1, 2, 3, 4), 32020332, 'hash3'); eq(hash3(9, -8, 0, 7), hash2(9, -8, 7), 'hash3 with z = 0');
+  near(hash01(3, 4, 5), 0.06686125695705414, 1e-15, 'hash01');
+  check(hash2(-1, -1, -1) >= 0, 'unsigned');
+  check(hash2(1, 2, 0) !== hash2(2, 1, 0), 'not symmetric in x and y');
+  check(hash2(5, 5, 1) !== hash2(5, 5, 2), 'seed matters');
+  const popcount = n => { let c = 0; while (n) { n &= n - 1; c++; } return c; };
+  let fx = 0, fy = 0, fs = 0, sum = 0, lo = 1, hi = 0;
+  for (let i = 0; i < 4000; i++) {
+    const x = (i * 7) % 300 - 150, y = Math.floor(i / 7) - 200;
+    fx += popcount(hash2(x, y, 3) ^ hash2(x + 1, y, 3));
+    fy += popcount(hash2(x, y, 3) ^ hash2(x, y + 1, 3));
+    fs += popcount(hash2(x, y, 3) ^ hash2(x, y, 4));
+  }
+  near(fx / 4000, 16, 0.5, 'avalanche: neighbors in x differ in about half the bits');
+  near(fy / 4000, 16, 0.5, 'avalanche in y'); near(fs / 4000, 16, 0.5, 'avalanche in seed');
+  for (let y = 0; y < 256; y++) for (let x = 0; x < 256; x++) { const v = hash01(x, y, 11); sum += v; lo = Math.min(lo, v); hi = Math.max(hi, v); }
+  near(sum / 65536, 0.5, 0.01, 'hash01 mean'); check(lo >= 0 && hi < 1, 'hash01 in [0, 1)');
+  const t0 = performance.now();
+  let acc = 0;
+  for (let i = 0; i < 4000000; i++) acc ^= hash2(i, i >> 3, 1);
+  const ms = performance.now() - t0;
+  check(ms < 800, `4M hashes in ${ms.toFixed(0)} ms (limit 800)`);
+}
+
+=== exercise value
+title: Value noise
+continues: hash
+--- prompt
+Add the first smooth noise.
+
+- `fade(t)`: Perlin's quintic `6t⁵ - 15t⁴ + 10t³`, written in Horner form `t * t * t * (t * (t * 6 - 15) + 10)`.
+- `lerp(a, b, t)`: `a + (b - a) * t`.
+- `valueNoise2(x, y, seed)`: let `xi = floor(x)`, `yi = floor(y)`; hash the four corners with `hash01(xi, yi, seed)`, `hash01(xi + 1, yi, seed)`, `hash01(xi, yi + 1, seed)`, `hash01(xi + 1, yi + 1, seed)`; blend along x with `u = fade(x - xi)` and then along y with `v = fade(y - yi)`. The result is in [0, 1).
+
+Use `Math.floor`, not `| 0` or `Math.trunc`: they round toward zero, so every cell between -1 and 1 would be twice as wide and the noise would have a visible seam along the axes.
+--- stubs
+function fade(t) {
+  return t;
+}
+
+function lerp(a, b, t) {
+  return a + (b - a) * t;
+}
+
+function valueNoise2(x, y, seed) {
+  return hash01(Math.floor(x), Math.floor(y), seed);
+}
+
+// Run: value noise at three scales. Notice the blocky, axis-aligned look: that is why Perlin is next.
+function demo() {
+  const w = canvas.width, h = canvas.height, f = new Float32Array(w * h), third = h / 3;
+  for (let y = 0; y < h; y++) {
+    const s = y < third ? 64 : y < 2 * third ? 24 : 8;
+    for (let x = 0; x < w; x++) f[y * w + x] = valueNoise2(x / s * (512 / w), y / s * (512 / w), 42);
+  }
+  showField(f, w, h, GRAY);
+}
+--- solution
+// ===== From the Pixels chapter =====
+function packRGBA(r, g, b, a = 255) {
+  return ((a & 255) << 24 | (b & 255) << 16 | (g & 255) << 8 | (r & 255)) >>> 0;
+}
+
+function srgbToLinear(c) {
+  return c <= 0.04045 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4);
+}
+
+function linearToSrgb(c) {
+  return c <= 0.0031308 ? c * 12.92 : 1.055 * Math.pow(c, 1 / 2.4) - 0.055;
+}
+
+function makeSrgbLUT() {
+  const lut = new Uint8Array(4097);
+  for (let i = 0; i <= 4096; i++) lut[i] = Math.round(255 * linearToSrgb(i / 4096));
+  return lut;
+}
+
+function floatToRGBA(src, dst, n, lut) {
+  for (let i = 0, j = 0; i < n; i++, j += 3) {
+    let r = src[j], g = src[j + 1], b = src[j + 2];
+    r = r > 0 ? (r < 1 ? r : 1) : 0;
+    g = g > 0 ? (g < 1 ? g : 1) : 0;
+    b = b > 0 ? (b < 1 ? b : 1) : 0;
+    dst[i] = (0xFF000000 | lut[(b * 4096 + 0.5) | 0] << 16 | lut[(g * 4096 + 0.5) | 0] << 8 | lut[(r * 4096 + 0.5) | 0]) >>> 0;
+  }
+}
+
+function cosinePalette(t, a, b, c, d, out) {
+  const TAU = 6.283185307179586;
+  out[0] = a[0] + b[0] * Math.cos(TAU * (c[0] * t + d[0]));
+  out[1] = a[1] + b[1] * Math.cos(TAU * (c[1] * t + d[1]));
+  out[2] = a[2] + b[2] * Math.cos(TAU * (c[2] * t + d[2]));
+  return out;
+}
+
+function makePaletteLUT(n, a, b, c, d) {
+  const lut = new Uint32Array(n), col = new Float64Array(3);
+  for (let i = 0; i < n; i++) {
+    cosinePalette(n > 1 ? i / (n - 1) : 0, a, b, c, d, col);
+    const r = Math.round(255 * Math.min(1, Math.max(0, col[0])));
+    const g = Math.round(255 * Math.min(1, Math.max(0, col[1])));
+    const bl = Math.round(255 * Math.min(1, Math.max(0, col[2])));
+    lut[i] = packRGBA(r, g, bl, 255);
+  }
+  return lut;
+}
+
+// New helper: show a scalar field (values in [0, 1], one float per pixel) through a 256-color LUT.
+function showField(field, w, h, lut) {
+  const image = new ImageData(w, h), px = new Uint32Array(image.data.buffer);
+  for (let i = 0; i < w * h; i++) {
+    const v = field[i] > 0 ? (field[i] < 1 ? field[i] : 1) : 0;
+    px[i] = lut[(v * 255 + 0.5) | 0];
+  }
+  canvas.getContext('2d').putImageData(image, 0, 0);
+}
+
+const GRAY = Uint32Array.from({ length: 256 }, (_, i) => packRGBA(i, i, i));
+// ===== Noise =====
+
+// ---- seeded generators ----
+// mulberry32 (Tommy Ettinger): 32 bits of state, floats in [0, 1).
+function mulberry32(seed) {
+  let a = seed | 0;
+  return function () {
+    a = (a + 0x6D2B79F5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+// sfc32 (Chris Doty-Humphrey, PractRand): 128 bits of state, floats in [0, 1).
+function sfc32(a, b, c, d) {
+  a |= 0; b |= 0; c |= 0; d |= 0;
+  return function () {
+    const t = ((a + b) | 0) + d | 0;
+    d = (d + 1) | 0;
+    a = b ^ (b >>> 9);
+    b = (c + (c << 3)) | 0;
+    c = (c << 21) | (c >>> 11);
+    c = (c + t) | 0;
+    return (t >>> 0) / 4294967296;
+  };
+}
+
+// Fisher-Yates, in place, driven by any rng() in [0, 1).
+function shuffle(arr, rng) {
+  for (let i = arr.length - 1; i > 0; i--) {
+    const j = Math.floor(rng() * (i + 1));
+    const t = arr[i]; arr[i] = arr[j]; arr[j] = t;
+  }
+  return arr;
+}
+
+// ---- integer hashing: random access instead of a sequence ----
+function hash2(x, y, seed) {
+  let h = (Math.imul(seed | 0, 0x9e3779b9) + 0x632be5ab) | 0;
+  h = Math.imul(h ^ Math.imul(x | 0, 0x27d4eb2d), 0x85ebca6b);
+  h ^= h >>> 15;
+  h = Math.imul(h ^ Math.imul(y | 0, 0x165667b1), 0xc2b2ae35);
+  h ^= h >>> 13;
+  h = Math.imul(h, 0x846ca68b);
+  return (h ^ (h >>> 16)) >>> 0;
+}
+
+function hash3(x, y, z, seed) {
+  return hash2(x ^ Math.imul(z | 0, 0x1b873593), y, seed);
+}
+
+function hash01(x, y, seed) {
+  return hash2(x, y, seed) / 4294967296;
+}
+
+// ---- value noise ----
+function fade(t) {
+  return t * t * t * (t * (t * 6 - 15) + 10);       // 6t^5 - 15t^4 + 10t^3
+}
+
+function lerp(a, b, t) {
+  return a + (b - a) * t;
+}
+
+// Random values at integer lattice points, smoothly interpolated. Range [0, 1).
+function valueNoise2(x, y, seed) {
+  const xi = Math.floor(x), yi = Math.floor(y);
+  const u = fade(x - xi), v = fade(y - yi);
+  const a = hash01(xi, yi, seed), b = hash01(xi + 1, yi, seed);
+  const c = hash01(xi, yi + 1, seed), d = hash01(xi + 1, yi + 1, seed);
+  return lerp(lerp(a, b, u), lerp(c, d, u), v);
+}
+
+// Run: value noise at three scales. Notice the blocky, axis-aligned look: that is why Perlin is next.
+function demo() {
+  const w = canvas.width, h = canvas.height, f = new Float32Array(w * h), third = h / 3;
+  for (let y = 0; y < h; y++) {
+    const s = y < third ? 64 : y < 2 * third ? 24 : 8;
+    for (let x = 0; x < w; x++) f[y * w + x] = valueNoise2(x / s * (512 / w), y / s * (512 / w), 42);
+  }
+  showField(f, w, h, GRAY);
+}
+
+setTimeout(demo);
+--- hint
+`lerp(lerp(a, b, u), lerp(c, d, u), v)` where `a`/`b` are the bottom corners and `c`/`d` the top ones.
+--- harness
+{
+  eq(fade(0), 0); eq(fade(1), 1); eq(fade(0.5), 0.5); near(fade(0.25), 0.103515625, 1e-15); near(fade(0.9), 0.99144, 1e-12);
+  near(lerp(2, 4, 0.25), 2.5, 1e-15);
+  near(valueNoise2(0.5, 0.5, 1), 0.35532914369832724, 1e-12, 'sample 1');
+  near(valueNoise2(3.25, -1.75, 7), 0.4535303191147113, 1e-12, 'sample 2');
+  near(valueNoise2(-10.6, 20.1, 0), 0.2348440272684176, 1e-12, 'sample 3 (negative x)');
+  eq(valueNoise2(3, 4, 5), hash01(3, 4, 5), 'equals the hash at lattice points');
+  eq(valueNoise2(-2, -7, 5), hash01(-2, -7, 5), 'negative lattice points');
+  near(valueNoise2(-0.5, 0.5, 2), lerp(lerp(hash01(-1, 0, 2), hash01(0, 0, 2), 0.5), lerp(hash01(-1, 1, 2), hash01(0, 1, 2), 0.5), 0.5), 1e-12, 'cell left of the y axis uses floor');
+  near(valueNoise2(2 - 1e-9, 0.3, 4), valueNoise2(2, 0.3, 4), 1e-7, 'continuous across cell borders');
+  check(Math.abs(valueNoise2(3 + 1e-3, 0.5, 9) - valueNoise2(3, 0.5, 9)) < 1e-7, 'flat at cell borders (quintic fade)');
+  let lo = 1, hi = 0;
+  for (let i = 0; i < 20000; i++) { const v = valueNoise2(i * 0.173 - 900, i * 0.071 - 300, 3); lo = Math.min(lo, v); hi = Math.max(hi, v); }
+  check(lo >= 0 && hi < 1 && hi - lo > 0.8, 'range inside [0, 1) and well spread');
+}
+
+=== exercise perlin
+title: Perlin noise in 2D and 3D
+continues: value
+--- prompt
+Add gradient noise with a seeded permutation table.
+
+- `makePerm(seed)`: a `Uint8Array(512)`: fill `p[i] = i` for `i < 256`, shuffle the first 256 entries (a `subarray` view) with your `shuffle` and `mulberry32(seed)`, then copy them to entries 256..511 (`p.copyWithin(256, 0, 256)`).
+- `grad2(h, x, y)`: by `h & 7`: 0: `x + y`, 1: `-x + y`, 2: `x - y`, 3: `-x - y`, 4: `x`, 5: `-x`, 6: `y`, 7: `-y`.
+- `perlin2(p, x, y)`: `X = floor(x) & 255`, `Y = floor(y) & 255`, fractional parts `x, y`, `u = fade(x)`, `v = fade(y)`; `A = p[X] + Y`, `B = p[X + 1] + Y`; corner gradients `p[A]` (0,0), `p[B]` (1,0), `p[A + 1]` (0,1), `p[B + 1]` (1,1), each dotted with the offset from its corner (`x - 1` and/or `y - 1`); `lerp` along x by `u`, then along y by `v`.
+- `grad3` and `perlin3(p, x, y, z)`: Perlin's improved reference, exactly as listed in the chapter.
+- `perlinGrid(out, w, h, seed, scale)`: `out[y * w + x] = perlin2(perm, x * scale, y * scale)` for a `Float32Array` `out`.
+
+`perlinGrid` is where the performance lesson lives: build the table **once** at the top of the call. The test fills a 1024×1024 grid and allows half a second; a correct implementation takes about 30 ms, and one that builds the table per sample takes seconds.
+--- stubs
+function makePerm(seed) {
+  return new Uint8Array(512);
+}
+
+function grad2(h, x, y) {
+  return 0;
+}
+
+function perlin2(p, x, y) {
+  return 0;
+}
+
+function grad3(hash, x, y, z) {
+  return 0;
+}
+
+function perlin3(p, x, y, z) {
+  return 0;
+}
+
+function perlinGrid(out, w, h, seed, scale) {
+}
+
+// Run: top, value noise; bottom, Perlin noise at the same scale. Gradient noise has no
+// blocky grid look and its features are all about the same size.
+function demo() {
+  const w = canvas.width, h = canvas.height, f = new Float32Array(w * h), s = 40 * w / 512;
+  perlinGrid(f, w, h, 42, 1 / s);
+  for (let y = 0; y < h; y++)
+    for (let x = 0; x < w; x++) {
+      const i = y * w + x;
+      f[i] = y < h / 2 ? valueNoise2(x / s, y / s, 42) : 0.5 + 0.5 * f[i];
+    }
+  showField(f, w, h, makePaletteLUT(256, [0.5, 0.5, 0.5], [0.5, 0.5, 0.5], [1, 1, 1], [0, 0.1, 0.2]));
+}
+--- solution
+// ===== From the Pixels chapter =====
+function packRGBA(r, g, b, a = 255) {
+  return ((a & 255) << 24 | (b & 255) << 16 | (g & 255) << 8 | (r & 255)) >>> 0;
+}
+
+function srgbToLinear(c) {
+  return c <= 0.04045 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4);
+}
+
+function linearToSrgb(c) {
+  return c <= 0.0031308 ? c * 12.92 : 1.055 * Math.pow(c, 1 / 2.4) - 0.055;
+}
+
+function makeSrgbLUT() {
+  const lut = new Uint8Array(4097);
+  for (let i = 0; i <= 4096; i++) lut[i] = Math.round(255 * linearToSrgb(i / 4096));
+  return lut;
+}
+
+function floatToRGBA(src, dst, n, lut) {
+  for (let i = 0, j = 0; i < n; i++, j += 3) {
+    let r = src[j], g = src[j + 1], b = src[j + 2];
+    r = r > 0 ? (r < 1 ? r : 1) : 0;
+    g = g > 0 ? (g < 1 ? g : 1) : 0;
+    b = b > 0 ? (b < 1 ? b : 1) : 0;
+    dst[i] = (0xFF000000 | lut[(b * 4096 + 0.5) | 0] << 16 | lut[(g * 4096 + 0.5) | 0] << 8 | lut[(r * 4096 + 0.5) | 0]) >>> 0;
+  }
+}
+
+function cosinePalette(t, a, b, c, d, out) {
+  const TAU = 6.283185307179586;
+  out[0] = a[0] + b[0] * Math.cos(TAU * (c[0] * t + d[0]));
+  out[1] = a[1] + b[1] * Math.cos(TAU * (c[1] * t + d[1]));
+  out[2] = a[2] + b[2] * Math.cos(TAU * (c[2] * t + d[2]));
+  return out;
+}
+
+function makePaletteLUT(n, a, b, c, d) {
+  const lut = new Uint32Array(n), col = new Float64Array(3);
+  for (let i = 0; i < n; i++) {
+    cosinePalette(n > 1 ? i / (n - 1) : 0, a, b, c, d, col);
+    const r = Math.round(255 * Math.min(1, Math.max(0, col[0])));
+    const g = Math.round(255 * Math.min(1, Math.max(0, col[1])));
+    const bl = Math.round(255 * Math.min(1, Math.max(0, col[2])));
+    lut[i] = packRGBA(r, g, bl, 255);
+  }
+  return lut;
+}
+
+// New helper: show a scalar field (values in [0, 1], one float per pixel) through a 256-color LUT.
+function showField(field, w, h, lut) {
+  const image = new ImageData(w, h), px = new Uint32Array(image.data.buffer);
+  for (let i = 0; i < w * h; i++) {
+    const v = field[i] > 0 ? (field[i] < 1 ? field[i] : 1) : 0;
+    px[i] = lut[(v * 255 + 0.5) | 0];
+  }
+  canvas.getContext('2d').putImageData(image, 0, 0);
+}
+
+const GRAY = Uint32Array.from({ length: 256 }, (_, i) => packRGBA(i, i, i));
+// ===== Noise =====
+
+// ---- seeded generators ----
+// mulberry32 (Tommy Ettinger): 32 bits of state, floats in [0, 1).
+function mulberry32(seed) {
+  let a = seed | 0;
+  return function () {
+    a = (a + 0x6D2B79F5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+// sfc32 (Chris Doty-Humphrey, PractRand): 128 bits of state, floats in [0, 1).
+function sfc32(a, b, c, d) {
+  a |= 0; b |= 0; c |= 0; d |= 0;
+  return function () {
+    const t = ((a + b) | 0) + d | 0;
+    d = (d + 1) | 0;
+    a = b ^ (b >>> 9);
+    b = (c + (c << 3)) | 0;
+    c = (c << 21) | (c >>> 11);
+    c = (c + t) | 0;
+    return (t >>> 0) / 4294967296;
+  };
+}
+
+// Fisher-Yates, in place, driven by any rng() in [0, 1).
+function shuffle(arr, rng) {
+  for (let i = arr.length - 1; i > 0; i--) {
+    const j = Math.floor(rng() * (i + 1));
+    const t = arr[i]; arr[i] = arr[j]; arr[j] = t;
+  }
+  return arr;
+}
+
+// ---- integer hashing: random access instead of a sequence ----
+function hash2(x, y, seed) {
+  let h = (Math.imul(seed | 0, 0x9e3779b9) + 0x632be5ab) | 0;
+  h = Math.imul(h ^ Math.imul(x | 0, 0x27d4eb2d), 0x85ebca6b);
+  h ^= h >>> 15;
+  h = Math.imul(h ^ Math.imul(y | 0, 0x165667b1), 0xc2b2ae35);
+  h ^= h >>> 13;
+  h = Math.imul(h, 0x846ca68b);
+  return (h ^ (h >>> 16)) >>> 0;
+}
+
+function hash3(x, y, z, seed) {
+  return hash2(x ^ Math.imul(z | 0, 0x1b873593), y, seed);
+}
+
+function hash01(x, y, seed) {
+  return hash2(x, y, seed) / 4294967296;
+}
+
+// ---- value noise ----
+function fade(t) {
+  return t * t * t * (t * (t * 6 - 15) + 10);       // 6t^5 - 15t^4 + 10t^3
+}
+
+function lerp(a, b, t) {
+  return a + (b - a) * t;
+}
+
+// Random values at integer lattice points, smoothly interpolated. Range [0, 1).
+function valueNoise2(x, y, seed) {
+  const xi = Math.floor(x), yi = Math.floor(y);
+  const u = fade(x - xi), v = fade(y - yi);
+  const a = hash01(xi, yi, seed), b = hash01(xi + 1, yi, seed);
+  const c = hash01(xi, yi + 1, seed), d = hash01(xi + 1, yi + 1, seed);
+  return lerp(lerp(a, b, u), lerp(c, d, u), v);
+}
+
+// ---- Perlin gradient noise (improved, 2002) ----
+// Permutation table: 0..255 shuffled by the seed, then repeated so p[i + 1] never needs a mask.
+function makePerm(seed) {
+  const p = new Uint8Array(512);
+  for (let i = 0; i < 256; i++) p[i] = i;
+  shuffle(p.subarray(0, 256), mulberry32(seed));
+  p.copyWithin(256, 0, 256);
+  return p;
+}
+
+// Dot product of the offset (x, y) with one of 8 gradients picked by the hash.
+function grad2(h, x, y) {
+  switch (h & 7) {
+    case 0: return x + y;
+    case 1: return -x + y;
+    case 2: return x - y;
+    case 3: return -x - y;
+    case 4: return x;
+    case 5: return -x;
+    case 6: return y;
+    default: return -y;
+  }
+}
+
+function perlin2(p, x, y) {
+  const xf = Math.floor(x), yf = Math.floor(y);
+  const X = xf & 255, Y = yf & 255;
+  x -= xf; y -= yf;
+  const u = fade(x), v = fade(y);
+  const A = p[X] + Y, B = p[X + 1] + Y;
+  return lerp(lerp(grad2(p[A], x, y), grad2(p[B], x - 1, y), u),
+              lerp(grad2(p[A + 1], x, y - 1), grad2(p[B + 1], x - 1, y - 1), u), v);
+}
+
+// Ken Perlin's reference gradient: 12 cube-edge directions (plus 4 repeats) from the low 4 bits.
+function grad3(hash, x, y, z) {
+  const h = hash & 15;
+  const u = h < 8 ? x : y;
+  const v = h < 4 ? y : h === 12 || h === 14 ? x : z;
+  return ((h & 1) === 0 ? u : -u) + ((h & 2) === 0 ? v : -v);
+}
+
+function perlin3(p, x, y, z) {
+  const xf = Math.floor(x), yf = Math.floor(y), zf = Math.floor(z);
+  const X = xf & 255, Y = yf & 255, Z = zf & 255;
+  x -= xf; y -= yf; z -= zf;
+  const u = fade(x), v = fade(y), w = fade(z);
+  const A = p[X] + Y, AA = p[A] + Z, AB = p[A + 1] + Z;
+  const B = p[X + 1] + Y, BA = p[B] + Z, BB = p[B + 1] + Z;
+  return lerp(
+    lerp(lerp(grad3(p[AA], x, y, z), grad3(p[BA], x - 1, y, z), u),
+         lerp(grad3(p[AB], x, y - 1, z), grad3(p[BB], x - 1, y - 1, z), u), v),
+    lerp(lerp(grad3(p[AA + 1], x, y, z - 1), grad3(p[BA + 1], x - 1, y, z - 1), u),
+         lerp(grad3(p[AB + 1], x, y - 1, z - 1), grad3(p[BB + 1], x - 1, y - 1, z - 1), u), v), w);
+}
+
+// Fills out[y * w + x] = perlin2(perm, x * scale, y * scale). The table is built once per call.
+function perlinGrid(out, w, h, seed, scale) {
+  const p = makePerm(seed);
+  for (let y = 0; y < h; y++)
+    for (let x = 0; x < w; x++) out[y * w + x] = perlin2(p, x * scale, y * scale);
+}
+
+// Run: top, value noise; bottom, Perlin noise at the same scale. Gradient noise has no
+// blocky grid look and its features are all about the same size.
+function demo() {
+  const w = canvas.width, h = canvas.height, f = new Float32Array(w * h), s = 40 * w / 512;
+  perlinGrid(f, w, h, 42, 1 / s);
+  for (let y = 0; y < h; y++)
+    for (let x = 0; x < w; x++) {
+      const i = y * w + x;
+      f[i] = y < h / 2 ? valueNoise2(x / s, y / s, 42) : 0.5 + 0.5 * f[i];
+    }
+  showField(f, w, h, makePaletteLUT(256, [0.5, 0.5, 0.5], [0.5, 0.5, 0.5], [1, 1, 1], [0, 0.1, 0.2]));
+}
+
+setTimeout(demo);
+--- hint
+`return lerp(lerp(grad2(p[A], x, y), grad2(p[B], x - 1, y), u), lerp(grad2(p[A + 1], x, y - 1), grad2(p[B + 1], x - 1, y - 1), u), v);`
+--- hint
+Subtract `Math.floor(x)` (not `X`) to get the fractional part: `X` has been masked to 0..255 and is only for indexing the table.
+--- harness
+{
+  const p = makePerm(1);
+  check(p instanceof Uint8Array && p.length === 512, 'Uint8Array(512)');
+  eq(Array.from(p.subarray(0, 8)), [104, 132, 173, 3, 17, 75, 85, 14], 'makePerm(1) starts');
+  check(p.subarray(0, 256).every((v, i) => p[i + 256] === v), 'second half repeats the first');
+  eq([...p.subarray(0, 256)].sort((a, b) => a - b), Array.from({ length: 256 }, (_, i) => i), 'a permutation of 0..255');
+  check(makePerm(2)[0] !== p[0] || makePerm(2)[1] !== p[1], 'seed matters');
+  eq([grad2(0, 0.3, 0.4), grad2(1, 0.3, 0.4), grad2(2, 0.3, 0.4), grad2(3, 0.3, 0.4)].map(v => +v.toFixed(6)), [0.7, 0.1, -0.1, -0.7], 'grad2 diagonals');
+  eq([grad2(12, 0.3, 0.4), grad2(13, 0.3, 0.4), grad2(14, 0.3, 0.4), grad2(255, 0.3, 0.4)], [0.3, -0.3, 0.4, -0.4], 'grad2 axes, low 3 bits');
+  near(grad3(0, 0.1, 0.2, 0.3), 0.30000000000000004, 1e-15, 'grad3 h=0'); near(grad3(13, 0.1, 0.2, 0.3), 0.09999999999999998, 1e-15, 'grad3 h=13: -y + z');
+  near(grad3(14, 0.1, 0.2, 0.3), 0.1, 1e-15, 'grad3 h=14: y - x'); near(grad3(7, 0.1, 0.2, 0.3), -0.4, 1e-15, 'grad3 h=7');
+  near(perlin2(p, 0.5, 0.5), -0.25, 1e-12, 'perlin2 sample 1');
+  near(perlin2(p, 1.3, 2.7), 0.30566996544, 1e-12, 'perlin2 sample 2');
+  near(perlin2(p, -3.2, 7.9), 0.12879643135999996, 1e-12, 'perlin2 sample 3 (negative x)');
+  near(perlin2(p, 300.25, 0.75), -0.3857688903808594, 1e-12, 'perlin2 beyond 256 wraps');
+  near(perlin2(p, 300.25, 0.75), perlin2(p, 44.25, 0.75), 1e-12, 'period 256');
+  eq([perlin2(p, 3, 4), perlin2(p, -7, 2), perlin2(p, 0, 0)], [0, 0, 0], 'zero at lattice points');
+  near(perlin3(p, 0.5, 0.5, 0.5), 0.125, 1e-12, 'perlin3 sample 1');
+  near(perlin3(p, 1.3, 2.7, -0.6), -0.10512488756413435, 1e-12, 'perlin3 sample 2');
+  near(perlin3(p, 10.1, -4.2, 3.3), 0.21832663262812152, 1e-12, 'perlin3 sample 3');
+  eq(perlin3(p, 1, 2, 3), 0, 'perlin3 zero at lattice points');
+  let worst = 0;
+  for (let i = 0; i < 20000; i++) worst = Math.max(worst, Math.abs(perlin2(p, i * 0.0137, (i * 0.0291) % 50)), Math.abs(perlin3(p, i * 0.031 % 9, i * 0.017 % 7, i * 0.001)));
+  check(worst <= 1 && worst > 0.6, 'range within [-1, 1]');
+  const small = new Float32Array(6 * 4);
+  perlinGrid(small, 6, 4, 9, 0.37);
+  const p9 = makePerm(9);
+  near(small[3 * 6 + 5], perlin2(p9, 5 * 0.37, 3 * 0.37), 1e-6, 'perlinGrid matches perlin2');
+  near(small[1 * 6 + 2], perlin2(p9, 2 * 0.37, 1 * 0.37), 1e-6, 'perlinGrid row-major');
+  const W = 1024, grid = new Float32Array(W * W);
+  const t0 = performance.now();
+  perlinGrid(grid, W, W, 3, 0.01);
+  const ms = performance.now() - t0;
+  check(ms < 500, `1024x1024 grid in ${ms.toFixed(0)} ms (limit 500): build the permutation table once`);
+  near(grid[777 * W + 555], perlin2(makePerm(3), 5.55, 7.77), 1e-6, 'large grid sample');
+}
+
+=== exercise simplex
+title: Simplex noise
+continues: perlin
+--- prompt
+Add 2D simplex noise, following Gustavson. The constants `F2`, `G2` and the 12-gradient table `GRAD3` (x, y, z per gradient; 2D noise uses x and y) are in the stubs.
+
+`simplex2(p, xin, yin)`:
+
+1. Skew: `s = (xin + yin) * F2`, `i = floor(xin + s)`, `j = floor(yin + s)`.
+2. Unskew the cell origin: `t = (i + j) * G2`, `x0 = xin - (i - t)`, `y0 = yin - (j - t)`.
+3. Middle corner: `(i1, j1) = (1, 0)` if `x0 > y0`, else `(0, 1)`. Offsets: `x1 = x0 - i1 + G2`, `y1 = y0 - j1 + G2`, `x2 = x0 - 1 + 2 G2`, `y2 = y0 - 1 + 2 G2`.
+4. Gradient indices with `ii = i & 255`, `jj = j & 255`: `p[ii + p[jj]] % 12`, `p[ii + i1 + p[jj + j1]] % 12`, `p[ii + 1 + p[jj + 1]] % 12`.
+5. Each corner `k`: `t = 0.5 - x² - y²` (its offsets); if `t > 0`, add `t⁴ · (gx · x + gy · y)`.
+6. Return `70 *` the sum.
+
+Three corners instead of four, no fade or lerps: in 2D simplex is about as fast as Perlin; in 3D and 4D it wins clearly (4 versus 8 corners, 5 versus 16). The test evaluates a million samples.
+--- stubs
+const F2 = 0.5 * (Math.sqrt(3) - 1), G2 = (3 - Math.sqrt(3)) / 6;
+const GRAD3 = new Int8Array([1, 1, 0, -1, 1, 0, 1, -1, 0, -1, -1, 0, 1, 0, 1, -1, 0, 1, 1, 0, -1, -1, 0, -1, 0, 1, 1, 0, -1, 1, 0, 1, -1, 0, -1, -1]);
+
+function simplex2(p, xin, yin) {
+  return 0;
+}
+
+// Run: left, Perlin; right, simplex, same seed and scale, contour-banded so the structure shows.
+function demo() {
+  const w = canvas.width, h = canvas.height, f = new Float32Array(w * h), p = makePerm(7), s = 48 * w / 512;
+  for (let y = 0; y < h; y++)
+    for (let x = 0; x < w; x++) {
+      const n = x < w / 2 ? perlin2(p, x / s, y / s) : simplex2(p, x / s, y / s);
+      const v = 0.5 + 0.5 * n;
+      f[y * w + x] = v * 0.85 + 0.15 * ((v * 12) % 1 < 0.1 ? 1 : 0);
+    }
+  showField(f, w, h, makePaletteLUT(256, [0.5, 0.5, 0.5], [0.5, 0.5, 0.5], [1, 0.7, 0.4], [0, 0.15, 0.2]));
+}
+--- solution
+// ===== From the Pixels chapter =====
+function packRGBA(r, g, b, a = 255) {
+  return ((a & 255) << 24 | (b & 255) << 16 | (g & 255) << 8 | (r & 255)) >>> 0;
+}
+
+function srgbToLinear(c) {
+  return c <= 0.04045 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4);
+}
+
+function linearToSrgb(c) {
+  return c <= 0.0031308 ? c * 12.92 : 1.055 * Math.pow(c, 1 / 2.4) - 0.055;
+}
+
+function makeSrgbLUT() {
+  const lut = new Uint8Array(4097);
+  for (let i = 0; i <= 4096; i++) lut[i] = Math.round(255 * linearToSrgb(i / 4096));
+  return lut;
+}
+
+function floatToRGBA(src, dst, n, lut) {
+  for (let i = 0, j = 0; i < n; i++, j += 3) {
+    let r = src[j], g = src[j + 1], b = src[j + 2];
+    r = r > 0 ? (r < 1 ? r : 1) : 0;
+    g = g > 0 ? (g < 1 ? g : 1) : 0;
+    b = b > 0 ? (b < 1 ? b : 1) : 0;
+    dst[i] = (0xFF000000 | lut[(b * 4096 + 0.5) | 0] << 16 | lut[(g * 4096 + 0.5) | 0] << 8 | lut[(r * 4096 + 0.5) | 0]) >>> 0;
+  }
+}
+
+function cosinePalette(t, a, b, c, d, out) {
+  const TAU = 6.283185307179586;
+  out[0] = a[0] + b[0] * Math.cos(TAU * (c[0] * t + d[0]));
+  out[1] = a[1] + b[1] * Math.cos(TAU * (c[1] * t + d[1]));
+  out[2] = a[2] + b[2] * Math.cos(TAU * (c[2] * t + d[2]));
+  return out;
+}
+
+function makePaletteLUT(n, a, b, c, d) {
+  const lut = new Uint32Array(n), col = new Float64Array(3);
+  for (let i = 0; i < n; i++) {
+    cosinePalette(n > 1 ? i / (n - 1) : 0, a, b, c, d, col);
+    const r = Math.round(255 * Math.min(1, Math.max(0, col[0])));
+    const g = Math.round(255 * Math.min(1, Math.max(0, col[1])));
+    const bl = Math.round(255 * Math.min(1, Math.max(0, col[2])));
+    lut[i] = packRGBA(r, g, bl, 255);
+  }
+  return lut;
+}
+
+// New helper: show a scalar field (values in [0, 1], one float per pixel) through a 256-color LUT.
+function showField(field, w, h, lut) {
+  const image = new ImageData(w, h), px = new Uint32Array(image.data.buffer);
+  for (let i = 0; i < w * h; i++) {
+    const v = field[i] > 0 ? (field[i] < 1 ? field[i] : 1) : 0;
+    px[i] = lut[(v * 255 + 0.5) | 0];
+  }
+  canvas.getContext('2d').putImageData(image, 0, 0);
+}
+
+const GRAY = Uint32Array.from({ length: 256 }, (_, i) => packRGBA(i, i, i));
+// ===== Noise =====
+
+// ---- seeded generators ----
+// mulberry32 (Tommy Ettinger): 32 bits of state, floats in [0, 1).
+function mulberry32(seed) {
+  let a = seed | 0;
+  return function () {
+    a = (a + 0x6D2B79F5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+// sfc32 (Chris Doty-Humphrey, PractRand): 128 bits of state, floats in [0, 1).
+function sfc32(a, b, c, d) {
+  a |= 0; b |= 0; c |= 0; d |= 0;
+  return function () {
+    const t = ((a + b) | 0) + d | 0;
+    d = (d + 1) | 0;
+    a = b ^ (b >>> 9);
+    b = (c + (c << 3)) | 0;
+    c = (c << 21) | (c >>> 11);
+    c = (c + t) | 0;
+    return (t >>> 0) / 4294967296;
+  };
+}
+
+// Fisher-Yates, in place, driven by any rng() in [0, 1).
+function shuffle(arr, rng) {
+  for (let i = arr.length - 1; i > 0; i--) {
+    const j = Math.floor(rng() * (i + 1));
+    const t = arr[i]; arr[i] = arr[j]; arr[j] = t;
+  }
+  return arr;
+}
+
+// ---- integer hashing: random access instead of a sequence ----
+function hash2(x, y, seed) {
+  let h = (Math.imul(seed | 0, 0x9e3779b9) + 0x632be5ab) | 0;
+  h = Math.imul(h ^ Math.imul(x | 0, 0x27d4eb2d), 0x85ebca6b);
+  h ^= h >>> 15;
+  h = Math.imul(h ^ Math.imul(y | 0, 0x165667b1), 0xc2b2ae35);
+  h ^= h >>> 13;
+  h = Math.imul(h, 0x846ca68b);
+  return (h ^ (h >>> 16)) >>> 0;
+}
+
+function hash3(x, y, z, seed) {
+  return hash2(x ^ Math.imul(z | 0, 0x1b873593), y, seed);
+}
+
+function hash01(x, y, seed) {
+  return hash2(x, y, seed) / 4294967296;
+}
+
+// ---- value noise ----
+function fade(t) {
+  return t * t * t * (t * (t * 6 - 15) + 10);       // 6t^5 - 15t^4 + 10t^3
+}
+
+function lerp(a, b, t) {
+  return a + (b - a) * t;
+}
+
+// Random values at integer lattice points, smoothly interpolated. Range [0, 1).
+function valueNoise2(x, y, seed) {
+  const xi = Math.floor(x), yi = Math.floor(y);
+  const u = fade(x - xi), v = fade(y - yi);
+  const a = hash01(xi, yi, seed), b = hash01(xi + 1, yi, seed);
+  const c = hash01(xi, yi + 1, seed), d = hash01(xi + 1, yi + 1, seed);
+  return lerp(lerp(a, b, u), lerp(c, d, u), v);
+}
+
+// ---- Perlin gradient noise (improved, 2002) ----
+// Permutation table: 0..255 shuffled by the seed, then repeated so p[i + 1] never needs a mask.
+function makePerm(seed) {
+  const p = new Uint8Array(512);
+  for (let i = 0; i < 256; i++) p[i] = i;
+  shuffle(p.subarray(0, 256), mulberry32(seed));
+  p.copyWithin(256, 0, 256);
+  return p;
+}
+
+// Dot product of the offset (x, y) with one of 8 gradients picked by the hash.
+function grad2(h, x, y) {
+  switch (h & 7) {
+    case 0: return x + y;
+    case 1: return -x + y;
+    case 2: return x - y;
+    case 3: return -x - y;
+    case 4: return x;
+    case 5: return -x;
+    case 6: return y;
+    default: return -y;
+  }
+}
+
+function perlin2(p, x, y) {
+  const xf = Math.floor(x), yf = Math.floor(y);
+  const X = xf & 255, Y = yf & 255;
+  x -= xf; y -= yf;
+  const u = fade(x), v = fade(y);
+  const A = p[X] + Y, B = p[X + 1] + Y;
+  return lerp(lerp(grad2(p[A], x, y), grad2(p[B], x - 1, y), u),
+              lerp(grad2(p[A + 1], x, y - 1), grad2(p[B + 1], x - 1, y - 1), u), v);
+}
+
+// Ken Perlin's reference gradient: 12 cube-edge directions (plus 4 repeats) from the low 4 bits.
+function grad3(hash, x, y, z) {
+  const h = hash & 15;
+  const u = h < 8 ? x : y;
+  const v = h < 4 ? y : h === 12 || h === 14 ? x : z;
+  return ((h & 1) === 0 ? u : -u) + ((h & 2) === 0 ? v : -v);
+}
+
+function perlin3(p, x, y, z) {
+  const xf = Math.floor(x), yf = Math.floor(y), zf = Math.floor(z);
+  const X = xf & 255, Y = yf & 255, Z = zf & 255;
+  x -= xf; y -= yf; z -= zf;
+  const u = fade(x), v = fade(y), w = fade(z);
+  const A = p[X] + Y, AA = p[A] + Z, AB = p[A + 1] + Z;
+  const B = p[X + 1] + Y, BA = p[B] + Z, BB = p[B + 1] + Z;
+  return lerp(
+    lerp(lerp(grad3(p[AA], x, y, z), grad3(p[BA], x - 1, y, z), u),
+         lerp(grad3(p[AB], x, y - 1, z), grad3(p[BB], x - 1, y - 1, z), u), v),
+    lerp(lerp(grad3(p[AA + 1], x, y, z - 1), grad3(p[BA + 1], x - 1, y, z - 1), u),
+         lerp(grad3(p[AB + 1], x, y - 1, z - 1), grad3(p[BB + 1], x - 1, y - 1, z - 1), u), v), w);
+}
+
+// Fills out[y * w + x] = perlin2(perm, x * scale, y * scale). The table is built once per call.
+function perlinGrid(out, w, h, seed, scale) {
+  const p = makePerm(seed);
+  for (let y = 0; y < h; y++)
+    for (let x = 0; x < w; x++) out[y * w + x] = perlin2(p, x * scale, y * scale);
+}
+
+// ---- simplex noise 2D (Perlin 2001; Gustavson's "Simplex noise demystified") ----
+const F2 = 0.5 * (Math.sqrt(3) - 1), G2 = (3 - Math.sqrt(3)) / 6;
+const GRAD3 = new Int8Array([1, 1, 0, -1, 1, 0, 1, -1, 0, -1, -1, 0, 1, 0, 1, -1, 0, 1, 1, 0, -1, -1, 0, -1, 0, 1, 1, 0, -1, 1, 0, 1, -1, 0, -1, -1]);
+
+function simplex2(p, xin, yin) {
+  const s = (xin + yin) * F2;                       // skew to the square grid
+  const i = Math.floor(xin + s), j = Math.floor(yin + s);
+  const t = (i + j) * G2;                           // unskew the cell origin back
+  const x0 = xin - (i - t), y0 = yin - (j - t);
+  const i1 = x0 > y0 ? 1 : 0, j1 = 1 - i1;          // which triangle of the cell
+  const x1 = x0 - i1 + G2, y1 = y0 - j1 + G2;
+  const x2 = x0 - 1 + 2 * G2, y2 = y0 - 1 + 2 * G2;
+  const ii = i & 255, jj = j & 255;
+  const g0 = (p[ii + p[jj]] % 12) * 3, g1 = (p[ii + i1 + p[jj + j1]] % 12) * 3, g2 = (p[ii + 1 + p[jj + 1]] % 12) * 3;
+  let n = 0;
+  let t0 = 0.5 - x0 * x0 - y0 * y0;
+  if (t0 > 0) { t0 *= t0; n += t0 * t0 * (GRAD3[g0] * x0 + GRAD3[g0 + 1] * y0); }
+  let t1 = 0.5 - x1 * x1 - y1 * y1;
+  if (t1 > 0) { t1 *= t1; n += t1 * t1 * (GRAD3[g1] * x1 + GRAD3[g1 + 1] * y1); }
+  let t2 = 0.5 - x2 * x2 - y2 * y2;
+  if (t2 > 0) { t2 *= t2; n += t2 * t2 * (GRAD3[g2] * x2 + GRAD3[g2 + 1] * y2); }
+  return 70 * n;
+}
+
+// Run: left, Perlin; right, simplex, same seed and scale, contour-banded so the structure shows.
+function demo() {
+  const w = canvas.width, h = canvas.height, f = new Float32Array(w * h), p = makePerm(7), s = 48 * w / 512;
+  for (let y = 0; y < h; y++)
+    for (let x = 0; x < w; x++) {
+      const n = x < w / 2 ? perlin2(p, x / s, y / s) : simplex2(p, x / s, y / s);
+      const v = 0.5 + 0.5 * n;
+      f[y * w + x] = v * 0.85 + 0.15 * ((v * 12) % 1 < 0.1 ? 1 : 0);
+    }
+  showField(f, w, h, makePaletteLUT(256, [0.5, 0.5, 0.5], [0.5, 0.5, 0.5], [1, 0.7, 0.4], [0, 0.15, 0.2]));
+}
+
+setTimeout(demo);
+--- hint
+With `g = index * 3`, the gradient components are `GRAD3[g]` and `GRAD3[g + 1]`.
+--- hint
+`t *= t; n += t * t * (gx * x + gy * y)` is the `t⁴` falloff without `Math.pow`.
+--- harness
+{
+  const p = makePerm(1);
+  near(F2, 0.3660254037844386, 1e-15, 'F2'); near(G2, 0.21132486540518713, 1e-15, 'G2');
+  near(simplex2(p, 0.5, 0.5), -0.6143130272544324, 1e-12, 'sample 1');
+  near(simplex2(p, 1.3, 2.7), 0.8236743575245623, 1e-12, 'sample 2');
+  near(simplex2(p, -3.2, 7.9), 0.23785375551302695, 1e-12, 'sample 3');
+  near(simplex2(p, 0.1, 0.9), 0.7465787952028463, 1e-12, 'sample 4 (upper triangle)');
+  eq(simplex2(p, 0, 0), 0, 'zero at a lattice point');
+  near(simplex2(p, 300.4, 0.2), simplex2(p, 300.4, 0.2), 0, 'deterministic');
+  near(simplex2(p, 3.7 + 1e-9, 1.1), simplex2(p, 3.7, 1.1), 1e-7, 'continuous');
+  let lo = 0, hi = 0;
+  for (let i = 0; i < 100000; i++) { const v = simplex2(p, (i % 500) * 0.031, Math.floor(i / 500) * 0.029); lo = Math.min(lo, v); hi = Math.max(hi, v); }
+  check(lo >= -1 && hi <= 1 && hi - lo > 1.8, 'range close to [-1, 1]');
+  const t0 = performance.now();
+  let acc = 0;
+  for (let i = 0; i < 1000000; i++) acc += simplex2(p, i * 0.001, i * 0.0013);
+  const ms = performance.now() - t0;
+  check(ms < 600, `1M samples in ${ms.toFixed(0)} ms (limit 600)`);
+}
+
+=== exercise fbm
+title: fBm, turbulence and ridged multifractal
+continues: simplex
+--- prompt
+Add the fractal sums, all built on `perlin2`. Octave `o` (from 0) samples at `(x * f + o * 19.19, y * f + o * 19.19)` with frequency `f = lacunarity^o` and amplitude `gain^o`; every function returns its sum divided by the sum of the amplitudes.
+
+- `fbm2(p, x, y, octaves, lacunarity = 2, gain = 0.5)`: sum of `amp * noise`.
+- `turbulence2(...)` (same parameters): sum of `amp * |noise|`.
+- `ridged2(p, x, y, octaves, lacunarity = 2, gain = 0.5, offset = 1)`: per octave `s = (offset - |noise|)²`, then `s *= weight`, then `weight = min(s * 2, 1)` (starting from `weight = 1`), and add `amp * s`.
+
+Keep it to one loop with running `amp` and `f` (multiply each octave; no `Math.pow` per octave) and call `perlin2` directly. A generic `fbm(noiseFn, ...)` that takes any noise function is tempting and fine for prototyping, but in the hot loop of a texture generator a direct call lets the engine inline the noise.
+--- stubs
+function fbm2(p, x, y, octaves, lacunarity = 2, gain = 0.5) {
+  return 0;
+}
+
+function turbulence2(p, x, y, octaves, lacunarity = 2, gain = 0.5) {
+  return 0;
+}
+
+function ridged2(p, x, y, octaves, lacunarity = 2, gain = 0.5, offset = 1) {
+  return 0;
+}
+
+// Run: three bands: fBm (clouds), turbulence (fire, marble veins), ridged (mountain ranges).
+function demo() {
+  const w = canvas.width, h = canvas.height, f = new Float32Array(w * h), p = makePerm(3), s = 128 * w / 512;
+  for (let y = 0; y < h; y++)
+    for (let x = 0; x < w; x++) {
+      const X = x / s, Y = y / s, band = Math.floor(y * 3 / h);
+      f[y * w + x] = band === 0 ? 0.5 + 0.6 * fbm2(p, X, Y, 6) : band === 1 ? turbulence2(p, X, Y, 6) * 1.6 : ridged2(p, X, Y, 6);
+    }
+  showField(f, w, h, makePaletteLUT(256, [0.5, 0.5, 0.5], [0.5, 0.5, 0.5], [1, 1, 0.5], [0.8, 0.9, 0.3]));
+}
+--- solution
+// ===== From the Pixels chapter =====
+function packRGBA(r, g, b, a = 255) {
+  return ((a & 255) << 24 | (b & 255) << 16 | (g & 255) << 8 | (r & 255)) >>> 0;
+}
+
+function srgbToLinear(c) {
+  return c <= 0.04045 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4);
+}
+
+function linearToSrgb(c) {
+  return c <= 0.0031308 ? c * 12.92 : 1.055 * Math.pow(c, 1 / 2.4) - 0.055;
+}
+
+function makeSrgbLUT() {
+  const lut = new Uint8Array(4097);
+  for (let i = 0; i <= 4096; i++) lut[i] = Math.round(255 * linearToSrgb(i / 4096));
+  return lut;
+}
+
+function floatToRGBA(src, dst, n, lut) {
+  for (let i = 0, j = 0; i < n; i++, j += 3) {
+    let r = src[j], g = src[j + 1], b = src[j + 2];
+    r = r > 0 ? (r < 1 ? r : 1) : 0;
+    g = g > 0 ? (g < 1 ? g : 1) : 0;
+    b = b > 0 ? (b < 1 ? b : 1) : 0;
+    dst[i] = (0xFF000000 | lut[(b * 4096 + 0.5) | 0] << 16 | lut[(g * 4096 + 0.5) | 0] << 8 | lut[(r * 4096 + 0.5) | 0]) >>> 0;
+  }
+}
+
+function cosinePalette(t, a, b, c, d, out) {
+  const TAU = 6.283185307179586;
+  out[0] = a[0] + b[0] * Math.cos(TAU * (c[0] * t + d[0]));
+  out[1] = a[1] + b[1] * Math.cos(TAU * (c[1] * t + d[1]));
+  out[2] = a[2] + b[2] * Math.cos(TAU * (c[2] * t + d[2]));
+  return out;
+}
+
+function makePaletteLUT(n, a, b, c, d) {
+  const lut = new Uint32Array(n), col = new Float64Array(3);
+  for (let i = 0; i < n; i++) {
+    cosinePalette(n > 1 ? i / (n - 1) : 0, a, b, c, d, col);
+    const r = Math.round(255 * Math.min(1, Math.max(0, col[0])));
+    const g = Math.round(255 * Math.min(1, Math.max(0, col[1])));
+    const bl = Math.round(255 * Math.min(1, Math.max(0, col[2])));
+    lut[i] = packRGBA(r, g, bl, 255);
+  }
+  return lut;
+}
+
+// New helper: show a scalar field (values in [0, 1], one float per pixel) through a 256-color LUT.
+function showField(field, w, h, lut) {
+  const image = new ImageData(w, h), px = new Uint32Array(image.data.buffer);
+  for (let i = 0; i < w * h; i++) {
+    const v = field[i] > 0 ? (field[i] < 1 ? field[i] : 1) : 0;
+    px[i] = lut[(v * 255 + 0.5) | 0];
+  }
+  canvas.getContext('2d').putImageData(image, 0, 0);
+}
+
+const GRAY = Uint32Array.from({ length: 256 }, (_, i) => packRGBA(i, i, i));
+// ===== Noise =====
+
+// ---- seeded generators ----
+// mulberry32 (Tommy Ettinger): 32 bits of state, floats in [0, 1).
+function mulberry32(seed) {
+  let a = seed | 0;
+  return function () {
+    a = (a + 0x6D2B79F5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+// sfc32 (Chris Doty-Humphrey, PractRand): 128 bits of state, floats in [0, 1).
+function sfc32(a, b, c, d) {
+  a |= 0; b |= 0; c |= 0; d |= 0;
+  return function () {
+    const t = ((a + b) | 0) + d | 0;
+    d = (d + 1) | 0;
+    a = b ^ (b >>> 9);
+    b = (c + (c << 3)) | 0;
+    c = (c << 21) | (c >>> 11);
+    c = (c + t) | 0;
+    return (t >>> 0) / 4294967296;
+  };
+}
+
+// Fisher-Yates, in place, driven by any rng() in [0, 1).
+function shuffle(arr, rng) {
+  for (let i = arr.length - 1; i > 0; i--) {
+    const j = Math.floor(rng() * (i + 1));
+    const t = arr[i]; arr[i] = arr[j]; arr[j] = t;
+  }
+  return arr;
+}
+
+// ---- integer hashing: random access instead of a sequence ----
+function hash2(x, y, seed) {
+  let h = (Math.imul(seed | 0, 0x9e3779b9) + 0x632be5ab) | 0;
+  h = Math.imul(h ^ Math.imul(x | 0, 0x27d4eb2d), 0x85ebca6b);
+  h ^= h >>> 15;
+  h = Math.imul(h ^ Math.imul(y | 0, 0x165667b1), 0xc2b2ae35);
+  h ^= h >>> 13;
+  h = Math.imul(h, 0x846ca68b);
+  return (h ^ (h >>> 16)) >>> 0;
+}
+
+function hash3(x, y, z, seed) {
+  return hash2(x ^ Math.imul(z | 0, 0x1b873593), y, seed);
+}
+
+function hash01(x, y, seed) {
+  return hash2(x, y, seed) / 4294967296;
+}
+
+// ---- value noise ----
+function fade(t) {
+  return t * t * t * (t * (t * 6 - 15) + 10);       // 6t^5 - 15t^4 + 10t^3
+}
+
+function lerp(a, b, t) {
+  return a + (b - a) * t;
+}
+
+// Random values at integer lattice points, smoothly interpolated. Range [0, 1).
+function valueNoise2(x, y, seed) {
+  const xi = Math.floor(x), yi = Math.floor(y);
+  const u = fade(x - xi), v = fade(y - yi);
+  const a = hash01(xi, yi, seed), b = hash01(xi + 1, yi, seed);
+  const c = hash01(xi, yi + 1, seed), d = hash01(xi + 1, yi + 1, seed);
+  return lerp(lerp(a, b, u), lerp(c, d, u), v);
+}
+
+// ---- Perlin gradient noise (improved, 2002) ----
+// Permutation table: 0..255 shuffled by the seed, then repeated so p[i + 1] never needs a mask.
+function makePerm(seed) {
+  const p = new Uint8Array(512);
+  for (let i = 0; i < 256; i++) p[i] = i;
+  shuffle(p.subarray(0, 256), mulberry32(seed));
+  p.copyWithin(256, 0, 256);
+  return p;
+}
+
+// Dot product of the offset (x, y) with one of 8 gradients picked by the hash.
+function grad2(h, x, y) {
+  switch (h & 7) {
+    case 0: return x + y;
+    case 1: return -x + y;
+    case 2: return x - y;
+    case 3: return -x - y;
+    case 4: return x;
+    case 5: return -x;
+    case 6: return y;
+    default: return -y;
+  }
+}
+
+function perlin2(p, x, y) {
+  const xf = Math.floor(x), yf = Math.floor(y);
+  const X = xf & 255, Y = yf & 255;
+  x -= xf; y -= yf;
+  const u = fade(x), v = fade(y);
+  const A = p[X] + Y, B = p[X + 1] + Y;
+  return lerp(lerp(grad2(p[A], x, y), grad2(p[B], x - 1, y), u),
+              lerp(grad2(p[A + 1], x, y - 1), grad2(p[B + 1], x - 1, y - 1), u), v);
+}
+
+// Ken Perlin's reference gradient: 12 cube-edge directions (plus 4 repeats) from the low 4 bits.
+function grad3(hash, x, y, z) {
+  const h = hash & 15;
+  const u = h < 8 ? x : y;
+  const v = h < 4 ? y : h === 12 || h === 14 ? x : z;
+  return ((h & 1) === 0 ? u : -u) + ((h & 2) === 0 ? v : -v);
+}
+
+function perlin3(p, x, y, z) {
+  const xf = Math.floor(x), yf = Math.floor(y), zf = Math.floor(z);
+  const X = xf & 255, Y = yf & 255, Z = zf & 255;
+  x -= xf; y -= yf; z -= zf;
+  const u = fade(x), v = fade(y), w = fade(z);
+  const A = p[X] + Y, AA = p[A] + Z, AB = p[A + 1] + Z;
+  const B = p[X + 1] + Y, BA = p[B] + Z, BB = p[B + 1] + Z;
+  return lerp(
+    lerp(lerp(grad3(p[AA], x, y, z), grad3(p[BA], x - 1, y, z), u),
+         lerp(grad3(p[AB], x, y - 1, z), grad3(p[BB], x - 1, y - 1, z), u), v),
+    lerp(lerp(grad3(p[AA + 1], x, y, z - 1), grad3(p[BA + 1], x - 1, y, z - 1), u),
+         lerp(grad3(p[AB + 1], x, y - 1, z - 1), grad3(p[BB + 1], x - 1, y - 1, z - 1), u), v), w);
+}
+
+// Fills out[y * w + x] = perlin2(perm, x * scale, y * scale). The table is built once per call.
+function perlinGrid(out, w, h, seed, scale) {
+  const p = makePerm(seed);
+  for (let y = 0; y < h; y++)
+    for (let x = 0; x < w; x++) out[y * w + x] = perlin2(p, x * scale, y * scale);
+}
+
+// ---- simplex noise 2D (Perlin 2001; Gustavson's "Simplex noise demystified") ----
+const F2 = 0.5 * (Math.sqrt(3) - 1), G2 = (3 - Math.sqrt(3)) / 6;
+const GRAD3 = new Int8Array([1, 1, 0, -1, 1, 0, 1, -1, 0, -1, -1, 0, 1, 0, 1, -1, 0, 1, 1, 0, -1, -1, 0, -1, 0, 1, 1, 0, -1, 1, 0, 1, -1, 0, -1, -1]);
+
+function simplex2(p, xin, yin) {
+  const s = (xin + yin) * F2;                       // skew to the square grid
+  const i = Math.floor(xin + s), j = Math.floor(yin + s);
+  const t = (i + j) * G2;                           // unskew the cell origin back
+  const x0 = xin - (i - t), y0 = yin - (j - t);
+  const i1 = x0 > y0 ? 1 : 0, j1 = 1 - i1;          // which triangle of the cell
+  const x1 = x0 - i1 + G2, y1 = y0 - j1 + G2;
+  const x2 = x0 - 1 + 2 * G2, y2 = y0 - 1 + 2 * G2;
+  const ii = i & 255, jj = j & 255;
+  const g0 = (p[ii + p[jj]] % 12) * 3, g1 = (p[ii + i1 + p[jj + j1]] % 12) * 3, g2 = (p[ii + 1 + p[jj + 1]] % 12) * 3;
+  let n = 0;
+  let t0 = 0.5 - x0 * x0 - y0 * y0;
+  if (t0 > 0) { t0 *= t0; n += t0 * t0 * (GRAD3[g0] * x0 + GRAD3[g0 + 1] * y0); }
+  let t1 = 0.5 - x1 * x1 - y1 * y1;
+  if (t1 > 0) { t1 *= t1; n += t1 * t1 * (GRAD3[g1] * x1 + GRAD3[g1 + 1] * y1); }
+  let t2 = 0.5 - x2 * x2 - y2 * y2;
+  if (t2 > 0) { t2 *= t2; n += t2 * t2 * (GRAD3[g2] * x2 + GRAD3[g2 + 1] * y2); }
+  return 70 * n;
+}
+
+// ---- fractal sums (Musgrave) ----
+// Octave o samples at frequency lacunarity^o, weight gain^o, shifted by o * 19.19 so the
+// octaves' lattices do not line up at the origin. Normalized by the total weight.
+function fbm2(p, x, y, octaves, lacunarity = 2, gain = 0.5) {
+  let sum = 0, amp = 1, norm = 0, f = 1;
+  for (let o = 0; o < octaves; o++) {
+    sum += amp * perlin2(p, x * f + o * 19.19, y * f + o * 19.19);
+    norm += amp; amp *= gain; f *= lacunarity;
+  }
+  return sum / norm;
+}
+
+function turbulence2(p, x, y, octaves, lacunarity = 2, gain = 0.5) {
+  let sum = 0, amp = 1, norm = 0, f = 1;
+  for (let o = 0; o < octaves; o++) {
+    sum += amp * Math.abs(perlin2(p, x * f + o * 19.19, y * f + o * 19.19));
+    norm += amp; amp *= gain; f *= lacunarity;
+  }
+  return sum / norm;
+}
+
+// Ridged multifractal: sharp ridges where the noise crosses zero; each octave is weighted by
+// the previous one, so detail piles up on the ridges and valleys stay smooth.
+function ridged2(p, x, y, octaves, lacunarity = 2, gain = 0.5, offset = 1) {
+  let sum = 0, amp = 1, norm = 0, f = 1, weight = 1;
+  for (let o = 0; o < octaves; o++) {
+    let s = offset - Math.abs(perlin2(p, x * f + o * 19.19, y * f + o * 19.19));
+    s *= s;
+    s *= weight;
+    weight = s * 2 > 1 ? 1 : s * 2;
+    sum += s * amp;
+    norm += amp; amp *= gain; f *= lacunarity;
+  }
+  return sum / norm;
+}
+
+// Run: three bands: fBm (clouds), turbulence (fire, marble veins), ridged (mountain ranges).
+function demo() {
+  const w = canvas.width, h = canvas.height, f = new Float32Array(w * h), p = makePerm(3), s = 128 * w / 512;
+  for (let y = 0; y < h; y++)
+    for (let x = 0; x < w; x++) {
+      const X = x / s, Y = y / s, band = Math.floor(y * 3 / h);
+      f[y * w + x] = band === 0 ? 0.5 + 0.6 * fbm2(p, X, Y, 6) : band === 1 ? turbulence2(p, X, Y, 6) * 1.6 : ridged2(p, X, Y, 6);
+    }
+  showField(f, w, h, makePaletteLUT(256, [0.5, 0.5, 0.5], [0.5, 0.5, 0.5], [1, 1, 0.5], [0.8, 0.9, 0.3]));
+}
+
+setTimeout(demo);
+--- hint
+`let sum = 0, amp = 1, norm = 0, f = 1; for (let o = 0; o < octaves; o++) { sum += amp * perlin2(p, x * f + o * 19.19, y * f + o * 19.19); norm += amp; amp *= gain; f *= lacunarity; } return sum / norm;`
+--- harness
+{
+  const p = makePerm(1);
+  near(fbm2(p, 0.3, 0.7, 5), 0.04185810122820869, 1e-12, 'fbm2 5 octaves');
+  near(fbm2(p, 1.3, 2.7, 3, 2.5, 0.4), 0.27967660289448276, 1e-12, 'fbm2 custom lacunarity and gain');
+  eq(fbm2(p, 1.3, 2.7, 1), perlin2(p, 1.3, 2.7), 'one octave is plain noise');
+  near(fbm2(p, 1.3, 2.7, 2), (perlin2(p, 1.3, 2.7) + 0.5 * perlin2(p, 2.6 + 19.19, 5.4 + 19.19)) / 1.5, 1e-12, 'two octaves, shifted and normalized');
+  near(turbulence2(p, 0.3, 0.7, 5), 0.09182742273219371, 1e-12, 'turbulence2');
+  near(ridged2(p, 0.3, 0.7, 5), 0.8301449968330864, 1e-12, 'ridged2');
+  near(ridged2(p, 2.1, -1.4, 6, 2, 0.5, 0.9), 0.4423468670050002, 1e-12, 'ridged2 with offset 0.9');
+  near(ridged2(p, 0.4, 0.9, 1), (1 - Math.abs(perlin2(p, 0.4, 0.9))) ** 2, 1e-12, 'ridged2 one octave');
+  let tmin = 1, rmin = 1, rmax = 0, fmax = 0;
+  for (let i = 0; i < 5000; i++) {
+    const x = i * 0.137, y = (i * 0.091) % 13;
+    tmin = Math.min(tmin, turbulence2(p, x, y, 4)); const r = ridged2(p, x, y, 5);
+    rmin = Math.min(rmin, r); rmax = Math.max(rmax, r); fmax = Math.max(fmax, Math.abs(fbm2(p, x, y, 6)));
+  }
+  check(tmin >= 0, 'turbulence is never negative'); check(rmin >= 0 && rmax <= 1, 'ridged stays in [0, 1]'); check(fmax <= 1, 'normalized fBm stays in [-1, 1]');
+  const t0 = performance.now();
+  let acc = 0;
+  for (let i = 0; i < 100000; i++) acc += fbm2(p, i * 0.01, i * 0.007, 8) + ridged2(p, i * 0.01, i * 0.007, 8);
+  const ms = performance.now() - t0;
+  check(ms < 800, `1.6M octaves in ${ms.toFixed(0)} ms (limit 800)`);
+}
+
+=== exercise warp
+title: Domain warping
+continues: fbm
+--- prompt
+Add Quilez's two-level domain warp.
+
+`warp2(p, x, y, octaves, out)`:
+
+```text
+qx = fbm2(p, x, y, octaves)                 qy = fbm2(p, x + 5.2, y + 1.3, octaves)
+rx = fbm2(p, x + 4qx + 1.7, y + 4qy + 9.2, octaves)
+ry = fbm2(p, x + 4qx + 8.3, y + 4qy + 2.8, octaves)
+return fbm2(p, x + 4rx, y + 4ry, octaves)
+```
+
+If `out` is given (a 4-element array), also write `qx, qy, rx, ry` into it so the caller can color by the warp, as the demo does. `out` is optional: callers that only need the value pass nothing, and you must not allocate a fallback array per call (just skip the write).
+--- stubs
+function warp2(p, x, y, octaves, out) {
+  return 0;
+}
+
+// Run: Quilez's warped fBm, colored by the warp vectors q and r, the way his article does it.
+function demo() {
+  const w = canvas.width, h = canvas.height, p = makePerm(11), s = 160 * w / 512, qr = new Float64Array(4);
+  const img = new Float32Array(w * h * 3), image = new ImageData(w, h);
+  for (let y = 0; y < h; y++)
+    for (let x = 0; x < w; x++) {
+      const f = 0.5 + 0.5 * warp2(p, x / s, y / s, 4, qr), i = (y * w + x) * 3;
+      const q = Math.min(1, Math.hypot(qr[0], qr[1]) * 2), r = Math.min(1, Math.abs(qr[2]) * 2);
+      let cr = lerp(0.10, 0.67, f), cg = lerp(0.62, 0.67, f), cb = lerp(0.67, 0.50, f);
+      cr = lerp(cr, 0, q); cg = lerp(cg, 0, q); cb = lerp(cb, 0.16, q);
+      cr = lerp(cr, 0.67, r); cg = lerp(cg, 1, r); cb = lerp(cb, 1, r);
+      const k = f * f * 1.6 + 0.1;
+      img[i] = srgbToLinear(Math.min(1, cr * k * 1.4)); img[i + 1] = srgbToLinear(Math.min(1, cg * k * 1.4)); img[i + 2] = srgbToLinear(Math.min(1, cb * k * 1.4));
+    }
+  floatToRGBA(img, new Uint32Array(image.data.buffer), w * h, makeSrgbLUT());
+  canvas.getContext('2d').putImageData(image, 0, 0);
+}
+--- solution
+// ===== From the Pixels chapter =====
+function packRGBA(r, g, b, a = 255) {
+  return ((a & 255) << 24 | (b & 255) << 16 | (g & 255) << 8 | (r & 255)) >>> 0;
+}
+
+function srgbToLinear(c) {
+  return c <= 0.04045 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4);
+}
+
+function linearToSrgb(c) {
+  return c <= 0.0031308 ? c * 12.92 : 1.055 * Math.pow(c, 1 / 2.4) - 0.055;
+}
+
+function makeSrgbLUT() {
+  const lut = new Uint8Array(4097);
+  for (let i = 0; i <= 4096; i++) lut[i] = Math.round(255 * linearToSrgb(i / 4096));
+  return lut;
+}
+
+function floatToRGBA(src, dst, n, lut) {
+  for (let i = 0, j = 0; i < n; i++, j += 3) {
+    let r = src[j], g = src[j + 1], b = src[j + 2];
+    r = r > 0 ? (r < 1 ? r : 1) : 0;
+    g = g > 0 ? (g < 1 ? g : 1) : 0;
+    b = b > 0 ? (b < 1 ? b : 1) : 0;
+    dst[i] = (0xFF000000 | lut[(b * 4096 + 0.5) | 0] << 16 | lut[(g * 4096 + 0.5) | 0] << 8 | lut[(r * 4096 + 0.5) | 0]) >>> 0;
+  }
+}
+
+function cosinePalette(t, a, b, c, d, out) {
+  const TAU = 6.283185307179586;
+  out[0] = a[0] + b[0] * Math.cos(TAU * (c[0] * t + d[0]));
+  out[1] = a[1] + b[1] * Math.cos(TAU * (c[1] * t + d[1]));
+  out[2] = a[2] + b[2] * Math.cos(TAU * (c[2] * t + d[2]));
+  return out;
+}
+
+function makePaletteLUT(n, a, b, c, d) {
+  const lut = new Uint32Array(n), col = new Float64Array(3);
+  for (let i = 0; i < n; i++) {
+    cosinePalette(n > 1 ? i / (n - 1) : 0, a, b, c, d, col);
+    const r = Math.round(255 * Math.min(1, Math.max(0, col[0])));
+    const g = Math.round(255 * Math.min(1, Math.max(0, col[1])));
+    const bl = Math.round(255 * Math.min(1, Math.max(0, col[2])));
+    lut[i] = packRGBA(r, g, bl, 255);
+  }
+  return lut;
+}
+
+// New helper: show a scalar field (values in [0, 1], one float per pixel) through a 256-color LUT.
+function showField(field, w, h, lut) {
+  const image = new ImageData(w, h), px = new Uint32Array(image.data.buffer);
+  for (let i = 0; i < w * h; i++) {
+    const v = field[i] > 0 ? (field[i] < 1 ? field[i] : 1) : 0;
+    px[i] = lut[(v * 255 + 0.5) | 0];
+  }
+  canvas.getContext('2d').putImageData(image, 0, 0);
+}
+
+const GRAY = Uint32Array.from({ length: 256 }, (_, i) => packRGBA(i, i, i));
+// ===== Noise =====
+
+// ---- seeded generators ----
+// mulberry32 (Tommy Ettinger): 32 bits of state, floats in [0, 1).
+function mulberry32(seed) {
+  let a = seed | 0;
+  return function () {
+    a = (a + 0x6D2B79F5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+// sfc32 (Chris Doty-Humphrey, PractRand): 128 bits of state, floats in [0, 1).
+function sfc32(a, b, c, d) {
+  a |= 0; b |= 0; c |= 0; d |= 0;
+  return function () {
+    const t = ((a + b) | 0) + d | 0;
+    d = (d + 1) | 0;
+    a = b ^ (b >>> 9);
+    b = (c + (c << 3)) | 0;
+    c = (c << 21) | (c >>> 11);
+    c = (c + t) | 0;
+    return (t >>> 0) / 4294967296;
+  };
+}
+
+// Fisher-Yates, in place, driven by any rng() in [0, 1).
+function shuffle(arr, rng) {
+  for (let i = arr.length - 1; i > 0; i--) {
+    const j = Math.floor(rng() * (i + 1));
+    const t = arr[i]; arr[i] = arr[j]; arr[j] = t;
+  }
+  return arr;
+}
+
+// ---- integer hashing: random access instead of a sequence ----
+function hash2(x, y, seed) {
+  let h = (Math.imul(seed | 0, 0x9e3779b9) + 0x632be5ab) | 0;
+  h = Math.imul(h ^ Math.imul(x | 0, 0x27d4eb2d), 0x85ebca6b);
+  h ^= h >>> 15;
+  h = Math.imul(h ^ Math.imul(y | 0, 0x165667b1), 0xc2b2ae35);
+  h ^= h >>> 13;
+  h = Math.imul(h, 0x846ca68b);
+  return (h ^ (h >>> 16)) >>> 0;
+}
+
+function hash3(x, y, z, seed) {
+  return hash2(x ^ Math.imul(z | 0, 0x1b873593), y, seed);
+}
+
+function hash01(x, y, seed) {
+  return hash2(x, y, seed) / 4294967296;
+}
+
+// ---- value noise ----
+function fade(t) {
+  return t * t * t * (t * (t * 6 - 15) + 10);       // 6t^5 - 15t^4 + 10t^3
+}
+
+function lerp(a, b, t) {
+  return a + (b - a) * t;
+}
+
+// Random values at integer lattice points, smoothly interpolated. Range [0, 1).
+function valueNoise2(x, y, seed) {
+  const xi = Math.floor(x), yi = Math.floor(y);
+  const u = fade(x - xi), v = fade(y - yi);
+  const a = hash01(xi, yi, seed), b = hash01(xi + 1, yi, seed);
+  const c = hash01(xi, yi + 1, seed), d = hash01(xi + 1, yi + 1, seed);
+  return lerp(lerp(a, b, u), lerp(c, d, u), v);
+}
+
+// ---- Perlin gradient noise (improved, 2002) ----
+// Permutation table: 0..255 shuffled by the seed, then repeated so p[i + 1] never needs a mask.
+function makePerm(seed) {
+  const p = new Uint8Array(512);
+  for (let i = 0; i < 256; i++) p[i] = i;
+  shuffle(p.subarray(0, 256), mulberry32(seed));
+  p.copyWithin(256, 0, 256);
+  return p;
+}
+
+// Dot product of the offset (x, y) with one of 8 gradients picked by the hash.
+function grad2(h, x, y) {
+  switch (h & 7) {
+    case 0: return x + y;
+    case 1: return -x + y;
+    case 2: return x - y;
+    case 3: return -x - y;
+    case 4: return x;
+    case 5: return -x;
+    case 6: return y;
+    default: return -y;
+  }
+}
+
+function perlin2(p, x, y) {
+  const xf = Math.floor(x), yf = Math.floor(y);
+  const X = xf & 255, Y = yf & 255;
+  x -= xf; y -= yf;
+  const u = fade(x), v = fade(y);
+  const A = p[X] + Y, B = p[X + 1] + Y;
+  return lerp(lerp(grad2(p[A], x, y), grad2(p[B], x - 1, y), u),
+              lerp(grad2(p[A + 1], x, y - 1), grad2(p[B + 1], x - 1, y - 1), u), v);
+}
+
+// Ken Perlin's reference gradient: 12 cube-edge directions (plus 4 repeats) from the low 4 bits.
+function grad3(hash, x, y, z) {
+  const h = hash & 15;
+  const u = h < 8 ? x : y;
+  const v = h < 4 ? y : h === 12 || h === 14 ? x : z;
+  return ((h & 1) === 0 ? u : -u) + ((h & 2) === 0 ? v : -v);
+}
+
+function perlin3(p, x, y, z) {
+  const xf = Math.floor(x), yf = Math.floor(y), zf = Math.floor(z);
+  const X = xf & 255, Y = yf & 255, Z = zf & 255;
+  x -= xf; y -= yf; z -= zf;
+  const u = fade(x), v = fade(y), w = fade(z);
+  const A = p[X] + Y, AA = p[A] + Z, AB = p[A + 1] + Z;
+  const B = p[X + 1] + Y, BA = p[B] + Z, BB = p[B + 1] + Z;
+  return lerp(
+    lerp(lerp(grad3(p[AA], x, y, z), grad3(p[BA], x - 1, y, z), u),
+         lerp(grad3(p[AB], x, y - 1, z), grad3(p[BB], x - 1, y - 1, z), u), v),
+    lerp(lerp(grad3(p[AA + 1], x, y, z - 1), grad3(p[BA + 1], x - 1, y, z - 1), u),
+         lerp(grad3(p[AB + 1], x, y - 1, z - 1), grad3(p[BB + 1], x - 1, y - 1, z - 1), u), v), w);
+}
+
+// Fills out[y * w + x] = perlin2(perm, x * scale, y * scale). The table is built once per call.
+function perlinGrid(out, w, h, seed, scale) {
+  const p = makePerm(seed);
+  for (let y = 0; y < h; y++)
+    for (let x = 0; x < w; x++) out[y * w + x] = perlin2(p, x * scale, y * scale);
+}
+
+// ---- simplex noise 2D (Perlin 2001; Gustavson's "Simplex noise demystified") ----
+const F2 = 0.5 * (Math.sqrt(3) - 1), G2 = (3 - Math.sqrt(3)) / 6;
+const GRAD3 = new Int8Array([1, 1, 0, -1, 1, 0, 1, -1, 0, -1, -1, 0, 1, 0, 1, -1, 0, 1, 1, 0, -1, -1, 0, -1, 0, 1, 1, 0, -1, 1, 0, 1, -1, 0, -1, -1]);
+
+function simplex2(p, xin, yin) {
+  const s = (xin + yin) * F2;                       // skew to the square grid
+  const i = Math.floor(xin + s), j = Math.floor(yin + s);
+  const t = (i + j) * G2;                           // unskew the cell origin back
+  const x0 = xin - (i - t), y0 = yin - (j - t);
+  const i1 = x0 > y0 ? 1 : 0, j1 = 1 - i1;          // which triangle of the cell
+  const x1 = x0 - i1 + G2, y1 = y0 - j1 + G2;
+  const x2 = x0 - 1 + 2 * G2, y2 = y0 - 1 + 2 * G2;
+  const ii = i & 255, jj = j & 255;
+  const g0 = (p[ii + p[jj]] % 12) * 3, g1 = (p[ii + i1 + p[jj + j1]] % 12) * 3, g2 = (p[ii + 1 + p[jj + 1]] % 12) * 3;
+  let n = 0;
+  let t0 = 0.5 - x0 * x0 - y0 * y0;
+  if (t0 > 0) { t0 *= t0; n += t0 * t0 * (GRAD3[g0] * x0 + GRAD3[g0 + 1] * y0); }
+  let t1 = 0.5 - x1 * x1 - y1 * y1;
+  if (t1 > 0) { t1 *= t1; n += t1 * t1 * (GRAD3[g1] * x1 + GRAD3[g1 + 1] * y1); }
+  let t2 = 0.5 - x2 * x2 - y2 * y2;
+  if (t2 > 0) { t2 *= t2; n += t2 * t2 * (GRAD3[g2] * x2 + GRAD3[g2 + 1] * y2); }
+  return 70 * n;
+}
+
+// ---- fractal sums (Musgrave) ----
+// Octave o samples at frequency lacunarity^o, weight gain^o, shifted by o * 19.19 so the
+// octaves' lattices do not line up at the origin. Normalized by the total weight.
+function fbm2(p, x, y, octaves, lacunarity = 2, gain = 0.5) {
+  let sum = 0, amp = 1, norm = 0, f = 1;
+  for (let o = 0; o < octaves; o++) {
+    sum += amp * perlin2(p, x * f + o * 19.19, y * f + o * 19.19);
+    norm += amp; amp *= gain; f *= lacunarity;
+  }
+  return sum / norm;
+}
+
+function turbulence2(p, x, y, octaves, lacunarity = 2, gain = 0.5) {
+  let sum = 0, amp = 1, norm = 0, f = 1;
+  for (let o = 0; o < octaves; o++) {
+    sum += amp * Math.abs(perlin2(p, x * f + o * 19.19, y * f + o * 19.19));
+    norm += amp; amp *= gain; f *= lacunarity;
+  }
+  return sum / norm;
+}
+
+// Ridged multifractal: sharp ridges where the noise crosses zero; each octave is weighted by
+// the previous one, so detail piles up on the ridges and valleys stay smooth.
+function ridged2(p, x, y, octaves, lacunarity = 2, gain = 0.5, offset = 1) {
+  let sum = 0, amp = 1, norm = 0, f = 1, weight = 1;
+  for (let o = 0; o < octaves; o++) {
+    let s = offset - Math.abs(perlin2(p, x * f + o * 19.19, y * f + o * 19.19));
+    s *= s;
+    s *= weight;
+    weight = s * 2 > 1 ? 1 : s * 2;
+    sum += s * amp;
+    norm += amp; amp *= gain; f *= lacunarity;
+  }
+  return sum / norm;
+}
+
+// ---- domain warping (Inigo Quilez) ----
+// f(p) = fbm(p + 4 r), r = fbm2D(p + 4 q), q = fbm2D(p). out (optional) receives q.x, q.y, r.x, r.y.
+function warp2(p, x, y, octaves, out) {
+  const qx = fbm2(p, x, y, octaves), qy = fbm2(p, x + 5.2, y + 1.3, octaves);
+  const rx = fbm2(p, x + 4 * qx + 1.7, y + 4 * qy + 9.2, octaves);
+  const ry = fbm2(p, x + 4 * qx + 8.3, y + 4 * qy + 2.8, octaves);
+  if (out) { out[0] = qx; out[1] = qy; out[2] = rx; out[3] = ry; }
+  return fbm2(p, x + 4 * rx, y + 4 * ry, octaves);
+}
+
+// Run: Quilez's warped fBm, colored by the warp vectors q and r, the way his article does it.
+function demo() {
+  const w = canvas.width, h = canvas.height, p = makePerm(11), s = 160 * w / 512, qr = new Float64Array(4);
+  const img = new Float32Array(w * h * 3), image = new ImageData(w, h);
+  for (let y = 0; y < h; y++)
+    for (let x = 0; x < w; x++) {
+      const f = 0.5 + 0.5 * warp2(p, x / s, y / s, 4, qr), i = (y * w + x) * 3;
+      const q = Math.min(1, Math.hypot(qr[0], qr[1]) * 2), r = Math.min(1, Math.abs(qr[2]) * 2);
+      let cr = lerp(0.10, 0.67, f), cg = lerp(0.62, 0.67, f), cb = lerp(0.67, 0.50, f);
+      cr = lerp(cr, 0, q); cg = lerp(cg, 0, q); cb = lerp(cb, 0.16, q);
+      cr = lerp(cr, 0.67, r); cg = lerp(cg, 1, r); cb = lerp(cb, 1, r);
+      const k = f * f * 1.6 + 0.1;
+      img[i] = srgbToLinear(Math.min(1, cr * k * 1.4)); img[i + 1] = srgbToLinear(Math.min(1, cg * k * 1.4)); img[i + 2] = srgbToLinear(Math.min(1, cb * k * 1.4));
+    }
+  floatToRGBA(img, new Uint32Array(image.data.buffer), w * h, makeSrgbLUT());
+  canvas.getContext('2d').putImageData(image, 0, 0);
+}
+
+setTimeout(demo);
+--- hint
+`if (out) { out[0] = qx; out[1] = qy; out[2] = rx; out[3] = ry; }`
+--- harness
+{
+  const p = makePerm(1), q = new Float64Array(4);
+  near(warp2(p, 0.3, 0.7, 4, q), -0.21771500306373964, 1e-12, 'warp2 value');
+  near(q[0], 0.03572125009451281, 1e-12, 'q.x'); near(q[1], -0.18903460716465734, 1e-12, 'q.y');
+  near(q[2], 0.10546713201740567, 1e-12, 'r.x'); near(q[3], -0.03259954786466203, 1e-12, 'r.y');
+  near(warp2(p, 0.3, 0.7, 4), -0.21771500306373964, 1e-12, 'out is optional');
+  const x = 2.2, y = -1.7, o = 3;
+  const qx = fbm2(p, x, y, o), qy = fbm2(p, x + 5.2, y + 1.3, o);
+  const rx = fbm2(p, x + 4 * qx + 1.7, y + 4 * qy + 9.2, o), ry = fbm2(p, x + 4 * qx + 8.3, y + 4 * qy + 2.8, o);
+  near(warp2(p, x, y, o), fbm2(p, x + 4 * rx, y + 4 * ry, o), 1e-12, 'matches the formula');
+  check(Math.abs(warp2(p, 1, 1, 4) - fbm2(p, 1, 1, 4)) > 1e-3, 'actually warped');
+}
+
+=== exercise tile
+title: Tileable noise
+continues: warp
+--- prompt
+Add noise that tiles.
+
+- `perlin2Periodic(p, x, y, px, py)`: like `perlin2`, but the lattice wraps with period `px` in x and `py` in y (integers from 1 to 256). With `xf = floor(x)`: `X0 = xf mod px` (a non-negative modulo: JavaScript's `%` keeps the sign), `X1 = X0 + 1`, or 0 if that equals `px`; same for `Y`. The corner hashes are `p[p[X0] + Y0]`, `p[p[X1] + Y0]`, `p[p[X0] + Y1]`, `p[p[X1] + Y1]`, which are the same as `perlin2`'s whenever nothing wraps.
+- `fbm2Periodic(p, x, y, period, octaves)`: `fbm2` with lacunarity 2 and gain 0.5 (same per-octave shift by `o * 19.19`), where octave `o` calls `perlin2Periodic` with period `period * 2^o` in both directions. The sum repeats every `period` units.
+
+To make a seamless `N×N` texture with `P` noise cells across, sample at `x = i / N * P`. The test checks that values agree across the tile edge, including at negative coordinates.
+--- stubs
+function perlin2Periodic(p, x, y, px, py) {
+  return perlin2(p, x, y);
+}
+
+function fbm2Periodic(p, x, y, period, octaves) {
+  return fbm2(p, x, y, octaves);
+}
+
+// Run: one 128 px tile of periodic fBm, repeated 4x4 (2x2 on small canvases). No seams.
+function demo() {
+  const W = canvas.width, T = W >> 2, tile = new Float32Array(T * T), p = makePerm(5), f = new Float32Array(W * W);
+  for (let y = 0; y < T; y++)
+    for (let x = 0; x < T; x++) tile[y * T + x] = 0.5 + 0.7 * fbm2Periodic(p, x / T * 4, y / T * 4, 4, 5);
+  for (let y = 0; y < W; y++)
+    for (let x = 0; x < W; x++) f[y * W + x] = tile[(y % T) * T + (x % T)];
+  showField(f, W, W, makePaletteLUT(256, [0.5, 0.5, 0.5], [0.5, 0.5, 0.5], [1, 1, 1], [0.3, 0.2, 0.2]));
+}
+--- solution
+// ===== From the Pixels chapter =====
+function packRGBA(r, g, b, a = 255) {
+  return ((a & 255) << 24 | (b & 255) << 16 | (g & 255) << 8 | (r & 255)) >>> 0;
+}
+
+function srgbToLinear(c) {
+  return c <= 0.04045 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4);
+}
+
+function linearToSrgb(c) {
+  return c <= 0.0031308 ? c * 12.92 : 1.055 * Math.pow(c, 1 / 2.4) - 0.055;
+}
+
+function makeSrgbLUT() {
+  const lut = new Uint8Array(4097);
+  for (let i = 0; i <= 4096; i++) lut[i] = Math.round(255 * linearToSrgb(i / 4096));
+  return lut;
+}
+
+function floatToRGBA(src, dst, n, lut) {
+  for (let i = 0, j = 0; i < n; i++, j += 3) {
+    let r = src[j], g = src[j + 1], b = src[j + 2];
+    r = r > 0 ? (r < 1 ? r : 1) : 0;
+    g = g > 0 ? (g < 1 ? g : 1) : 0;
+    b = b > 0 ? (b < 1 ? b : 1) : 0;
+    dst[i] = (0xFF000000 | lut[(b * 4096 + 0.5) | 0] << 16 | lut[(g * 4096 + 0.5) | 0] << 8 | lut[(r * 4096 + 0.5) | 0]) >>> 0;
+  }
+}
+
+function cosinePalette(t, a, b, c, d, out) {
+  const TAU = 6.283185307179586;
+  out[0] = a[0] + b[0] * Math.cos(TAU * (c[0] * t + d[0]));
+  out[1] = a[1] + b[1] * Math.cos(TAU * (c[1] * t + d[1]));
+  out[2] = a[2] + b[2] * Math.cos(TAU * (c[2] * t + d[2]));
+  return out;
+}
+
+function makePaletteLUT(n, a, b, c, d) {
+  const lut = new Uint32Array(n), col = new Float64Array(3);
+  for (let i = 0; i < n; i++) {
+    cosinePalette(n > 1 ? i / (n - 1) : 0, a, b, c, d, col);
+    const r = Math.round(255 * Math.min(1, Math.max(0, col[0])));
+    const g = Math.round(255 * Math.min(1, Math.max(0, col[1])));
+    const bl = Math.round(255 * Math.min(1, Math.max(0, col[2])));
+    lut[i] = packRGBA(r, g, bl, 255);
+  }
+  return lut;
+}
+
+// New helper: show a scalar field (values in [0, 1], one float per pixel) through a 256-color LUT.
+function showField(field, w, h, lut) {
+  const image = new ImageData(w, h), px = new Uint32Array(image.data.buffer);
+  for (let i = 0; i < w * h; i++) {
+    const v = field[i] > 0 ? (field[i] < 1 ? field[i] : 1) : 0;
+    px[i] = lut[(v * 255 + 0.5) | 0];
+  }
+  canvas.getContext('2d').putImageData(image, 0, 0);
+}
+
+const GRAY = Uint32Array.from({ length: 256 }, (_, i) => packRGBA(i, i, i));
+// ===== Noise =====
+
+// ---- seeded generators ----
+// mulberry32 (Tommy Ettinger): 32 bits of state, floats in [0, 1).
+function mulberry32(seed) {
+  let a = seed | 0;
+  return function () {
+    a = (a + 0x6D2B79F5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+// sfc32 (Chris Doty-Humphrey, PractRand): 128 bits of state, floats in [0, 1).
+function sfc32(a, b, c, d) {
+  a |= 0; b |= 0; c |= 0; d |= 0;
+  return function () {
+    const t = ((a + b) | 0) + d | 0;
+    d = (d + 1) | 0;
+    a = b ^ (b >>> 9);
+    b = (c + (c << 3)) | 0;
+    c = (c << 21) | (c >>> 11);
+    c = (c + t) | 0;
+    return (t >>> 0) / 4294967296;
+  };
+}
+
+// Fisher-Yates, in place, driven by any rng() in [0, 1).
+function shuffle(arr, rng) {
+  for (let i = arr.length - 1; i > 0; i--) {
+    const j = Math.floor(rng() * (i + 1));
+    const t = arr[i]; arr[i] = arr[j]; arr[j] = t;
+  }
+  return arr;
+}
+
+// ---- integer hashing: random access instead of a sequence ----
+function hash2(x, y, seed) {
+  let h = (Math.imul(seed | 0, 0x9e3779b9) + 0x632be5ab) | 0;
+  h = Math.imul(h ^ Math.imul(x | 0, 0x27d4eb2d), 0x85ebca6b);
+  h ^= h >>> 15;
+  h = Math.imul(h ^ Math.imul(y | 0, 0x165667b1), 0xc2b2ae35);
+  h ^= h >>> 13;
+  h = Math.imul(h, 0x846ca68b);
+  return (h ^ (h >>> 16)) >>> 0;
+}
+
+function hash3(x, y, z, seed) {
+  return hash2(x ^ Math.imul(z | 0, 0x1b873593), y, seed);
+}
+
+function hash01(x, y, seed) {
+  return hash2(x, y, seed) / 4294967296;
+}
+
+// ---- value noise ----
+function fade(t) {
+  return t * t * t * (t * (t * 6 - 15) + 10);       // 6t^5 - 15t^4 + 10t^3
+}
+
+function lerp(a, b, t) {
+  return a + (b - a) * t;
+}
+
+// Random values at integer lattice points, smoothly interpolated. Range [0, 1).
+function valueNoise2(x, y, seed) {
+  const xi = Math.floor(x), yi = Math.floor(y);
+  const u = fade(x - xi), v = fade(y - yi);
+  const a = hash01(xi, yi, seed), b = hash01(xi + 1, yi, seed);
+  const c = hash01(xi, yi + 1, seed), d = hash01(xi + 1, yi + 1, seed);
+  return lerp(lerp(a, b, u), lerp(c, d, u), v);
+}
+
+// ---- Perlin gradient noise (improved, 2002) ----
+// Permutation table: 0..255 shuffled by the seed, then repeated so p[i + 1] never needs a mask.
+function makePerm(seed) {
+  const p = new Uint8Array(512);
+  for (let i = 0; i < 256; i++) p[i] = i;
+  shuffle(p.subarray(0, 256), mulberry32(seed));
+  p.copyWithin(256, 0, 256);
+  return p;
+}
+
+// Dot product of the offset (x, y) with one of 8 gradients picked by the hash.
+function grad2(h, x, y) {
+  switch (h & 7) {
+    case 0: return x + y;
+    case 1: return -x + y;
+    case 2: return x - y;
+    case 3: return -x - y;
+    case 4: return x;
+    case 5: return -x;
+    case 6: return y;
+    default: return -y;
+  }
+}
+
+function perlin2(p, x, y) {
+  const xf = Math.floor(x), yf = Math.floor(y);
+  const X = xf & 255, Y = yf & 255;
+  x -= xf; y -= yf;
+  const u = fade(x), v = fade(y);
+  const A = p[X] + Y, B = p[X + 1] + Y;
+  return lerp(lerp(grad2(p[A], x, y), grad2(p[B], x - 1, y), u),
+              lerp(grad2(p[A + 1], x, y - 1), grad2(p[B + 1], x - 1, y - 1), u), v);
+}
+
+// Ken Perlin's reference gradient: 12 cube-edge directions (plus 4 repeats) from the low 4 bits.
+function grad3(hash, x, y, z) {
+  const h = hash & 15;
+  const u = h < 8 ? x : y;
+  const v = h < 4 ? y : h === 12 || h === 14 ? x : z;
+  return ((h & 1) === 0 ? u : -u) + ((h & 2) === 0 ? v : -v);
+}
+
+function perlin3(p, x, y, z) {
+  const xf = Math.floor(x), yf = Math.floor(y), zf = Math.floor(z);
+  const X = xf & 255, Y = yf & 255, Z = zf & 255;
+  x -= xf; y -= yf; z -= zf;
+  const u = fade(x), v = fade(y), w = fade(z);
+  const A = p[X] + Y, AA = p[A] + Z, AB = p[A + 1] + Z;
+  const B = p[X + 1] + Y, BA = p[B] + Z, BB = p[B + 1] + Z;
+  return lerp(
+    lerp(lerp(grad3(p[AA], x, y, z), grad3(p[BA], x - 1, y, z), u),
+         lerp(grad3(p[AB], x, y - 1, z), grad3(p[BB], x - 1, y - 1, z), u), v),
+    lerp(lerp(grad3(p[AA + 1], x, y, z - 1), grad3(p[BA + 1], x - 1, y, z - 1), u),
+         lerp(grad3(p[AB + 1], x, y - 1, z - 1), grad3(p[BB + 1], x - 1, y - 1, z - 1), u), v), w);
+}
+
+// Fills out[y * w + x] = perlin2(perm, x * scale, y * scale). The table is built once per call.
+function perlinGrid(out, w, h, seed, scale) {
+  const p = makePerm(seed);
+  for (let y = 0; y < h; y++)
+    for (let x = 0; x < w; x++) out[y * w + x] = perlin2(p, x * scale, y * scale);
+}
+
+// ---- simplex noise 2D (Perlin 2001; Gustavson's "Simplex noise demystified") ----
+const F2 = 0.5 * (Math.sqrt(3) - 1), G2 = (3 - Math.sqrt(3)) / 6;
+const GRAD3 = new Int8Array([1, 1, 0, -1, 1, 0, 1, -1, 0, -1, -1, 0, 1, 0, 1, -1, 0, 1, 1, 0, -1, -1, 0, -1, 0, 1, 1, 0, -1, 1, 0, 1, -1, 0, -1, -1]);
+
+function simplex2(p, xin, yin) {
+  const s = (xin + yin) * F2;                       // skew to the square grid
+  const i = Math.floor(xin + s), j = Math.floor(yin + s);
+  const t = (i + j) * G2;                           // unskew the cell origin back
+  const x0 = xin - (i - t), y0 = yin - (j - t);
+  const i1 = x0 > y0 ? 1 : 0, j1 = 1 - i1;          // which triangle of the cell
+  const x1 = x0 - i1 + G2, y1 = y0 - j1 + G2;
+  const x2 = x0 - 1 + 2 * G2, y2 = y0 - 1 + 2 * G2;
+  const ii = i & 255, jj = j & 255;
+  const g0 = (p[ii + p[jj]] % 12) * 3, g1 = (p[ii + i1 + p[jj + j1]] % 12) * 3, g2 = (p[ii + 1 + p[jj + 1]] % 12) * 3;
+  let n = 0;
+  let t0 = 0.5 - x0 * x0 - y0 * y0;
+  if (t0 > 0) { t0 *= t0; n += t0 * t0 * (GRAD3[g0] * x0 + GRAD3[g0 + 1] * y0); }
+  let t1 = 0.5 - x1 * x1 - y1 * y1;
+  if (t1 > 0) { t1 *= t1; n += t1 * t1 * (GRAD3[g1] * x1 + GRAD3[g1 + 1] * y1); }
+  let t2 = 0.5 - x2 * x2 - y2 * y2;
+  if (t2 > 0) { t2 *= t2; n += t2 * t2 * (GRAD3[g2] * x2 + GRAD3[g2 + 1] * y2); }
+  return 70 * n;
+}
+
+// ---- fractal sums (Musgrave) ----
+// Octave o samples at frequency lacunarity^o, weight gain^o, shifted by o * 19.19 so the
+// octaves' lattices do not line up at the origin. Normalized by the total weight.
+function fbm2(p, x, y, octaves, lacunarity = 2, gain = 0.5) {
+  let sum = 0, amp = 1, norm = 0, f = 1;
+  for (let o = 0; o < octaves; o++) {
+    sum += amp * perlin2(p, x * f + o * 19.19, y * f + o * 19.19);
+    norm += amp; amp *= gain; f *= lacunarity;
+  }
+  return sum / norm;
+}
+
+function turbulence2(p, x, y, octaves, lacunarity = 2, gain = 0.5) {
+  let sum = 0, amp = 1, norm = 0, f = 1;
+  for (let o = 0; o < octaves; o++) {
+    sum += amp * Math.abs(perlin2(p, x * f + o * 19.19, y * f + o * 19.19));
+    norm += amp; amp *= gain; f *= lacunarity;
+  }
+  return sum / norm;
+}
+
+// Ridged multifractal: sharp ridges where the noise crosses zero; each octave is weighted by
+// the previous one, so detail piles up on the ridges and valleys stay smooth.
+function ridged2(p, x, y, octaves, lacunarity = 2, gain = 0.5, offset = 1) {
+  let sum = 0, amp = 1, norm = 0, f = 1, weight = 1;
+  for (let o = 0; o < octaves; o++) {
+    let s = offset - Math.abs(perlin2(p, x * f + o * 19.19, y * f + o * 19.19));
+    s *= s;
+    s *= weight;
+    weight = s * 2 > 1 ? 1 : s * 2;
+    sum += s * amp;
+    norm += amp; amp *= gain; f *= lacunarity;
+  }
+  return sum / norm;
+}
+
+// ---- domain warping (Inigo Quilez) ----
+// f(p) = fbm(p + 4 r), r = fbm2D(p + 4 q), q = fbm2D(p). out (optional) receives q.x, q.y, r.x, r.y.
+function warp2(p, x, y, octaves, out) {
+  const qx = fbm2(p, x, y, octaves), qy = fbm2(p, x + 5.2, y + 1.3, octaves);
+  const rx = fbm2(p, x + 4 * qx + 1.7, y + 4 * qy + 9.2, octaves);
+  const ry = fbm2(p, x + 4 * qx + 8.3, y + 4 * qy + 2.8, octaves);
+  if (out) { out[0] = qx; out[1] = qy; out[2] = rx; out[3] = ry; }
+  return fbm2(p, x + 4 * rx, y + 4 * ry, octaves);
+}
+
+// ---- tileable noise: wrap the lattice ----
+// Same as perlin2, but lattice coordinates wrap modulo (px, py), integers in 1..256.
+function perlin2Periodic(p, x, y, px, py) {
+  const xf = Math.floor(x), yf = Math.floor(y);
+  x -= xf; y -= yf;
+  let X0 = xf % px; if (X0 < 0) X0 += px;
+  let Y0 = yf % py; if (Y0 < 0) Y0 += py;
+  const X1 = X0 + 1 === px ? 0 : X0 + 1, Y1 = Y0 + 1 === py ? 0 : Y0 + 1;
+  const u = fade(x), v = fade(y);
+  return lerp(lerp(grad2(p[p[X0] + Y0], x, y), grad2(p[p[X1] + Y0], x - 1, y), u),
+              lerp(grad2(p[p[X0] + Y1], x, y - 1), grad2(p[p[X1] + Y1], x - 1, y - 1), u), v);
+}
+
+// fbm2 with lacunarity 2 and gain 0.5 whose octave o wraps with period * 2^o: tiles every `period` units.
+function fbm2Periodic(p, x, y, period, octaves) {
+  let sum = 0, amp = 1, norm = 0, f = 1;
+  for (let o = 0; o < octaves; o++) {
+    sum += amp * perlin2Periodic(p, x * f + o * 19.19, y * f + o * 19.19, period * f, period * f);
+    norm += amp; amp *= 0.5; f *= 2;
+  }
+  return sum / norm;
+}
+
+// Run: one 128 px tile of periodic fBm, repeated 4x4 (2x2 on small canvases). No seams.
+function demo() {
+  const W = canvas.width, T = W >> 2, tile = new Float32Array(T * T), p = makePerm(5), f = new Float32Array(W * W);
+  for (let y = 0; y < T; y++)
+    for (let x = 0; x < T; x++) tile[y * T + x] = 0.5 + 0.7 * fbm2Periodic(p, x / T * 4, y / T * 4, 4, 5);
+  for (let y = 0; y < W; y++)
+    for (let x = 0; x < W; x++) f[y * W + x] = tile[(y % T) * T + (x % T)];
+  showField(f, W, W, makePaletteLUT(256, [0.5, 0.5, 0.5], [0.5, 0.5, 0.5], [1, 1, 1], [0.3, 0.2, 0.2]));
+}
+
+setTimeout(demo);
+--- hint
+Non-negative modulo: `let X0 = xf % px; if (X0 < 0) X0 += px;`
+--- hint
+In `fbm2Periodic`, keep `f` (1, 2, 4, ...) and pass `period * f` as both periods.
+--- harness
+{
+  const p = makePerm(1);
+  near(perlin2Periodic(p, 3.3, 1.2, 4, 4), -0.07777776255999988, 1e-12, 'sample in the wrapping column');
+  near(perlin2Periodic(p, 7.3, 1.2, 4, 4), -0.07777776255999988, 1e-12, 'one period later');
+  near(perlin2Periodic(p, -0.7, 1.2, 4, 4), -0.07777776255999988, 1e-12, 'one period earlier (negative x)');
+  eq(perlin2Periodic(p, 1.5, 2.25, 4, 4), perlin2(p, 1.5, 2.25), 'same as perlin2 where nothing wraps');
+  eq(perlin2Periodic(p, 1.5, 2.25, 256, 256), perlin2(p, 1.5, 2.25), 'period 256 is plain perlin2');
+  check(perlin2Periodic(p, 3.5, 0.5, 4, 4) !== perlin2(p, 3.5, 0.5), 'the last column wraps');
+  near(perlin2Periodic(p, 2.5, 6.4, 5, 3), perlin2Periodic(p, 2.5 + 5, 6.4 - 3, 5, 3), 1e-12, 'different periods in x and y');
+  near(perlin2Periodic(p, 0.3, 0.6, 1, 1), perlin2Periodic(p, 9.3, -4.4, 1, 1), 1e-12, 'period 1');
+  near(fbm2Periodic(p, 1.3, 2.1, 4, 5), 0.12378284666121475, 1e-12, 'fbm2Periodic sample');
+  let worst = 0;
+  for (let i = 0; i < 200; i++) {
+    const t = i / 200 * 4;
+    worst = Math.max(worst, Math.abs(fbm2Periodic(p, 0, t, 4, 5) - fbm2Periodic(p, 4, t, 4, 5)), Math.abs(fbm2Periodic(p, t, 0, 4, 5) - fbm2Periodic(p, t, 4, 4, 5)),
+      Math.abs(fbm2Periodic(p, t - 4, t, 4, 5) - fbm2Periodic(p, t, t + 8, 4, 5)));
+  }
+  check(worst < 1e-9, 'fbm2Periodic tiles in x and y, also at negative coordinates (worst ' + worst + ')');
+  check(Math.abs(fbm2Periodic(p, 1.3, 2.1, 4, 5) - fbm2(p, 1.3, 2.1, 5)) > 1e-6, 'higher octaves really wrap');
+}
+
+=== exercise deriv
+title: Analytic derivatives and eroded fBm
+continues: tile
+--- prompt
+Add derivatives, and the fBm variant they enable.
+
+- `valueNoise2d(x, y, seed, out)`: write `[value, d/dx, d/dy]` of `valueNoise2(x, y, seed)` into `out` and return it, using the formulas from the chapter: with corners `a, b, c, d`, `k1 = b - a`, `k2 = c - a`, `k3 = a - b - c + d`, value `a + k1 u + k2 v + k3 u v`, `d/dx = du (k1 + k3 v)`, `d/dy = dv (k2 + k3 u)`, where `du = 30 fx² (fx - 1)²` (likewise `dv`).
+- `erodedFbm2(x, y, seed, octaves)`: start with `sum = 0, amp = 0.5, norm = 0, dx = dy = 0`. For octave `o`: get `valueNoise2d(x, y, seed + o)`, add its derivative to `(dx, dy)`, add `amp * value / (1 + dx² + dy²)` to `sum`, add `amp` to `norm`, halve `amp`, then transform the domain: `(x, y) ← (1.6x - 1.2y, 1.2x + 1.6y)` (a rotation by about 37° and a scale by 2, which hides the lattice). Return `sum / norm`.
+
+`erodedFbm2` runs per pixel, so it must not allocate its `[value, dx, dy]` scratch array per call: keep one at the top level. Using the rotation instead of shifting octaves is Quilez's version; either hides the grid, the rotation also hides the axis alignment of value noise.
+--- stubs
+function valueNoise2d(x, y, seed, out) {
+  out[0] = valueNoise2(x, y, seed); out[1] = 0; out[2] = 0;
+  return out;
+}
+
+function erodedFbm2(x, y, seed, octaves) {
+  return 0;
+}
+
+// Run: an eroded-fBm height field as a lit map: water, grass, rock and snow. The light uses
+// slopes from neighboring heights in the buffer (no extra noise evaluations).
+function demo() {
+  const w = canvas.width, h = canvas.height, s = 170 * w / 512, n = w * h;
+  const hgt = new Float32Array(n), img = new Float32Array(n * 3), image = new ImageData(w, h);
+  for (let y = 0; y < h; y++)
+    for (let x = 0; x < w; x++) hgt[y * w + x] = erodedFbm2(x / s, y / s, 9, 9);
+  const k = 90 * 512 / w, lx = -0.55, ly = -0.55, lz = 0.63, sea = 0.36;
+  for (let y = 0; y < h; y++)
+    for (let x = 0; x < w; x++) {
+      const i = y * w + x, e = Math.max(sea, hgt[i]);
+      const gx = (Math.max(sea, hgt[y * w + Math.min(w - 1, x + 1)]) - Math.max(sea, hgt[y * w + Math.max(0, x - 1)])) * k;
+      const gy = (Math.max(sea, hgt[Math.min(h - 1, y + 1) * w + x]) - Math.max(sea, hgt[Math.max(0, y - 1) * w + x])) * k;
+      const inv = 1 / Math.sqrt(gx * gx + gy * gy + 1), nz = inv;
+      const light = Math.max(0, (-gx * lx - gy * ly + lz) * inv) * 0.9 + 0.1;
+      let r, g, b;
+      if (hgt[i] < sea) { const d = (sea - hgt[i]) * 4; r = 0.02; g = 0.12 - d * 0.1; b = 0.3 - d * 0.15; }
+      else if (e > 0.62 && nz > 0.7) { r = 0.9; g = 0.92; b = 1; }
+      else if (nz < 0.8) { r = 0.25; g = 0.2; b = 0.16; }
+      else { const t = (e - sea) * 3; r = lerp(0.12, 0.3, t); g = lerp(0.3, 0.32, t); b = lerp(0.05, 0.12, t); }
+      img[i * 3] = r * light; img[i * 3 + 1] = g * light; img[i * 3 + 2] = b * light;
+    }
+  floatToRGBA(img, new Uint32Array(image.data.buffer), n, makeSrgbLUT());
+  canvas.getContext('2d').putImageData(image, 0, 0);
+}
+--- solution
+// ===== From the Pixels chapter =====
+function packRGBA(r, g, b, a = 255) {
+  return ((a & 255) << 24 | (b & 255) << 16 | (g & 255) << 8 | (r & 255)) >>> 0;
+}
+
+function srgbToLinear(c) {
+  return c <= 0.04045 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4);
+}
+
+function linearToSrgb(c) {
+  return c <= 0.0031308 ? c * 12.92 : 1.055 * Math.pow(c, 1 / 2.4) - 0.055;
+}
+
+function makeSrgbLUT() {
+  const lut = new Uint8Array(4097);
+  for (let i = 0; i <= 4096; i++) lut[i] = Math.round(255 * linearToSrgb(i / 4096));
+  return lut;
+}
+
+function floatToRGBA(src, dst, n, lut) {
+  for (let i = 0, j = 0; i < n; i++, j += 3) {
+    let r = src[j], g = src[j + 1], b = src[j + 2];
+    r = r > 0 ? (r < 1 ? r : 1) : 0;
+    g = g > 0 ? (g < 1 ? g : 1) : 0;
+    b = b > 0 ? (b < 1 ? b : 1) : 0;
+    dst[i] = (0xFF000000 | lut[(b * 4096 + 0.5) | 0] << 16 | lut[(g * 4096 + 0.5) | 0] << 8 | lut[(r * 4096 + 0.5) | 0]) >>> 0;
+  }
+}
+
+function cosinePalette(t, a, b, c, d, out) {
+  const TAU = 6.283185307179586;
+  out[0] = a[0] + b[0] * Math.cos(TAU * (c[0] * t + d[0]));
+  out[1] = a[1] + b[1] * Math.cos(TAU * (c[1] * t + d[1]));
+  out[2] = a[2] + b[2] * Math.cos(TAU * (c[2] * t + d[2]));
+  return out;
+}
+
+function makePaletteLUT(n, a, b, c, d) {
+  const lut = new Uint32Array(n), col = new Float64Array(3);
+  for (let i = 0; i < n; i++) {
+    cosinePalette(n > 1 ? i / (n - 1) : 0, a, b, c, d, col);
+    const r = Math.round(255 * Math.min(1, Math.max(0, col[0])));
+    const g = Math.round(255 * Math.min(1, Math.max(0, col[1])));
+    const bl = Math.round(255 * Math.min(1, Math.max(0, col[2])));
+    lut[i] = packRGBA(r, g, bl, 255);
+  }
+  return lut;
+}
+
+// New helper: show a scalar field (values in [0, 1], one float per pixel) through a 256-color LUT.
+function showField(field, w, h, lut) {
+  const image = new ImageData(w, h), px = new Uint32Array(image.data.buffer);
+  for (let i = 0; i < w * h; i++) {
+    const v = field[i] > 0 ? (field[i] < 1 ? field[i] : 1) : 0;
+    px[i] = lut[(v * 255 + 0.5) | 0];
+  }
+  canvas.getContext('2d').putImageData(image, 0, 0);
+}
+
+const GRAY = Uint32Array.from({ length: 256 }, (_, i) => packRGBA(i, i, i));
+// ===== Noise =====
+
+// ---- seeded generators ----
+// mulberry32 (Tommy Ettinger): 32 bits of state, floats in [0, 1).
+function mulberry32(seed) {
+  let a = seed | 0;
+  return function () {
+    a = (a + 0x6D2B79F5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+// sfc32 (Chris Doty-Humphrey, PractRand): 128 bits of state, floats in [0, 1).
+function sfc32(a, b, c, d) {
+  a |= 0; b |= 0; c |= 0; d |= 0;
+  return function () {
+    const t = ((a + b) | 0) + d | 0;
+    d = (d + 1) | 0;
+    a = b ^ (b >>> 9);
+    b = (c + (c << 3)) | 0;
+    c = (c << 21) | (c >>> 11);
+    c = (c + t) | 0;
+    return (t >>> 0) / 4294967296;
+  };
+}
+
+// Fisher-Yates, in place, driven by any rng() in [0, 1).
+function shuffle(arr, rng) {
+  for (let i = arr.length - 1; i > 0; i--) {
+    const j = Math.floor(rng() * (i + 1));
+    const t = arr[i]; arr[i] = arr[j]; arr[j] = t;
+  }
+  return arr;
+}
+
+// ---- integer hashing: random access instead of a sequence ----
+function hash2(x, y, seed) {
+  let h = (Math.imul(seed | 0, 0x9e3779b9) + 0x632be5ab) | 0;
+  h = Math.imul(h ^ Math.imul(x | 0, 0x27d4eb2d), 0x85ebca6b);
+  h ^= h >>> 15;
+  h = Math.imul(h ^ Math.imul(y | 0, 0x165667b1), 0xc2b2ae35);
+  h ^= h >>> 13;
+  h = Math.imul(h, 0x846ca68b);
+  return (h ^ (h >>> 16)) >>> 0;
+}
+
+function hash3(x, y, z, seed) {
+  return hash2(x ^ Math.imul(z | 0, 0x1b873593), y, seed);
+}
+
+function hash01(x, y, seed) {
+  return hash2(x, y, seed) / 4294967296;
+}
+
+// ---- value noise ----
+function fade(t) {
+  return t * t * t * (t * (t * 6 - 15) + 10);       // 6t^5 - 15t^4 + 10t^3
+}
+
+function lerp(a, b, t) {
+  return a + (b - a) * t;
+}
+
+// Random values at integer lattice points, smoothly interpolated. Range [0, 1).
+function valueNoise2(x, y, seed) {
+  const xi = Math.floor(x), yi = Math.floor(y);
+  const u = fade(x - xi), v = fade(y - yi);
+  const a = hash01(xi, yi, seed), b = hash01(xi + 1, yi, seed);
+  const c = hash01(xi, yi + 1, seed), d = hash01(xi + 1, yi + 1, seed);
+  return lerp(lerp(a, b, u), lerp(c, d, u), v);
+}
+
+// ---- Perlin gradient noise (improved, 2002) ----
+// Permutation table: 0..255 shuffled by the seed, then repeated so p[i + 1] never needs a mask.
+function makePerm(seed) {
+  const p = new Uint8Array(512);
+  for (let i = 0; i < 256; i++) p[i] = i;
+  shuffle(p.subarray(0, 256), mulberry32(seed));
+  p.copyWithin(256, 0, 256);
+  return p;
+}
+
+// Dot product of the offset (x, y) with one of 8 gradients picked by the hash.
+function grad2(h, x, y) {
+  switch (h & 7) {
+    case 0: return x + y;
+    case 1: return -x + y;
+    case 2: return x - y;
+    case 3: return -x - y;
+    case 4: return x;
+    case 5: return -x;
+    case 6: return y;
+    default: return -y;
+  }
+}
+
+function perlin2(p, x, y) {
+  const xf = Math.floor(x), yf = Math.floor(y);
+  const X = xf & 255, Y = yf & 255;
+  x -= xf; y -= yf;
+  const u = fade(x), v = fade(y);
+  const A = p[X] + Y, B = p[X + 1] + Y;
+  return lerp(lerp(grad2(p[A], x, y), grad2(p[B], x - 1, y), u),
+              lerp(grad2(p[A + 1], x, y - 1), grad2(p[B + 1], x - 1, y - 1), u), v);
+}
+
+// Ken Perlin's reference gradient: 12 cube-edge directions (plus 4 repeats) from the low 4 bits.
+function grad3(hash, x, y, z) {
+  const h = hash & 15;
+  const u = h < 8 ? x : y;
+  const v = h < 4 ? y : h === 12 || h === 14 ? x : z;
+  return ((h & 1) === 0 ? u : -u) + ((h & 2) === 0 ? v : -v);
+}
+
+function perlin3(p, x, y, z) {
+  const xf = Math.floor(x), yf = Math.floor(y), zf = Math.floor(z);
+  const X = xf & 255, Y = yf & 255, Z = zf & 255;
+  x -= xf; y -= yf; z -= zf;
+  const u = fade(x), v = fade(y), w = fade(z);
+  const A = p[X] + Y, AA = p[A] + Z, AB = p[A + 1] + Z;
+  const B = p[X + 1] + Y, BA = p[B] + Z, BB = p[B + 1] + Z;
+  return lerp(
+    lerp(lerp(grad3(p[AA], x, y, z), grad3(p[BA], x - 1, y, z), u),
+         lerp(grad3(p[AB], x, y - 1, z), grad3(p[BB], x - 1, y - 1, z), u), v),
+    lerp(lerp(grad3(p[AA + 1], x, y, z - 1), grad3(p[BA + 1], x - 1, y, z - 1), u),
+         lerp(grad3(p[AB + 1], x, y - 1, z - 1), grad3(p[BB + 1], x - 1, y - 1, z - 1), u), v), w);
+}
+
+// Fills out[y * w + x] = perlin2(perm, x * scale, y * scale). The table is built once per call.
+function perlinGrid(out, w, h, seed, scale) {
+  const p = makePerm(seed);
+  for (let y = 0; y < h; y++)
+    for (let x = 0; x < w; x++) out[y * w + x] = perlin2(p, x * scale, y * scale);
+}
+
+// ---- simplex noise 2D (Perlin 2001; Gustavson's "Simplex noise demystified") ----
+const F2 = 0.5 * (Math.sqrt(3) - 1), G2 = (3 - Math.sqrt(3)) / 6;
+const GRAD3 = new Int8Array([1, 1, 0, -1, 1, 0, 1, -1, 0, -1, -1, 0, 1, 0, 1, -1, 0, 1, 1, 0, -1, -1, 0, -1, 0, 1, 1, 0, -1, 1, 0, 1, -1, 0, -1, -1]);
+
+function simplex2(p, xin, yin) {
+  const s = (xin + yin) * F2;                       // skew to the square grid
+  const i = Math.floor(xin + s), j = Math.floor(yin + s);
+  const t = (i + j) * G2;                           // unskew the cell origin back
+  const x0 = xin - (i - t), y0 = yin - (j - t);
+  const i1 = x0 > y0 ? 1 : 0, j1 = 1 - i1;          // which triangle of the cell
+  const x1 = x0 - i1 + G2, y1 = y0 - j1 + G2;
+  const x2 = x0 - 1 + 2 * G2, y2 = y0 - 1 + 2 * G2;
+  const ii = i & 255, jj = j & 255;
+  const g0 = (p[ii + p[jj]] % 12) * 3, g1 = (p[ii + i1 + p[jj + j1]] % 12) * 3, g2 = (p[ii + 1 + p[jj + 1]] % 12) * 3;
+  let n = 0;
+  let t0 = 0.5 - x0 * x0 - y0 * y0;
+  if (t0 > 0) { t0 *= t0; n += t0 * t0 * (GRAD3[g0] * x0 + GRAD3[g0 + 1] * y0); }
+  let t1 = 0.5 - x1 * x1 - y1 * y1;
+  if (t1 > 0) { t1 *= t1; n += t1 * t1 * (GRAD3[g1] * x1 + GRAD3[g1 + 1] * y1); }
+  let t2 = 0.5 - x2 * x2 - y2 * y2;
+  if (t2 > 0) { t2 *= t2; n += t2 * t2 * (GRAD3[g2] * x2 + GRAD3[g2 + 1] * y2); }
+  return 70 * n;
+}
+
+// ---- fractal sums (Musgrave) ----
+// Octave o samples at frequency lacunarity^o, weight gain^o, shifted by o * 19.19 so the
+// octaves' lattices do not line up at the origin. Normalized by the total weight.
+function fbm2(p, x, y, octaves, lacunarity = 2, gain = 0.5) {
+  let sum = 0, amp = 1, norm = 0, f = 1;
+  for (let o = 0; o < octaves; o++) {
+    sum += amp * perlin2(p, x * f + o * 19.19, y * f + o * 19.19);
+    norm += amp; amp *= gain; f *= lacunarity;
+  }
+  return sum / norm;
+}
+
+function turbulence2(p, x, y, octaves, lacunarity = 2, gain = 0.5) {
+  let sum = 0, amp = 1, norm = 0, f = 1;
+  for (let o = 0; o < octaves; o++) {
+    sum += amp * Math.abs(perlin2(p, x * f + o * 19.19, y * f + o * 19.19));
+    norm += amp; amp *= gain; f *= lacunarity;
+  }
+  return sum / norm;
+}
+
+// Ridged multifractal: sharp ridges where the noise crosses zero; each octave is weighted by
+// the previous one, so detail piles up on the ridges and valleys stay smooth.
+function ridged2(p, x, y, octaves, lacunarity = 2, gain = 0.5, offset = 1) {
+  let sum = 0, amp = 1, norm = 0, f = 1, weight = 1;
+  for (let o = 0; o < octaves; o++) {
+    let s = offset - Math.abs(perlin2(p, x * f + o * 19.19, y * f + o * 19.19));
+    s *= s;
+    s *= weight;
+    weight = s * 2 > 1 ? 1 : s * 2;
+    sum += s * amp;
+    norm += amp; amp *= gain; f *= lacunarity;
+  }
+  return sum / norm;
+}
+
+// ---- domain warping (Inigo Quilez) ----
+// f(p) = fbm(p + 4 r), r = fbm2D(p + 4 q), q = fbm2D(p). out (optional) receives q.x, q.y, r.x, r.y.
+function warp2(p, x, y, octaves, out) {
+  const qx = fbm2(p, x, y, octaves), qy = fbm2(p, x + 5.2, y + 1.3, octaves);
+  const rx = fbm2(p, x + 4 * qx + 1.7, y + 4 * qy + 9.2, octaves);
+  const ry = fbm2(p, x + 4 * qx + 8.3, y + 4 * qy + 2.8, octaves);
+  if (out) { out[0] = qx; out[1] = qy; out[2] = rx; out[3] = ry; }
+  return fbm2(p, x + 4 * rx, y + 4 * ry, octaves);
+}
+
+// ---- tileable noise: wrap the lattice ----
+// Same as perlin2, but lattice coordinates wrap modulo (px, py), integers in 1..256.
+function perlin2Periodic(p, x, y, px, py) {
+  const xf = Math.floor(x), yf = Math.floor(y);
+  x -= xf; y -= yf;
+  let X0 = xf % px; if (X0 < 0) X0 += px;
+  let Y0 = yf % py; if (Y0 < 0) Y0 += py;
+  const X1 = X0 + 1 === px ? 0 : X0 + 1, Y1 = Y0 + 1 === py ? 0 : Y0 + 1;
+  const u = fade(x), v = fade(y);
+  return lerp(lerp(grad2(p[p[X0] + Y0], x, y), grad2(p[p[X1] + Y0], x - 1, y), u),
+              lerp(grad2(p[p[X0] + Y1], x, y - 1), grad2(p[p[X1] + Y1], x - 1, y - 1), u), v);
+}
+
+// fbm2 with lacunarity 2 and gain 0.5 whose octave o wraps with period * 2^o: tiles every `period` units.
+function fbm2Periodic(p, x, y, period, octaves) {
+  let sum = 0, amp = 1, norm = 0, f = 1;
+  for (let o = 0; o < octaves; o++) {
+    sum += amp * perlin2Periodic(p, x * f + o * 19.19, y * f + o * 19.19, period * f, period * f);
+    norm += amp; amp *= 0.5; f *= 2;
+  }
+  return sum / norm;
+}
+
+// ---- analytic derivatives ----
+// Value noise and its gradient in one pass: out = [value, d/dx, d/dy].
+function valueNoise2d(x, y, seed, out) {
+  const xi = Math.floor(x), yi = Math.floor(y), fx = x - xi, fy = y - yi;
+  const u = fade(fx), v = fade(fy);
+  const du = 30 * fx * fx * (fx - 1) * (fx - 1), dv = 30 * fy * fy * (fy - 1) * (fy - 1);
+  const a = hash01(xi, yi, seed), b = hash01(xi + 1, yi, seed);
+  const c = hash01(xi, yi + 1, seed), d = hash01(xi + 1, yi + 1, seed);
+  const k1 = b - a, k2 = c - a, k3 = a - b - c + d;
+  out[0] = a + k1 * u + k2 * v + k3 * u * v;
+  out[1] = du * (k1 + k3 * v);
+  out[2] = dv * (k2 + k3 * u);
+  return out;
+}
+
+const nd_ = new Float64Array(3);
+// Quilez's "eroded" fBm: octaves are damped where the summed slope is steep, so slopes stay
+// smooth and detail collects on flats and ridges. Octave o uses seed + o; the domain is
+// rotated and scaled by [1.6 -1.2; 1.2 1.6] between octaves. Range about [0, 1].
+function erodedFbm2(x, y, seed, octaves) {
+  let sum = 0, amp = 0.5, norm = 0, dx = 0, dy = 0;
+  for (let o = 0; o < octaves; o++) {
+    valueNoise2d(x, y, seed + o, nd_);
+    dx += nd_[1]; dy += nd_[2];
+    sum += amp * nd_[0] / (1 + dx * dx + dy * dy);
+    norm += amp; amp *= 0.5;
+    const nx = 1.6 * x - 1.2 * y;
+    y = 1.2 * x + 1.6 * y; x = nx;
+  }
+  return sum / norm;
+}
+
+// Run: an eroded-fBm height field as a lit map: water, grass, rock and snow. The light uses
+// slopes from neighboring heights in the buffer (no extra noise evaluations).
+function demo() {
+  const w = canvas.width, h = canvas.height, s = 170 * w / 512, n = w * h;
+  const hgt = new Float32Array(n), img = new Float32Array(n * 3), image = new ImageData(w, h);
+  for (let y = 0; y < h; y++)
+    for (let x = 0; x < w; x++) hgt[y * w + x] = erodedFbm2(x / s, y / s, 9, 9);
+  const k = 90 * 512 / w, lx = -0.55, ly = -0.55, lz = 0.63, sea = 0.36;
+  for (let y = 0; y < h; y++)
+    for (let x = 0; x < w; x++) {
+      const i = y * w + x, e = Math.max(sea, hgt[i]);
+      const gx = (Math.max(sea, hgt[y * w + Math.min(w - 1, x + 1)]) - Math.max(sea, hgt[y * w + Math.max(0, x - 1)])) * k;
+      const gy = (Math.max(sea, hgt[Math.min(h - 1, y + 1) * w + x]) - Math.max(sea, hgt[Math.max(0, y - 1) * w + x])) * k;
+      const inv = 1 / Math.sqrt(gx * gx + gy * gy + 1), nz = inv;
+      const light = Math.max(0, (-gx * lx - gy * ly + lz) * inv) * 0.9 + 0.1;
+      let r, g, b;
+      if (hgt[i] < sea) { const d = (sea - hgt[i]) * 4; r = 0.02; g = 0.12 - d * 0.1; b = 0.3 - d * 0.15; }
+      else if (e > 0.62 && nz > 0.7) { r = 0.9; g = 0.92; b = 1; }
+      else if (nz < 0.8) { r = 0.25; g = 0.2; b = 0.16; }
+      else { const t = (e - sea) * 3; r = lerp(0.12, 0.3, t); g = lerp(0.3, 0.32, t); b = lerp(0.05, 0.12, t); }
+      img[i * 3] = r * light; img[i * 3 + 1] = g * light; img[i * 3 + 2] = b * light;
+    }
+  floatToRGBA(img, new Uint32Array(image.data.buffer), n, makeSrgbLUT());
+  canvas.getContext('2d').putImageData(image, 0, 0);
+}
+
+setTimeout(demo);
+--- hint
+`fade'(t) = 30t⁴ - 60t³ + 30t² = 30t²(t - 1)²`.
+--- hint
+Compute the new `x` into a temporary before overwriting it, since the new `y` needs the old `x`.
+--- harness
+{
+  const o = new Float64Array(3);
+  check(valueNoise2d(1.3, 2.6, 5, o) === o, 'returns out');
+  near(o[0], 0.7404097309786011, 1e-12, 'value'); near(o[1], 0.26555276394840704, 1e-12, 'd/dx'); near(o[2], 0.27070876606665195, 1e-12, 'd/dy');
+  let worstV = 0, worstD = 0;
+  const e = 1e-5;
+  for (let i = 0; i < 300; i++) {
+    const x = i * 0.377 - 50, y = i * 0.213 - 20, s = i % 7;
+    valueNoise2d(x, y, s, o);
+    worstV = Math.max(worstV, Math.abs(o[0] - valueNoise2(x, y, s)));
+    const fx = (valueNoise2(x + e, y, s) - valueNoise2(x - e, y, s)) / (2 * e), fy = (valueNoise2(x, y + e, s) - valueNoise2(x, y - e, s)) / (2 * e);
+    worstD = Math.max(worstD, Math.abs(o[1] - fx), Math.abs(o[2] - fy));
+  }
+  check(worstV < 1e-12, 'value matches valueNoise2'); check(worstD < 1e-6, 'derivatives match central differences (worst ' + worstD + ')');
+  valueNoise2d(4, -3, 2, o);
+  check(o[1] === 0 && o[2] === 0, 'zero slope at lattice points');
+  near(erodedFbm2(1.3, 2.6, 5, 6), 0.43877507092753154, 1e-12, 'eroded fBm sample 1');
+  near(erodedFbm2(-3.7, 0.2, 1, 8), 0.4441873644766085, 1e-12, 'eroded fBm sample 2');
+  valueNoise2d(0.7, 0.2, 3, o);
+  near(erodedFbm2(0.7, 0.2, 3, 1), o[0] / (1 + o[1] * o[1] + o[2] * o[2]), 1e-12, 'one octave');
+  const t0 = performance.now();
+  let acc = 0;
+  for (let i = 0; i < 100000; i++) acc += erodedFbm2(i * 0.01, i * 0.003, 1, 8);
+  const ms = performance.now() - t0;
+  check(ms < 800, `800k eroded octaves in ${ms.toFixed(0)} ms (limit 800)`);
+}
+
+=== exercise animate
+title: Project: animated warped noise
+continues: deriv
+--- prompt
+Finish with an animated field: 3D noise, time as the third axis, domain-warped, colored through a palette, at interactive frame rates.
+
+- `fbm3(p, x, y, z, octaves)`: like `fbm2` with lacunarity 2 and gain 0.5, but with `perlin3`, every coordinate shifted by `o * 19.19`.
+- `flow(p, x, y, t)`: with `z = 0.15 * t`: `qx = fbm3(p, x, y, z, 4)`, `qy = fbm3(p, x + 5.2, y + 1.3, z, 4)`, return `fbm3(p, x + 4 qx, y + 4 qy, z, 4)`.
+- `renderFrame(px, w, h, t, p, lut, scale)`: for each pixel, `v = clamp(0.5 + 0.9 * flow(p, x * scale, y * scale, t), 0, 1)` and `px[y * w + x] = lut[(v * 255 + 0.5) | 0]`. `px` is a `Uint32Array` (a view of an `ImageData`), `lut` a 256-color palette.
+
+That is 12 `perlin3` calls per pixel, about 800,000 per 256×256 frame. The test allows 0.8 s for a frame (a good implementation takes well under 0.1 s). `renderFrame` must allocate nothing: it runs every animation frame, and the garbage collector will turn any per-pixel or per-frame allocation into visible hitches.
+
+Run it: the demo renders at 256×256 into a small `OffscreenCanvas` and scales it up with `drawImage`. Hold the mouse button and move horizontally to change the scale. Then experiment: color by `qx` and `qy` like the warp demo, try `ridged` octaves, or swap the palette. The textures chapter starts from this library.
+--- stubs
+function fbm3(p, x, y, z, octaves) {
+  return 0;
+}
+
+function flow(p, x, y, t) {
+  return 0;
+}
+
+function renderFrame(px, w, h, t, p, lut, scale) {
+}
+
+// Run: animated, warped 3D noise at 256x256, scaled up to the canvas. Everything allocated
+// once; each frame is one renderFrame and one putImageData. Drag the mouse to change scale.
+function demo() {
+  const R = 256, small = new OffscreenCanvas(R, R), sctx = small.getContext('2d');
+  const image = new ImageData(R, R), px = new Uint32Array(image.data.buffer), p = makePerm(2025);
+  const lut = makePaletteLUT(256, [0.5, 0.5, 0.5], [0.5, 0.5, 0.5], [1, 1, 1], [0.0, 0.10, 0.20]);
+  const ctx = canvas.getContext('2d');
+  ctx.imageSmoothingEnabled = true;
+  function frame(ms) {
+    const scale = (mouse.down ? 1 + 3 * mouse.x / canvas.width : 2) / R;
+    renderFrame(px, R, R, ms / 1000, p, lut, scale * 1.5);
+    sctx.putImageData(image, 0, 0);
+    ctx.drawImage(small, 0, 0, canvas.width, canvas.height);
+    requestAnimationFrame(frame);
+  }
+  requestAnimationFrame(frame);
+}
+--- solution
+// ===== From the Pixels chapter =====
+function packRGBA(r, g, b, a = 255) {
+  return ((a & 255) << 24 | (b & 255) << 16 | (g & 255) << 8 | (r & 255)) >>> 0;
+}
+
+function srgbToLinear(c) {
+  return c <= 0.04045 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4);
+}
+
+function linearToSrgb(c) {
+  return c <= 0.0031308 ? c * 12.92 : 1.055 * Math.pow(c, 1 / 2.4) - 0.055;
+}
+
+function makeSrgbLUT() {
+  const lut = new Uint8Array(4097);
+  for (let i = 0; i <= 4096; i++) lut[i] = Math.round(255 * linearToSrgb(i / 4096));
+  return lut;
+}
+
+function floatToRGBA(src, dst, n, lut) {
+  for (let i = 0, j = 0; i < n; i++, j += 3) {
+    let r = src[j], g = src[j + 1], b = src[j + 2];
+    r = r > 0 ? (r < 1 ? r : 1) : 0;
+    g = g > 0 ? (g < 1 ? g : 1) : 0;
+    b = b > 0 ? (b < 1 ? b : 1) : 0;
+    dst[i] = (0xFF000000 | lut[(b * 4096 + 0.5) | 0] << 16 | lut[(g * 4096 + 0.5) | 0] << 8 | lut[(r * 4096 + 0.5) | 0]) >>> 0;
+  }
+}
+
+function cosinePalette(t, a, b, c, d, out) {
+  const TAU = 6.283185307179586;
+  out[0] = a[0] + b[0] * Math.cos(TAU * (c[0] * t + d[0]));
+  out[1] = a[1] + b[1] * Math.cos(TAU * (c[1] * t + d[1]));
+  out[2] = a[2] + b[2] * Math.cos(TAU * (c[2] * t + d[2]));
+  return out;
+}
+
+function makePaletteLUT(n, a, b, c, d) {
+  const lut = new Uint32Array(n), col = new Float64Array(3);
+  for (let i = 0; i < n; i++) {
+    cosinePalette(n > 1 ? i / (n - 1) : 0, a, b, c, d, col);
+    const r = Math.round(255 * Math.min(1, Math.max(0, col[0])));
+    const g = Math.round(255 * Math.min(1, Math.max(0, col[1])));
+    const bl = Math.round(255 * Math.min(1, Math.max(0, col[2])));
+    lut[i] = packRGBA(r, g, bl, 255);
+  }
+  return lut;
+}
+
+// New helper: show a scalar field (values in [0, 1], one float per pixel) through a 256-color LUT.
+function showField(field, w, h, lut) {
+  const image = new ImageData(w, h), px = new Uint32Array(image.data.buffer);
+  for (let i = 0; i < w * h; i++) {
+    const v = field[i] > 0 ? (field[i] < 1 ? field[i] : 1) : 0;
+    px[i] = lut[(v * 255 + 0.5) | 0];
+  }
+  canvas.getContext('2d').putImageData(image, 0, 0);
+}
+
+const GRAY = Uint32Array.from({ length: 256 }, (_, i) => packRGBA(i, i, i));
+// ===== Noise =====
+
+// ---- seeded generators ----
+// mulberry32 (Tommy Ettinger): 32 bits of state, floats in [0, 1).
+function mulberry32(seed) {
+  let a = seed | 0;
+  return function () {
+    a = (a + 0x6D2B79F5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+// sfc32 (Chris Doty-Humphrey, PractRand): 128 bits of state, floats in [0, 1).
+function sfc32(a, b, c, d) {
+  a |= 0; b |= 0; c |= 0; d |= 0;
+  return function () {
+    const t = ((a + b) | 0) + d | 0;
+    d = (d + 1) | 0;
+    a = b ^ (b >>> 9);
+    b = (c + (c << 3)) | 0;
+    c = (c << 21) | (c >>> 11);
+    c = (c + t) | 0;
+    return (t >>> 0) / 4294967296;
+  };
+}
+
+// Fisher-Yates, in place, driven by any rng() in [0, 1).
+function shuffle(arr, rng) {
+  for (let i = arr.length - 1; i > 0; i--) {
+    const j = Math.floor(rng() * (i + 1));
+    const t = arr[i]; arr[i] = arr[j]; arr[j] = t;
+  }
+  return arr;
+}
+
+// ---- integer hashing: random access instead of a sequence ----
+function hash2(x, y, seed) {
+  let h = (Math.imul(seed | 0, 0x9e3779b9) + 0x632be5ab) | 0;
+  h = Math.imul(h ^ Math.imul(x | 0, 0x27d4eb2d), 0x85ebca6b);
+  h ^= h >>> 15;
+  h = Math.imul(h ^ Math.imul(y | 0, 0x165667b1), 0xc2b2ae35);
+  h ^= h >>> 13;
+  h = Math.imul(h, 0x846ca68b);
+  return (h ^ (h >>> 16)) >>> 0;
+}
+
+function hash3(x, y, z, seed) {
+  return hash2(x ^ Math.imul(z | 0, 0x1b873593), y, seed);
+}
+
+function hash01(x, y, seed) {
+  return hash2(x, y, seed) / 4294967296;
+}
+
+// ---- value noise ----
+function fade(t) {
+  return t * t * t * (t * (t * 6 - 15) + 10);       // 6t^5 - 15t^4 + 10t^3
+}
+
+function lerp(a, b, t) {
+  return a + (b - a) * t;
+}
+
+// Random values at integer lattice points, smoothly interpolated. Range [0, 1).
+function valueNoise2(x, y, seed) {
+  const xi = Math.floor(x), yi = Math.floor(y);
+  const u = fade(x - xi), v = fade(y - yi);
+  const a = hash01(xi, yi, seed), b = hash01(xi + 1, yi, seed);
+  const c = hash01(xi, yi + 1, seed), d = hash01(xi + 1, yi + 1, seed);
+  return lerp(lerp(a, b, u), lerp(c, d, u), v);
+}
+
+// ---- Perlin gradient noise (improved, 2002) ----
+// Permutation table: 0..255 shuffled by the seed, then repeated so p[i + 1] never needs a mask.
+function makePerm(seed) {
+  const p = new Uint8Array(512);
+  for (let i = 0; i < 256; i++) p[i] = i;
+  shuffle(p.subarray(0, 256), mulberry32(seed));
+  p.copyWithin(256, 0, 256);
+  return p;
+}
+
+// Dot product of the offset (x, y) with one of 8 gradients picked by the hash.
+function grad2(h, x, y) {
+  switch (h & 7) {
+    case 0: return x + y;
+    case 1: return -x + y;
+    case 2: return x - y;
+    case 3: return -x - y;
+    case 4: return x;
+    case 5: return -x;
+    case 6: return y;
+    default: return -y;
+  }
+}
+
+function perlin2(p, x, y) {
+  const xf = Math.floor(x), yf = Math.floor(y);
+  const X = xf & 255, Y = yf & 255;
+  x -= xf; y -= yf;
+  const u = fade(x), v = fade(y);
+  const A = p[X] + Y, B = p[X + 1] + Y;
+  return lerp(lerp(grad2(p[A], x, y), grad2(p[B], x - 1, y), u),
+              lerp(grad2(p[A + 1], x, y - 1), grad2(p[B + 1], x - 1, y - 1), u), v);
+}
+
+// Ken Perlin's reference gradient: 12 cube-edge directions (plus 4 repeats) from the low 4 bits.
+function grad3(hash, x, y, z) {
+  const h = hash & 15;
+  const u = h < 8 ? x : y;
+  const v = h < 4 ? y : h === 12 || h === 14 ? x : z;
+  return ((h & 1) === 0 ? u : -u) + ((h & 2) === 0 ? v : -v);
+}
+
+function perlin3(p, x, y, z) {
+  const xf = Math.floor(x), yf = Math.floor(y), zf = Math.floor(z);
+  const X = xf & 255, Y = yf & 255, Z = zf & 255;
+  x -= xf; y -= yf; z -= zf;
+  const u = fade(x), v = fade(y), w = fade(z);
+  const A = p[X] + Y, AA = p[A] + Z, AB = p[A + 1] + Z;
+  const B = p[X + 1] + Y, BA = p[B] + Z, BB = p[B + 1] + Z;
+  return lerp(
+    lerp(lerp(grad3(p[AA], x, y, z), grad3(p[BA], x - 1, y, z), u),
+         lerp(grad3(p[AB], x, y - 1, z), grad3(p[BB], x - 1, y - 1, z), u), v),
+    lerp(lerp(grad3(p[AA + 1], x, y, z - 1), grad3(p[BA + 1], x - 1, y, z - 1), u),
+         lerp(grad3(p[AB + 1], x, y - 1, z - 1), grad3(p[BB + 1], x - 1, y - 1, z - 1), u), v), w);
+}
+
+// Fills out[y * w + x] = perlin2(perm, x * scale, y * scale). The table is built once per call.
+function perlinGrid(out, w, h, seed, scale) {
+  const p = makePerm(seed);
+  for (let y = 0; y < h; y++)
+    for (let x = 0; x < w; x++) out[y * w + x] = perlin2(p, x * scale, y * scale);
+}
+
+// ---- simplex noise 2D (Perlin 2001; Gustavson's "Simplex noise demystified") ----
+const F2 = 0.5 * (Math.sqrt(3) - 1), G2 = (3 - Math.sqrt(3)) / 6;
+const GRAD3 = new Int8Array([1, 1, 0, -1, 1, 0, 1, -1, 0, -1, -1, 0, 1, 0, 1, -1, 0, 1, 1, 0, -1, -1, 0, -1, 0, 1, 1, 0, -1, 1, 0, 1, -1, 0, -1, -1]);
+
+function simplex2(p, xin, yin) {
+  const s = (xin + yin) * F2;                       // skew to the square grid
+  const i = Math.floor(xin + s), j = Math.floor(yin + s);
+  const t = (i + j) * G2;                           // unskew the cell origin back
+  const x0 = xin - (i - t), y0 = yin - (j - t);
+  const i1 = x0 > y0 ? 1 : 0, j1 = 1 - i1;          // which triangle of the cell
+  const x1 = x0 - i1 + G2, y1 = y0 - j1 + G2;
+  const x2 = x0 - 1 + 2 * G2, y2 = y0 - 1 + 2 * G2;
+  const ii = i & 255, jj = j & 255;
+  const g0 = (p[ii + p[jj]] % 12) * 3, g1 = (p[ii + i1 + p[jj + j1]] % 12) * 3, g2 = (p[ii + 1 + p[jj + 1]] % 12) * 3;
+  let n = 0;
+  let t0 = 0.5 - x0 * x0 - y0 * y0;
+  if (t0 > 0) { t0 *= t0; n += t0 * t0 * (GRAD3[g0] * x0 + GRAD3[g0 + 1] * y0); }
+  let t1 = 0.5 - x1 * x1 - y1 * y1;
+  if (t1 > 0) { t1 *= t1; n += t1 * t1 * (GRAD3[g1] * x1 + GRAD3[g1 + 1] * y1); }
+  let t2 = 0.5 - x2 * x2 - y2 * y2;
+  if (t2 > 0) { t2 *= t2; n += t2 * t2 * (GRAD3[g2] * x2 + GRAD3[g2 + 1] * y2); }
+  return 70 * n;
+}
+
+// ---- fractal sums (Musgrave) ----
+// Octave o samples at frequency lacunarity^o, weight gain^o, shifted by o * 19.19 so the
+// octaves' lattices do not line up at the origin. Normalized by the total weight.
+function fbm2(p, x, y, octaves, lacunarity = 2, gain = 0.5) {
+  let sum = 0, amp = 1, norm = 0, f = 1;
+  for (let o = 0; o < octaves; o++) {
+    sum += amp * perlin2(p, x * f + o * 19.19, y * f + o * 19.19);
+    norm += amp; amp *= gain; f *= lacunarity;
+  }
+  return sum / norm;
+}
+
+function turbulence2(p, x, y, octaves, lacunarity = 2, gain = 0.5) {
+  let sum = 0, amp = 1, norm = 0, f = 1;
+  for (let o = 0; o < octaves; o++) {
+    sum += amp * Math.abs(perlin2(p, x * f + o * 19.19, y * f + o * 19.19));
+    norm += amp; amp *= gain; f *= lacunarity;
+  }
+  return sum / norm;
+}
+
+// Ridged multifractal: sharp ridges where the noise crosses zero; each octave is weighted by
+// the previous one, so detail piles up on the ridges and valleys stay smooth.
+function ridged2(p, x, y, octaves, lacunarity = 2, gain = 0.5, offset = 1) {
+  let sum = 0, amp = 1, norm = 0, f = 1, weight = 1;
+  for (let o = 0; o < octaves; o++) {
+    let s = offset - Math.abs(perlin2(p, x * f + o * 19.19, y * f + o * 19.19));
+    s *= s;
+    s *= weight;
+    weight = s * 2 > 1 ? 1 : s * 2;
+    sum += s * amp;
+    norm += amp; amp *= gain; f *= lacunarity;
+  }
+  return sum / norm;
+}
+
+// ---- domain warping (Inigo Quilez) ----
+// f(p) = fbm(p + 4 r), r = fbm2D(p + 4 q), q = fbm2D(p). out (optional) receives q.x, q.y, r.x, r.y.
+function warp2(p, x, y, octaves, out) {
+  const qx = fbm2(p, x, y, octaves), qy = fbm2(p, x + 5.2, y + 1.3, octaves);
+  const rx = fbm2(p, x + 4 * qx + 1.7, y + 4 * qy + 9.2, octaves);
+  const ry = fbm2(p, x + 4 * qx + 8.3, y + 4 * qy + 2.8, octaves);
+  if (out) { out[0] = qx; out[1] = qy; out[2] = rx; out[3] = ry; }
+  return fbm2(p, x + 4 * rx, y + 4 * ry, octaves);
+}
+
+// ---- tileable noise: wrap the lattice ----
+// Same as perlin2, but lattice coordinates wrap modulo (px, py), integers in 1..256.
+function perlin2Periodic(p, x, y, px, py) {
+  const xf = Math.floor(x), yf = Math.floor(y);
+  x -= xf; y -= yf;
+  let X0 = xf % px; if (X0 < 0) X0 += px;
+  let Y0 = yf % py; if (Y0 < 0) Y0 += py;
+  const X1 = X0 + 1 === px ? 0 : X0 + 1, Y1 = Y0 + 1 === py ? 0 : Y0 + 1;
+  const u = fade(x), v = fade(y);
+  return lerp(lerp(grad2(p[p[X0] + Y0], x, y), grad2(p[p[X1] + Y0], x - 1, y), u),
+              lerp(grad2(p[p[X0] + Y1], x, y - 1), grad2(p[p[X1] + Y1], x - 1, y - 1), u), v);
+}
+
+// fbm2 with lacunarity 2 and gain 0.5 whose octave o wraps with period * 2^o: tiles every `period` units.
+function fbm2Periodic(p, x, y, period, octaves) {
+  let sum = 0, amp = 1, norm = 0, f = 1;
+  for (let o = 0; o < octaves; o++) {
+    sum += amp * perlin2Periodic(p, x * f + o * 19.19, y * f + o * 19.19, period * f, period * f);
+    norm += amp; amp *= 0.5; f *= 2;
+  }
+  return sum / norm;
+}
+
+// ---- analytic derivatives ----
+// Value noise and its gradient in one pass: out = [value, d/dx, d/dy].
+function valueNoise2d(x, y, seed, out) {
+  const xi = Math.floor(x), yi = Math.floor(y), fx = x - xi, fy = y - yi;
+  const u = fade(fx), v = fade(fy);
+  const du = 30 * fx * fx * (fx - 1) * (fx - 1), dv = 30 * fy * fy * (fy - 1) * (fy - 1);
+  const a = hash01(xi, yi, seed), b = hash01(xi + 1, yi, seed);
+  const c = hash01(xi, yi + 1, seed), d = hash01(xi + 1, yi + 1, seed);
+  const k1 = b - a, k2 = c - a, k3 = a - b - c + d;
+  out[0] = a + k1 * u + k2 * v + k3 * u * v;
+  out[1] = du * (k1 + k3 * v);
+  out[2] = dv * (k2 + k3 * u);
+  return out;
+}
+
+const nd_ = new Float64Array(3);
+// Quilez's "eroded" fBm: octaves are damped where the summed slope is steep, so slopes stay
+// smooth and detail collects on flats and ridges. Octave o uses seed + o; the domain is
+// rotated and scaled by [1.6 -1.2; 1.2 1.6] between octaves. Range about [0, 1].
+function erodedFbm2(x, y, seed, octaves) {
+  let sum = 0, amp = 0.5, norm = 0, dx = 0, dy = 0;
+  for (let o = 0; o < octaves; o++) {
+    valueNoise2d(x, y, seed + o, nd_);
+    dx += nd_[1]; dy += nd_[2];
+    sum += amp * nd_[0] / (1 + dx * dx + dy * dy);
+    norm += amp; amp *= 0.5;
+    const nx = 1.6 * x - 1.2 * y;
+    y = 1.2 * x + 1.6 * y; x = nx;
+  }
+  return sum / norm;
+}
+
+// ---- animated noise: time is the third dimension ----
+function fbm3(p, x, y, z, octaves) {
+  let sum = 0, amp = 1, norm = 0, f = 1;
+  for (let o = 0; o < octaves; o++) {
+    sum += amp * perlin3(p, x * f + o * 19.19, y * f + o * 19.19, z * f + o * 19.19);
+    norm += amp; amp *= 0.5; f *= 2;
+  }
+  return sum / norm;
+}
+
+// One warped, animated sample: q = (fbm3(x, y, z), fbm3(x + 5.2, y + 1.3, z)) with z = 0.15 t,
+// then fbm3(x + 4 q.x, y + 4 q.y, z). Four octaves each.
+function flow(p, x, y, t) {
+  const z = 0.15 * t;
+  const qx = fbm3(p, x, y, z, 4), qy = fbm3(p, x + 5.2, y + 1.3, z, 4);
+  return fbm3(p, x + 4 * qx, y + 4 * qy, z, 4);
+}
+
+// px: packed output (w * h). Pixel (x, y) samples flow at (x * scale, y * scale) and colors
+// it with lut[(v * 255 + 0.5) | 0], v = clamp(0.5 + 0.9 * flow, 0, 1). Allocates nothing.
+function renderFrame(px, w, h, t, p, lut, scale) {
+  for (let y = 0; y < h; y++)
+    for (let x = 0; x < w; x++) {
+      let v = 0.5 + 0.9 * flow(p, x * scale, y * scale, t);
+      v = v > 0 ? (v < 1 ? v : 1) : 0;
+      px[y * w + x] = lut[(v * 255 + 0.5) | 0];
+    }
+}
+
+// Run: animated, warped 3D noise at 256x256, scaled up to the canvas. Everything allocated
+// once; each frame is one renderFrame and one putImageData. Drag the mouse to change scale.
+function demo() {
+  const R = 256, small = new OffscreenCanvas(R, R), sctx = small.getContext('2d');
+  const image = new ImageData(R, R), px = new Uint32Array(image.data.buffer), p = makePerm(2025);
+  const lut = makePaletteLUT(256, [0.5, 0.5, 0.5], [0.5, 0.5, 0.5], [1, 1, 1], [0.0, 0.10, 0.20]);
+  const ctx = canvas.getContext('2d');
+  ctx.imageSmoothingEnabled = true;
+  function frame(ms) {
+    const scale = (mouse.down ? 1 + 3 * mouse.x / canvas.width : 2) / R;
+    renderFrame(px, R, R, ms / 1000, p, lut, scale * 1.5);
+    sctx.putImageData(image, 0, 0);
+    ctx.drawImage(small, 0, 0, canvas.width, canvas.height);
+    requestAnimationFrame(frame);
+  }
+  requestAnimationFrame(frame);
+}
+
+setTimeout(demo);
+--- hint
+Same loop as `fbm2`, with `perlin3(p, x * f + o * 19.19, y * f + o * 19.19, z * f + o * 19.19)`.
+--- harness
+{
+  const p = makePerm(1);
+  near(fbm3(p, 0.3, 0.7, 0.2, 4), -0.08548352606506296, 1e-12, 'fbm3 sample');
+  eq(fbm3(p, 1.1, 2.2, 3.3, 1), perlin3(p, 1.1, 2.2, 3.3), 'one octave');
+  near(flow(p, 0.3, 0.7, 1.5), -0.13928359060063805, 1e-12, 'flow at t = 1.5');
+  near(flow(p, 0.3, 0.7, 0), 0.10346222910442979, 1e-12, 'flow at t = 0');
+  near(flow(p, 2.1, -0.4, 3 + 1e-6), flow(p, 2.1, -0.4, 3), 1e-5, 'continuous in time');
+  check(Math.abs(flow(p, 2.1, -0.4, 3) - flow(p, 2.1, -0.4, 6)) > 1e-4, 'changes over time');
+  const lut = Uint32Array.from({ length: 256 }, (_, i) => packRGBA(i, 255 - i, i >> 1));
+  const w = 7, h = 5, px = new Uint32Array(w * h);
+  renderFrame(px, w, h, 2.5, p, lut, 0.11);
+  let bad = 0;
+  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+    const v = Math.min(1, Math.max(0, 0.5 + 0.9 * flow(p, x * 0.11, y * 0.11, 2.5)));
+    if (px[y * w + x] !== lut[(v * 255 + 0.5) | 0]) bad++;
+  }
+  eq(bad, 0, 'every pixel is lut[(v * 255 + 0.5) | 0]');
+  const R = 256, big = new Uint32Array(R * R), again = new Uint32Array(R * R);
+  const t0 = performance.now();
+  renderFrame(big, R, R, 1, p, lut, 2 / R);
+  const ms = performance.now() - t0;
+  check(ms < 800, `256x256 frame in ${ms.toFixed(0)} ms (limit 800)`);
+  renderFrame(again, R, R, 1, p, lut, 2 / R);
+  check(big.every((v, i) => v === again[i]), 'deterministic');
+  check(new Set(big).size > 40, 'uses many palette entries');
+}
+
+=== quiz
+--- q
+Why do procedural generators use a hash of the coordinates rather than a seeded sequence generator for noise lattices?
+--- choice
+Hashes produce higher-quality random numbers than any sequence generator.
+--- answer
+A hash gives random access: the value at any lattice point depends only on its coordinates and the seed, not on what was generated before, so chunks, pixels and GPU threads can be computed independently and in any order.
+--- choice
+Sequence generators cannot be seeded in JavaScript.
+--- choice
+Hashes use less memory than one generator's state.
+--- explain
+A generator produces a sequence, so "the value at (812, -44)" would depend on the order of evaluation. Noise must be a pure function of position: the same in every chunk, every frame and every thread.
+
+=== quiz
+run: yes
+--- q
+What does this print?
+--- code
+const a = 0x9e3779b9, b = 0x85ebca6b;
+console.log((a * b) % 4294967296 === (Math.imul(a, b) >>> 0));
+--- answer
+false
+--- choice
+true
+--- choice
+NaN
+--- choice
+It throws a RangeError.
+--- explain
+The exact product of two 32-bit numbers needs up to 64 bits; a double keeps 53, so `a * b` is rounded and its low 32 bits are wrong. `Math.imul` computes the true low 32 bits, which is what hashes and generators need.
+
+=== quiz
+--- q
+Classic Perlin noise evaluated exactly at an integer lattice point returns what?
+--- answer
+0, because every gradient is dotted with an offset vector, and at a lattice point the offset from that corner is zero while the other corners' weights are zero.
+--- choice
+The random value stored at that lattice point.
+--- choice
+1, the maximum of the noise.
+--- choice
+A value that depends on the gradient at that point.
+--- explain
+That is the key difference from value noise, which equals its hashed value at lattice points. Perlin noise crosses zero on the whole lattice and has its extremes in between, which is why it looks less grid-aligned.
+
+=== quiz
+run: yes
+--- q
+Perlin's fade curve is `6t⁵ - 15t⁴ + 10t³`. What does this print?
+--- code
+const fade = t => t * t * t * (t * (t * 6 - 15) + 10);
+const d1 = (f, t, e = 1e-4) => (f(t + e) - f(t - e)) / (2 * e);
+const d2 = (f, t, e = 1e-3) => (f(t + e) - 2 * f(t) + f(t - e)) / (e * e);
+console.log(fade(0.5), Math.abs(d1(fade, 1)) < 1e-6, Math.abs(d2(fade, 1)) < 1e-3);
+--- answer
+0.5 true true
+--- choice
+0.5 true false
+--- choice
+0.5 false false
+--- choice
+0.625 true true
+--- explain
+The quintic is symmetric (0.5 at 0.5) and both its first and second derivatives vanish at 0 and 1. The older cubic `3t² - 2t³` has zero slope at the ends but a second derivative of ∓6, which shows as creases in lighting computed from the noise.
+
+=== quiz
+--- q
+You want 8 octaves of fBm with lacunarity 2 on a 512-pixel texture whose base frequency is 4 noise cells across. Roughly how many octaves add visible detail?
+--- choice
+All 8: more octaves always add detail.
+--- answer
+About 7: octave 6 has 4 × 2⁶ = 256 cells (2 pixels per cell); octave 7 would have 512 cells, one per pixel, which mostly adds aliasing.
+--- choice
+3: anything past 3 octaves is invisible.
+--- choice
+It depends only on the gain.
+--- explain
+Each octave doubles the frequency. Once a noise cell is smaller than about two pixels its features cannot be represented and only alias; stop the loop there (and on the GPU, compute the cutoff from the screen-space derivative).
+
+=== quiz
+--- q
+How do you animate a noise texture so features evolve smoothly instead of sliding or pulsing?
+--- choice
+Add the time to the x coordinate of 2D noise.
+--- choice
+Cross-fade between two 2D noise fields with different seeds.
+--- answer
+Use 3D noise and use time (times a speed) as the third coordinate, so each frame is a slice through a smooth volume.
+--- choice
+Re-seed the permutation table every frame.
+--- explain
+Offsetting x just scrolls the pattern; cross-fading two fields dims contrast in the middle of each fade; reseeding gives unrelated frames. Slicing a 3D (or, for volumes, 4D) noise along its extra axis morphs the features continuously.

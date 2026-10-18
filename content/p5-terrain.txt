@@ -55,7 +55,9 @@ static float ridged(float x, float y, int octaves) {    /* Musgrave-style ridged
         n = n * n * weight;
         weight = fminf(1, n * 2);                         /* detail follows the ridges */
         sum += n * amp; norm += amp;
-        x *= 2.03f; y *= 2.03f; amp *= 0.5f;
+        float rx = (0.8f * x - 0.6f * y) * 2.03f;      /* rotate each octave: hides the lattice */
+        y = (0.6f * x + 0.8f * y) * 2.03f; x = rx;
+        amp *= 0.5f;
     }
     return sum / norm;
 }

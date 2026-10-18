@@ -25,5 +25,9 @@ __attribute__((constructor)) static void t_init_(void) { setvbuf(stdout, NULL, _
     return res.didExecute && res.exit === 0 && /ALL TESTS PASSED/.test(res.stdout);
   }
   const norm = s => (s || '').replace(/\r/g, '').split('\n').map(l => l.replace(/\s+$/, '')).join('\n').replace(/\n+$/, '');
-  g.Assemble = { PRELUDE, harness, passed, norm };
+  // Concatenates engine headers for a single-file compile: drops #pragma once and local includes.
+  function cLibs(names, texts) {
+    return texts.map((t, i) => `#line 1 "${names[i]}"\n` + t.replace(/^\s*#\s*pragma\s+once.*$/mg, '').replace(/^\s*#\s*include\s+"[^"]*".*$/mg, '')).join('\n') + '\n#line 1 "main.c"\n';
+  }
+  g.Assemble = { PRELUDE, harness, passed, norm, cLibs };
 })(typeof window !== 'undefined' ? window : globalThis);

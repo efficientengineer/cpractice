@@ -49,4 +49,4 @@ The learner wants graphics programming with a heavy focus on procedural generati
 
 ## The Procedural World course
 
-See [ENGINE.md](ENGINE.md). Chapters with `lib: yes` ship `content/world/lib/FILE.js`; later chapters get it preloaded. The world canvas is 960×540 with pointer lock on click (`mouse.dx`/`mouse.dy` accumulate movement; read and zero them each frame; `mouse.locked`).
+See [ENGINE.md](ENGINE.md). The course is in C: online exercises are checked on the site with the engine headers named in earlier chapters' `lib:` headers prepended; GPU work is done in `world/` as **local steps**: an exercise with a `--- local` field (markdown instructions: files to edit, commands to run, which test must pass) and no harness/tests shows a "Mark as done" button. An exercise may have both (online part + local follow-up). Verify with `node tools/verify.mjs world [prefix]`; local steps are verified by building `world/` and running `world_tests` (see world/README.md).

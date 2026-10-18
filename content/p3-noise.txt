@@ -1,0 +1,3549 @@
+=== chapter p3-noise
+title: Noise
+blurb: Project: a noise library. Integer hashes, value noise, Perlin's improved gradient noise in 2D and 3D, simplex noise, fBm, turbulence, ridged multifractals, domain warping, tileable noise and analytic derivatives.
+--- body
+## Why noise
+
+Almost every procedural texture, terrain and effect starts from **coherent noise**: a function from position to a value that looks random at large scales but changes smoothly at small ones. Clouds, marble, wood, rock, grass distribution, terrain heights, camera shake and fire all come from it. Ken Perlin invented the classic version for the film *Tron* (1982) and published it in 1985 ("An Image Synthesizer", SIGGRAPH), won a technical Academy Award for it in 1997, and published the improved version used everywhere today in 2002 ("Improving Noise").
+
+This chapter builds a noise library in ten steps. The starter brings in the image library from "Images from scratch" (images, sRGB output, `lerpf`, `smoothstepf`, ramps, cosine palettes) and a few `vec3` helpers from "Vector math for graphics". The next chapter, procedural textures, starts from this one's finished code.
+
+## Why not `rand()`?
+
+The first idea is `rand()` per pixel. It fails every requirement a generator has:
+
+- **No coherence.** Neighboring pixels are unrelated: you get TV static, not terrain.
+- **Order dependence.** `rand()` is a sequence. The value at a pixel depends on how many calls came before it, so rendering a tile, a chunk, or the pixels in a different order (multithreaded, on the GPU) gives a different world.
+- **Hidden global state** that any other code calling `rand()` disturbs, and an implementation that differs between platforms (MSVC's and glibc's `rand` give different sequences for the same seed), so the same seed is not the same world.
+- **No random access.** You can't ask "what's the value at (10 000, -3 000)?" without generating everything before it.
+
+What procedural generation needs instead is a **hash**: a pure function from (position, seed) to random-looking bits. Same inputs, same output, on any machine, in any order, at any position, with no state. "Hashing instead of storing" is the core trick of infinite worlds: nothing is generated until it's looked at, and it is the same every time it is.
+
+## Integer hashes
+
+A good hash for this job is fast, has no visible patterns, and changes about half its output bits when one input bit changes (avalanche). Two well-known choices:
+
+- **PCG hash** (from Jarzynski and Olano, "Hash Functions for GPU Rendering", JCGT 2020), a single round of the PCG random number generator. It is the one this chapter uses.
+- **Squirrel noise** (Squirrel Eiserloh, "Math for Game Programmers: Noise-Based RNG", GDC 2017): multiply by large primes, mix with shifts and xors.
+
+```c
+uint32_t hash_u32(uint32_t x) {                 /* PCG hash */
+    uint32_t state = x * 747796405u + 2891336453u;
+    uint32_t word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
+    return (word >> 22u) ^ word;
+}
+```
+
+Everything is `uint32_t` deliberately: **unsigned overflow wraps** (it's defined arithmetic modulo 2³²), while **signed overflow is undefined behavior**. Write the same hash with `int` and UBSan here will flag it, and an optimizer is allowed to break it.
+
+Multi-dimensional input is nested: `hash(x + hash(y + hash(seed)))`. To get a float in `[0, 1)`, keep the top 24 bits (exactly what a `float` mantissa can hold): `(h >> 8) * (1.0f / 16777216.0f)`.
+
+> **Performance:** a hash costs a few multiplies and shifts, far less than a cache miss. That's why procedural engines hash coordinates instead of storing random tables for the world: the "table" is infinite, costs no memory, and needs no loading.
+
+## Value noise
+
+Put a random value at each integer lattice point and interpolate between them. For a point `(x, y)`: take the cell corner `(floor x, floor y)`, the four corner values `a b c d`, the fractional position `(tx, ty)`, and blend:
+
+```text
+value = lerp(lerp(a, b, s(tx)), lerp(c, d, s(tx)), s(ty))
+```
+
+The **fade curve** `s` matters. Plain linear interpolation (`s(t) = t`) shows the grid as creases. Smoothstep `3t² - 2t³` has zero slope at the lattice points, which hides creases in the values, but its second derivative jumps, which shows up as creases in *lighting* (normals come from the slope). Perlin's 2002 **quintic** `6t⁵ - 15t⁴ + 10t³` has zero first *and* second derivatives at both ends. Use the quintic.
+
+One classic bug: `(int)x` truncates toward zero, so `(int)-0.5` is 0, not -1. Every negative coordinate then picks the wrong cell, and the noise mirrors around zero. Use `floorf` first.
+
+```c
+#include <math.h>
+#include <stdint.h>
+#include <stdio.h>
+
+static uint32_t hash_u32(uint32_t x) {
+    uint32_t state = x * 747796405u + 2891336453u;
+    uint32_t word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
+    return (word >> 22u) ^ word;
+}
+static float hash2f(int x, int y) {
+    return (hash_u32((uint32_t)x + hash_u32((uint32_t)y)) >> 8) * (1.0f / 16777216.0f);
+}
+static float fade(float t) { return t * t * t * (t * (t * 6 - 15) + 10); }
+
+static float value_noise(float x, float y) {
+    float fx = floorf(x), fy = floorf(y);
+    int ix = (int)fx, iy = (int)fy;
+    float u = fade(x - fx), v = fade(y - fy);
+    float a = hash2f(ix, iy), b = hash2f(ix + 1, iy), c = hash2f(ix, iy + 1), d = hash2f(ix + 1, iy + 1);
+    float top = a + (b - a) * u, bottom = c + (d - c) * u;
+    return top + (bottom - top) * v;
+}
+
+int main(void) {
+    int w = 128, h = 64;
+    printf("P2\n%d %d\n255\n", w, h);
+    for (int y = 0; y < h; y++) {
+        for (int x = 0; x < w; x++) {
+            /* left: raw hash per pixel (white noise); right: value noise, one lattice cell per 12 pixels */
+            float v = x < 64 ? hash2f(x, y) : value_noise((x - 64) / 12.0f - 3.0f, y / 12.0f - 2.5f);
+            printf("%d ", (int)(v * 255));
+        }
+        printf("\n");
+    }
+    return 0;
+}
+```
+
+Value noise is cheap but "blobby": its features line up with the grid, and the eye spots it.
+
+## Perlin's gradient noise
+
+Perlin's idea: store a random **gradient** (a direction) at each lattice point instead of a value. Each corner contributes `dot(gradient, offset from corner to point)`, and those four numbers are blended with the fade curve. The noise is 0 at every lattice point and its bumps don't align with the grid nearly as obviously; the result looks more natural for the same cost.
+
+Instead of hashing per corner, Perlin uses a **permutation table**: the numbers 0..255 shuffled once by a seed, stored twice (512 entries) so `perm[perm[X] + Y]` never needs a wrap check. Hashing a 3D corner is three table loads. The low bits of the result select a gradient from a small fixed set. The 2002 improvements were the quintic fade and a fixed set of 12 gradients (the edge midpoints of a cube, `(±1, ±1, 0)` and permutations), which avoid the clumping of random gradients and need no multiplication to apply:
+
+```c
+float grad3(int hash, float x, float y, float z) {
+    int h = hash & 15;
+    float u = h < 8 ? x : y;
+    float v = h < 4 ? y : (h == 12 || h == 14) ? x : z;
+    return ((h & 1) ? -u : u) + ((h & 2) ? -v : v);
+}
+```
+
+(16 cases, with 4 of the 12 directions repeated, so `& 15` replaces a slow `% 12`.) For 2D noise we use 8 gradients, the 4 diagonals and the 4 axes.
+
+> **Performance:** the permutation table is built **once per seed**, at startup, and passed to every call. Building it inside the noise function (or allocating anything there) multiplies the cost of every sample by hundreds. The table is 512 bytes, so it lives in L1 cache for the whole render.
+
+Gradient noise output is roughly in `[-1, 1]`, centered on 0, and most values are within ±0.5. Remap with `0.5 + 0.5 n` for display.
+
+## Simplex noise
+
+Perlin's 2001 **simplex noise** samples a triangular (in 2D) or tetrahedral (in 3D) lattice instead of a square/cubic one: 3 corners per sample in 2D instead of 4, `n + 1` instead of `2ⁿ` in n dimensions, and no axis-aligned artifacts. Each corner contributes `max(0, 0.5 - d²)⁴ * dot(gradient, d)`, a radially symmetric falloff, and the contributions are summed, not interpolated. To find the triangle, skew the input by `F2 = (√3 - 1)/2` so the triangular lattice becomes square, take the floor, and unskew by `G2 = (3 - √3)/6`. Stefan Gustavson's "Simplex noise demystified" (2005) is the readable reference. (Simplex noise in 3D+ was patented until January 2022, which is why OpenSimplex exists; in 2D it was never an issue.)
+
+## Fractal sums: fBm, turbulence, ridges
+
+One noise layer has one feature size. Nature has detail at every scale. **Fractional Brownian motion** sums *octaves* of noise, each at a higher frequency and lower amplitude:
+
+```text
+fbm(p) = sum over i < octaves of  gain^i * noise(lacunarity^i * p)
+```
+
+- **lacunarity** (typically 2): frequency multiplier per octave.
+- **gain** (typically 0.5): amplitude multiplier per octave. Higher gain is rougher. Musgrave writes it as `lacunarity^-H` with `H` the Hurst exponent.
+- **octaves**: stop when the next octave would be smaller than a pixel; extra octaves only cost time and alias.
+
+Variations from F. Kenton Musgrave's chapters in *Texturing and Modeling: A Procedural Approach* (Ebert, Musgrave, Peachey, Perlin, Worley):
+
+- **turbulence**: sum `|noise|` instead of `noise`. The absolute value creates sharp creases at the zero crossings: Perlin's original marble and fire.
+- **ridged multifractal**: `(1 - |noise|)²` turns the creases into sharp ridges. Weighting each octave by the previous octave's value puts detail on ridges and leaves valleys smooth: mountain ranges.
+
+Every octave of gradient noise is 0 at the origin and along lattice lines, so summing octaves at the same origin piles up artifacts there. Offset each octave by a different constant.
+
+## Domain warping
+
+Inigo Quilez's "warp" article: feed noise *into the coordinates* of noise. `f(p + k * fbm(p))` bends the pattern; doing it twice,
+
+```text
+q = (fbm(p), fbm(p + (5.2, 1.3)))
+r = (fbm(p + 4q + (1.7, 9.2)), fbm(p + 4q + (8.3, 2.8)))
+result = fbm(p + 4r)
+```
+
+gives the marbled, flowing look of his famous images, and coloring by `|q|` and `r` adds structure for free. It costs five fBm evaluations per pixel, which is fine at 128×128 and worth thinking about at 4K.
+
+## Tileable noise
+
+Textures repeat. Noise that tiles needs its lattice to repeat: wrap the integer cell coordinates modulo the period before hashing, so cell `period` *is* cell 0. Values, gradients and therefore the whole function then repeat exactly. For fBm, double the period with each octave along with the frequency. (The alternative, sampling 4D noise on a torus, works for any noise but costs a 4D evaluation per sample; cross-fading the edges of a non-tiling texture always looks smeared.)
+
+## Derivatives
+
+Lighting a height field needs its slope. Finite differences cost two or three extra samples per pixel and are noisy at fine scales. Noise built from polynomials can return its **analytic derivative** at little extra cost (Quilez, "value noise derivatives"). For value noise, written as
+
+```text
+n = a + (b - a) u + (c - a) v + (a - b - c + d) u v        with u = s(tx), v = s(ty)
+dn/dx = s'(tx) ((b - a) + (a - b - c + d) v)
+dn/dy = s'(ty) ((c - a) + (a - b - c + d) u)               s'(t) = 30 t² (t - 1)²
+```
+
+Through fBm, the chain rule scales each octave's derivative by its frequency. A surface `height = h(x, y)` then has the normal `normalize(-dh/dx, 1, -dh/dy)` (y up). Derivatives also drive better fBm: damping each octave by the slope accumulated so far gives eroded-looking terrain cheaply, as the last exercise's picture shows.
+
+=== exercise nz_hash
+title: Noise, step 1: integer hashing
+--- prompt
+The starter contains the image library from the earlier chapters. Start the noise library with hashing:
+
+- `uint32_t hash_u32(uint32_t x)`: the PCG hash from the chapter text, exactly (the tests compare bits).
+- `uint32_t hash2(int x, int y, uint32_t seed)`: `hash_u32((uint32_t)x + hash_u32((uint32_t)y + hash_u32(seed)))`.
+- `float hash2f(int x, int y, uint32_t seed)`: the top 24 bits of `hash2` as a float in `[0, 1)`: `(h >> 8) * (1.0f / 16777216.0f)`.
+
+All arithmetic on `uint32_t`: unsigned overflow wraps by definition; signed overflow is undefined (UBSan here flags it). Converting a negative `int` to `uint32_t` is well defined (it wraps), so negative coordinates are fine.
+
+Besides exact values, the tests check the statistics a good hash must have over a 512×512 grid of coordinates: mean near 0.5, no correlation between neighbors, and every output bit set about half the time. A "hash" like `x * 31 + y` fails all three.
+--- starter
+#include <math.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+/* ---------- From "Images from scratch" ---------- */
+typedef struct { float r, g, b; } Color;
+typedef struct { int w, h; Color *px; } Image;
+
+static inline Color rgb(float r, float g, float b) { return (Color){ r, g, b }; }
+static inline float clampf(float v, float lo, float hi) { return v < lo ? lo : v > hi ? hi : v; }
+static inline Color color_scale(Color c, float k) { return rgb(c.r * k, c.g * k, c.b * k); }
+
+Image image_new(int w, int h) {
+    Image im = { w, h, calloc((size_t)w * (size_t)h, sizeof(Color)) };
+    return im;
+}
+
+void image_free(Image *im) {
+    free(im->px);
+    im->px = NULL;
+    im->w = im->h = 0;
+}
+
+Color *image_at(Image *im, int x, int y) {
+    return &im->px[(size_t)y * im->w + x];
+}
+
+uint8_t to_byte(float v) {
+    if (!(v > 0.0f)) return 0;
+    if (v >= 1.0f) return 255;
+    return (uint8_t)(v * 255.0f + 0.5f);
+}
+
+float srgb_encode(float l) {
+    if (!(l > 0.0f)) return 0.0f;
+    if (l >= 1.0f) return 1.0f;
+    return l <= 0.0031308f ? 12.92f * l : 1.055f * powf(l, 1.0f / 2.4f) - 0.055f;
+}
+
+float srgb_decode(float s) {
+    if (!(s > 0.0f)) return 0.0f;
+    if (s >= 1.0f) return 1.0f;
+    return s <= 0.04045f ? s / 12.92f : powf((s + 0.055f) / 1.055f, 2.4f);
+}
+
+void srgb_lut_init(uint8_t lut[4096]) {
+    for (int i = 0; i < 4096; i++) lut[i] = to_byte(srgb_encode(i / 4095.0f));
+}
+
+static inline int lut_index(float v) {
+    if (!(v > 0.0f)) return 0;
+    if (v >= 1.0f) return 4095;
+    return (int)(v * 4095.0f + 0.5f);
+}
+
+void image_write_ppm_srgb(const Image *im, FILE *f, const uint8_t lut[4096]) {
+    fprintf(f, "P3\n%d %d\n255\n", im->w, im->h);
+    for (int y = 0; y < im->h; y++) {
+        const Color *row = im->px + (size_t)y * im->w;
+        for (int x = 0; x < im->w; x++)
+            fprintf(f, x ? " %d %d %d" : "%d %d %d", lut[lut_index(row[x].r)], lut[lut_index(row[x].g)],
+                    lut[lut_index(row[x].b)]);
+        fputc('\n', f);
+    }
+}
+
+Color color_lerp(Color a, Color b, float t) {
+    return rgb(a.r + (b.r - a.r) * t, a.g + (b.g - a.g) * t, a.b + (b.b - a.b) * t);
+}
+
+float lerpf(float a, float b, float t) { return a + (b - a) * t; }
+
+float smoothstepf(float e0, float e1, float x) {
+    float t = clampf((x - e0) / (e1 - e0), 0.0f, 1.0f);
+    return t * t * (3.0f - 2.0f * t);
+}
+
+typedef struct { float pos; Color c; } Stop;
+
+Color ramp_sample(const Stop *s, int n, float t) {
+    if (t <= s[0].pos) return s[0].c;
+    if (t >= s[n - 1].pos) return s[n - 1].c;
+    int i = 0;
+    while (i < n - 2 && t > s[i + 1].pos) i++;
+    float span = s[i + 1].pos - s[i].pos;
+    if (span <= 0.0f) return s[i + 1].c;
+    return color_lerp(s[i].c, s[i + 1].c, (t - s[i].pos) / span);
+}
+
+Color cosine_palette(float t, Color a, Color b, Color c, Color d) {
+    const float tau = 6.2831853f;
+    return rgb(a.r + b.r * cosf(tau * (c.r * t + d.r)), a.g + b.g * cosf(tau * (c.g * t + d.g)),
+               a.b + b.b * cosf(tau * (c.b * t + d.b)));
+}
+
+/* ---------- From "Vector math for graphics" ---------- */
+typedef struct { float x, y; } vec2;
+typedef struct { float x, y, z; } vec3;
+
+static inline vec3 v3(float x, float y, float z) { return (vec3){ x, y, z }; }
+static inline float v3_dot(vec3 a, vec3 b) { return a.x * b.x + a.y * b.y + a.z * b.z; }
+
+vec3 v3_normalize(vec3 a) {
+    float l2 = v3_dot(a, a);
+    if (l2 < 1e-20f) return v3(0, 0, 0);
+    float k = 1.0f / sqrtf(l2);
+    return v3(a.x * k, a.y * k, a.z * k);
+}
+
+/* ---------- Noise ---------- */
+
+uint32_t hash_u32(uint32_t x) {
+    return x;
+}
+
+uint32_t hash2(int x, int y, uint32_t seed) {
+    return (uint32_t)x * 31u + (uint32_t)y + seed;
+}
+
+float hash2f(int x, int y, uint32_t seed) {
+    return (hash2(x, y, seed) % 1000) / 1000.0f;
+}
+
+int main(void) {
+    static uint8_t lut[4096];
+    srgb_lut_init(lut);
+    Image im = image_new(128, 64);
+    if (!im.px) return 1;
+    for (int y = 0; y < im.h; y++)
+        for (int x = 0; x < im.w; x++) {
+            /* left: one hash per pixel; right: one hash per 8x8 cell, the lattice that value noise smooths */
+            float v = x < 64 ? hash2f(x, y, 1) : hash2f(x / 8, y / 8, 1);
+            *image_at(&im, x, y) = rgb(v, v, v);
+        }
+    image_write_ppm_srgb(&im, stdout, lut);
+    image_free(&im);
+    return 0;
+}
+--- solution
+#include <math.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+/* ---------- From "Images from scratch" ---------- */
+typedef struct { float r, g, b; } Color;
+typedef struct { int w, h; Color *px; } Image;
+
+static inline Color rgb(float r, float g, float b) { return (Color){ r, g, b }; }
+static inline float clampf(float v, float lo, float hi) { return v < lo ? lo : v > hi ? hi : v; }
+static inline Color color_scale(Color c, float k) { return rgb(c.r * k, c.g * k, c.b * k); }
+
+Image image_new(int w, int h) {
+    Image im = { w, h, calloc((size_t)w * (size_t)h, sizeof(Color)) };
+    return im;
+}
+
+void image_free(Image *im) {
+    free(im->px);
+    im->px = NULL;
+    im->w = im->h = 0;
+}
+
+Color *image_at(Image *im, int x, int y) {
+    return &im->px[(size_t)y * im->w + x];
+}
+
+uint8_t to_byte(float v) {
+    if (!(v > 0.0f)) return 0;
+    if (v >= 1.0f) return 255;
+    return (uint8_t)(v * 255.0f + 0.5f);
+}
+
+float srgb_encode(float l) {
+    if (!(l > 0.0f)) return 0.0f;
+    if (l >= 1.0f) return 1.0f;
+    return l <= 0.0031308f ? 12.92f * l : 1.055f * powf(l, 1.0f / 2.4f) - 0.055f;
+}
+
+float srgb_decode(float s) {
+    if (!(s > 0.0f)) return 0.0f;
+    if (s >= 1.0f) return 1.0f;
+    return s <= 0.04045f ? s / 12.92f : powf((s + 0.055f) / 1.055f, 2.4f);
+}
+
+void srgb_lut_init(uint8_t lut[4096]) {
+    for (int i = 0; i < 4096; i++) lut[i] = to_byte(srgb_encode(i / 4095.0f));
+}
+
+static inline int lut_index(float v) {
+    if (!(v > 0.0f)) return 0;
+    if (v >= 1.0f) return 4095;
+    return (int)(v * 4095.0f + 0.5f);
+}
+
+void image_write_ppm_srgb(const Image *im, FILE *f, const uint8_t lut[4096]) {
+    fprintf(f, "P3\n%d %d\n255\n", im->w, im->h);
+    for (int y = 0; y < im->h; y++) {
+        const Color *row = im->px + (size_t)y * im->w;
+        for (int x = 0; x < im->w; x++)
+            fprintf(f, x ? " %d %d %d" : "%d %d %d", lut[lut_index(row[x].r)], lut[lut_index(row[x].g)],
+                    lut[lut_index(row[x].b)]);
+        fputc('\n', f);
+    }
+}
+
+Color color_lerp(Color a, Color b, float t) {
+    return rgb(a.r + (b.r - a.r) * t, a.g + (b.g - a.g) * t, a.b + (b.b - a.b) * t);
+}
+
+float lerpf(float a, float b, float t) { return a + (b - a) * t; }
+
+float smoothstepf(float e0, float e1, float x) {
+    float t = clampf((x - e0) / (e1 - e0), 0.0f, 1.0f);
+    return t * t * (3.0f - 2.0f * t);
+}
+
+typedef struct { float pos; Color c; } Stop;
+
+Color ramp_sample(const Stop *s, int n, float t) {
+    if (t <= s[0].pos) return s[0].c;
+    if (t >= s[n - 1].pos) return s[n - 1].c;
+    int i = 0;
+    while (i < n - 2 && t > s[i + 1].pos) i++;
+    float span = s[i + 1].pos - s[i].pos;
+    if (span <= 0.0f) return s[i + 1].c;
+    return color_lerp(s[i].c, s[i + 1].c, (t - s[i].pos) / span);
+}
+
+Color cosine_palette(float t, Color a, Color b, Color c, Color d) {
+    const float tau = 6.2831853f;
+    return rgb(a.r + b.r * cosf(tau * (c.r * t + d.r)), a.g + b.g * cosf(tau * (c.g * t + d.g)),
+               a.b + b.b * cosf(tau * (c.b * t + d.b)));
+}
+
+/* ---------- From "Vector math for graphics" ---------- */
+typedef struct { float x, y; } vec2;
+typedef struct { float x, y, z; } vec3;
+
+static inline vec3 v3(float x, float y, float z) { return (vec3){ x, y, z }; }
+static inline float v3_dot(vec3 a, vec3 b) { return a.x * b.x + a.y * b.y + a.z * b.z; }
+
+vec3 v3_normalize(vec3 a) {
+    float l2 = v3_dot(a, a);
+    if (l2 < 1e-20f) return v3(0, 0, 0);
+    float k = 1.0f / sqrtf(l2);
+    return v3(a.x * k, a.y * k, a.z * k);
+}
+
+/* ---------- Noise ---------- */
+
+uint32_t hash_u32(uint32_t x) {
+    uint32_t state = x * 747796405u + 2891336453u;
+    uint32_t word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
+    return (word >> 22u) ^ word;
+}
+
+uint32_t hash2(int x, int y, uint32_t seed) {
+    return hash_u32((uint32_t)x + hash_u32((uint32_t)y + hash_u32(seed)));
+}
+
+float hash2f(int x, int y, uint32_t seed) {
+    return (hash2(x, y, seed) >> 8) * (1.0f / 16777216.0f);
+}
+
+int main(void) {
+    static uint8_t lut[4096];
+    srgb_lut_init(lut);
+    Image im = image_new(128, 64);
+    if (!im.px) return 1;
+    for (int y = 0; y < im.h; y++)
+        for (int x = 0; x < im.w; x++) {
+            /* left: one hash per pixel; right: one hash per 8x8 cell, the lattice that value noise smooths */
+            float v = x < 64 ? hash2f(x, y, 1) : hash2f(x / 8, y / 8, 1);
+            *image_at(&im, x, y) = rgb(v, v, v);
+        }
+    image_write_ppm_srgb(&im, stdout, lut);
+    image_free(&im);
+    return 0;
+}
+--- hint
+Copy the three lines of `hash_u32` from the chapter text; the other two functions are one line each.
+--- hint
+`(uint32_t)x` on a negative `x` is fine (wraps modulo 2³²); `x * 747796405` on an `int` would be signed overflow.
+--- harness
+int main(void) {
+    CHECK_UINT(hash_u32(0), 129708002u);
+    CHECK_UINT(hash_u32(1), 2831084092u);
+    CHECK_UINT(hash_u32(12345), 4099845390u);
+    CHECK_UINT(hash_u32(0xFFFFFFFFu), 3861530882u);
+    CHECK_UINT(hash2(0, 0, 0), hash_u32(hash_u32(hash_u32(0))));
+    CHECK_UINT(hash2(3, -7, 42), hash_u32(3u + hash_u32((uint32_t)-7 + hash_u32(42))));
+    CHECK_UINT(hash2(10, 20, 1), 2486345074u);
+    CHECK(hash2(1, 2, 0) != hash2(2, 1, 0));
+    CHECK(hash2(5, 5, 1) != hash2(5, 5, 2));
+    CHECK(fabsf(hash2f(10, 20, 1) - (2486345074u >> 8) / 16777216.0f) < 1e-9f);
+    CHECK(hash2f(-100, 37, 9) == hash2f(-100, 37, 9));
+
+    int n = 512, lo = 0;
+    double sum = 0, sxy = 0, sxx = 0, sx = 0, sy = 0;
+    int bits[32] = { 0 };
+    float mn = 1, mx = 0;
+    for (int y = -n / 2; y < n / 2; y++)
+        for (int x = -n / 2; x < n / 2; x++) {
+            float a = hash2f(x, y, 7), b = hash2f(x + 1, y, 7);
+            if (a < 0 || a >= 1) lo++;
+            if (a < mn) mn = a;
+            if (a > mx) mx = a;
+            sum += a;
+            sx += a; sy += b; sxx += a * a; sxy += a * b;
+            uint32_t h = hash2(x, y, 7);
+            for (int k = 0; k < 32; k++) bits[k] += (h >> k) & 1;
+        }
+    double N = (double)n * n, mean = sum / N;
+    double cov = sxy / N - (sx / N) * (sy / N), var = sxx / N - mean * mean;
+    CHECK_INT(lo, 0);
+    CHECK(fabs(mean - 0.5) < 0.005);
+    CHECK(fabs(cov / var) < 0.01);
+    CHECK(mn < 0.001f && mx > 0.999f);
+    int balanced = 1;
+    for (int k = 0; k < 32; k++) if (fabs(bits[k] / N - 0.5) > 0.01) balanced = 0;
+    CHECK(balanced);
+    return TEST_END();
+}
+
+=== exercise nz_value
+title: Noise, step 2: value noise and fade curves
+continues: nz_hash
+--- prompt
+Add value noise:
+
+- `float fade_cubic(float t)`: `t² (3 - 2t)` (smoothstep).
+- `float fade_quintic(float t)`: `t³ (t (6t - 15) + 10)`, Perlin's 2002 fade.
+- `float value_noise2(float x, float y, uint32_t seed)`: the cell is `ix = (int)floorf(x)`, `iy = (int)floorf(y)`; corner values `a = hash2f(ix, iy)`, `b = hash2f(ix+1, iy)`, `c = hash2f(ix, iy+1)`, `d = hash2f(ix+1, iy+1)` (all with `seed`); with `u = fade_quintic(x - floorf(x))` and `v` likewise, return `lerpf(lerpf(a, b, u), lerpf(c, d, u), v)`.
+
+The tests check the lattice values, the interpolation, **negative coordinates** (where `(int)x` without `floorf` picks the wrong cell), continuity across cell borders, and that the quintic fade makes the slope vanish at lattice points.
+--- solution
+#include <math.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+/* ---------- From "Images from scratch" ---------- */
+typedef struct { float r, g, b; } Color;
+typedef struct { int w, h; Color *px; } Image;
+
+static inline Color rgb(float r, float g, float b) { return (Color){ r, g, b }; }
+static inline float clampf(float v, float lo, float hi) { return v < lo ? lo : v > hi ? hi : v; }
+static inline Color color_scale(Color c, float k) { return rgb(c.r * k, c.g * k, c.b * k); }
+
+Image image_new(int w, int h) {
+    Image im = { w, h, calloc((size_t)w * (size_t)h, sizeof(Color)) };
+    return im;
+}
+
+void image_free(Image *im) {
+    free(im->px);
+    im->px = NULL;
+    im->w = im->h = 0;
+}
+
+Color *image_at(Image *im, int x, int y) {
+    return &im->px[(size_t)y * im->w + x];
+}
+
+uint8_t to_byte(float v) {
+    if (!(v > 0.0f)) return 0;
+    if (v >= 1.0f) return 255;
+    return (uint8_t)(v * 255.0f + 0.5f);
+}
+
+float srgb_encode(float l) {
+    if (!(l > 0.0f)) return 0.0f;
+    if (l >= 1.0f) return 1.0f;
+    return l <= 0.0031308f ? 12.92f * l : 1.055f * powf(l, 1.0f / 2.4f) - 0.055f;
+}
+
+float srgb_decode(float s) {
+    if (!(s > 0.0f)) return 0.0f;
+    if (s >= 1.0f) return 1.0f;
+    return s <= 0.04045f ? s / 12.92f : powf((s + 0.055f) / 1.055f, 2.4f);
+}
+
+void srgb_lut_init(uint8_t lut[4096]) {
+    for (int i = 0; i < 4096; i++) lut[i] = to_byte(srgb_encode(i / 4095.0f));
+}
+
+static inline int lut_index(float v) {
+    if (!(v > 0.0f)) return 0;
+    if (v >= 1.0f) return 4095;
+    return (int)(v * 4095.0f + 0.5f);
+}
+
+void image_write_ppm_srgb(const Image *im, FILE *f, const uint8_t lut[4096]) {
+    fprintf(f, "P3\n%d %d\n255\n", im->w, im->h);
+    for (int y = 0; y < im->h; y++) {
+        const Color *row = im->px + (size_t)y * im->w;
+        for (int x = 0; x < im->w; x++)
+            fprintf(f, x ? " %d %d %d" : "%d %d %d", lut[lut_index(row[x].r)], lut[lut_index(row[x].g)],
+                    lut[lut_index(row[x].b)]);
+        fputc('\n', f);
+    }
+}
+
+Color color_lerp(Color a, Color b, float t) {
+    return rgb(a.r + (b.r - a.r) * t, a.g + (b.g - a.g) * t, a.b + (b.b - a.b) * t);
+}
+
+float lerpf(float a, float b, float t) { return a + (b - a) * t; }
+
+float smoothstepf(float e0, float e1, float x) {
+    float t = clampf((x - e0) / (e1 - e0), 0.0f, 1.0f);
+    return t * t * (3.0f - 2.0f * t);
+}
+
+typedef struct { float pos; Color c; } Stop;
+
+Color ramp_sample(const Stop *s, int n, float t) {
+    if (t <= s[0].pos) return s[0].c;
+    if (t >= s[n - 1].pos) return s[n - 1].c;
+    int i = 0;
+    while (i < n - 2 && t > s[i + 1].pos) i++;
+    float span = s[i + 1].pos - s[i].pos;
+    if (span <= 0.0f) return s[i + 1].c;
+    return color_lerp(s[i].c, s[i + 1].c, (t - s[i].pos) / span);
+}
+
+Color cosine_palette(float t, Color a, Color b, Color c, Color d) {
+    const float tau = 6.2831853f;
+    return rgb(a.r + b.r * cosf(tau * (c.r * t + d.r)), a.g + b.g * cosf(tau * (c.g * t + d.g)),
+               a.b + b.b * cosf(tau * (c.b * t + d.b)));
+}
+
+/* ---------- From "Vector math for graphics" ---------- */
+typedef struct { float x, y; } vec2;
+typedef struct { float x, y, z; } vec3;
+
+static inline vec3 v3(float x, float y, float z) { return (vec3){ x, y, z }; }
+static inline float v3_dot(vec3 a, vec3 b) { return a.x * b.x + a.y * b.y + a.z * b.z; }
+
+vec3 v3_normalize(vec3 a) {
+    float l2 = v3_dot(a, a);
+    if (l2 < 1e-20f) return v3(0, 0, 0);
+    float k = 1.0f / sqrtf(l2);
+    return v3(a.x * k, a.y * k, a.z * k);
+}
+
+/* ---------- Noise ---------- */
+
+uint32_t hash_u32(uint32_t x) {
+    uint32_t state = x * 747796405u + 2891336453u;
+    uint32_t word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
+    return (word >> 22u) ^ word;
+}
+
+uint32_t hash2(int x, int y, uint32_t seed) {
+    return hash_u32((uint32_t)x + hash_u32((uint32_t)y + hash_u32(seed)));
+}
+
+float hash2f(int x, int y, uint32_t seed) {
+    return (hash2(x, y, seed) >> 8) * (1.0f / 16777216.0f);
+}
+
+float fade_cubic(float t) {
+    return t * t * (3.0f - 2.0f * t);
+}
+
+float fade_quintic(float t) {
+    return t * t * t * (t * (t * 6.0f - 15.0f) + 10.0f);
+}
+
+float value_noise2(float x, float y, uint32_t seed) {
+    float fx = floorf(x), fy = floorf(y);
+    int ix = (int)fx, iy = (int)fy;
+    float u = fade_quintic(x - fx), v = fade_quintic(y - fy);
+    float a = hash2f(ix, iy, seed), b = hash2f(ix + 1, iy, seed);
+    float c = hash2f(ix, iy + 1, seed), d = hash2f(ix + 1, iy + 1, seed);
+    return lerpf(lerpf(a, b, u), lerpf(c, d, u), v);
+}
+
+int main(void) {
+    static uint8_t lut[4096];
+    srgb_lut_init(lut);
+    Image im = image_new(128, 96);
+    if (!im.px) return 1;
+    for (int y = 0; y < im.h; y++)
+        for (int x = 0; x < im.w; x++) {
+            int band = y / 32;                       /* three zoom levels */
+            float scale = band == 0 ? 4.0f : band == 1 ? 10.0f : 24.0f;
+            float v = value_noise2(x / scale, y / scale, 3);
+            *image_at(&im, x, y) = rgb(v * v, v, 0.3f + 0.7f * v);
+        }
+    image_write_ppm_srgb(&im, stdout, lut);
+    image_free(&im);
+    return 0;
+}
+--- stubs
+float fade_cubic(float t) {
+    return t;
+}
+
+float fade_quintic(float t) {
+    return t;
+}
+
+float value_noise2(float x, float y, uint32_t seed) {
+    return hash2f((int)x, (int)y, seed);
+}
+--- hint
+`floorf` first, then convert: `int ix = (int)floorf(x);`. The fractional part is `x - floorf(x)`, always in `[0, 1)`.
+--- harness
+int main(void) {
+    CHECK_DBL(fade_cubic(0.25f), 0.15625);
+    CHECK_DBL(fade_cubic(0.5f), 0.5);
+    CHECK_DBL(fade_quintic(0.5f), 0.5);
+    CHECK_DBL(fade_quintic(0.25f), 0.103515625);
+    CHECK_DBL(fade_quintic(0.0f), 0.0);
+    CHECK_DBL(fade_quintic(1.0f), 1.0);
+    CHECK_DBL(fade_quintic(0.9f), 0.99144);
+
+    CHECK_DBL(value_noise2(3, 5, 1), hash2f(3, 5, 1));
+    CHECK_DBL(value_noise2(-4, 0, 9), hash2f(-4, 0, 9));
+    CHECK_DBL(value_noise2(-1, -1, 2), hash2f(-1, -1, 2));
+    float a = hash2f(7, 2, 5), b = hash2f(8, 2, 5), c = hash2f(7, 3, 5), d = hash2f(8, 3, 5);
+    CHECK(fabsf(value_noise2(7.5f, 2.0f, 5) - (a + b) / 2) < 1e-6f);
+    CHECK(fabsf(value_noise2(7.5f, 2.5f, 5) - (a + b + c + d) / 4) < 1e-6f);
+    float u = fade_quintic(0.25f), v = fade_quintic(0.75f);
+    float want = lerpf(lerpf(a, b, u), lerpf(c, d, u), v);
+    CHECK(fabsf(value_noise2(7.25f, 2.75f, 5) - want) < 1e-6f);
+    a = hash2f(-1, 0, 5); b = hash2f(0, 0, 5); c = hash2f(-1, 1, 5); d = hash2f(0, 1, 5);
+    u = fade_quintic(0.5f); v = fade_quintic(0.25f);
+    CHECK(fabsf(value_noise2(-0.5f, 0.25f, 5) - lerpf(lerpf(a, b, u), lerpf(c, d, u), v)) < 1e-6f);
+    a = hash2f(-3, -2, 5); b = hash2f(-2, -2, 5); c = hash2f(-3, -1, 5); d = hash2f(-2, -1, 5);
+    u = fade_quintic(0.75f); v = fade_quintic(0.5f);
+    CHECK(fabsf(value_noise2(-2.25f, -1.5f, 5) - lerpf(lerpf(a, b, u), lerpf(c, d, u), v)) < 1e-6f);
+    CHECK(fabsf(value_noise2(1.9999f, 0.3f, 8) - value_noise2(2.0001f, 0.3f, 8)) < 1e-3f);
+    CHECK(fabsf(value_noise2(-0.0001f, 4.7f, 8) - value_noise2(0.0001f, 4.7f, 8)) < 1e-3f);
+    CHECK(fabsf(value_noise2(5.3f, -0.0001f, 8) - value_noise2(5.3f, 0.0001f, 8)) < 1e-3f);
+    float flat = value_noise2(4.002f, 6.0f, 3) - value_noise2(3.998f, 6.0f, 3);
+    CHECK(fabsf(flat) < 1e-5f);
+    float mn = 1, mx = 0;
+    for (int i = 0; i < 20000; i++) {
+        float s = value_noise2(i * 0.0137f - 100, i * 0.0071f + 3, 4);
+        if (s < mn) mn = s;
+        if (s > mx) mx = s;
+    }
+    CHECK(mn >= 0.0f && mx < 1.0f);
+    return TEST_END();
+}
+
+=== exercise nz_perm
+title: Noise, step 3: the permutation table
+continues: nz_value
+--- prompt
+Perlin noise hashes lattice corners with a **permutation table**. Add it. Put the type in your code:
+
+```c
+typedef struct { uint8_t perm[512]; } Perlin;
+```
+
+`void perlin_init(Perlin *p, uint32_t seed)`:
+
+1. `perm[i] = i` for `i = 0..255`.
+2. Fisher-Yates shuffle, from the top: for `i = 255` down to `1`, `j = hash_u32(hash_u32(seed) + i) % (i + 1)`, swap `perm[i]` and `perm[j]`. (Compute `hash_u32(seed)` once.)
+3. Duplicate: `perm[256 + i] = perm[i]`, so lookups like `perm[perm[X] + Y]` with `X, Y < 256` never need a wrap check.
+
+The stubs also give you `perlin_init_reference`, which loads Ken Perlin's own table from his 2002 reference implementation; the next steps compare your noise against values computed with it.
+
+Build the table **once per seed**, then pass a `const Perlin *` to every noise call. It's 512 bytes: it lives in L1 cache for the whole render.
+--- solution
+#include <math.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+/* ---------- From "Images from scratch" ---------- */
+typedef struct { float r, g, b; } Color;
+typedef struct { int w, h; Color *px; } Image;
+
+static inline Color rgb(float r, float g, float b) { return (Color){ r, g, b }; }
+static inline float clampf(float v, float lo, float hi) { return v < lo ? lo : v > hi ? hi : v; }
+static inline Color color_scale(Color c, float k) { return rgb(c.r * k, c.g * k, c.b * k); }
+
+Image image_new(int w, int h) {
+    Image im = { w, h, calloc((size_t)w * (size_t)h, sizeof(Color)) };
+    return im;
+}
+
+void image_free(Image *im) {
+    free(im->px);
+    im->px = NULL;
+    im->w = im->h = 0;
+}
+
+Color *image_at(Image *im, int x, int y) {
+    return &im->px[(size_t)y * im->w + x];
+}
+
+uint8_t to_byte(float v) {
+    if (!(v > 0.0f)) return 0;
+    if (v >= 1.0f) return 255;
+    return (uint8_t)(v * 255.0f + 0.5f);
+}
+
+float srgb_encode(float l) {
+    if (!(l > 0.0f)) return 0.0f;
+    if (l >= 1.0f) return 1.0f;
+    return l <= 0.0031308f ? 12.92f * l : 1.055f * powf(l, 1.0f / 2.4f) - 0.055f;
+}
+
+float srgb_decode(float s) {
+    if (!(s > 0.0f)) return 0.0f;
+    if (s >= 1.0f) return 1.0f;
+    return s <= 0.04045f ? s / 12.92f : powf((s + 0.055f) / 1.055f, 2.4f);
+}
+
+void srgb_lut_init(uint8_t lut[4096]) {
+    for (int i = 0; i < 4096; i++) lut[i] = to_byte(srgb_encode(i / 4095.0f));
+}
+
+static inline int lut_index(float v) {
+    if (!(v > 0.0f)) return 0;
+    if (v >= 1.0f) return 4095;
+    return (int)(v * 4095.0f + 0.5f);
+}
+
+void image_write_ppm_srgb(const Image *im, FILE *f, const uint8_t lut[4096]) {
+    fprintf(f, "P3\n%d %d\n255\n", im->w, im->h);
+    for (int y = 0; y < im->h; y++) {
+        const Color *row = im->px + (size_t)y * im->w;
+        for (int x = 0; x < im->w; x++)
+            fprintf(f, x ? " %d %d %d" : "%d %d %d", lut[lut_index(row[x].r)], lut[lut_index(row[x].g)],
+                    lut[lut_index(row[x].b)]);
+        fputc('\n', f);
+    }
+}
+
+Color color_lerp(Color a, Color b, float t) {
+    return rgb(a.r + (b.r - a.r) * t, a.g + (b.g - a.g) * t, a.b + (b.b - a.b) * t);
+}
+
+float lerpf(float a, float b, float t) { return a + (b - a) * t; }
+
+float smoothstepf(float e0, float e1, float x) {
+    float t = clampf((x - e0) / (e1 - e0), 0.0f, 1.0f);
+    return t * t * (3.0f - 2.0f * t);
+}
+
+typedef struct { float pos; Color c; } Stop;
+
+Color ramp_sample(const Stop *s, int n, float t) {
+    if (t <= s[0].pos) return s[0].c;
+    if (t >= s[n - 1].pos) return s[n - 1].c;
+    int i = 0;
+    while (i < n - 2 && t > s[i + 1].pos) i++;
+    float span = s[i + 1].pos - s[i].pos;
+    if (span <= 0.0f) return s[i + 1].c;
+    return color_lerp(s[i].c, s[i + 1].c, (t - s[i].pos) / span);
+}
+
+Color cosine_palette(float t, Color a, Color b, Color c, Color d) {
+    const float tau = 6.2831853f;
+    return rgb(a.r + b.r * cosf(tau * (c.r * t + d.r)), a.g + b.g * cosf(tau * (c.g * t + d.g)),
+               a.b + b.b * cosf(tau * (c.b * t + d.b)));
+}
+
+/* ---------- From "Vector math for graphics" ---------- */
+typedef struct { float x, y; } vec2;
+typedef struct { float x, y, z; } vec3;
+
+static inline vec3 v3(float x, float y, float z) { return (vec3){ x, y, z }; }
+static inline float v3_dot(vec3 a, vec3 b) { return a.x * b.x + a.y * b.y + a.z * b.z; }
+
+vec3 v3_normalize(vec3 a) {
+    float l2 = v3_dot(a, a);
+    if (l2 < 1e-20f) return v3(0, 0, 0);
+    float k = 1.0f / sqrtf(l2);
+    return v3(a.x * k, a.y * k, a.z * k);
+}
+
+/* ---------- Noise ---------- */
+
+uint32_t hash_u32(uint32_t x) {
+    uint32_t state = x * 747796405u + 2891336453u;
+    uint32_t word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
+    return (word >> 22u) ^ word;
+}
+
+uint32_t hash2(int x, int y, uint32_t seed) {
+    return hash_u32((uint32_t)x + hash_u32((uint32_t)y + hash_u32(seed)));
+}
+
+float hash2f(int x, int y, uint32_t seed) {
+    return (hash2(x, y, seed) >> 8) * (1.0f / 16777216.0f);
+}
+
+float fade_cubic(float t) {
+    return t * t * (3.0f - 2.0f * t);
+}
+
+float fade_quintic(float t) {
+    return t * t * t * (t * (t * 6.0f - 15.0f) + 10.0f);
+}
+
+float value_noise2(float x, float y, uint32_t seed) {
+    float fx = floorf(x), fy = floorf(y);
+    int ix = (int)fx, iy = (int)fy;
+    float u = fade_quintic(x - fx), v = fade_quintic(y - fy);
+    float a = hash2f(ix, iy, seed), b = hash2f(ix + 1, iy, seed);
+    float c = hash2f(ix, iy + 1, seed), d = hash2f(ix + 1, iy + 1, seed);
+    return lerpf(lerpf(a, b, u), lerpf(c, d, u), v);
+}
+
+typedef struct { uint8_t perm[512]; } Perlin;
+
+void perlin_init(Perlin *p, uint32_t seed) {
+    for (int i = 0; i < 256; i++) p->perm[i] = (uint8_t)i;
+    uint32_t base = hash_u32(seed);
+    for (int i = 255; i > 0; i--) {
+        uint32_t j = hash_u32(base + (uint32_t)i) % (uint32_t)(i + 1);
+        uint8_t t = p->perm[i];
+        p->perm[i] = p->perm[j];
+        p->perm[j] = t;
+    }
+    for (int i = 0; i < 256; i++) p->perm[256 + i] = p->perm[i];
+}
+
+/* Ken Perlin's permutation from "Improving Noise" (2002). */
+void perlin_init_reference(Perlin *p) {
+    static const uint8_t KEN[256] = {
+        151,160,137,91,90,15,131,13,201,95,96,53,194,233,7,225,140,36,103,30,69,142,8,99,37,240,21,10,23,
+        190,6,148,247,120,234,75,0,26,197,62,94,252,219,203,117,35,11,32,57,177,33,88,237,149,56,87,174,20,
+        125,136,171,168,68,175,74,165,71,134,139,48,27,166,77,146,158,231,83,111,229,122,60,211,133,230,220,
+        105,92,41,55,46,245,40,244,102,143,54,65,25,63,161,1,216,80,73,209,76,132,187,208,89,18,169,200,196,
+        135,130,116,188,159,86,164,100,109,198,173,186,3,64,52,217,226,250,124,123,5,202,38,147,118,126,255,
+        82,85,212,207,206,59,227,47,16,58,17,182,189,28,42,223,183,170,213,119,248,152,2,44,154,163,70,221,
+        153,101,155,167,43,172,9,129,22,39,253,19,98,108,110,79,113,224,232,178,185,112,104,218,246,97,228,
+        251,34,242,193,238,210,144,12,191,179,162,241,81,51,145,235,249,14,239,107,49,192,214,31,181,199,106,
+        157,184,84,204,176,115,121,50,45,127,4,150,254,138,236,205,93,222,114,67,29,24,72,243,141,128,195,78,
+        66,215,61,156,180
+    };
+    for (int i = 0; i < 256; i++) p->perm[i] = p->perm[256 + i] = KEN[i];
+}
+
+int main(void) {
+    static uint8_t lut[4096];
+    srgb_lut_init(lut);
+    Perlin p;
+    perlin_init(&p, 2024);
+    Image im = image_new(128, 128);
+    if (!im.px) return 1;
+    for (int y = 0; y < im.h; y++)
+        for (int x = 0; x < im.w; x++) {
+            /* each 8x8 cell shows perm[perm[X] + Y]: the table-based lattice hash */
+            int X = x / 8, Y = y / 8;
+            float v = p.perm[p.perm[X] + Y] / 255.0f;
+            *image_at(&im, x, y) = cosine_palette(v, rgb(0.5f, 0.5f, 0.5f), rgb(0.5f, 0.5f, 0.5f), rgb(1, 1, 1), rgb(0, 0.33f, 0.67f));
+        }
+    image_write_ppm_srgb(&im, stdout, lut);
+    image_free(&im);
+    return 0;
+}
+--- stubs
+typedef struct { uint8_t perm[512]; } Perlin;
+
+void perlin_init(Perlin *p, uint32_t seed) {
+    (void)seed;
+    for (int i = 0; i < 512; i++) p->perm[i] = (uint8_t)i;
+}
+
+/* Ken Perlin's permutation from "Improving Noise" (2002). */
+void perlin_init_reference(Perlin *p) {
+    static const uint8_t KEN[256] = {
+        151,160,137,91,90,15,131,13,201,95,96,53,194,233,7,225,140,36,103,30,69,142,8,99,37,240,21,10,23,
+        190,6,148,247,120,234,75,0,26,197,62,94,252,219,203,117,35,11,32,57,177,33,88,237,149,56,87,174,20,
+        125,136,171,168,68,175,74,165,71,134,139,48,27,166,77,146,158,231,83,111,229,122,60,211,133,230,220,
+        105,92,41,55,46,245,40,244,102,143,54,65,25,63,161,1,216,80,73,209,76,132,187,208,89,18,169,200,196,
+        135,130,116,188,159,86,164,100,109,198,173,186,3,64,52,217,226,250,124,123,5,202,38,147,118,126,255,
+        82,85,212,207,206,59,227,47,16,58,17,182,189,28,42,223,183,170,213,119,248,152,2,44,154,163,70,221,
+        153,101,155,167,43,172,9,129,22,39,253,19,98,108,110,79,113,224,232,178,185,112,104,218,246,97,228,
+        251,34,242,193,238,210,144,12,191,179,162,241,81,51,145,235,249,14,239,107,49,192,214,31,181,199,106,
+        157,184,84,204,176,115,121,50,45,127,4,150,254,138,236,205,93,222,114,67,29,24,72,243,141,128,195,78,
+        66,215,61,156,180
+    };
+    for (int i = 0; i < 256; i++) p->perm[i] = p->perm[256 + i] = KEN[i];
+}
+--- hint
+Compute `uint32_t base = hash_u32(seed);` before the loop; inside, `j = hash_u32(base + (uint32_t)i) % (uint32_t)(i + 1)`.
+--- harness
+int main(void) {
+    Perlin p;
+    memset(&p, 0, sizeof p);
+    perlin_init(&p, 1);
+    int seen[256] = { 0 }, ok = 1;
+    for (int i = 0; i < 256; i++) seen[p.perm[i]]++;
+    for (int i = 0; i < 256; i++) if (seen[i] != 1) ok = 0;
+    CHECK(ok);
+    ok = 1;
+    for (int i = 0; i < 256; i++) if (p.perm[256 + i] != p.perm[i]) ok = 0;
+    CHECK(ok);
+    CHECK_INT(p.perm[0], 142);
+    CHECK_INT(p.perm[1], 42);
+    CHECK_INT(p.perm[100], 226);
+    CHECK_INT(p.perm[255], 225);
+    int fixed = 0;
+    for (int i = 0; i < 256; i++) fixed += p.perm[i] == i;
+    CHECK(fixed < 8);
+    Perlin q;
+    perlin_init(&q, 2);
+    int same = 0;
+    for (int i = 0; i < 256; i++) same += p.perm[i] == q.perm[i];
+    CHECK(same < 8);
+    CHECK_INT(q.perm[0], 10);
+    Perlin r;
+    perlin_init(&r, 1);
+    CHECK(memcmp(&p, &r, sizeof p) == 0);
+    perlin_init_reference(&r);
+    CHECK_INT(r.perm[0], 151);
+    CHECK_INT(r.perm[511], 180);
+    return TEST_END();
+}
+
+=== exercise nz_perlin2
+title: Noise, step 4: 2D gradient noise
+continues: nz_perm
+--- prompt
+Add 2D Perlin noise in the style of the 2002 improved noise:
+
+```c
+static const float GRAD2[8][2] = { {1,1}, {-1,1}, {1,-1}, {-1,-1}, {1,0}, {-1,0}, {0,1}, {0,-1} };
+```
+
+- `float grad2(int hash, float x, float y)`: `GRAD2[hash & 7]` dotted with `(x, y)`.
+- `float perlin2(const Perlin *p, float x, float y)`:
+  1. `X = (int)floorf(x) & 255`, `Y = (int)floorf(y) & 255`; `x -= floorf(x)`, `y -= floorf(y)` (now in `[0, 1)`).
+  2. `u = fade_quintic(x)`, `v = fade_quintic(y)`.
+  3. Corner hashes from the table `P = p->perm`: `aa = P[P[X] + Y]`, `ba = P[P[X+1] + Y]`, `ab = P[P[X] + Y+1]`, `bb = P[P[X+1] + Y+1]`.
+  4. Return `lerp(lerp(grad2(aa, x, y), grad2(ba, x-1, y), u), lerp(grad2(ab, x, y-1), grad2(bb, x-1, y-1), u), v)`.
+
+The result is 0 at every lattice point and stays within `[-1, 1]`. `& 255` makes the noise repeat every 256 units; that's the price of a 512-byte table, and nobody notices at sensible scales. (`(int)floorf(x) & 255` on a negative number relies on two's complement, which every C compiler you'll meet uses, and C23 requires.)
+--- solution
+#include <math.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+/* ---------- From "Images from scratch" ---------- */
+typedef struct { float r, g, b; } Color;
+typedef struct { int w, h; Color *px; } Image;
+
+static inline Color rgb(float r, float g, float b) { return (Color){ r, g, b }; }
+static inline float clampf(float v, float lo, float hi) { return v < lo ? lo : v > hi ? hi : v; }
+static inline Color color_scale(Color c, float k) { return rgb(c.r * k, c.g * k, c.b * k); }
+
+Image image_new(int w, int h) {
+    Image im = { w, h, calloc((size_t)w * (size_t)h, sizeof(Color)) };
+    return im;
+}
+
+void image_free(Image *im) {
+    free(im->px);
+    im->px = NULL;
+    im->w = im->h = 0;
+}
+
+Color *image_at(Image *im, int x, int y) {
+    return &im->px[(size_t)y * im->w + x];
+}
+
+uint8_t to_byte(float v) {
+    if (!(v > 0.0f)) return 0;
+    if (v >= 1.0f) return 255;
+    return (uint8_t)(v * 255.0f + 0.5f);
+}
+
+float srgb_encode(float l) {
+    if (!(l > 0.0f)) return 0.0f;
+    if (l >= 1.0f) return 1.0f;
+    return l <= 0.0031308f ? 12.92f * l : 1.055f * powf(l, 1.0f / 2.4f) - 0.055f;
+}
+
+float srgb_decode(float s) {
+    if (!(s > 0.0f)) return 0.0f;
+    if (s >= 1.0f) return 1.0f;
+    return s <= 0.04045f ? s / 12.92f : powf((s + 0.055f) / 1.055f, 2.4f);
+}
+
+void srgb_lut_init(uint8_t lut[4096]) {
+    for (int i = 0; i < 4096; i++) lut[i] = to_byte(srgb_encode(i / 4095.0f));
+}
+
+static inline int lut_index(float v) {
+    if (!(v > 0.0f)) return 0;
+    if (v >= 1.0f) return 4095;
+    return (int)(v * 4095.0f + 0.5f);
+}
+
+void image_write_ppm_srgb(const Image *im, FILE *f, const uint8_t lut[4096]) {
+    fprintf(f, "P3\n%d %d\n255\n", im->w, im->h);
+    for (int y = 0; y < im->h; y++) {
+        const Color *row = im->px + (size_t)y * im->w;
+        for (int x = 0; x < im->w; x++)
+            fprintf(f, x ? " %d %d %d" : "%d %d %d", lut[lut_index(row[x].r)], lut[lut_index(row[x].g)],
+                    lut[lut_index(row[x].b)]);
+        fputc('\n', f);
+    }
+}
+
+Color color_lerp(Color a, Color b, float t) {
+    return rgb(a.r + (b.r - a.r) * t, a.g + (b.g - a.g) * t, a.b + (b.b - a.b) * t);
+}
+
+float lerpf(float a, float b, float t) { return a + (b - a) * t; }
+
+float smoothstepf(float e0, float e1, float x) {
+    float t = clampf((x - e0) / (e1 - e0), 0.0f, 1.0f);
+    return t * t * (3.0f - 2.0f * t);
+}
+
+typedef struct { float pos; Color c; } Stop;
+
+Color ramp_sample(const Stop *s, int n, float t) {
+    if (t <= s[0].pos) return s[0].c;
+    if (t >= s[n - 1].pos) return s[n - 1].c;
+    int i = 0;
+    while (i < n - 2 && t > s[i + 1].pos) i++;
+    float span = s[i + 1].pos - s[i].pos;
+    if (span <= 0.0f) return s[i + 1].c;
+    return color_lerp(s[i].c, s[i + 1].c, (t - s[i].pos) / span);
+}
+
+Color cosine_palette(float t, Color a, Color b, Color c, Color d) {
+    const float tau = 6.2831853f;
+    return rgb(a.r + b.r * cosf(tau * (c.r * t + d.r)), a.g + b.g * cosf(tau * (c.g * t + d.g)),
+               a.b + b.b * cosf(tau * (c.b * t + d.b)));
+}
+
+/* ---------- From "Vector math for graphics" ---------- */
+typedef struct { float x, y; } vec2;
+typedef struct { float x, y, z; } vec3;
+
+static inline vec3 v3(float x, float y, float z) { return (vec3){ x, y, z }; }
+static inline float v3_dot(vec3 a, vec3 b) { return a.x * b.x + a.y * b.y + a.z * b.z; }
+
+vec3 v3_normalize(vec3 a) {
+    float l2 = v3_dot(a, a);
+    if (l2 < 1e-20f) return v3(0, 0, 0);
+    float k = 1.0f / sqrtf(l2);
+    return v3(a.x * k, a.y * k, a.z * k);
+}
+
+/* ---------- Noise ---------- */
+
+uint32_t hash_u32(uint32_t x) {
+    uint32_t state = x * 747796405u + 2891336453u;
+    uint32_t word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
+    return (word >> 22u) ^ word;
+}
+
+uint32_t hash2(int x, int y, uint32_t seed) {
+    return hash_u32((uint32_t)x + hash_u32((uint32_t)y + hash_u32(seed)));
+}
+
+float hash2f(int x, int y, uint32_t seed) {
+    return (hash2(x, y, seed) >> 8) * (1.0f / 16777216.0f);
+}
+
+float fade_cubic(float t) {
+    return t * t * (3.0f - 2.0f * t);
+}
+
+float fade_quintic(float t) {
+    return t * t * t * (t * (t * 6.0f - 15.0f) + 10.0f);
+}
+
+float value_noise2(float x, float y, uint32_t seed) {
+    float fx = floorf(x), fy = floorf(y);
+    int ix = (int)fx, iy = (int)fy;
+    float u = fade_quintic(x - fx), v = fade_quintic(y - fy);
+    float a = hash2f(ix, iy, seed), b = hash2f(ix + 1, iy, seed);
+    float c = hash2f(ix, iy + 1, seed), d = hash2f(ix + 1, iy + 1, seed);
+    return lerpf(lerpf(a, b, u), lerpf(c, d, u), v);
+}
+
+typedef struct { uint8_t perm[512]; } Perlin;
+
+void perlin_init(Perlin *p, uint32_t seed) {
+    for (int i = 0; i < 256; i++) p->perm[i] = (uint8_t)i;
+    uint32_t base = hash_u32(seed);
+    for (int i = 255; i > 0; i--) {
+        uint32_t j = hash_u32(base + (uint32_t)i) % (uint32_t)(i + 1);
+        uint8_t t = p->perm[i];
+        p->perm[i] = p->perm[j];
+        p->perm[j] = t;
+    }
+    for (int i = 0; i < 256; i++) p->perm[256 + i] = p->perm[i];
+}
+
+/* Ken Perlin's permutation from "Improving Noise" (2002). */
+void perlin_init_reference(Perlin *p) {
+    static const uint8_t KEN[256] = {
+        151,160,137,91,90,15,131,13,201,95,96,53,194,233,7,225,140,36,103,30,69,142,8,99,37,240,21,10,23,
+        190,6,148,247,120,234,75,0,26,197,62,94,252,219,203,117,35,11,32,57,177,33,88,237,149,56,87,174,20,
+        125,136,171,168,68,175,74,165,71,134,139,48,27,166,77,146,158,231,83,111,229,122,60,211,133,230,220,
+        105,92,41,55,46,245,40,244,102,143,54,65,25,63,161,1,216,80,73,209,76,132,187,208,89,18,169,200,196,
+        135,130,116,188,159,86,164,100,109,198,173,186,3,64,52,217,226,250,124,123,5,202,38,147,118,126,255,
+        82,85,212,207,206,59,227,47,16,58,17,182,189,28,42,223,183,170,213,119,248,152,2,44,154,163,70,221,
+        153,101,155,167,43,172,9,129,22,39,253,19,98,108,110,79,113,224,232,178,185,112,104,218,246,97,228,
+        251,34,242,193,238,210,144,12,191,179,162,241,81,51,145,235,249,14,239,107,49,192,214,31,181,199,106,
+        157,184,84,204,176,115,121,50,45,127,4,150,254,138,236,205,93,222,114,67,29,24,72,243,141,128,195,78,
+        66,215,61,156,180
+    };
+    for (int i = 0; i < 256; i++) p->perm[i] = p->perm[256 + i] = KEN[i];
+}
+
+static const float GRAD2[8][2] = { { 1, 1 }, { -1, 1 }, { 1, -1 }, { -1, -1 }, { 1, 0 }, { -1, 0 }, { 0, 1 }, { 0, -1 } };
+
+float grad2(int hash, float x, float y) {
+    const float *g = GRAD2[hash & 7];
+    return g[0] * x + g[1] * y;
+}
+
+float perlin2(const Perlin *p, float x, float y) {
+    float fx = floorf(x), fy = floorf(y);
+    int X = (int)fx & 255, Y = (int)fy & 255;
+    x -= fx;
+    y -= fy;
+    float u = fade_quintic(x), v = fade_quintic(y);
+    const uint8_t *P = p->perm;
+    int aa = P[P[X] + Y], ba = P[P[X + 1] + Y], ab = P[P[X] + Y + 1], bb = P[P[X + 1] + Y + 1];
+    return lerpf(lerpf(grad2(aa, x, y), grad2(ba, x - 1, y), u),
+                 lerpf(grad2(ab, x, y - 1), grad2(bb, x - 1, y - 1), u), v);
+}
+
+int main(void) {
+    static uint8_t lut[4096];
+    srgb_lut_init(lut);
+    Perlin p;
+    perlin_init(&p, 7);
+    Image im = image_new(128, 128);
+    if (!im.px) return 1;
+    for (int y = 0; y < im.h; y++)
+        for (int x = 0; x < im.w; x++) {
+            float n = perlin2(&p, x / 16.0f, y / 16.0f), v = 0.5f + 0.5f * n;
+            *image_at(&im, x, y) = x < 64 ? rgb(v, v, v) : (n > 0 ? rgb(n, 0.3f * n, 0) : rgb(0, -0.4f * n, -n));
+        }
+    image_write_ppm_srgb(&im, stdout, lut);
+    image_free(&im);
+    return 0;
+}
+--- stubs
+float grad2(int hash, float x, float y) {
+    (void)hash;
+    return x + y;
+}
+
+float perlin2(const Perlin *p, float x, float y) {
+    (void)p;
+    return value_noise2(x, y, 0) * 2 - 1;
+}
+--- hint
+Keep `fx = floorf(x)` in a variable: you need it both for `X` and for the fractional part.
+--- hint
+The four `grad2` calls use the offsets from each corner to the point: `(x, y)`, `(x-1, y)`, `(x, y-1)`, `(x-1, y-1)`.
+--- harness
+int main(void) {
+    CHECK_DBL(grad2(0, 0.25f, 0.5f), 0.75);
+    CHECK_DBL(grad2(3, 0.25f, 0.5f), -0.75);
+    CHECK_DBL(grad2(13, 0.25f, 0.5f), -0.25);
+    CHECK_DBL(grad2(14, 0.25f, 0.5f), 0.5);
+    CHECK_DBL(grad2(15, 0.25f, 0.5f), -0.5);
+    Perlin p;
+    perlin_init_reference(&p);
+    CHECK(fabsf(perlin2(&p, 0, 0)) < 1e-7f);
+    CHECK(fabsf(perlin2(&p, 17, -3)) < 1e-7f);
+    CHECK(fabsf(perlin2(&p, 0.5f, 0.5f) - (-0.5f)) < 1e-6f);
+    CHECK(fabsf(perlin2(&p, 3.14f, 42.0f) - (-0.15584f)) < 1e-4f);
+    CHECK(fabsf(perlin2(&p, 0.3f, 0.7f) - (-0.310638f)) < 1e-4f);
+    CHECK(fabsf(perlin2(&p, -1.3f, 2.7f) - (-0.346615f)) < 1e-4f);
+    CHECK(fabsf(perlin2(&p, -0.25f, -0.75f) - (-0.517842f)) < 1e-4f);
+    CHECK(fabsf(perlin2(&p, 100.6f, 7.2f) - perlin2(&p, 356.6f, 7.2f)) < 1e-4f);
+    Perlin q;
+    perlin_init(&q, 99);
+    CHECK(fabsf(perlin2(&q, 1.5f, 2.25f) - 0.0258789f) < 1e-4f);
+    float mn = 0, mx = 0;
+    double sum = 0;
+    for (int i = 0; i < 100000; i++) {
+        float n = perlin2(&q, (i % 317) * 0.173f - 20, (i / 317) * 0.191f - 15);
+        if (n < mn) mn = n;
+        if (n > mx) mx = n;
+        sum += n;
+    }
+    CHECK(mn >= -1.0f && mx <= 1.0f);
+    CHECK(mn < -0.6f && mx > 0.6f);
+    CHECK(fabs(sum / 100000) < 0.03);
+    CHECK(fabsf(perlin2(&q, 4.9999f, 2.3f) - perlin2(&q, 5.0001f, 2.3f)) < 1e-3f);
+    CHECK(fabsf(perlin2(&q, -7.3f, -0.0001f) - perlin2(&q, -7.3f, 0.0001f)) < 1e-3f);
+    return TEST_END();
+}
+
+=== exercise nz_perlin3
+title: Noise, step 5: Perlin's improved noise in 3D
+continues: nz_perlin2
+--- prompt
+Add Ken Perlin's 2002 improved noise in 3D, the function behind more procedural content than any other:
+
+- `float grad3(int hash, float x, float y, float z)`: the 12-direction gradient from the chapter text (`h = hash & 15`, `u = h < 8 ? x : y`, `v = h < 4 ? y : (h == 12 || h == 14) ? x : z`, signs from bits 0 and 1).
+- `float perlin3(const Perlin *p, float x, float y, float z)`: the 2D algorithm extended to 8 corners. With `X, Y, Z` the cell (`& 255`), `x, y, z` the fractions and `u, v, w` their fades:
+
+```text
+A = P[X] + Y,   AA = P[A] + Z,   AB = P[A + 1] + Z
+B = P[X+1] + Y, BA = P[B] + Z,   BB = P[B + 1] + Z
+lerp(w, lerp(v, lerp(u, grad3(P[AA],   x, y,   z  ), grad3(P[BA],   x-1, y,   z  )),
+                lerp(u, grad3(P[AB],   x, y-1, z  ), grad3(P[BB],   x-1, y-1, z  ))),
+        lerp(v, lerp(u, grad3(P[AA+1], x, y,   z-1), grad3(P[BA+1], x-1, y,   z-1)),
+                lerp(u, grad3(P[AB+1], x, y-1, z-1), grad3(P[BB+1], x-1, y-1, z-1))))
+```
+
+(Perlin's `lerp(t, a, b)` takes `t` first; `lerpf(a, b, t)` takes it last.)
+
+With Perlin's own table, your function must reproduce his reference implementation: `perlin3(3.14, 42, 7)` is `0.13691995878400012` in his Java code (doubles); in `float` you'll match it to about 6 digits.
+
+Run shows four slices through 3D noise at increasing `z`: the third dimension is often *time*, which is how noise animates smoothly.
+--- solution
+#include <math.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+/* ---------- From "Images from scratch" ---------- */
+typedef struct { float r, g, b; } Color;
+typedef struct { int w, h; Color *px; } Image;
+
+static inline Color rgb(float r, float g, float b) { return (Color){ r, g, b }; }
+static inline float clampf(float v, float lo, float hi) { return v < lo ? lo : v > hi ? hi : v; }
+static inline Color color_scale(Color c, float k) { return rgb(c.r * k, c.g * k, c.b * k); }
+
+Image image_new(int w, int h) {
+    Image im = { w, h, calloc((size_t)w * (size_t)h, sizeof(Color)) };
+    return im;
+}
+
+void image_free(Image *im) {
+    free(im->px);
+    im->px = NULL;
+    im->w = im->h = 0;
+}
+
+Color *image_at(Image *im, int x, int y) {
+    return &im->px[(size_t)y * im->w + x];
+}
+
+uint8_t to_byte(float v) {
+    if (!(v > 0.0f)) return 0;
+    if (v >= 1.0f) return 255;
+    return (uint8_t)(v * 255.0f + 0.5f);
+}
+
+float srgb_encode(float l) {
+    if (!(l > 0.0f)) return 0.0f;
+    if (l >= 1.0f) return 1.0f;
+    return l <= 0.0031308f ? 12.92f * l : 1.055f * powf(l, 1.0f / 2.4f) - 0.055f;
+}
+
+float srgb_decode(float s) {
+    if (!(s > 0.0f)) return 0.0f;
+    if (s >= 1.0f) return 1.0f;
+    return s <= 0.04045f ? s / 12.92f : powf((s + 0.055f) / 1.055f, 2.4f);
+}
+
+void srgb_lut_init(uint8_t lut[4096]) {
+    for (int i = 0; i < 4096; i++) lut[i] = to_byte(srgb_encode(i / 4095.0f));
+}
+
+static inline int lut_index(float v) {
+    if (!(v > 0.0f)) return 0;
+    if (v >= 1.0f) return 4095;
+    return (int)(v * 4095.0f + 0.5f);
+}
+
+void image_write_ppm_srgb(const Image *im, FILE *f, const uint8_t lut[4096]) {
+    fprintf(f, "P3\n%d %d\n255\n", im->w, im->h);
+    for (int y = 0; y < im->h; y++) {
+        const Color *row = im->px + (size_t)y * im->w;
+        for (int x = 0; x < im->w; x++)
+            fprintf(f, x ? " %d %d %d" : "%d %d %d", lut[lut_index(row[x].r)], lut[lut_index(row[x].g)],
+                    lut[lut_index(row[x].b)]);
+        fputc('\n', f);
+    }
+}
+
+Color color_lerp(Color a, Color b, float t) {
+    return rgb(a.r + (b.r - a.r) * t, a.g + (b.g - a.g) * t, a.b + (b.b - a.b) * t);
+}
+
+float lerpf(float a, float b, float t) { return a + (b - a) * t; }
+
+float smoothstepf(float e0, float e1, float x) {
+    float t = clampf((x - e0) / (e1 - e0), 0.0f, 1.0f);
+    return t * t * (3.0f - 2.0f * t);
+}
+
+typedef struct { float pos; Color c; } Stop;
+
+Color ramp_sample(const Stop *s, int n, float t) {
+    if (t <= s[0].pos) return s[0].c;
+    if (t >= s[n - 1].pos) return s[n - 1].c;
+    int i = 0;
+    while (i < n - 2 && t > s[i + 1].pos) i++;
+    float span = s[i + 1].pos - s[i].pos;
+    if (span <= 0.0f) return s[i + 1].c;
+    return color_lerp(s[i].c, s[i + 1].c, (t - s[i].pos) / span);
+}
+
+Color cosine_palette(float t, Color a, Color b, Color c, Color d) {
+    const float tau = 6.2831853f;
+    return rgb(a.r + b.r * cosf(tau * (c.r * t + d.r)), a.g + b.g * cosf(tau * (c.g * t + d.g)),
+               a.b + b.b * cosf(tau * (c.b * t + d.b)));
+}
+
+/* ---------- From "Vector math for graphics" ---------- */
+typedef struct { float x, y; } vec2;
+typedef struct { float x, y, z; } vec3;
+
+static inline vec3 v3(float x, float y, float z) { return (vec3){ x, y, z }; }
+static inline float v3_dot(vec3 a, vec3 b) { return a.x * b.x + a.y * b.y + a.z * b.z; }
+
+vec3 v3_normalize(vec3 a) {
+    float l2 = v3_dot(a, a);
+    if (l2 < 1e-20f) return v3(0, 0, 0);
+    float k = 1.0f / sqrtf(l2);
+    return v3(a.x * k, a.y * k, a.z * k);
+}
+
+/* ---------- Noise ---------- */
+
+uint32_t hash_u32(uint32_t x) {
+    uint32_t state = x * 747796405u + 2891336453u;
+    uint32_t word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
+    return (word >> 22u) ^ word;
+}
+
+uint32_t hash2(int x, int y, uint32_t seed) {
+    return hash_u32((uint32_t)x + hash_u32((uint32_t)y + hash_u32(seed)));
+}
+
+float hash2f(int x, int y, uint32_t seed) {
+    return (hash2(x, y, seed) >> 8) * (1.0f / 16777216.0f);
+}
+
+float fade_cubic(float t) {
+    return t * t * (3.0f - 2.0f * t);
+}
+
+float fade_quintic(float t) {
+    return t * t * t * (t * (t * 6.0f - 15.0f) + 10.0f);
+}
+
+float value_noise2(float x, float y, uint32_t seed) {
+    float fx = floorf(x), fy = floorf(y);
+    int ix = (int)fx, iy = (int)fy;
+    float u = fade_quintic(x - fx), v = fade_quintic(y - fy);
+    float a = hash2f(ix, iy, seed), b = hash2f(ix + 1, iy, seed);
+    float c = hash2f(ix, iy + 1, seed), d = hash2f(ix + 1, iy + 1, seed);
+    return lerpf(lerpf(a, b, u), lerpf(c, d, u), v);
+}
+
+typedef struct { uint8_t perm[512]; } Perlin;
+
+void perlin_init(Perlin *p, uint32_t seed) {
+    for (int i = 0; i < 256; i++) p->perm[i] = (uint8_t)i;
+    uint32_t base = hash_u32(seed);
+    for (int i = 255; i > 0; i--) {
+        uint32_t j = hash_u32(base + (uint32_t)i) % (uint32_t)(i + 1);
+        uint8_t t = p->perm[i];
+        p->perm[i] = p->perm[j];
+        p->perm[j] = t;
+    }
+    for (int i = 0; i < 256; i++) p->perm[256 + i] = p->perm[i];
+}
+
+/* Ken Perlin's permutation from "Improving Noise" (2002). */
+void perlin_init_reference(Perlin *p) {
+    static const uint8_t KEN[256] = {
+        151,160,137,91,90,15,131,13,201,95,96,53,194,233,7,225,140,36,103,30,69,142,8,99,37,240,21,10,23,
+        190,6,148,247,120,234,75,0,26,197,62,94,252,219,203,117,35,11,32,57,177,33,88,237,149,56,87,174,20,
+        125,136,171,168,68,175,74,165,71,134,139,48,27,166,77,146,158,231,83,111,229,122,60,211,133,230,220,
+        105,92,41,55,46,245,40,244,102,143,54,65,25,63,161,1,216,80,73,209,76,132,187,208,89,18,169,200,196,
+        135,130,116,188,159,86,164,100,109,198,173,186,3,64,52,217,226,250,124,123,5,202,38,147,118,126,255,
+        82,85,212,207,206,59,227,47,16,58,17,182,189,28,42,223,183,170,213,119,248,152,2,44,154,163,70,221,
+        153,101,155,167,43,172,9,129,22,39,253,19,98,108,110,79,113,224,232,178,185,112,104,218,246,97,228,
+        251,34,242,193,238,210,144,12,191,179,162,241,81,51,145,235,249,14,239,107,49,192,214,31,181,199,106,
+        157,184,84,204,176,115,121,50,45,127,4,150,254,138,236,205,93,222,114,67,29,24,72,243,141,128,195,78,
+        66,215,61,156,180
+    };
+    for (int i = 0; i < 256; i++) p->perm[i] = p->perm[256 + i] = KEN[i];
+}
+
+static const float GRAD2[8][2] = { { 1, 1 }, { -1, 1 }, { 1, -1 }, { -1, -1 }, { 1, 0 }, { -1, 0 }, { 0, 1 }, { 0, -1 } };
+
+float grad2(int hash, float x, float y) {
+    const float *g = GRAD2[hash & 7];
+    return g[0] * x + g[1] * y;
+}
+
+float perlin2(const Perlin *p, float x, float y) {
+    float fx = floorf(x), fy = floorf(y);
+    int X = (int)fx & 255, Y = (int)fy & 255;
+    x -= fx;
+    y -= fy;
+    float u = fade_quintic(x), v = fade_quintic(y);
+    const uint8_t *P = p->perm;
+    int aa = P[P[X] + Y], ba = P[P[X + 1] + Y], ab = P[P[X] + Y + 1], bb = P[P[X + 1] + Y + 1];
+    return lerpf(lerpf(grad2(aa, x, y), grad2(ba, x - 1, y), u),
+                 lerpf(grad2(ab, x, y - 1), grad2(bb, x - 1, y - 1), u), v);
+}
+
+float grad3(int hash, float x, float y, float z) {
+    int h = hash & 15;
+    float u = h < 8 ? x : y;
+    float v = h < 4 ? y : (h == 12 || h == 14) ? x : z;
+    return ((h & 1) ? -u : u) + ((h & 2) ? -v : v);
+}
+
+float perlin3(const Perlin *p, float x, float y, float z) {
+    float fx = floorf(x), fy = floorf(y), fz = floorf(z);
+    int X = (int)fx & 255, Y = (int)fy & 255, Z = (int)fz & 255;
+    x -= fx;
+    y -= fy;
+    z -= fz;
+    float u = fade_quintic(x), v = fade_quintic(y), w = fade_quintic(z);
+    const uint8_t *P = p->perm;
+    int A = P[X] + Y, AA = P[A] + Z, AB = P[A + 1] + Z;
+    int B = P[X + 1] + Y, BA = P[B] + Z, BB = P[B + 1] + Z;
+    return lerpf(lerpf(lerpf(grad3(P[AA], x, y, z), grad3(P[BA], x - 1, y, z), u),
+                       lerpf(grad3(P[AB], x, y - 1, z), grad3(P[BB], x - 1, y - 1, z), u), v),
+                 lerpf(lerpf(grad3(P[AA + 1], x, y, z - 1), grad3(P[BA + 1], x - 1, y, z - 1), u),
+                       lerpf(grad3(P[AB + 1], x, y - 1, z - 1), grad3(P[BB + 1], x - 1, y - 1, z - 1), u), v),
+                 w);
+}
+
+int main(void) {
+    static uint8_t lut[4096];
+    srgb_lut_init(lut);
+    Perlin p;
+    perlin_init(&p, 11);
+    Image im = image_new(128, 128);
+    if (!im.px) return 1;
+    for (int y = 0; y < im.h; y++)
+        for (int x = 0; x < im.w; x++) {
+            int panel = (y / 64) * 2 + x / 64;           /* four slices: z = 0, 0.25, 0.5, 0.75 */
+            float n = perlin3(&p, (x % 64) / 12.0f, (y % 64) / 12.0f, panel * 0.25f);
+            float v = 0.5f + 0.7f * n;
+            *image_at(&im, x, y) = rgb(v * 0.9f, v * v, 0.2f + 0.6f * v);
+        }
+    image_write_ppm_srgb(&im, stdout, lut);
+    image_free(&im);
+    return 0;
+}
+--- stubs
+float grad3(int hash, float x, float y, float z) {
+    (void)hash;
+    return x + y + z;
+}
+
+float perlin3(const Perlin *p, float x, float y, float z) {
+    (void)z;
+    return perlin2(p, x, y);
+}
+--- hint
+Write the eight `grad3` calls in the order of the formula; the corner offset subtracts 1 from each coordinate whose corner is on the far side.
+--- harness
+int main(void) {
+    CHECK_DBL(grad3(0, 1, 2, 3), 3.0);
+    CHECK_DBL(grad3(5, 1, 2, 3), 2.0);
+    CHECK_DBL(grad3(12, 1, 2, 3), 3.0);
+    CHECK_DBL(grad3(14, 1, 2, 3), 1.0);
+    CHECK_DBL(grad3(13, 1, 2, 3), 1.0);
+    CHECK_DBL(grad3(11, 1, 2, 3), -5.0);
+    CHECK_DBL(grad3(16 + 7, 1, 2, 3), -4.0);
+    Perlin p;
+    perlin_init_reference(&p);
+    CHECK(fabsf(perlin3(&p, 3.14f, 42.0f, 7.0f) - 0.136919958784f) < 2e-6f);
+    CHECK(fabsf(perlin3(&p, 0.5f, 0.5f, 0.5f) - (-0.25f)) < 1e-6f);
+    CHECK(fabsf(perlin3(&p, -1.3f, 2.7f, 0.25f) - (-0.122284258f)) < 2e-6f);
+    CHECK(fabsf(perlin3(&p, 1, 2, 3)) < 1e-7f);
+    CHECK(fabsf(perlin3(&p, 10.25f, -3.5f, 0.75f) - 0.275424f) < 1e-5f);
+    CHECK(fabsf(perlin3(&p, 0.3f, 0.7f, 0.0f) - perlin2(&p, 0.3f, 0.7f)) > 1e-4f);
+    Perlin q;
+    perlin_init(&q, 5);
+    CHECK(fabsf(perlin3(&q, 0.1f, 0.2f, 0.3f) - (-0.0841603f)) < 1e-5f);
+    float mn = 0, mx = 0;
+    for (int i = 0; i < 60000; i++) {
+        float n = perlin3(&q, (i % 41) * 0.37f, (i / 41 % 37) * 0.29f, (i / 1517) * 0.31f);
+        if (n < mn) mn = n;
+        if (n > mx) mx = n;
+    }
+    CHECK(mn >= -1.0f && mx <= 1.0f && mn < -0.5f && mx > 0.5f);
+    CHECK(fabsf(perlin3(&q, 2.3f, 1.9999f, 4.4f) - perlin3(&q, 2.3f, 2.0001f, 4.4f)) < 1e-3f);
+    return TEST_END();
+}
+
+=== exercise nz_simplex
+title: Noise, step 6: 2D simplex noise
+continues: nz_perlin3
+--- prompt
+Add `float simplex2(const Perlin *p, float x, float y)`, Stefan Gustavson's formulation of Perlin's simplex noise, with your `grad2` and table:
+
+```text
+F2 = 0.36602540378f   (sqrt(3) - 1) / 2         G2 = 0.21132486540f   (3 - sqrt(3)) / 6
+s = (x + y) F2;  i = floorf(x + s);  j = floorf(y + s)            skew to find the cell
+t = (i + j) G2;  x0 = x - (i - t);  y0 = y - (j - t)              offset from corner 0
+i1, j1 = (1, 0) if x0 > y0 else (0, 1)                            which triangle
+x1 = x0 - i1 + G2;      y1 = y0 - j1 + G2                          offset from corner 1
+x2 = x0 - 1 + 2 G2;     y2 = y0 - 1 + 2 G2                         offset from corner 2
+ii = (int)i & 255;  jj = (int)j & 255
+g0 = P[ii + P[jj]];  g1 = P[ii + i1 + P[jj + j1]];  g2 = P[ii + 1 + P[jj + 1]]
+for each corner k: tk = 0.5 - xk² - yk²; if tk > 0: n += tk⁴ * grad2(gk, xk, yk)
+return 70 * n
+```
+
+Three corners instead of four, no interpolation, and no grid-aligned artifacts. The output is roughly within `[-1, 1]`.
+
+Run shows Perlin noise (left) beside simplex noise (right) at the same scale.
+--- solution
+#include <math.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+/* ---------- From "Images from scratch" ---------- */
+typedef struct { float r, g, b; } Color;
+typedef struct { int w, h; Color *px; } Image;
+
+static inline Color rgb(float r, float g, float b) { return (Color){ r, g, b }; }
+static inline float clampf(float v, float lo, float hi) { return v < lo ? lo : v > hi ? hi : v; }
+static inline Color color_scale(Color c, float k) { return rgb(c.r * k, c.g * k, c.b * k); }
+
+Image image_new(int w, int h) {
+    Image im = { w, h, calloc((size_t)w * (size_t)h, sizeof(Color)) };
+    return im;
+}
+
+void image_free(Image *im) {
+    free(im->px);
+    im->px = NULL;
+    im->w = im->h = 0;
+}
+
+Color *image_at(Image *im, int x, int y) {
+    return &im->px[(size_t)y * im->w + x];
+}
+
+uint8_t to_byte(float v) {
+    if (!(v > 0.0f)) return 0;
+    if (v >= 1.0f) return 255;
+    return (uint8_t)(v * 255.0f + 0.5f);
+}
+
+float srgb_encode(float l) {
+    if (!(l > 0.0f)) return 0.0f;
+    if (l >= 1.0f) return 1.0f;
+    return l <= 0.0031308f ? 12.92f * l : 1.055f * powf(l, 1.0f / 2.4f) - 0.055f;
+}
+
+float srgb_decode(float s) {
+    if (!(s > 0.0f)) return 0.0f;
+    if (s >= 1.0f) return 1.0f;
+    return s <= 0.04045f ? s / 12.92f : powf((s + 0.055f) / 1.055f, 2.4f);
+}
+
+void srgb_lut_init(uint8_t lut[4096]) {
+    for (int i = 0; i < 4096; i++) lut[i] = to_byte(srgb_encode(i / 4095.0f));
+}
+
+static inline int lut_index(float v) {
+    if (!(v > 0.0f)) return 0;
+    if (v >= 1.0f) return 4095;
+    return (int)(v * 4095.0f + 0.5f);
+}
+
+void image_write_ppm_srgb(const Image *im, FILE *f, const uint8_t lut[4096]) {
+    fprintf(f, "P3\n%d %d\n255\n", im->w, im->h);
+    for (int y = 0; y < im->h; y++) {
+        const Color *row = im->px + (size_t)y * im->w;
+        for (int x = 0; x < im->w; x++)
+            fprintf(f, x ? " %d %d %d" : "%d %d %d", lut[lut_index(row[x].r)], lut[lut_index(row[x].g)],
+                    lut[lut_index(row[x].b)]);
+        fputc('\n', f);
+    }
+}
+
+Color color_lerp(Color a, Color b, float t) {
+    return rgb(a.r + (b.r - a.r) * t, a.g + (b.g - a.g) * t, a.b + (b.b - a.b) * t);
+}
+
+float lerpf(float a, float b, float t) { return a + (b - a) * t; }
+
+float smoothstepf(float e0, float e1, float x) {
+    float t = clampf((x - e0) / (e1 - e0), 0.0f, 1.0f);
+    return t * t * (3.0f - 2.0f * t);
+}
+
+typedef struct { float pos; Color c; } Stop;
+
+Color ramp_sample(const Stop *s, int n, float t) {
+    if (t <= s[0].pos) return s[0].c;
+    if (t >= s[n - 1].pos) return s[n - 1].c;
+    int i = 0;
+    while (i < n - 2 && t > s[i + 1].pos) i++;
+    float span = s[i + 1].pos - s[i].pos;
+    if (span <= 0.0f) return s[i + 1].c;
+    return color_lerp(s[i].c, s[i + 1].c, (t - s[i].pos) / span);
+}
+
+Color cosine_palette(float t, Color a, Color b, Color c, Color d) {
+    const float tau = 6.2831853f;
+    return rgb(a.r + b.r * cosf(tau * (c.r * t + d.r)), a.g + b.g * cosf(tau * (c.g * t + d.g)),
+               a.b + b.b * cosf(tau * (c.b * t + d.b)));
+}
+
+/* ---------- From "Vector math for graphics" ---------- */
+typedef struct { float x, y; } vec2;
+typedef struct { float x, y, z; } vec3;
+
+static inline vec3 v3(float x, float y, float z) { return (vec3){ x, y, z }; }
+static inline float v3_dot(vec3 a, vec3 b) { return a.x * b.x + a.y * b.y + a.z * b.z; }
+
+vec3 v3_normalize(vec3 a) {
+    float l2 = v3_dot(a, a);
+    if (l2 < 1e-20f) return v3(0, 0, 0);
+    float k = 1.0f / sqrtf(l2);
+    return v3(a.x * k, a.y * k, a.z * k);
+}
+
+/* ---------- Noise ---------- */
+
+uint32_t hash_u32(uint32_t x) {
+    uint32_t state = x * 747796405u + 2891336453u;
+    uint32_t word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
+    return (word >> 22u) ^ word;
+}
+
+uint32_t hash2(int x, int y, uint32_t seed) {
+    return hash_u32((uint32_t)x + hash_u32((uint32_t)y + hash_u32(seed)));
+}
+
+float hash2f(int x, int y, uint32_t seed) {
+    return (hash2(x, y, seed) >> 8) * (1.0f / 16777216.0f);
+}
+
+float fade_cubic(float t) {
+    return t * t * (3.0f - 2.0f * t);
+}
+
+float fade_quintic(float t) {
+    return t * t * t * (t * (t * 6.0f - 15.0f) + 10.0f);
+}
+
+float value_noise2(float x, float y, uint32_t seed) {
+    float fx = floorf(x), fy = floorf(y);
+    int ix = (int)fx, iy = (int)fy;
+    float u = fade_quintic(x - fx), v = fade_quintic(y - fy);
+    float a = hash2f(ix, iy, seed), b = hash2f(ix + 1, iy, seed);
+    float c = hash2f(ix, iy + 1, seed), d = hash2f(ix + 1, iy + 1, seed);
+    return lerpf(lerpf(a, b, u), lerpf(c, d, u), v);
+}
+
+typedef struct { uint8_t perm[512]; } Perlin;
+
+void perlin_init(Perlin *p, uint32_t seed) {
+    for (int i = 0; i < 256; i++) p->perm[i] = (uint8_t)i;
+    uint32_t base = hash_u32(seed);
+    for (int i = 255; i > 0; i--) {
+        uint32_t j = hash_u32(base + (uint32_t)i) % (uint32_t)(i + 1);
+        uint8_t t = p->perm[i];
+        p->perm[i] = p->perm[j];
+        p->perm[j] = t;
+    }
+    for (int i = 0; i < 256; i++) p->perm[256 + i] = p->perm[i];
+}
+
+/* Ken Perlin's permutation from "Improving Noise" (2002). */
+void perlin_init_reference(Perlin *p) {
+    static const uint8_t KEN[256] = {
+        151,160,137,91,90,15,131,13,201,95,96,53,194,233,7,225,140,36,103,30,69,142,8,99,37,240,21,10,23,
+        190,6,148,247,120,234,75,0,26,197,62,94,252,219,203,117,35,11,32,57,177,33,88,237,149,56,87,174,20,
+        125,136,171,168,68,175,74,165,71,134,139,48,27,166,77,146,158,231,83,111,229,122,60,211,133,230,220,
+        105,92,41,55,46,245,40,244,102,143,54,65,25,63,161,1,216,80,73,209,76,132,187,208,89,18,169,200,196,
+        135,130,116,188,159,86,164,100,109,198,173,186,3,64,52,217,226,250,124,123,5,202,38,147,118,126,255,
+        82,85,212,207,206,59,227,47,16,58,17,182,189,28,42,223,183,170,213,119,248,152,2,44,154,163,70,221,
+        153,101,155,167,43,172,9,129,22,39,253,19,98,108,110,79,113,224,232,178,185,112,104,218,246,97,228,
+        251,34,242,193,238,210,144,12,191,179,162,241,81,51,145,235,249,14,239,107,49,192,214,31,181,199,106,
+        157,184,84,204,176,115,121,50,45,127,4,150,254,138,236,205,93,222,114,67,29,24,72,243,141,128,195,78,
+        66,215,61,156,180
+    };
+    for (int i = 0; i < 256; i++) p->perm[i] = p->perm[256 + i] = KEN[i];
+}
+
+static const float GRAD2[8][2] = { { 1, 1 }, { -1, 1 }, { 1, -1 }, { -1, -1 }, { 1, 0 }, { -1, 0 }, { 0, 1 }, { 0, -1 } };
+
+float grad2(int hash, float x, float y) {
+    const float *g = GRAD2[hash & 7];
+    return g[0] * x + g[1] * y;
+}
+
+float perlin2(const Perlin *p, float x, float y) {
+    float fx = floorf(x), fy = floorf(y);
+    int X = (int)fx & 255, Y = (int)fy & 255;
+    x -= fx;
+    y -= fy;
+    float u = fade_quintic(x), v = fade_quintic(y);
+    const uint8_t *P = p->perm;
+    int aa = P[P[X] + Y], ba = P[P[X + 1] + Y], ab = P[P[X] + Y + 1], bb = P[P[X + 1] + Y + 1];
+    return lerpf(lerpf(grad2(aa, x, y), grad2(ba, x - 1, y), u),
+                 lerpf(grad2(ab, x, y - 1), grad2(bb, x - 1, y - 1), u), v);
+}
+
+float grad3(int hash, float x, float y, float z) {
+    int h = hash & 15;
+    float u = h < 8 ? x : y;
+    float v = h < 4 ? y : (h == 12 || h == 14) ? x : z;
+    return ((h & 1) ? -u : u) + ((h & 2) ? -v : v);
+}
+
+float perlin3(const Perlin *p, float x, float y, float z) {
+    float fx = floorf(x), fy = floorf(y), fz = floorf(z);
+    int X = (int)fx & 255, Y = (int)fy & 255, Z = (int)fz & 255;
+    x -= fx;
+    y -= fy;
+    z -= fz;
+    float u = fade_quintic(x), v = fade_quintic(y), w = fade_quintic(z);
+    const uint8_t *P = p->perm;
+    int A = P[X] + Y, AA = P[A] + Z, AB = P[A + 1] + Z;
+    int B = P[X + 1] + Y, BA = P[B] + Z, BB = P[B + 1] + Z;
+    return lerpf(lerpf(lerpf(grad3(P[AA], x, y, z), grad3(P[BA], x - 1, y, z), u),
+                       lerpf(grad3(P[AB], x, y - 1, z), grad3(P[BB], x - 1, y - 1, z), u), v),
+                 lerpf(lerpf(grad3(P[AA + 1], x, y, z - 1), grad3(P[BA + 1], x - 1, y, z - 1), u),
+                       lerpf(grad3(P[AB + 1], x, y - 1, z - 1), grad3(P[BB + 1], x - 1, y - 1, z - 1), u), v),
+                 w);
+}
+
+float simplex2(const Perlin *p, float x, float y) {
+    const float F2 = 0.36602540378f, G2 = 0.21132486540f;
+    const uint8_t *P = p->perm;
+    float s = (x + y) * F2;
+    float fi = floorf(x + s), fj = floorf(y + s);
+    float t = (fi + fj) * G2;
+    float x0 = x - (fi - t), y0 = y - (fj - t);
+    int i1 = x0 > y0 ? 1 : 0, j1 = 1 - i1;
+    float x1 = x0 - i1 + G2, y1 = y0 - j1 + G2;
+    float x2 = x0 - 1.0f + 2.0f * G2, y2 = y0 - 1.0f + 2.0f * G2;
+    int ii = (int)fi & 255, jj = (int)fj & 255;
+    int g0 = P[ii + P[jj]], g1 = P[ii + i1 + P[jj + j1]], g2 = P[ii + 1 + P[jj + 1]];
+    float n = 0;
+    float t0 = 0.5f - x0 * x0 - y0 * y0;
+    if (t0 > 0) { t0 *= t0; n += t0 * t0 * grad2(g0, x0, y0); }
+    float t1 = 0.5f - x1 * x1 - y1 * y1;
+    if (t1 > 0) { t1 *= t1; n += t1 * t1 * grad2(g1, x1, y1); }
+    float t2 = 0.5f - x2 * x2 - y2 * y2;
+    if (t2 > 0) { t2 *= t2; n += t2 * t2 * grad2(g2, x2, y2); }
+    return 70.0f * n;
+}
+
+int main(void) {
+    static uint8_t lut[4096];
+    srgb_lut_init(lut);
+    Perlin p;
+    perlin_init(&p, 3);
+    Image im = image_new(128, 64);
+    if (!im.px) return 1;
+    for (int y = 0; y < im.h; y++)
+        for (int x = 0; x < im.w; x++) {
+            float n = x < 64 ? perlin2(&p, x / 10.0f, y / 10.0f) : simplex2(&p, x / 10.0f, y / 10.0f);
+            float v = 0.5f + 0.5f * n;
+            *image_at(&im, x, y) = rgb(v, v, v);
+        }
+    image_write_ppm_srgb(&im, stdout, lut);
+    image_free(&im);
+    return 0;
+}
+--- stubs
+float simplex2(const Perlin *p, float x, float y) {
+    return perlin2(p, x, y);
+}
+--- hint
+`i1` and `j1` are ints (0 or 1); mixing them into float expressions like `x0 - i1 + G2` converts automatically.
+--- hint
+Each corner's contribution: `t = 0.5f - x*x - y*y; if (t > 0) { t *= t; n += t * t * grad2(g, x, y); }`.
+--- harness
+int main(void) {
+    Perlin p;
+    perlin_init_reference(&p);
+    CHECK(fabsf(simplex2(&p, 0, 0)) < 1e-7f);
+    CHECK(fabsf(simplex2(&p, 0.3f, 0.7f) - (-0.282939f)) < 1e-4f);
+    CHECK(fabsf(simplex2(&p, 3.14f, 42.0f) - 0.369047f) < 1e-4f);
+    CHECK(fabsf(simplex2(&p, -1.3f, 2.7f) - (-0.416856f)) < 1e-4f);
+    CHECK(fabsf(simplex2(&p, -20.5f, -0.25f) - 0.839353f) < 1e-4f);
+    CHECK(fabsf(simplex2(&p, 0.1f, 0.9f) - simplex2(&p, 0.9f, 0.1f)) > 1e-3f);
+    Perlin q;
+    perlin_init(&q, 42);
+    CHECK(fabsf(simplex2(&q, 5.5f, 1.25f) - 0.535161f) < 1e-4f);
+    float mn = 0, mx = 0;
+    double sum = 0;
+    for (int i = 0; i < 100000; i++) {
+        float n = simplex2(&q, (i % 331) * 0.137f - 20, (i / 331) * 0.149f - 25);
+        if (n < mn) mn = n;
+        if (n > mx) mx = n;
+        sum += n;
+    }
+    CHECK(mn >= -1.0f && mx <= 1.0f && mn < -0.7f && mx > 0.7f);
+    CHECK(fabs(sum / 100000) < 0.03);
+    float a = simplex2(&q, 1.0f, 1.0f), b = simplex2(&q, 1.0001f, 1.0001f);
+    CHECK(fabsf(a - b) < 1e-3f);
+    return TEST_END();
+}
+
+=== exercise nz_fbm
+title: Noise, step 7: fBm, turbulence, ridged multifractal
+continues: nz_simplex
+--- prompt
+Add the fractal sums, all over `perlin2`. Octave `i` (from 0) samples at frequency `freq = lacunarity^i`, amplitude `amp = gain^i`, and is **offset** by `o = 17.13f * i` in both coordinates, so the octaves don't all share zeros at the origin:
+
+```text
+n_i = perlin2(p, x * freq + o, y * freq + o)
+```
+
+- `float fbm2(const Perlin *p, float x, float y, int octaves, float lacunarity, float gain)`: `sum of amp * n_i`.
+- `float turbulence2(...)` (same parameters): `sum of amp * |n_i|`.
+- `float ridged2(...)` (same parameters): a simplified form of Musgrave's ridged multifractal. Keep `weight = 1` before the loop; per octave `r = (1 - |n_i|)²`, add `r * amp * weight`, then `weight = r`. Ridges get detail; valleys stay smooth.
+
+Update `freq` and `amp` by multiplying each octave (no `powf` in the loop). `octaves = 0` returns 0.
+
+The last test renders 512×512 pixels with 6 octaves: 1.5 million noise samples, well under a second with the table built once. Rebuilding the table, or allocating anything, inside a noise call would multiply that by hundreds.
+--- solution
+#include <math.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+/* ---------- From "Images from scratch" ---------- */
+typedef struct { float r, g, b; } Color;
+typedef struct { int w, h; Color *px; } Image;
+
+static inline Color rgb(float r, float g, float b) { return (Color){ r, g, b }; }
+static inline float clampf(float v, float lo, float hi) { return v < lo ? lo : v > hi ? hi : v; }
+static inline Color color_scale(Color c, float k) { return rgb(c.r * k, c.g * k, c.b * k); }
+
+Image image_new(int w, int h) {
+    Image im = { w, h, calloc((size_t)w * (size_t)h, sizeof(Color)) };
+    return im;
+}
+
+void image_free(Image *im) {
+    free(im->px);
+    im->px = NULL;
+    im->w = im->h = 0;
+}
+
+Color *image_at(Image *im, int x, int y) {
+    return &im->px[(size_t)y * im->w + x];
+}
+
+uint8_t to_byte(float v) {
+    if (!(v > 0.0f)) return 0;
+    if (v >= 1.0f) return 255;
+    return (uint8_t)(v * 255.0f + 0.5f);
+}
+
+float srgb_encode(float l) {
+    if (!(l > 0.0f)) return 0.0f;
+    if (l >= 1.0f) return 1.0f;
+    return l <= 0.0031308f ? 12.92f * l : 1.055f * powf(l, 1.0f / 2.4f) - 0.055f;
+}
+
+float srgb_decode(float s) {
+    if (!(s > 0.0f)) return 0.0f;
+    if (s >= 1.0f) return 1.0f;
+    return s <= 0.04045f ? s / 12.92f : powf((s + 0.055f) / 1.055f, 2.4f);
+}
+
+void srgb_lut_init(uint8_t lut[4096]) {
+    for (int i = 0; i < 4096; i++) lut[i] = to_byte(srgb_encode(i / 4095.0f));
+}
+
+static inline int lut_index(float v) {
+    if (!(v > 0.0f)) return 0;
+    if (v >= 1.0f) return 4095;
+    return (int)(v * 4095.0f + 0.5f);
+}
+
+void image_write_ppm_srgb(const Image *im, FILE *f, const uint8_t lut[4096]) {
+    fprintf(f, "P3\n%d %d\n255\n", im->w, im->h);
+    for (int y = 0; y < im->h; y++) {
+        const Color *row = im->px + (size_t)y * im->w;
+        for (int x = 0; x < im->w; x++)
+            fprintf(f, x ? " %d %d %d" : "%d %d %d", lut[lut_index(row[x].r)], lut[lut_index(row[x].g)],
+                    lut[lut_index(row[x].b)]);
+        fputc('\n', f);
+    }
+}
+
+Color color_lerp(Color a, Color b, float t) {
+    return rgb(a.r + (b.r - a.r) * t, a.g + (b.g - a.g) * t, a.b + (b.b - a.b) * t);
+}
+
+float lerpf(float a, float b, float t) { return a + (b - a) * t; }
+
+float smoothstepf(float e0, float e1, float x) {
+    float t = clampf((x - e0) / (e1 - e0), 0.0f, 1.0f);
+    return t * t * (3.0f - 2.0f * t);
+}
+
+typedef struct { float pos; Color c; } Stop;
+
+Color ramp_sample(const Stop *s, int n, float t) {
+    if (t <= s[0].pos) return s[0].c;
+    if (t >= s[n - 1].pos) return s[n - 1].c;
+    int i = 0;
+    while (i < n - 2 && t > s[i + 1].pos) i++;
+    float span = s[i + 1].pos - s[i].pos;
+    if (span <= 0.0f) return s[i + 1].c;
+    return color_lerp(s[i].c, s[i + 1].c, (t - s[i].pos) / span);
+}
+
+Color cosine_palette(float t, Color a, Color b, Color c, Color d) {
+    const float tau = 6.2831853f;
+    return rgb(a.r + b.r * cosf(tau * (c.r * t + d.r)), a.g + b.g * cosf(tau * (c.g * t + d.g)),
+               a.b + b.b * cosf(tau * (c.b * t + d.b)));
+}
+
+/* ---------- From "Vector math for graphics" ---------- */
+typedef struct { float x, y; } vec2;
+typedef struct { float x, y, z; } vec3;
+
+static inline vec3 v3(float x, float y, float z) { return (vec3){ x, y, z }; }
+static inline float v3_dot(vec3 a, vec3 b) { return a.x * b.x + a.y * b.y + a.z * b.z; }
+
+vec3 v3_normalize(vec3 a) {
+    float l2 = v3_dot(a, a);
+    if (l2 < 1e-20f) return v3(0, 0, 0);
+    float k = 1.0f / sqrtf(l2);
+    return v3(a.x * k, a.y * k, a.z * k);
+}
+
+/* ---------- Noise ---------- */
+
+uint32_t hash_u32(uint32_t x) {
+    uint32_t state = x * 747796405u + 2891336453u;
+    uint32_t word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
+    return (word >> 22u) ^ word;
+}
+
+uint32_t hash2(int x, int y, uint32_t seed) {
+    return hash_u32((uint32_t)x + hash_u32((uint32_t)y + hash_u32(seed)));
+}
+
+float hash2f(int x, int y, uint32_t seed) {
+    return (hash2(x, y, seed) >> 8) * (1.0f / 16777216.0f);
+}
+
+float fade_cubic(float t) {
+    return t * t * (3.0f - 2.0f * t);
+}
+
+float fade_quintic(float t) {
+    return t * t * t * (t * (t * 6.0f - 15.0f) + 10.0f);
+}
+
+float value_noise2(float x, float y, uint32_t seed) {
+    float fx = floorf(x), fy = floorf(y);
+    int ix = (int)fx, iy = (int)fy;
+    float u = fade_quintic(x - fx), v = fade_quintic(y - fy);
+    float a = hash2f(ix, iy, seed), b = hash2f(ix + 1, iy, seed);
+    float c = hash2f(ix, iy + 1, seed), d = hash2f(ix + 1, iy + 1, seed);
+    return lerpf(lerpf(a, b, u), lerpf(c, d, u), v);
+}
+
+typedef struct { uint8_t perm[512]; } Perlin;
+
+void perlin_init(Perlin *p, uint32_t seed) {
+    for (int i = 0; i < 256; i++) p->perm[i] = (uint8_t)i;
+    uint32_t base = hash_u32(seed);
+    for (int i = 255; i > 0; i--) {
+        uint32_t j = hash_u32(base + (uint32_t)i) % (uint32_t)(i + 1);
+        uint8_t t = p->perm[i];
+        p->perm[i] = p->perm[j];
+        p->perm[j] = t;
+    }
+    for (int i = 0; i < 256; i++) p->perm[256 + i] = p->perm[i];
+}
+
+/* Ken Perlin's permutation from "Improving Noise" (2002). */
+void perlin_init_reference(Perlin *p) {
+    static const uint8_t KEN[256] = {
+        151,160,137,91,90,15,131,13,201,95,96,53,194,233,7,225,140,36,103,30,69,142,8,99,37,240,21,10,23,
+        190,6,148,247,120,234,75,0,26,197,62,94,252,219,203,117,35,11,32,57,177,33,88,237,149,56,87,174,20,
+        125,136,171,168,68,175,74,165,71,134,139,48,27,166,77,146,158,231,83,111,229,122,60,211,133,230,220,
+        105,92,41,55,46,245,40,244,102,143,54,65,25,63,161,1,216,80,73,209,76,132,187,208,89,18,169,200,196,
+        135,130,116,188,159,86,164,100,109,198,173,186,3,64,52,217,226,250,124,123,5,202,38,147,118,126,255,
+        82,85,212,207,206,59,227,47,16,58,17,182,189,28,42,223,183,170,213,119,248,152,2,44,154,163,70,221,
+        153,101,155,167,43,172,9,129,22,39,253,19,98,108,110,79,113,224,232,178,185,112,104,218,246,97,228,
+        251,34,242,193,238,210,144,12,191,179,162,241,81,51,145,235,249,14,239,107,49,192,214,31,181,199,106,
+        157,184,84,204,176,115,121,50,45,127,4,150,254,138,236,205,93,222,114,67,29,24,72,243,141,128,195,78,
+        66,215,61,156,180
+    };
+    for (int i = 0; i < 256; i++) p->perm[i] = p->perm[256 + i] = KEN[i];
+}
+
+static const float GRAD2[8][2] = { { 1, 1 }, { -1, 1 }, { 1, -1 }, { -1, -1 }, { 1, 0 }, { -1, 0 }, { 0, 1 }, { 0, -1 } };
+
+float grad2(int hash, float x, float y) {
+    const float *g = GRAD2[hash & 7];
+    return g[0] * x + g[1] * y;
+}
+
+float perlin2(const Perlin *p, float x, float y) {
+    float fx = floorf(x), fy = floorf(y);
+    int X = (int)fx & 255, Y = (int)fy & 255;
+    x -= fx;
+    y -= fy;
+    float u = fade_quintic(x), v = fade_quintic(y);
+    const uint8_t *P = p->perm;
+    int aa = P[P[X] + Y], ba = P[P[X + 1] + Y], ab = P[P[X] + Y + 1], bb = P[P[X + 1] + Y + 1];
+    return lerpf(lerpf(grad2(aa, x, y), grad2(ba, x - 1, y), u),
+                 lerpf(grad2(ab, x, y - 1), grad2(bb, x - 1, y - 1), u), v);
+}
+
+float grad3(int hash, float x, float y, float z) {
+    int h = hash & 15;
+    float u = h < 8 ? x : y;
+    float v = h < 4 ? y : (h == 12 || h == 14) ? x : z;
+    return ((h & 1) ? -u : u) + ((h & 2) ? -v : v);
+}
+
+float perlin3(const Perlin *p, float x, float y, float z) {
+    float fx = floorf(x), fy = floorf(y), fz = floorf(z);
+    int X = (int)fx & 255, Y = (int)fy & 255, Z = (int)fz & 255;
+    x -= fx;
+    y -= fy;
+    z -= fz;
+    float u = fade_quintic(x), v = fade_quintic(y), w = fade_quintic(z);
+    const uint8_t *P = p->perm;
+    int A = P[X] + Y, AA = P[A] + Z, AB = P[A + 1] + Z;
+    int B = P[X + 1] + Y, BA = P[B] + Z, BB = P[B + 1] + Z;
+    return lerpf(lerpf(lerpf(grad3(P[AA], x, y, z), grad3(P[BA], x - 1, y, z), u),
+                       lerpf(grad3(P[AB], x, y - 1, z), grad3(P[BB], x - 1, y - 1, z), u), v),
+                 lerpf(lerpf(grad3(P[AA + 1], x, y, z - 1), grad3(P[BA + 1], x - 1, y, z - 1), u),
+                       lerpf(grad3(P[AB + 1], x, y - 1, z - 1), grad3(P[BB + 1], x - 1, y - 1, z - 1), u), v),
+                 w);
+}
+
+float simplex2(const Perlin *p, float x, float y) {
+    const float F2 = 0.36602540378f, G2 = 0.21132486540f;
+    const uint8_t *P = p->perm;
+    float s = (x + y) * F2;
+    float fi = floorf(x + s), fj = floorf(y + s);
+    float t = (fi + fj) * G2;
+    float x0 = x - (fi - t), y0 = y - (fj - t);
+    int i1 = x0 > y0 ? 1 : 0, j1 = 1 - i1;
+    float x1 = x0 - i1 + G2, y1 = y0 - j1 + G2;
+    float x2 = x0 - 1.0f + 2.0f * G2, y2 = y0 - 1.0f + 2.0f * G2;
+    int ii = (int)fi & 255, jj = (int)fj & 255;
+    int g0 = P[ii + P[jj]], g1 = P[ii + i1 + P[jj + j1]], g2 = P[ii + 1 + P[jj + 1]];
+    float n = 0;
+    float t0 = 0.5f - x0 * x0 - y0 * y0;
+    if (t0 > 0) { t0 *= t0; n += t0 * t0 * grad2(g0, x0, y0); }
+    float t1 = 0.5f - x1 * x1 - y1 * y1;
+    if (t1 > 0) { t1 *= t1; n += t1 * t1 * grad2(g1, x1, y1); }
+    float t2 = 0.5f - x2 * x2 - y2 * y2;
+    if (t2 > 0) { t2 *= t2; n += t2 * t2 * grad2(g2, x2, y2); }
+    return 70.0f * n;
+}
+
+float fbm2(const Perlin *p, float x, float y, int octaves, float lacunarity, float gain) {
+    float sum = 0, amp = 1, freq = 1;
+    for (int i = 0; i < octaves; i++) {
+        float o = 17.13f * i;
+        sum += amp * perlin2(p, x * freq + o, y * freq + o);
+        freq *= lacunarity;
+        amp *= gain;
+    }
+    return sum;
+}
+
+float turbulence2(const Perlin *p, float x, float y, int octaves, float lacunarity, float gain) {
+    float sum = 0, amp = 1, freq = 1;
+    for (int i = 0; i < octaves; i++) {
+        float o = 17.13f * i;
+        sum += amp * fabsf(perlin2(p, x * freq + o, y * freq + o));
+        freq *= lacunarity;
+        amp *= gain;
+    }
+    return sum;
+}
+
+float ridged2(const Perlin *p, float x, float y, int octaves, float lacunarity, float gain) {
+    float sum = 0, amp = 1, freq = 1, weight = 1;
+    for (int i = 0; i < octaves; i++) {
+        float o = 17.13f * i;
+        float r = 1.0f - fabsf(perlin2(p, x * freq + o, y * freq + o));
+        r *= r;
+        sum += r * amp * weight;
+        weight = r;
+        freq *= lacunarity;
+        amp *= gain;
+    }
+    return sum;
+}
+
+int main(void) {
+    static uint8_t lut[4096];
+    srgb_lut_init(lut);
+    Perlin p;
+    perlin_init(&p, 21);
+    Image im = image_new(128, 128);
+    if (!im.px) return 1;
+    Stop rock[] = { { 0.0f, { 0.02f, 0.02f, 0.05f } }, { 0.5f, { 0.25f, 0.18f, 0.12f } }, { 1.0f, { 1.0f, 0.95f, 0.9f } } };
+    for (int y = 0; y < im.h; y++)
+        for (int x = 0; x < im.w; x++) {
+            float fx = (x % 64) / 20.0f, fy = (y % 64) / 20.0f;
+            int panel = (y / 64) * 2 + x / 64;
+            Color c;
+            if (panel == 0) { float v = 0.5f + 0.5f * fbm2(&p, fx, fy, 6, 2, 0.5f); c = rgb(v, v, v); }
+            else if (panel == 1) { float v = turbulence2(&p, fx, fy, 6, 2, 0.5f); c = rgb(v * 1.4f, v * v, v * 0.3f); }
+            else if (panel == 2) c = ramp_sample(rock, 3, ridged2(&p, fx, fy, 6, 2, 0.5f) * 0.6f);
+            else { float v = 0.5f + 0.5f * fbm2(&p, fx, fy, 6, 2, 0.8f); c = rgb(v * 0.4f, v * 0.7f, v); }
+            *image_at(&im, x, y) = c;
+        }
+    image_write_ppm_srgb(&im, stdout, lut);
+    image_free(&im);
+    return 0;
+}
+--- stubs
+float fbm2(const Perlin *p, float x, float y, int octaves, float lacunarity, float gain) {
+    (void)octaves; (void)lacunarity; (void)gain;
+    return perlin2(p, x, y);
+}
+
+float turbulence2(const Perlin *p, float x, float y, int octaves, float lacunarity, float gain) {
+    return fabsf(fbm2(p, x, y, octaves, lacunarity, gain));
+}
+
+float ridged2(const Perlin *p, float x, float y, int octaves, float lacunarity, float gain) {
+    return 1 - turbulence2(p, x, y, octaves, lacunarity, gain);
+}
+--- hint
+One loop shape for all three: `o = 17.13f * i`, sample, accumulate, then `freq *= lacunarity; amp *= gain;`.
+--- hint
+In `ridged2`, square `r` before using it, and set `weight = r` *after* adding this octave.
+--- harness
+int main(void) {
+    Perlin p;
+    perlin_init_reference(&p);
+    CHECK_DBL(fbm2(&p, 0.3f, 0.7f, 1, 2, 0.5f), perlin2(&p, 0.3f, 0.7f));
+    CHECK_DBL(fbm2(&p, 0.3f, 0.7f, 0, 2, 0.5f), 0.0);
+    CHECK_DBL(fbm2(&p, 0.3f, 0.7f, 5, 2, 0.0f), perlin2(&p, 0.3f, 0.7f));
+    float want = perlin2(&p, 1.1f, 2.2f) + 0.5f * perlin2(&p, 2.2f + 17.13f, 4.4f + 17.13f) +
+                 0.25f * perlin2(&p, 4.4f + 34.26f, 8.8f + 34.26f);
+    CHECK(fabsf(fbm2(&p, 1.1f, 2.2f, 3, 2, 0.5f) - want) < 1e-5f);
+    CHECK(fabsf(fbm2(&p, 0.3f, 0.7f, 6, 2, 0.5f) - (-0.219852f)) < 1e-4f);
+    CHECK(fabsf(fbm2(&p, -3.7f, 12.1f, 8, 1.9f, 0.6f) - 0.290462f) < 1e-4f);
+    want = fabsf(perlin2(&p, 1.1f, 2.2f)) + 0.6f * fabsf(perlin2(&p, 3.3f + 17.13f, 6.6f + 17.13f));
+    CHECK(fabsf(turbulence2(&p, 1.1f, 2.2f, 2, 3, 0.6f) - want) < 1e-5f);
+    CHECK(fabsf(turbulence2(&p, 0.3f, 0.7f, 6, 2, 0.5f) - 0.437286f) < 1e-4f);
+    float r0 = 1 - fabsf(perlin2(&p, 1.1f, 2.2f)), r1 = 1 - fabsf(perlin2(&p, 2.2f + 17.13f, 4.4f + 17.13f));
+    r0 *= r0; r1 *= r1;
+    CHECK(fabsf(ridged2(&p, 1.1f, 2.2f, 2, 2, 0.5f) - (r0 + 0.5f * r1 * r0)) < 1e-5f);
+    CHECK(fabsf(ridged2(&p, 0.3f, 0.7f, 6, 2, 0.5f) - 0.93667f) < 1e-4f);
+    CHECK_DBL(ridged2(&p, 5, 5, 1, 2, 0.5f), 1.0);
+
+    Perlin q;
+    perlin_init(&q, 8);
+    double s = 0, t = 0, r = 0;
+    int n = 512;
+    for (int y = 0; y < n; y++)
+        for (int x = 0; x < n; x++) {
+            float fx = x / 64.0f, fy = y / 64.0f;
+            s += fbm2(&q, fx, fy, 6, 2, 0.5f);
+            if (x % 4 == 0) { t += turbulence2(&q, fx, fy, 4, 2, 0.5f); r += ridged2(&q, fx, fy, 4, 2, 0.5f); }
+        }
+    CHECK(fabs(s / (n * n) - (-0.00646637)) < 1e-3);
+    CHECK(fabs(t / (n * n / 4) - 0.393537) < 1e-3);
+    CHECK(fabs(r / (n * n / 4) - 1.01246) < 1e-3);
+    return TEST_END();
+}
+
+=== exercise nz_warp
+title: Noise, step 8: domain warping
+continues: nz_fbm
+--- prompt
+Add Quilez's two-level domain warp, `float warp2(const Perlin *p, float x, float y, float k, int octaves, vec2 *q_out, vec2 *r_out)`. Every `fbm` here is `fbm2(p, ..., octaves, 2.0f, 0.5f)`:
+
+```text
+q = ( fbm(x, y),                         fbm(x + 5.2, y + 1.3) )
+r = ( fbm(x + k qx + 1.7, y + k qy + 9.2), fbm(x + k qx + 8.3, y + k qy + 2.8) )
+return fbm(x + k rx, y + k ry)
+```
+
+If `q_out` / `r_out` are not `NULL`, store `q` and `r` there: they make great extra inputs for coloring (the Run picture mixes colors by them, as Quilez does). With `k = 0` the warp vanishes and the result is plain `fbm(x, y)`.
+
+Five fBm evaluations per pixel: at 6 octaves that's 30 noise samples. Fine for a texture you bake once; for real-time use, bake it or move it to the GPU (the WebGPU course does).
+--- solution
+#include <math.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+/* ---------- From "Images from scratch" ---------- */
+typedef struct { float r, g, b; } Color;
+typedef struct { int w, h; Color *px; } Image;
+
+static inline Color rgb(float r, float g, float b) { return (Color){ r, g, b }; }
+static inline float clampf(float v, float lo, float hi) { return v < lo ? lo : v > hi ? hi : v; }
+static inline Color color_scale(Color c, float k) { return rgb(c.r * k, c.g * k, c.b * k); }
+
+Image image_new(int w, int h) {
+    Image im = { w, h, calloc((size_t)w * (size_t)h, sizeof(Color)) };
+    return im;
+}
+
+void image_free(Image *im) {
+    free(im->px);
+    im->px = NULL;
+    im->w = im->h = 0;
+}
+
+Color *image_at(Image *im, int x, int y) {
+    return &im->px[(size_t)y * im->w + x];
+}
+
+uint8_t to_byte(float v) {
+    if (!(v > 0.0f)) return 0;
+    if (v >= 1.0f) return 255;
+    return (uint8_t)(v * 255.0f + 0.5f);
+}
+
+float srgb_encode(float l) {
+    if (!(l > 0.0f)) return 0.0f;
+    if (l >= 1.0f) return 1.0f;
+    return l <= 0.0031308f ? 12.92f * l : 1.055f * powf(l, 1.0f / 2.4f) - 0.055f;
+}
+
+float srgb_decode(float s) {
+    if (!(s > 0.0f)) return 0.0f;
+    if (s >= 1.0f) return 1.0f;
+    return s <= 0.04045f ? s / 12.92f : powf((s + 0.055f) / 1.055f, 2.4f);
+}
+
+void srgb_lut_init(uint8_t lut[4096]) {
+    for (int i = 0; i < 4096; i++) lut[i] = to_byte(srgb_encode(i / 4095.0f));
+}
+
+static inline int lut_index(float v) {
+    if (!(v > 0.0f)) return 0;
+    if (v >= 1.0f) return 4095;
+    return (int)(v * 4095.0f + 0.5f);
+}
+
+void image_write_ppm_srgb(const Image *im, FILE *f, const uint8_t lut[4096]) {
+    fprintf(f, "P3\n%d %d\n255\n", im->w, im->h);
+    for (int y = 0; y < im->h; y++) {
+        const Color *row = im->px + (size_t)y * im->w;
+        for (int x = 0; x < im->w; x++)
+            fprintf(f, x ? " %d %d %d" : "%d %d %d", lut[lut_index(row[x].r)], lut[lut_index(row[x].g)],
+                    lut[lut_index(row[x].b)]);
+        fputc('\n', f);
+    }
+}
+
+Color color_lerp(Color a, Color b, float t) {
+    return rgb(a.r + (b.r - a.r) * t, a.g + (b.g - a.g) * t, a.b + (b.b - a.b) * t);
+}
+
+float lerpf(float a, float b, float t) { return a + (b - a) * t; }
+
+float smoothstepf(float e0, float e1, float x) {
+    float t = clampf((x - e0) / (e1 - e0), 0.0f, 1.0f);
+    return t * t * (3.0f - 2.0f * t);
+}
+
+typedef struct { float pos; Color c; } Stop;
+
+Color ramp_sample(const Stop *s, int n, float t) {
+    if (t <= s[0].pos) return s[0].c;
+    if (t >= s[n - 1].pos) return s[n - 1].c;
+    int i = 0;
+    while (i < n - 2 && t > s[i + 1].pos) i++;
+    float span = s[i + 1].pos - s[i].pos;
+    if (span <= 0.0f) return s[i + 1].c;
+    return color_lerp(s[i].c, s[i + 1].c, (t - s[i].pos) / span);
+}
+
+Color cosine_palette(float t, Color a, Color b, Color c, Color d) {
+    const float tau = 6.2831853f;
+    return rgb(a.r + b.r * cosf(tau * (c.r * t + d.r)), a.g + b.g * cosf(tau * (c.g * t + d.g)),
+               a.b + b.b * cosf(tau * (c.b * t + d.b)));
+}
+
+/* ---------- From "Vector math for graphics" ---------- */
+typedef struct { float x, y; } vec2;
+typedef struct { float x, y, z; } vec3;
+
+static inline vec3 v3(float x, float y, float z) { return (vec3){ x, y, z }; }
+static inline float v3_dot(vec3 a, vec3 b) { return a.x * b.x + a.y * b.y + a.z * b.z; }
+
+vec3 v3_normalize(vec3 a) {
+    float l2 = v3_dot(a, a);
+    if (l2 < 1e-20f) return v3(0, 0, 0);
+    float k = 1.0f / sqrtf(l2);
+    return v3(a.x * k, a.y * k, a.z * k);
+}
+
+/* ---------- Noise ---------- */
+
+uint32_t hash_u32(uint32_t x) {
+    uint32_t state = x * 747796405u + 2891336453u;
+    uint32_t word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
+    return (word >> 22u) ^ word;
+}
+
+uint32_t hash2(int x, int y, uint32_t seed) {
+    return hash_u32((uint32_t)x + hash_u32((uint32_t)y + hash_u32(seed)));
+}
+
+float hash2f(int x, int y, uint32_t seed) {
+    return (hash2(x, y, seed) >> 8) * (1.0f / 16777216.0f);
+}
+
+float fade_cubic(float t) {
+    return t * t * (3.0f - 2.0f * t);
+}
+
+float fade_quintic(float t) {
+    return t * t * t * (t * (t * 6.0f - 15.0f) + 10.0f);
+}
+
+float value_noise2(float x, float y, uint32_t seed) {
+    float fx = floorf(x), fy = floorf(y);
+    int ix = (int)fx, iy = (int)fy;
+    float u = fade_quintic(x - fx), v = fade_quintic(y - fy);
+    float a = hash2f(ix, iy, seed), b = hash2f(ix + 1, iy, seed);
+    float c = hash2f(ix, iy + 1, seed), d = hash2f(ix + 1, iy + 1, seed);
+    return lerpf(lerpf(a, b, u), lerpf(c, d, u), v);
+}
+
+typedef struct { uint8_t perm[512]; } Perlin;
+
+void perlin_init(Perlin *p, uint32_t seed) {
+    for (int i = 0; i < 256; i++) p->perm[i] = (uint8_t)i;
+    uint32_t base = hash_u32(seed);
+    for (int i = 255; i > 0; i--) {
+        uint32_t j = hash_u32(base + (uint32_t)i) % (uint32_t)(i + 1);
+        uint8_t t = p->perm[i];
+        p->perm[i] = p->perm[j];
+        p->perm[j] = t;
+    }
+    for (int i = 0; i < 256; i++) p->perm[256 + i] = p->perm[i];
+}
+
+/* Ken Perlin's permutation from "Improving Noise" (2002). */
+void perlin_init_reference(Perlin *p) {
+    static const uint8_t KEN[256] = {
+        151,160,137,91,90,15,131,13,201,95,96,53,194,233,7,225,140,36,103,30,69,142,8,99,37,240,21,10,23,
+        190,6,148,247,120,234,75,0,26,197,62,94,252,219,203,117,35,11,32,57,177,33,88,237,149,56,87,174,20,
+        125,136,171,168,68,175,74,165,71,134,139,48,27,166,77,146,158,231,83,111,229,122,60,211,133,230,220,
+        105,92,41,55,46,245,40,244,102,143,54,65,25,63,161,1,216,80,73,209,76,132,187,208,89,18,169,200,196,
+        135,130,116,188,159,86,164,100,109,198,173,186,3,64,52,217,226,250,124,123,5,202,38,147,118,126,255,
+        82,85,212,207,206,59,227,47,16,58,17,182,189,28,42,223,183,170,213,119,248,152,2,44,154,163,70,221,
+        153,101,155,167,43,172,9,129,22,39,253,19,98,108,110,79,113,224,232,178,185,112,104,218,246,97,228,
+        251,34,242,193,238,210,144,12,191,179,162,241,81,51,145,235,249,14,239,107,49,192,214,31,181,199,106,
+        157,184,84,204,176,115,121,50,45,127,4,150,254,138,236,205,93,222,114,67,29,24,72,243,141,128,195,78,
+        66,215,61,156,180
+    };
+    for (int i = 0; i < 256; i++) p->perm[i] = p->perm[256 + i] = KEN[i];
+}
+
+static const float GRAD2[8][2] = { { 1, 1 }, { -1, 1 }, { 1, -1 }, { -1, -1 }, { 1, 0 }, { -1, 0 }, { 0, 1 }, { 0, -1 } };
+
+float grad2(int hash, float x, float y) {
+    const float *g = GRAD2[hash & 7];
+    return g[0] * x + g[1] * y;
+}
+
+float perlin2(const Perlin *p, float x, float y) {
+    float fx = floorf(x), fy = floorf(y);
+    int X = (int)fx & 255, Y = (int)fy & 255;
+    x -= fx;
+    y -= fy;
+    float u = fade_quintic(x), v = fade_quintic(y);
+    const uint8_t *P = p->perm;
+    int aa = P[P[X] + Y], ba = P[P[X + 1] + Y], ab = P[P[X] + Y + 1], bb = P[P[X + 1] + Y + 1];
+    return lerpf(lerpf(grad2(aa, x, y), grad2(ba, x - 1, y), u),
+                 lerpf(grad2(ab, x, y - 1), grad2(bb, x - 1, y - 1), u), v);
+}
+
+float grad3(int hash, float x, float y, float z) {
+    int h = hash & 15;
+    float u = h < 8 ? x : y;
+    float v = h < 4 ? y : (h == 12 || h == 14) ? x : z;
+    return ((h & 1) ? -u : u) + ((h & 2) ? -v : v);
+}
+
+float perlin3(const Perlin *p, float x, float y, float z) {
+    float fx = floorf(x), fy = floorf(y), fz = floorf(z);
+    int X = (int)fx & 255, Y = (int)fy & 255, Z = (int)fz & 255;
+    x -= fx;
+    y -= fy;
+    z -= fz;
+    float u = fade_quintic(x), v = fade_quintic(y), w = fade_quintic(z);
+    const uint8_t *P = p->perm;
+    int A = P[X] + Y, AA = P[A] + Z, AB = P[A + 1] + Z;
+    int B = P[X + 1] + Y, BA = P[B] + Z, BB = P[B + 1] + Z;
+    return lerpf(lerpf(lerpf(grad3(P[AA], x, y, z), grad3(P[BA], x - 1, y, z), u),
+                       lerpf(grad3(P[AB], x, y - 1, z), grad3(P[BB], x - 1, y - 1, z), u), v),
+                 lerpf(lerpf(grad3(P[AA + 1], x, y, z - 1), grad3(P[BA + 1], x - 1, y, z - 1), u),
+                       lerpf(grad3(P[AB + 1], x, y - 1, z - 1), grad3(P[BB + 1], x - 1, y - 1, z - 1), u), v),
+                 w);
+}
+
+float simplex2(const Perlin *p, float x, float y) {
+    const float F2 = 0.36602540378f, G2 = 0.21132486540f;
+    const uint8_t *P = p->perm;
+    float s = (x + y) * F2;
+    float fi = floorf(x + s), fj = floorf(y + s);
+    float t = (fi + fj) * G2;
+    float x0 = x - (fi - t), y0 = y - (fj - t);
+    int i1 = x0 > y0 ? 1 : 0, j1 = 1 - i1;
+    float x1 = x0 - i1 + G2, y1 = y0 - j1 + G2;
+    float x2 = x0 - 1.0f + 2.0f * G2, y2 = y0 - 1.0f + 2.0f * G2;
+    int ii = (int)fi & 255, jj = (int)fj & 255;
+    int g0 = P[ii + P[jj]], g1 = P[ii + i1 + P[jj + j1]], g2 = P[ii + 1 + P[jj + 1]];
+    float n = 0;
+    float t0 = 0.5f - x0 * x0 - y0 * y0;
+    if (t0 > 0) { t0 *= t0; n += t0 * t0 * grad2(g0, x0, y0); }
+    float t1 = 0.5f - x1 * x1 - y1 * y1;
+    if (t1 > 0) { t1 *= t1; n += t1 * t1 * grad2(g1, x1, y1); }
+    float t2 = 0.5f - x2 * x2 - y2 * y2;
+    if (t2 > 0) { t2 *= t2; n += t2 * t2 * grad2(g2, x2, y2); }
+    return 70.0f * n;
+}
+
+float fbm2(const Perlin *p, float x, float y, int octaves, float lacunarity, float gain) {
+    float sum = 0, amp = 1, freq = 1;
+    for (int i = 0; i < octaves; i++) {
+        float o = 17.13f * i;
+        sum += amp * perlin2(p, x * freq + o, y * freq + o);
+        freq *= lacunarity;
+        amp *= gain;
+    }
+    return sum;
+}
+
+float turbulence2(const Perlin *p, float x, float y, int octaves, float lacunarity, float gain) {
+    float sum = 0, amp = 1, freq = 1;
+    for (int i = 0; i < octaves; i++) {
+        float o = 17.13f * i;
+        sum += amp * fabsf(perlin2(p, x * freq + o, y * freq + o));
+        freq *= lacunarity;
+        amp *= gain;
+    }
+    return sum;
+}
+
+float ridged2(const Perlin *p, float x, float y, int octaves, float lacunarity, float gain) {
+    float sum = 0, amp = 1, freq = 1, weight = 1;
+    for (int i = 0; i < octaves; i++) {
+        float o = 17.13f * i;
+        float r = 1.0f - fabsf(perlin2(p, x * freq + o, y * freq + o));
+        r *= r;
+        sum += r * amp * weight;
+        weight = r;
+        freq *= lacunarity;
+        amp *= gain;
+    }
+    return sum;
+}
+
+float warp2(const Perlin *p, float x, float y, float k, int octaves, vec2 *q_out, vec2 *r_out) {
+    vec2 q = { fbm2(p, x, y, octaves, 2.0f, 0.5f), fbm2(p, x + 5.2f, y + 1.3f, octaves, 2.0f, 0.5f) };
+    float wx = x + k * q.x, wy = y + k * q.y;
+    vec2 r = { fbm2(p, wx + 1.7f, wy + 9.2f, octaves, 2.0f, 0.5f), fbm2(p, wx + 8.3f, wy + 2.8f, octaves, 2.0f, 0.5f) };
+    if (q_out) *q_out = q;
+    if (r_out) *r_out = r;
+    return fbm2(p, x + k * r.x, y + k * r.y, octaves, 2.0f, 0.5f);
+}
+
+int main(void) {
+    static uint8_t lut[4096];
+    srgb_lut_init(lut);
+    Perlin p;
+    perlin_init(&p, 4);
+    Image im = image_new(128, 128);
+    if (!im.px) return 1;
+    for (int y = 0; y < im.h; y++)
+        for (int x = 0; x < im.w; x++) {
+            vec2 q, r;
+            float f = warp2(&p, x / 64.0f, y / 64.0f, 1.0f, 5, &q, &r);
+            float t = clampf(0.5f + f, 0, 1);
+            Color c = color_lerp(rgb(0.10f, 0.62f, 0.67f), rgb(0.67f, 0.67f, 0.50f), clampf(t * t * 4, 0, 1));
+            c = color_lerp(c, rgb(0, 0, 0.16f), clampf(sqrtf(q.x * q.x + q.y * q.y), 0, 1));
+            c = color_lerp(c, rgb(0.67f, 1, 1), clampf(fabsf(r.x) * 1.2f, 0, 1));
+            c = color_scale(c, (f * f * f + 0.6f * f * f + 0.5f * f + 0.45f) * 1.6f);
+            *image_at(&im, x, y) = rgb(srgb_decode(clampf(c.r, 0, 1)), srgb_decode(clampf(c.g, 0, 1)), srgb_decode(clampf(c.b, 0, 1)));
+        }
+    image_write_ppm_srgb(&im, stdout, lut);
+    image_free(&im);
+    return 0;
+}
+--- stubs
+float warp2(const Perlin *p, float x, float y, float k, int octaves, vec2 *q_out, vec2 *r_out) {
+    (void)k; (void)q_out; (void)r_out;
+    return fbm2(p, x, y, octaves, 2.0f, 0.5f);
+}
+--- hint
+Compute `q`, then the warped point `(x + k*q.x, y + k*q.y)` once, then `r` from it, then the final fBm at `(x + k*r.x, y + k*r.y)`.
+--- harness
+int main(void) {
+    Perlin p;
+    perlin_init_reference(&p);
+    CHECK_DBL(warp2(&p, 0.3f, 0.7f, 0, 4, NULL, NULL), fbm2(&p, 0.3f, 0.7f, 4, 2, 0.5f));
+    vec2 q = { 9, 9 }, r = { 9, 9 };
+    float f = warp2(&p, 1.25f, 0.5f, 4, 4, &q, &r);
+    CHECK_DBL(q.x, fbm2(&p, 1.25f, 0.5f, 4, 2, 0.5f));
+    CHECK_DBL(q.y, fbm2(&p, 1.25f + 5.2f, 0.5f + 1.3f, 4, 2, 0.5f));
+    float wx = 1.25f + 4 * q.x, wy = 0.5f + 4 * q.y;
+    CHECK(fabsf(r.x - fbm2(&p, wx + 1.7f, wy + 9.2f, 4, 2, 0.5f)) < 1e-6f);
+    CHECK(fabsf(r.y - fbm2(&p, wx + 8.3f, wy + 2.8f, 4, 2, 0.5f)) < 1e-6f);
+    CHECK(fabsf(f - fbm2(&p, 1.25f + 4 * r.x, 0.5f + 4 * r.y, 4, 2, 0.5f)) < 1e-6f);
+    CHECK(fabsf(f - 0.0632777f) < 1e-4f);
+    CHECK(fabsf(warp2(&p, -2.5f, 3.75f, 2, 6, NULL, NULL) - 0.0988576f) < 1e-4f);
+    Perlin s;
+    perlin_init(&s, 4);
+    CHECK(fabsf(warp2(&s, 1.6f, 0.9f, 4, 5, NULL, &r) - 0.00317948f) < 1e-4f);
+    CHECK(fabsf(r.x - 0.368928f) < 1e-4f);
+    return TEST_END();
+}
+
+=== exercise nz_tile
+title: Noise, step 9: tileable noise
+continues: nz_warp
+--- prompt
+Make noise that tiles, by wrapping the lattice:
+
+- `float perlin2_tiled(const Perlin *p, float x, float y, int period)` (`1 <= period <= 256`): `perlin2`, except the four corner cells are wrapped modulo `period` **before** the table lookups. With `X0 = floor(x) mod period` (a true modulo: the result is in `0..period-1` even for negative `x`) and `X1 = (X0 + 1) % period`, and likewise `Y0`, `Y1`: `aa = P[P[X0] + Y0]`, `ba = P[P[X1] + Y0]`, `ab = P[P[X0] + Y1]`, `bb = P[P[X1] + Y1]`. Fractions, fades and gradients are as before.
+- `float fbm2_tiled(const Perlin *p, float x, float y, int period, int octaves)`: octave `i` is `0.5^i * perlin2_tiled(p, x * 2^i, y * 2^i, period * 2^i)`. Doubling the period with the frequency keeps every octave periodic in the same `period` units. No per-octave offset here: a non-integer offset would break the tiling. (`period << (octaves - 1)` must stay at most 256.)
+
+Then `f(x + period, y) == f(x, y)` for any `x`, and a texture sampled over `[0, period)²` repeats seamlessly. Inside the first period, away from the wrap, `perlin2_tiled` matches `perlin2` exactly.
+
+C's `%` on negative numbers keeps the sign (`-1 % 8 == -1`), so a true modulo needs a fix-up: `m = a % n; if (m < 0) m += n;`.
+--- solution
+#include <math.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+/* ---------- From "Images from scratch" ---------- */
+typedef struct { float r, g, b; } Color;
+typedef struct { int w, h; Color *px; } Image;
+
+static inline Color rgb(float r, float g, float b) { return (Color){ r, g, b }; }
+static inline float clampf(float v, float lo, float hi) { return v < lo ? lo : v > hi ? hi : v; }
+static inline Color color_scale(Color c, float k) { return rgb(c.r * k, c.g * k, c.b * k); }
+
+Image image_new(int w, int h) {
+    Image im = { w, h, calloc((size_t)w * (size_t)h, sizeof(Color)) };
+    return im;
+}
+
+void image_free(Image *im) {
+    free(im->px);
+    im->px = NULL;
+    im->w = im->h = 0;
+}
+
+Color *image_at(Image *im, int x, int y) {
+    return &im->px[(size_t)y * im->w + x];
+}
+
+uint8_t to_byte(float v) {
+    if (!(v > 0.0f)) return 0;
+    if (v >= 1.0f) return 255;
+    return (uint8_t)(v * 255.0f + 0.5f);
+}
+
+float srgb_encode(float l) {
+    if (!(l > 0.0f)) return 0.0f;
+    if (l >= 1.0f) return 1.0f;
+    return l <= 0.0031308f ? 12.92f * l : 1.055f * powf(l, 1.0f / 2.4f) - 0.055f;
+}
+
+float srgb_decode(float s) {
+    if (!(s > 0.0f)) return 0.0f;
+    if (s >= 1.0f) return 1.0f;
+    return s <= 0.04045f ? s / 12.92f : powf((s + 0.055f) / 1.055f, 2.4f);
+}
+
+void srgb_lut_init(uint8_t lut[4096]) {
+    for (int i = 0; i < 4096; i++) lut[i] = to_byte(srgb_encode(i / 4095.0f));
+}
+
+static inline int lut_index(float v) {
+    if (!(v > 0.0f)) return 0;
+    if (v >= 1.0f) return 4095;
+    return (int)(v * 4095.0f + 0.5f);
+}
+
+void image_write_ppm_srgb(const Image *im, FILE *f, const uint8_t lut[4096]) {
+    fprintf(f, "P3\n%d %d\n255\n", im->w, im->h);
+    for (int y = 0; y < im->h; y++) {
+        const Color *row = im->px + (size_t)y * im->w;
+        for (int x = 0; x < im->w; x++)
+            fprintf(f, x ? " %d %d %d" : "%d %d %d", lut[lut_index(row[x].r)], lut[lut_index(row[x].g)],
+                    lut[lut_index(row[x].b)]);
+        fputc('\n', f);
+    }
+}
+
+Color color_lerp(Color a, Color b, float t) {
+    return rgb(a.r + (b.r - a.r) * t, a.g + (b.g - a.g) * t, a.b + (b.b - a.b) * t);
+}
+
+float lerpf(float a, float b, float t) { return a + (b - a) * t; }
+
+float smoothstepf(float e0, float e1, float x) {
+    float t = clampf((x - e0) / (e1 - e0), 0.0f, 1.0f);
+    return t * t * (3.0f - 2.0f * t);
+}
+
+typedef struct { float pos; Color c; } Stop;
+
+Color ramp_sample(const Stop *s, int n, float t) {
+    if (t <= s[0].pos) return s[0].c;
+    if (t >= s[n - 1].pos) return s[n - 1].c;
+    int i = 0;
+    while (i < n - 2 && t > s[i + 1].pos) i++;
+    float span = s[i + 1].pos - s[i].pos;
+    if (span <= 0.0f) return s[i + 1].c;
+    return color_lerp(s[i].c, s[i + 1].c, (t - s[i].pos) / span);
+}
+
+Color cosine_palette(float t, Color a, Color b, Color c, Color d) {
+    const float tau = 6.2831853f;
+    return rgb(a.r + b.r * cosf(tau * (c.r * t + d.r)), a.g + b.g * cosf(tau * (c.g * t + d.g)),
+               a.b + b.b * cosf(tau * (c.b * t + d.b)));
+}
+
+/* ---------- From "Vector math for graphics" ---------- */
+typedef struct { float x, y; } vec2;
+typedef struct { float x, y, z; } vec3;
+
+static inline vec3 v3(float x, float y, float z) { return (vec3){ x, y, z }; }
+static inline float v3_dot(vec3 a, vec3 b) { return a.x * b.x + a.y * b.y + a.z * b.z; }
+
+vec3 v3_normalize(vec3 a) {
+    float l2 = v3_dot(a, a);
+    if (l2 < 1e-20f) return v3(0, 0, 0);
+    float k = 1.0f / sqrtf(l2);
+    return v3(a.x * k, a.y * k, a.z * k);
+}
+
+/* ---------- Noise ---------- */
+
+uint32_t hash_u32(uint32_t x) {
+    uint32_t state = x * 747796405u + 2891336453u;
+    uint32_t word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
+    return (word >> 22u) ^ word;
+}
+
+uint32_t hash2(int x, int y, uint32_t seed) {
+    return hash_u32((uint32_t)x + hash_u32((uint32_t)y + hash_u32(seed)));
+}
+
+float hash2f(int x, int y, uint32_t seed) {
+    return (hash2(x, y, seed) >> 8) * (1.0f / 16777216.0f);
+}
+
+float fade_cubic(float t) {
+    return t * t * (3.0f - 2.0f * t);
+}
+
+float fade_quintic(float t) {
+    return t * t * t * (t * (t * 6.0f - 15.0f) + 10.0f);
+}
+
+float value_noise2(float x, float y, uint32_t seed) {
+    float fx = floorf(x), fy = floorf(y);
+    int ix = (int)fx, iy = (int)fy;
+    float u = fade_quintic(x - fx), v = fade_quintic(y - fy);
+    float a = hash2f(ix, iy, seed), b = hash2f(ix + 1, iy, seed);
+    float c = hash2f(ix, iy + 1, seed), d = hash2f(ix + 1, iy + 1, seed);
+    return lerpf(lerpf(a, b, u), lerpf(c, d, u), v);
+}
+
+typedef struct { uint8_t perm[512]; } Perlin;
+
+void perlin_init(Perlin *p, uint32_t seed) {
+    for (int i = 0; i < 256; i++) p->perm[i] = (uint8_t)i;
+    uint32_t base = hash_u32(seed);
+    for (int i = 255; i > 0; i--) {
+        uint32_t j = hash_u32(base + (uint32_t)i) % (uint32_t)(i + 1);
+        uint8_t t = p->perm[i];
+        p->perm[i] = p->perm[j];
+        p->perm[j] = t;
+    }
+    for (int i = 0; i < 256; i++) p->perm[256 + i] = p->perm[i];
+}
+
+/* Ken Perlin's permutation from "Improving Noise" (2002). */
+void perlin_init_reference(Perlin *p) {
+    static const uint8_t KEN[256] = {
+        151,160,137,91,90,15,131,13,201,95,96,53,194,233,7,225,140,36,103,30,69,142,8,99,37,240,21,10,23,
+        190,6,148,247,120,234,75,0,26,197,62,94,252,219,203,117,35,11,32,57,177,33,88,237,149,56,87,174,20,
+        125,136,171,168,68,175,74,165,71,134,139,48,27,166,77,146,158,231,83,111,229,122,60,211,133,230,220,
+        105,92,41,55,46,245,40,244,102,143,54,65,25,63,161,1,216,80,73,209,76,132,187,208,89,18,169,200,196,
+        135,130,116,188,159,86,164,100,109,198,173,186,3,64,52,217,226,250,124,123,5,202,38,147,118,126,255,
+        82,85,212,207,206,59,227,47,16,58,17,182,189,28,42,223,183,170,213,119,248,152,2,44,154,163,70,221,
+        153,101,155,167,43,172,9,129,22,39,253,19,98,108,110,79,113,224,232,178,185,112,104,218,246,97,228,
+        251,34,242,193,238,210,144,12,191,179,162,241,81,51,145,235,249,14,239,107,49,192,214,31,181,199,106,
+        157,184,84,204,176,115,121,50,45,127,4,150,254,138,236,205,93,222,114,67,29,24,72,243,141,128,195,78,
+        66,215,61,156,180
+    };
+    for (int i = 0; i < 256; i++) p->perm[i] = p->perm[256 + i] = KEN[i];
+}
+
+static const float GRAD2[8][2] = { { 1, 1 }, { -1, 1 }, { 1, -1 }, { -1, -1 }, { 1, 0 }, { -1, 0 }, { 0, 1 }, { 0, -1 } };
+
+float grad2(int hash, float x, float y) {
+    const float *g = GRAD2[hash & 7];
+    return g[0] * x + g[1] * y;
+}
+
+float perlin2(const Perlin *p, float x, float y) {
+    float fx = floorf(x), fy = floorf(y);
+    int X = (int)fx & 255, Y = (int)fy & 255;
+    x -= fx;
+    y -= fy;
+    float u = fade_quintic(x), v = fade_quintic(y);
+    const uint8_t *P = p->perm;
+    int aa = P[P[X] + Y], ba = P[P[X + 1] + Y], ab = P[P[X] + Y + 1], bb = P[P[X + 1] + Y + 1];
+    return lerpf(lerpf(grad2(aa, x, y), grad2(ba, x - 1, y), u),
+                 lerpf(grad2(ab, x, y - 1), grad2(bb, x - 1, y - 1), u), v);
+}
+
+float grad3(int hash, float x, float y, float z) {
+    int h = hash & 15;
+    float u = h < 8 ? x : y;
+    float v = h < 4 ? y : (h == 12 || h == 14) ? x : z;
+    return ((h & 1) ? -u : u) + ((h & 2) ? -v : v);
+}
+
+float perlin3(const Perlin *p, float x, float y, float z) {
+    float fx = floorf(x), fy = floorf(y), fz = floorf(z);
+    int X = (int)fx & 255, Y = (int)fy & 255, Z = (int)fz & 255;
+    x -= fx;
+    y -= fy;
+    z -= fz;
+    float u = fade_quintic(x), v = fade_quintic(y), w = fade_quintic(z);
+    const uint8_t *P = p->perm;
+    int A = P[X] + Y, AA = P[A] + Z, AB = P[A + 1] + Z;
+    int B = P[X + 1] + Y, BA = P[B] + Z, BB = P[B + 1] + Z;
+    return lerpf(lerpf(lerpf(grad3(P[AA], x, y, z), grad3(P[BA], x - 1, y, z), u),
+                       lerpf(grad3(P[AB], x, y - 1, z), grad3(P[BB], x - 1, y - 1, z), u), v),
+                 lerpf(lerpf(grad3(P[AA + 1], x, y, z - 1), grad3(P[BA + 1], x - 1, y, z - 1), u),
+                       lerpf(grad3(P[AB + 1], x, y - 1, z - 1), grad3(P[BB + 1], x - 1, y - 1, z - 1), u), v),
+                 w);
+}
+
+float simplex2(const Perlin *p, float x, float y) {
+    const float F2 = 0.36602540378f, G2 = 0.21132486540f;
+    const uint8_t *P = p->perm;
+    float s = (x + y) * F2;
+    float fi = floorf(x + s), fj = floorf(y + s);
+    float t = (fi + fj) * G2;
+    float x0 = x - (fi - t), y0 = y - (fj - t);
+    int i1 = x0 > y0 ? 1 : 0, j1 = 1 - i1;
+    float x1 = x0 - i1 + G2, y1 = y0 - j1 + G2;
+    float x2 = x0 - 1.0f + 2.0f * G2, y2 = y0 - 1.0f + 2.0f * G2;
+    int ii = (int)fi & 255, jj = (int)fj & 255;
+    int g0 = P[ii + P[jj]], g1 = P[ii + i1 + P[jj + j1]], g2 = P[ii + 1 + P[jj + 1]];
+    float n = 0;
+    float t0 = 0.5f - x0 * x0 - y0 * y0;
+    if (t0 > 0) { t0 *= t0; n += t0 * t0 * grad2(g0, x0, y0); }
+    float t1 = 0.5f - x1 * x1 - y1 * y1;
+    if (t1 > 0) { t1 *= t1; n += t1 * t1 * grad2(g1, x1, y1); }
+    float t2 = 0.5f - x2 * x2 - y2 * y2;
+    if (t2 > 0) { t2 *= t2; n += t2 * t2 * grad2(g2, x2, y2); }
+    return 70.0f * n;
+}
+
+float fbm2(const Perlin *p, float x, float y, int octaves, float lacunarity, float gain) {
+    float sum = 0, amp = 1, freq = 1;
+    for (int i = 0; i < octaves; i++) {
+        float o = 17.13f * i;
+        sum += amp * perlin2(p, x * freq + o, y * freq + o);
+        freq *= lacunarity;
+        amp *= gain;
+    }
+    return sum;
+}
+
+float turbulence2(const Perlin *p, float x, float y, int octaves, float lacunarity, float gain) {
+    float sum = 0, amp = 1, freq = 1;
+    for (int i = 0; i < octaves; i++) {
+        float o = 17.13f * i;
+        sum += amp * fabsf(perlin2(p, x * freq + o, y * freq + o));
+        freq *= lacunarity;
+        amp *= gain;
+    }
+    return sum;
+}
+
+float ridged2(const Perlin *p, float x, float y, int octaves, float lacunarity, float gain) {
+    float sum = 0, amp = 1, freq = 1, weight = 1;
+    for (int i = 0; i < octaves; i++) {
+        float o = 17.13f * i;
+        float r = 1.0f - fabsf(perlin2(p, x * freq + o, y * freq + o));
+        r *= r;
+        sum += r * amp * weight;
+        weight = r;
+        freq *= lacunarity;
+        amp *= gain;
+    }
+    return sum;
+}
+
+float warp2(const Perlin *p, float x, float y, float k, int octaves, vec2 *q_out, vec2 *r_out) {
+    vec2 q = { fbm2(p, x, y, octaves, 2.0f, 0.5f), fbm2(p, x + 5.2f, y + 1.3f, octaves, 2.0f, 0.5f) };
+    float wx = x + k * q.x, wy = y + k * q.y;
+    vec2 r = { fbm2(p, wx + 1.7f, wy + 9.2f, octaves, 2.0f, 0.5f), fbm2(p, wx + 8.3f, wy + 2.8f, octaves, 2.0f, 0.5f) };
+    if (q_out) *q_out = q;
+    if (r_out) *r_out = r;
+    return fbm2(p, x + k * r.x, y + k * r.y, octaves, 2.0f, 0.5f);
+}
+
+static inline int mod_pos(int a, int n) {
+    int m = a % n;
+    return m < 0 ? m + n : m;
+}
+
+float perlin2_tiled(const Perlin *p, float x, float y, int period) {
+    float fx = floorf(x), fy = floorf(y);
+    int X0 = mod_pos((int)fx, period), Y0 = mod_pos((int)fy, period);
+    int X1 = (X0 + 1) % period, Y1 = (Y0 + 1) % period;
+    x -= fx;
+    y -= fy;
+    float u = fade_quintic(x), v = fade_quintic(y);
+    const uint8_t *P = p->perm;
+    int aa = P[P[X0] + Y0], ba = P[P[X1] + Y0], ab = P[P[X0] + Y1], bb = P[P[X1] + Y1];
+    return lerpf(lerpf(grad2(aa, x, y), grad2(ba, x - 1, y), u),
+                 lerpf(grad2(ab, x, y - 1), grad2(bb, x - 1, y - 1), u), v);
+}
+
+float fbm2_tiled(const Perlin *p, float x, float y, int period, int octaves) {
+    float sum = 0, amp = 1, freq = 1;
+    for (int i = 0; i < octaves; i++) {
+        sum += amp * perlin2_tiled(p, x * freq, y * freq, period << i);
+        freq *= 2.0f;
+        amp *= 0.5f;
+    }
+    return sum;
+}
+
+int main(void) {
+    static uint8_t lut[4096];
+    srgb_lut_init(lut);
+    Perlin p;
+    perlin_init(&p, 13);
+    Image tile = image_new(64, 64), im = image_new(128, 128);
+    if (!tile.px || !im.px) { image_free(&tile); image_free(&im); return 1; }
+    for (int y = 0; y < 64; y++)
+        for (int x = 0; x < 64; x++) {
+            float n = fbm2_tiled(&p, x / 16.0f, y / 16.0f, 4, 5);    /* one tile = 4 lattice cells */
+            float v = clampf(0.5f + 0.6f * n, 0, 1);
+            *image_at(&tile, x, y) = rgb(0.3f * v, 0.5f * v + 0.1f, 0.2f + 0.8f * v * v);
+        }
+    for (int y = 0; y < 128; y++)                                    /* repeat 2x2: no seams */
+        for (int x = 0; x < 128; x++) *image_at(&im, x, y) = *image_at(&tile, x % 64, y % 64);
+    image_write_ppm_srgb(&im, stdout, lut);
+    image_free(&tile);
+    image_free(&im);
+    return 0;
+}
+--- stubs
+float perlin2_tiled(const Perlin *p, float x, float y, int period) {
+    (void)period;
+    return perlin2(p, x, y);
+}
+
+float fbm2_tiled(const Perlin *p, float x, float y, int period, int octaves) {
+    (void)period;
+    return fbm2(p, x, y, octaves, 2.0f, 0.5f);
+}
+--- hint
+Write a helper `int mod_pos(int a, int n)` for the true modulo, and use it for `X0` and `Y0`.
+--- hint
+In `fbm2_tiled`, the period for octave `i` is `period << i`.
+--- harness
+int main(void) {
+    Perlin p;
+    perlin_init(&p, 31);
+    CHECK_DBL(perlin2_tiled(&p, 2.5f, 3.25f, 8), perlin2(&p, 2.5f, 3.25f));
+    CHECK_DBL(perlin2_tiled(&p, 0.1f, 6.9f, 8), perlin2(&p, 0.1f, 6.9f));
+    CHECK(fabsf(perlin2_tiled(&p, 7.5f, 3.25f, 8) - perlin2(&p, 7.5f, 3.25f)) > 1e-4f);
+    int ok = 1;
+    for (int i = 0; i < 200; i++) {
+        float x = i * 0.173f - 12, y = i * 0.091f - 5;
+        float a = perlin2_tiled(&p, x, y, 8);
+        if (fabsf(a - perlin2_tiled(&p, x + 8, y, 8)) > 1e-4f) ok = 0;
+        if (fabsf(a - perlin2_tiled(&p, x, y - 16, 8)) > 1e-4f) ok = 0;
+        if (fabsf(a - perlin2_tiled(&p, x - 24, y + 8, 8)) > 1e-4f) ok = 0;
+    }
+    CHECK(ok);
+    CHECK(fabsf(perlin2_tiled(&p, 5 - 1e-4f, 2.3f, 5) - perlin2_tiled(&p, 1e-4f, 2.3f, 5)) < 1e-3f);
+    CHECK(fabsf(perlin2_tiled(&p, -0.75f, 1.5f, 3) - perlin2_tiled(&p, 2.25f, 1.5f, 3)) < 1e-5f);
+    CHECK(fabsf(perlin2_tiled(&p, 0.3f, 0.3f, 1) - 0.27384f) < 1e-4f);
+    CHECK_DBL(fbm2_tiled(&p, 1.3f, 2.7f, 4, 1), perlin2_tiled(&p, 1.3f, 2.7f, 4));
+    float want = perlin2_tiled(&p, 1.3f, 2.7f, 4) + 0.5f * perlin2_tiled(&p, 2.6f, 5.4f, 8) + 0.25f * perlin2_tiled(&p, 5.2f, 10.8f, 16);
+    CHECK(fabsf(fbm2_tiled(&p, 1.3f, 2.7f, 4, 3) - want) < 1e-6f);
+    ok = 1;
+    for (int i = 0; i < 64; i++) {
+        float t = i / 16.0f;
+        if (fabsf(fbm2_tiled(&p, 0, t, 4, 6) - fbm2_tiled(&p, 4, t, 4, 6)) > 1e-4f) ok = 0;
+        if (fabsf(fbm2_tiled(&p, t, 0.01f, 4, 6) - fbm2_tiled(&p, t, 4.01f, 4, 6)) > 1e-4f) ok = 0;
+    }
+    CHECK(ok);
+    CHECK(fabsf(fbm2_tiled(&p, 0.6f, 1.7f, 4, 6) - (-0.157244f)) < 1e-4f);
+    return TEST_END();
+}
+
+=== exercise nz_deriv
+title: Noise, step 10: analytic derivatives and lit relief
+continues: nz_tile
+--- prompt
+Finish the library with derivatives, the input to normals and lighting:
+
+- `float value_noise2_d(float x, float y, uint32_t seed, float *dx, float *dy)`: returns exactly `value_noise2(x, y, seed)` and writes its partial derivatives, using the formulas in the chapter text. With `tx, ty` the fractions, `u = fade_quintic(tx)`, `du = 30 tx² (tx - 1)²` (and the same for `v`, `dv`), and `k = a - b - c + d`:
+  `n = a + (b - a) u + (c - a) v + k u v`, `dx = du ((b - a) + k v)`, `dy = dv ((c - a) + k u)`.
+- `float fbm_value_d(float x, float y, uint32_t seed, int octaves, float *dx, float *dy)`: fBm of value noise with lacunarity 2 and gain 0.5, octave `i` using seed `seed + i` and no offset; return the sum and write the summed derivatives. By the chain rule, octave `i` contributes `amp * freq * (its derivative)`.
+
+The tests compare with central finite differences. The analytic version gives the slope for little more than the cost of the value, where finite differences take three noise evaluations and are noisy at fine scales.
+
+Run lights a height field with the normal `normalize(-s dh/dx, 1, -s dh/dy)`, using Quilez's trick of damping each octave by the slope accumulated so far, which gives an eroded, ridge-and-gully look for free. This is where the terrain chapter picks up.
+--- solution
+#include <math.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+/* ---------- From "Images from scratch" ---------- */
+typedef struct { float r, g, b; } Color;
+typedef struct { int w, h; Color *px; } Image;
+
+static inline Color rgb(float r, float g, float b) { return (Color){ r, g, b }; }
+static inline float clampf(float v, float lo, float hi) { return v < lo ? lo : v > hi ? hi : v; }
+static inline Color color_scale(Color c, float k) { return rgb(c.r * k, c.g * k, c.b * k); }
+
+Image image_new(int w, int h) {
+    Image im = { w, h, calloc((size_t)w * (size_t)h, sizeof(Color)) };
+    return im;
+}
+
+void image_free(Image *im) {
+    free(im->px);
+    im->px = NULL;
+    im->w = im->h = 0;
+}
+
+Color *image_at(Image *im, int x, int y) {
+    return &im->px[(size_t)y * im->w + x];
+}
+
+uint8_t to_byte(float v) {
+    if (!(v > 0.0f)) return 0;
+    if (v >= 1.0f) return 255;
+    return (uint8_t)(v * 255.0f + 0.5f);
+}
+
+float srgb_encode(float l) {
+    if (!(l > 0.0f)) return 0.0f;
+    if (l >= 1.0f) return 1.0f;
+    return l <= 0.0031308f ? 12.92f * l : 1.055f * powf(l, 1.0f / 2.4f) - 0.055f;
+}
+
+float srgb_decode(float s) {
+    if (!(s > 0.0f)) return 0.0f;
+    if (s >= 1.0f) return 1.0f;
+    return s <= 0.04045f ? s / 12.92f : powf((s + 0.055f) / 1.055f, 2.4f);
+}
+
+void srgb_lut_init(uint8_t lut[4096]) {
+    for (int i = 0; i < 4096; i++) lut[i] = to_byte(srgb_encode(i / 4095.0f));
+}
+
+static inline int lut_index(float v) {
+    if (!(v > 0.0f)) return 0;
+    if (v >= 1.0f) return 4095;
+    return (int)(v * 4095.0f + 0.5f);
+}
+
+void image_write_ppm_srgb(const Image *im, FILE *f, const uint8_t lut[4096]) {
+    fprintf(f, "P3\n%d %d\n255\n", im->w, im->h);
+    for (int y = 0; y < im->h; y++) {
+        const Color *row = im->px + (size_t)y * im->w;
+        for (int x = 0; x < im->w; x++)
+            fprintf(f, x ? " %d %d %d" : "%d %d %d", lut[lut_index(row[x].r)], lut[lut_index(row[x].g)],
+                    lut[lut_index(row[x].b)]);
+        fputc('\n', f);
+    }
+}
+
+Color color_lerp(Color a, Color b, float t) {
+    return rgb(a.r + (b.r - a.r) * t, a.g + (b.g - a.g) * t, a.b + (b.b - a.b) * t);
+}
+
+float lerpf(float a, float b, float t) { return a + (b - a) * t; }
+
+float smoothstepf(float e0, float e1, float x) {
+    float t = clampf((x - e0) / (e1 - e0), 0.0f, 1.0f);
+    return t * t * (3.0f - 2.0f * t);
+}
+
+typedef struct { float pos; Color c; } Stop;
+
+Color ramp_sample(const Stop *s, int n, float t) {
+    if (t <= s[0].pos) return s[0].c;
+    if (t >= s[n - 1].pos) return s[n - 1].c;
+    int i = 0;
+    while (i < n - 2 && t > s[i + 1].pos) i++;
+    float span = s[i + 1].pos - s[i].pos;
+    if (span <= 0.0f) return s[i + 1].c;
+    return color_lerp(s[i].c, s[i + 1].c, (t - s[i].pos) / span);
+}
+
+Color cosine_palette(float t, Color a, Color b, Color c, Color d) {
+    const float tau = 6.2831853f;
+    return rgb(a.r + b.r * cosf(tau * (c.r * t + d.r)), a.g + b.g * cosf(tau * (c.g * t + d.g)),
+               a.b + b.b * cosf(tau * (c.b * t + d.b)));
+}
+
+/* ---------- From "Vector math for graphics" ---------- */
+typedef struct { float x, y; } vec2;
+typedef struct { float x, y, z; } vec3;
+
+static inline vec3 v3(float x, float y, float z) { return (vec3){ x, y, z }; }
+static inline float v3_dot(vec3 a, vec3 b) { return a.x * b.x + a.y * b.y + a.z * b.z; }
+
+vec3 v3_normalize(vec3 a) {
+    float l2 = v3_dot(a, a);
+    if (l2 < 1e-20f) return v3(0, 0, 0);
+    float k = 1.0f / sqrtf(l2);
+    return v3(a.x * k, a.y * k, a.z * k);
+}
+
+/* ---------- Noise ---------- */
+
+uint32_t hash_u32(uint32_t x) {
+    uint32_t state = x * 747796405u + 2891336453u;
+    uint32_t word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
+    return (word >> 22u) ^ word;
+}
+
+uint32_t hash2(int x, int y, uint32_t seed) {
+    return hash_u32((uint32_t)x + hash_u32((uint32_t)y + hash_u32(seed)));
+}
+
+float hash2f(int x, int y, uint32_t seed) {
+    return (hash2(x, y, seed) >> 8) * (1.0f / 16777216.0f);
+}
+
+float fade_cubic(float t) {
+    return t * t * (3.0f - 2.0f * t);
+}
+
+float fade_quintic(float t) {
+    return t * t * t * (t * (t * 6.0f - 15.0f) + 10.0f);
+}
+
+float value_noise2(float x, float y, uint32_t seed) {
+    float fx = floorf(x), fy = floorf(y);
+    int ix = (int)fx, iy = (int)fy;
+    float u = fade_quintic(x - fx), v = fade_quintic(y - fy);
+    float a = hash2f(ix, iy, seed), b = hash2f(ix + 1, iy, seed);
+    float c = hash2f(ix, iy + 1, seed), d = hash2f(ix + 1, iy + 1, seed);
+    return lerpf(lerpf(a, b, u), lerpf(c, d, u), v);
+}
+
+typedef struct { uint8_t perm[512]; } Perlin;
+
+void perlin_init(Perlin *p, uint32_t seed) {
+    for (int i = 0; i < 256; i++) p->perm[i] = (uint8_t)i;
+    uint32_t base = hash_u32(seed);
+    for (int i = 255; i > 0; i--) {
+        uint32_t j = hash_u32(base + (uint32_t)i) % (uint32_t)(i + 1);
+        uint8_t t = p->perm[i];
+        p->perm[i] = p->perm[j];
+        p->perm[j] = t;
+    }
+    for (int i = 0; i < 256; i++) p->perm[256 + i] = p->perm[i];
+}
+
+/* Ken Perlin's permutation from "Improving Noise" (2002). */
+void perlin_init_reference(Perlin *p) {
+    static const uint8_t KEN[256] = {
+        151,160,137,91,90,15,131,13,201,95,96,53,194,233,7,225,140,36,103,30,69,142,8,99,37,240,21,10,23,
+        190,6,148,247,120,234,75,0,26,197,62,94,252,219,203,117,35,11,32,57,177,33,88,237,149,56,87,174,20,
+        125,136,171,168,68,175,74,165,71,134,139,48,27,166,77,146,158,231,83,111,229,122,60,211,133,230,220,
+        105,92,41,55,46,245,40,244,102,143,54,65,25,63,161,1,216,80,73,209,76,132,187,208,89,18,169,200,196,
+        135,130,116,188,159,86,164,100,109,198,173,186,3,64,52,217,226,250,124,123,5,202,38,147,118,126,255,
+        82,85,212,207,206,59,227,47,16,58,17,182,189,28,42,223,183,170,213,119,248,152,2,44,154,163,70,221,
+        153,101,155,167,43,172,9,129,22,39,253,19,98,108,110,79,113,224,232,178,185,112,104,218,246,97,228,
+        251,34,242,193,238,210,144,12,191,179,162,241,81,51,145,235,249,14,239,107,49,192,214,31,181,199,106,
+        157,184,84,204,176,115,121,50,45,127,4,150,254,138,236,205,93,222,114,67,29,24,72,243,141,128,195,78,
+        66,215,61,156,180
+    };
+    for (int i = 0; i < 256; i++) p->perm[i] = p->perm[256 + i] = KEN[i];
+}
+
+static const float GRAD2[8][2] = { { 1, 1 }, { -1, 1 }, { 1, -1 }, { -1, -1 }, { 1, 0 }, { -1, 0 }, { 0, 1 }, { 0, -1 } };
+
+float grad2(int hash, float x, float y) {
+    const float *g = GRAD2[hash & 7];
+    return g[0] * x + g[1] * y;
+}
+
+float perlin2(const Perlin *p, float x, float y) {
+    float fx = floorf(x), fy = floorf(y);
+    int X = (int)fx & 255, Y = (int)fy & 255;
+    x -= fx;
+    y -= fy;
+    float u = fade_quintic(x), v = fade_quintic(y);
+    const uint8_t *P = p->perm;
+    int aa = P[P[X] + Y], ba = P[P[X + 1] + Y], ab = P[P[X] + Y + 1], bb = P[P[X + 1] + Y + 1];
+    return lerpf(lerpf(grad2(aa, x, y), grad2(ba, x - 1, y), u),
+                 lerpf(grad2(ab, x, y - 1), grad2(bb, x - 1, y - 1), u), v);
+}
+
+float grad3(int hash, float x, float y, float z) {
+    int h = hash & 15;
+    float u = h < 8 ? x : y;
+    float v = h < 4 ? y : (h == 12 || h == 14) ? x : z;
+    return ((h & 1) ? -u : u) + ((h & 2) ? -v : v);
+}
+
+float perlin3(const Perlin *p, float x, float y, float z) {
+    float fx = floorf(x), fy = floorf(y), fz = floorf(z);
+    int X = (int)fx & 255, Y = (int)fy & 255, Z = (int)fz & 255;
+    x -= fx;
+    y -= fy;
+    z -= fz;
+    float u = fade_quintic(x), v = fade_quintic(y), w = fade_quintic(z);
+    const uint8_t *P = p->perm;
+    int A = P[X] + Y, AA = P[A] + Z, AB = P[A + 1] + Z;
+    int B = P[X + 1] + Y, BA = P[B] + Z, BB = P[B + 1] + Z;
+    return lerpf(lerpf(lerpf(grad3(P[AA], x, y, z), grad3(P[BA], x - 1, y, z), u),
+                       lerpf(grad3(P[AB], x, y - 1, z), grad3(P[BB], x - 1, y - 1, z), u), v),
+                 lerpf(lerpf(grad3(P[AA + 1], x, y, z - 1), grad3(P[BA + 1], x - 1, y, z - 1), u),
+                       lerpf(grad3(P[AB + 1], x, y - 1, z - 1), grad3(P[BB + 1], x - 1, y - 1, z - 1), u), v),
+                 w);
+}
+
+float simplex2(const Perlin *p, float x, float y) {
+    const float F2 = 0.36602540378f, G2 = 0.21132486540f;
+    const uint8_t *P = p->perm;
+    float s = (x + y) * F2;
+    float fi = floorf(x + s), fj = floorf(y + s);
+    float t = (fi + fj) * G2;
+    float x0 = x - (fi - t), y0 = y - (fj - t);
+    int i1 = x0 > y0 ? 1 : 0, j1 = 1 - i1;
+    float x1 = x0 - i1 + G2, y1 = y0 - j1 + G2;
+    float x2 = x0 - 1.0f + 2.0f * G2, y2 = y0 - 1.0f + 2.0f * G2;
+    int ii = (int)fi & 255, jj = (int)fj & 255;
+    int g0 = P[ii + P[jj]], g1 = P[ii + i1 + P[jj + j1]], g2 = P[ii + 1 + P[jj + 1]];
+    float n = 0;
+    float t0 = 0.5f - x0 * x0 - y0 * y0;
+    if (t0 > 0) { t0 *= t0; n += t0 * t0 * grad2(g0, x0, y0); }
+    float t1 = 0.5f - x1 * x1 - y1 * y1;
+    if (t1 > 0) { t1 *= t1; n += t1 * t1 * grad2(g1, x1, y1); }
+    float t2 = 0.5f - x2 * x2 - y2 * y2;
+    if (t2 > 0) { t2 *= t2; n += t2 * t2 * grad2(g2, x2, y2); }
+    return 70.0f * n;
+}
+
+float fbm2(const Perlin *p, float x, float y, int octaves, float lacunarity, float gain) {
+    float sum = 0, amp = 1, freq = 1;
+    for (int i = 0; i < octaves; i++) {
+        float o = 17.13f * i;
+        sum += amp * perlin2(p, x * freq + o, y * freq + o);
+        freq *= lacunarity;
+        amp *= gain;
+    }
+    return sum;
+}
+
+float turbulence2(const Perlin *p, float x, float y, int octaves, float lacunarity, float gain) {
+    float sum = 0, amp = 1, freq = 1;
+    for (int i = 0; i < octaves; i++) {
+        float o = 17.13f * i;
+        sum += amp * fabsf(perlin2(p, x * freq + o, y * freq + o));
+        freq *= lacunarity;
+        amp *= gain;
+    }
+    return sum;
+}
+
+float ridged2(const Perlin *p, float x, float y, int octaves, float lacunarity, float gain) {
+    float sum = 0, amp = 1, freq = 1, weight = 1;
+    for (int i = 0; i < octaves; i++) {
+        float o = 17.13f * i;
+        float r = 1.0f - fabsf(perlin2(p, x * freq + o, y * freq + o));
+        r *= r;
+        sum += r * amp * weight;
+        weight = r;
+        freq *= lacunarity;
+        amp *= gain;
+    }
+    return sum;
+}
+
+float warp2(const Perlin *p, float x, float y, float k, int octaves, vec2 *q_out, vec2 *r_out) {
+    vec2 q = { fbm2(p, x, y, octaves, 2.0f, 0.5f), fbm2(p, x + 5.2f, y + 1.3f, octaves, 2.0f, 0.5f) };
+    float wx = x + k * q.x, wy = y + k * q.y;
+    vec2 r = { fbm2(p, wx + 1.7f, wy + 9.2f, octaves, 2.0f, 0.5f), fbm2(p, wx + 8.3f, wy + 2.8f, octaves, 2.0f, 0.5f) };
+    if (q_out) *q_out = q;
+    if (r_out) *r_out = r;
+    return fbm2(p, x + k * r.x, y + k * r.y, octaves, 2.0f, 0.5f);
+}
+
+static inline int mod_pos(int a, int n) {
+    int m = a % n;
+    return m < 0 ? m + n : m;
+}
+
+float perlin2_tiled(const Perlin *p, float x, float y, int period) {
+    float fx = floorf(x), fy = floorf(y);
+    int X0 = mod_pos((int)fx, period), Y0 = mod_pos((int)fy, period);
+    int X1 = (X0 + 1) % period, Y1 = (Y0 + 1) % period;
+    x -= fx;
+    y -= fy;
+    float u = fade_quintic(x), v = fade_quintic(y);
+    const uint8_t *P = p->perm;
+    int aa = P[P[X0] + Y0], ba = P[P[X1] + Y0], ab = P[P[X0] + Y1], bb = P[P[X1] + Y1];
+    return lerpf(lerpf(grad2(aa, x, y), grad2(ba, x - 1, y), u),
+                 lerpf(grad2(ab, x, y - 1), grad2(bb, x - 1, y - 1), u), v);
+}
+
+float fbm2_tiled(const Perlin *p, float x, float y, int period, int octaves) {
+    float sum = 0, amp = 1, freq = 1;
+    for (int i = 0; i < octaves; i++) {
+        sum += amp * perlin2_tiled(p, x * freq, y * freq, period << i);
+        freq *= 2.0f;
+        amp *= 0.5f;
+    }
+    return sum;
+}
+
+float value_noise2_d(float x, float y, uint32_t seed, float *dx, float *dy) {
+    float fx = floorf(x), fy = floorf(y);
+    int ix = (int)fx, iy = (int)fy;
+    float tx = x - fx, ty = y - fy;
+    float u = fade_quintic(tx), v = fade_quintic(ty);
+    float du = 30.0f * tx * tx * (tx - 1.0f) * (tx - 1.0f), dv = 30.0f * ty * ty * (ty - 1.0f) * (ty - 1.0f);
+    float a = hash2f(ix, iy, seed), b = hash2f(ix + 1, iy, seed);
+    float c = hash2f(ix, iy + 1, seed), d = hash2f(ix + 1, iy + 1, seed);
+    float k = a - b - c + d;
+    *dx = du * ((b - a) + k * v);
+    *dy = dv * ((c - a) + k * u);
+    return a + (b - a) * u + (c - a) * v + k * u * v;
+}
+
+float fbm_value_d(float x, float y, uint32_t seed, int octaves, float *dx, float *dy) {
+    float sum = 0, sx = 0, sy = 0, amp = 1, freq = 1;
+    for (int i = 0; i < octaves; i++) {
+        float nx, ny;
+        sum += amp * value_noise2_d(x * freq, y * freq, seed + (uint32_t)i, &nx, &ny);
+        sx += amp * freq * nx;
+        sy += amp * freq * ny;
+        freq *= 2.0f;
+        amp *= 0.5f;
+    }
+    *dx = sx;
+    *dy = sy;
+    return sum;
+}
+
+/* Quilez-style "eroded" fBm: each octave is damped by the slope accumulated so far. */
+static float terrain(float x, float y, float *gx, float *gy) {
+    float h = 0, sx = 0, sy = 0, amp = 0.5f, freq = 1;
+    for (int i = 0; i < 7; i++) {
+        float nx, ny, n = value_noise2_d(x * freq, y * freq, 100 + (uint32_t)i, &nx, &ny);
+        sx += amp * freq * nx;
+        sy += amp * freq * ny;
+        h += amp * n / (1.0f + sx * sx + sy * sy);
+        freq *= 2.0f;
+        amp *= 0.5f;
+    }
+    *gx = sx;
+    *gy = sy;
+    return h;
+}
+
+int main(void) {
+    static uint8_t lut[4096];
+    srgb_lut_init(lut);
+    Image im = image_new(128, 128);
+    if (!im.px) return 1;
+    vec3 sun = v3_normalize(v3(-0.8f, 0.6f, -0.3f));
+    Stop ramp[] = { { 0.20f, { 0.05f, 0.12f, 0.25f } }, { 0.30f, { 0.10f, 0.25f, 0.08f } }, { 0.45f, { 0.30f, 0.28f, 0.12f } },
+                    { 0.60f, { 0.35f, 0.30f, 0.28f } }, { 0.70f, { 0.90f, 0.90f, 0.95f } } };
+    for (int y = 0; y < im.h; y++)
+        for (int x = 0; x < im.w; x++) {
+            float dx, dy, h = terrain(x / 40.0f, y / 40.0f, &dx, &dy);
+            vec3 n = v3_normalize(v3(-0.4f * dx, 1.0f, -0.4f * dy));
+            float light = 0.25f + 0.9f * fmaxf(0.0f, v3_dot(n, sun));
+            *image_at(&im, x, y) = color_scale(ramp_sample(ramp, 5, h), light);
+        }
+    image_write_ppm_srgb(&im, stdout, lut);
+    image_free(&im);
+    return 0;
+}
+--- stubs
+float value_noise2_d(float x, float y, uint32_t seed, float *dx, float *dy) {
+    *dx = *dy = 0;
+    return value_noise2(x, y, seed);
+}
+
+float fbm_value_d(float x, float y, uint32_t seed, int octaves, float *dx, float *dy) {
+    (void)octaves;
+    return value_noise2_d(x, y, seed, dx, dy);
+}
+--- hint
+Write the noise in the expanded form `a + (b-a) u + (c-a) v + k u v`; then each derivative is the derivative of `u` (or `v`) times what multiplies it.
+--- hint
+For fBm, `value_noise2_d(x * freq, ...)` returns the derivative with respect to its own argument `x * freq`; multiply by `freq` to get the derivative with respect to `x`.
+--- harness
+static int check_d(float x, float y, uint32_t seed) {
+    float dx, dy, h = 1e-3f, ex, ey;
+    float n = value_noise2_d(x, y, seed, &dx, &dy);
+    if (fabsf(n - value_noise2(x, y, seed)) > 1e-6f) return 0;
+    ex = (value_noise2(x + h, y, seed) - value_noise2(x - h, y, seed)) / (2 * h);
+    ey = (value_noise2(x, y + h, seed) - value_noise2(x, y - h, seed)) / (2 * h);
+    return fabsf(dx - ex) < 2e-2f * (1 + fabsf(ex)) && fabsf(dy - ey) < 2e-2f * (1 + fabsf(ey));
+}
+
+int main(void) {
+    CHECK(check_d(0.3f, 0.7f, 1));
+    CHECK(check_d(5.45f, 2.12f, 2));
+    CHECK(check_d(-3.6f, 8.81f, 3));
+    CHECK(check_d(-0.25f, -0.5f, 4));
+    CHECK(check_d(12.9f, -7.35f, 5));
+    float dx = 9, dy = 9;
+    float n = value_noise2_d(4.0f, 7.0f, 6, &dx, &dy);
+    CHECK_DBL(n, hash2f(4, 7, 6));
+    CHECK(fabsf(dx) < 1e-6f && fabsf(dy) < 1e-6f);
+    n = value_noise2_d(1.5f, 2.5f, 9, &dx, &dy);
+    float a = hash2f(1, 2, 9), b = hash2f(2, 2, 9), c = hash2f(1, 3, 9), d = hash2f(2, 3, 9);
+    CHECK(fabsf(dx - 1.875f * ((b - a) + (a - b - c + d) * 0.5f)) < 1e-5f);
+    CHECK(fabsf(dy - 1.875f * ((c - a) + (a - b - c + d) * 0.5f)) < 1e-5f);
+
+    float fx, fy;
+    float f = fbm_value_d(0.37f, 1.21f, 10, 1, &fx, &fy);
+    CHECK_DBL(f, value_noise2(0.37f, 1.21f, 10));
+    f = fbm_value_d(0.37f, 1.21f, 10, 5, &fx, &fy);
+    float want = 0, amp = 1, freq = 1;
+    for (int i = 0; i < 5; i++) { want += amp * value_noise2(0.37f * freq, 1.21f * freq, 10 + i); amp *= 0.5f; freq *= 2; }
+    CHECK(fabsf(f - want) < 1e-5f);
+    float h = 1e-3f, ex = 0, ey = 0, tmp1, tmp2;
+    ex = (fbm_value_d(0.37f + h, 1.21f, 10, 5, &tmp1, &tmp2) - fbm_value_d(0.37f - h, 1.21f, 10, 5, &tmp1, &tmp2)) / (2 * h);
+    ey = (fbm_value_d(0.37f, 1.21f + h, 10, 5, &tmp1, &tmp2) - fbm_value_d(0.37f, 1.21f - h, 10, 5, &tmp1, &tmp2)) / (2 * h);
+    CHECK(fabsf(fx - ex) < 5e-2f * (1 + fabsf(ex)));
+    CHECK(fabsf(fy - ey) < 5e-2f * (1 + fabsf(ey)));
+    f = fbm_value_d(-2.6f, 3.3f, 1, 6, &fx, &fy);
+    CHECK(fabsf(f - 0.705516f) < 1e-4f);
+    CHECK(fabsf(fx - 1.90644f) < 1e-3f);
+    CHECK(fabsf(fy - 0.396297f) < 1e-3f);
+    return TEST_END();
+}
+
+=== quiz
+--- q
+Why is `rand()` called once per pixel a poor basis for procedural generation?
+--- choice
+`rand()` is too slow to call per pixel.
+--- answer
+Its result depends on call order and hidden global state, differs between C libraries, has no spatial coherence, and can't be evaluated at an arbitrary position on its own.
+--- choice
+`rand()` returns only values up to `RAND_MAX`, which is too small for colors.
+--- choice
+`rand()` is undefined behavior when called from multiple loops.
+--- explain
+A hash of (position, seed) is order-independent, stateless, portable, and gives random access: what chunked worlds, GPU shaders and multithreaded generators need.
+
+=== quiz
+run: yes
+--- q
+What does this print?
+--- code
+#include <math.h>
+#include <stdio.h>
+
+int main(void) {
+    float x = -0.25f;
+    printf("%d %d %d\n", (int)x, (int)floorf(x), -1 % 8);
+    return 0;
+}
+--- choice
+-1 -1 7
+--- answer
+0 -1 -1
+--- choice
+0 -1 7
+--- choice
+-1 -1 -1
+--- explain
+Conversion to `int` truncates toward zero, so `(int)-0.25f` is 0: the wrong lattice cell. `floorf` rounds down. And `%` keeps the sign of the left operand, so a wrapping lattice index needs a fix-up for negatives.
+
+=== quiz
+--- q
+Why does Perlin's 2002 improved noise use the quintic `6t⁵ - 15t⁴ + 10t³` instead of the cubic `3t² - 2t³` to blend between lattice points?
+--- choice
+The quintic is cheaper to evaluate.
+--- choice
+The cubic doesn't reach 1 at `t = 1`.
+--- answer
+The quintic also has zero *second* derivative at the lattice points, so normals and lighting computed from the noise don't show creases along the grid.
+--- choice
+The quintic makes the noise range exactly [-1, 1].
+--- explain
+Both curves have zero slope at 0 and 1, so the values are smooth. The cubic's second derivative jumps at every lattice line, which shows up in anything computed from the slope (normals, lighting).
+
+=== quiz
+--- q
+An fBm has lacunarity 2 and gain 0.5, and is drawn into a 512-pixel-wide image where the base frequency gives 4 noise cells across the image. Roughly how many octaves are worth computing?
+--- choice
+3
+--- answer
+About 7: octave i has 4·2ⁱ cells across 512 pixels, and beyond about 2 pixels per cell (i ≈ 7) new octaves only add aliasing.
+--- choice
+16, so the result converges.
+--- choice
+As many as fit in the frame budget; more is always more detail.
+--- explain
+Octaves smaller than a pixel can't be represented; they alias into noise and cost time. Choose the octave count from the sampling rate.
+
+=== quiz
+--- q
+You need a 256×256 texture of fBm noise that tiles seamlessly. Which approach is correct and cheap?
+--- answer
+Wrap the lattice coordinates modulo the period before hashing (doubling the period with each octave), and sample over exactly one period.
+--- choice
+Generate normal noise and cross-fade a strip along each edge with the opposite edge.
+--- choice
+Mirror the texture horizontally and vertically.
+--- choice
+Use a larger permutation table so the repetition is less visible.
+--- explain
+A periodic lattice makes the noise function itself periodic, so the tile repeats exactly. Cross-fading blurs and loses contrast near the edges; mirroring creates obvious symmetry.

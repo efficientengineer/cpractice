@@ -7,8 +7,8 @@ window.CHAPTER_FILES = [
   '# Procedural graphics', 'p1-images', 'p2-vecmath', 'p3-noise', 'p4-textures', 'p5-terrain',
   'p6-lsystems', 'p7-raymarch', 'p8-performance'
 ];
-// The world course is one continuous project; chapters with "lib: yes" ship a reference engine
-// module in content/world/lib/FILE.js that later chapters load automatically.
+// The world course is one continuous project in C (native app in world/). A chapter's "lib:" header
+// names engine headers (world/engine/) it introduces; later chapters' online exercises get them prepended.
 window.WORLD_FILES = [
   '# Part 1: First light', '00-start', '01-noise', '02-compute', '03-terrain', '04-controller', '05-shading',
   '# Part 2: Terrain at scale', '06-shaping', '07-erosion', '08-chunks', '09-texturing', '10-materials',
@@ -17,8 +17,8 @@ window.WORLD_FILES = [
   '21-sky-water', '22-profiling', '23-world'
 ];
 window.COURSES = [
-  { id: 'world', title: 'Procedural World', lang: 'webgpu', dir: 'content/world', files: window.WORLD_FILES, canvas: [960, 540], pointerLock: true,
-    blurb: 'One continuous project: a procedural, high-detail open world in WebGPU. Terrain, cliffs, rocks, foliage, trees and procedural materials, with LOD, frustum and occlusion culling, GPU-driven rendering, shadows and full-screen effects.' },
+  { id: 'world', title: 'Procedural World', lang: 'c', dir: 'content/world', libDir: 'world/engine/', files: window.WORLD_FILES,
+    blurb: 'One continuous project in C: a procedural, high-detail open world on native WebGPU (Dawn). Terrain, cliffs, rocks, foliage, trees and procedural materials, with LOD, frustum and occlusion culling, GPU-driven rendering, shadows and full-screen effects.' },
   { id: 'js', title: 'JavaScript', lang: 'js', dir: 'content/js',
     files: ['00-start', '01-functions', '02-objects', '03-arrays', '04-classes', '05-collections', '06-async',
       '07-types', '08-strings', '09-functional', '10-binary', '11-metaprogramming', '12-projects',

@@ -66,8 +66,8 @@
   // Runs code for the current course. For WebGPU a fresh canvas is created in canvasHost.
   // Runs code for the current course. JS/WebGPU code that mentions `canvas` gets a fresh canvas
   // in canvasHost with keyboard/mouse forwarded to the worker; later console output streams into out.
-  function execute(code, stdin, canvasHost, out) {
-    if (isC()) return Runner.run(code, stdin);
+  async function execute(code, stdin, canvasHost, out) {
+    if (isC()) return Runner.run(await withCLibs(code), stdin);
     let canvas;
     if (canvasHost) canvasHost.hidden = true;
     if (canvasHost && /\bcanvas\b/.test(code)) {
@@ -107,10 +107,21 @@
     };
     return JSRunner.run(code, { canvas, libs: libsFor(curChapter), keepAlive: true, timeout: CUR.lang === 'webgpu' ? 15000 : 5000, onLate });
   }
+  // C courses with libDir: prepend the engine headers introduced by earlier chapters ("lib: a.h b.h").
+  const libText = {};
+  async function withCLibs(code) {
+    if (!CUR.libDir) return code;
+    const list = CUR.chapters, end = curChapter ? list.indexOf(curChapter) : list.length;
+    const names = list.slice(0, end).flatMap(c => (c.lib || '').split(/\s+/).filter(Boolean));
+    if (!names.length) return code;
+    const texts = await Promise.all(names.map(n => libText[n] ??= fetch(CUR.libDir + n).then(r => r.text())));
+    return Assemble.cLibs(names, texts) + code;
+  }
   // Engine libraries (header "lib: yes") of chapters before ch, or of all chapters in the playground.
   let curChapter = null;
   function libsFor(ch) {
     const list = CUR.chapters, end = ch ? list.indexOf(ch) : list.length;
+    if (CUR.libDir) return [];
     return list.slice(0, end).filter(c => c.lib === 'yes').map(c => `${CUR.dir}/lib/${c.file}.js`);
   }
   const assemble = (code, ex) => isC() ? Assemble.harness(code, ex) : JSRunner.harness(code, ex);
@@ -229,7 +240,7 @@
         ${ch.quiz.length ? `<h2 id="quiz">Check yourself</h2>${ch.quiz.map(quizHtml).join('')}` : ''}
         <h2 id="exercises">Exercises</h2>
         <ol class="exercises">${ch.exercises.map(e => `<li><a href="${R('ex/' + ch.id + '/' + e.id)}">${P.done[exKey(ch, e)] ? '✓' : '○'} ${esc(e.title)}</a>
-          <span class="muted small">${e.harness ? 'function' : 'program'}</span></li>`).join('')}</ol>
+          <span class="muted small">${e.harness ? 'function' : e.tests ? 'program' : 'local'}</span></li>`).join('')}</ol>
         <div class="pager">${prev ? `<a class="btn" href="${R('ch/' + prev.id)}">← ${esc(prev.title)}</a>` : '<span></span>'}
           ${next ? `<a class="btn" href="${R('ch/' + next.id)}">${esc(next.title)} →</a>` : ''}</div>
       </article>`;
@@ -246,14 +257,16 @@
     let hintsShown = 0;
     main.innerHTML = `
       <div class="exercise">
-        <div class="crumbs muted small"><a href="${R('ch/' + ch.id)}">${esc(ch.title)}</a> · exercise ${i + 1} of ${list.length} · ${ex.harness ? 'function exercise' : 'program exercise'}
+        <div class="crumbs muted small"><a href="${R('ch/' + ch.id)}">${esc(ch.title)}</a> · exercise ${i + 1} of ${list.length} · ${ex.harness ? 'function exercise' : ex.tests ? 'program exercise' : 'local step'}
           ${P.done[key] ? ' · <span class="ok">✓ solved</span>' : ''}</div>
         <h1>${esc(ex.title)}</h1>
         <div class="prompt">${MD.render(ex.prompt)}</div>
         <div class="hints"></div>
-        <div class="editorhost"></div>
+        <div class="editorhost" ${ex.local && !ex.harness && !ex.tests ? 'hidden' : ''}></div>
         ${isC() ? `<details class="stdinbox"><summary>stdin for Run</summary><textarea class="stdin" spellcheck="false">${esc(ex.tests ? ex.tests[0].stdin : '')}</textarea></details>` : ''}
-        <div class="toolbar">
+        ${ex.local ? `<div class="local"><div class="label">do this in your local project (world/)</div>${MD.render(ex.local)}
+          <button class="btn primary" id="markdone">${P.done[key] ? '✓ Done' : 'Mark as done'}</button></div>` : ''}
+        <div class="toolbar" ${ex.local && !ex.harness && !ex.tests ? 'hidden' : ''}>
           <button class="btn" id="run" title="Ctrl+Enter">▶ Run</button>
           <button class="btn primary" id="check" title="Ctrl+Shift+Enter">✓ Check</button>
           ${ex.hints.length ? `<button class="btn" id="hint">Hint (${ex.hints.length})</button>` : ''}
@@ -310,6 +323,7 @@
       if (res) showResult(out, res, banner); else out.innerHTML = banner + html + `<div class="backend muted">${esc(last.backend)}</div>`;
     };
     $('#run').onclick = run; $('#check').onclick = check;
+    if (ex.local) $('#markdone').onclick = () => { P.done[key] = !P.done[key]; save(); renderSide(ch, ex); $('#markdone').textContent = P.done[key] ? '✓ Done' : 'Mark as done'; };
     $('#reset').onclick = () => { if (confirm('Replace your code with the starter?')) ed.set(fromPrev ?? ex.starter); };
     $('#solution').onclick = () => {
       out.innerHTML = `<div class="label">reference solution</div><pre class="qcode"><code>${MD.highlight(ex.solution, CUR.lang)}</code></pre>

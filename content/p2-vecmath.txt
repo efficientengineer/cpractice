@@ -1,0 +1,4293 @@
+=== chapter p2-vecmath
+title: Vector math for graphics
+blurb: Project: a software 3D renderer. Vectors by value, column-major matrices, transforms, perspective and lookAt, quaternions, parametric meshes, wireframes, and filled triangles with a z-buffer and flat shading.
+--- body
+## What you are building
+
+This chapter turns the image library from "Images from scratch" into a tiny **software renderer**: the same pipeline a GPU runs, written out by hand in about 300 lines. Every step adds math you will use for the rest of your graphics life:
+
+1. `vec3` operations (dot, cross, normalize, reflect)
+2. 4×4 matrices, column-major
+3. translate, rotate, scale and composing them
+4. a camera: lookAt, perspective projection, the viewport
+5. quaternions
+6. parametric meshes: cube and UV sphere
+7. a torus
+8. wireframe rendering
+9. filled triangles: edge functions, the top-left rule, a z-buffer
+10. flat-shaded meshes, and a lit 3D scene
+
+The first step's starter contains the finished image library from the previous chapter (images, sRGB output, `put_pixel`, `draw_line`), trimmed to what the renderer needs.
+
+## Small vectors, passed by value
+
+```c
+typedef struct { float x, y; } vec2;
+typedef struct { float x, y, z; } vec3;
+typedef struct { float x, y, z, w; } vec4;
+
+static inline vec3 v3(float x, float y, float z) { return (vec3){ x, y, z }; }
+vec3 v3_add(vec3 a, vec3 b) { return v3(a.x + b.x, a.y + b.y, a.z + b.z); }
+```
+
+Pass and return these **by value**. A `vec3` is 12 bytes; on x86-64 and ARM64 small structs travel in registers, and the compiler inlines these functions away. Pointers (`void v3_add(vec3 *out, const vec3 *a, const vec3 *b)`) look "faster" to C# eyes but force values through memory, invite aliasing questions, and make expressions unreadable. C has no operator overloading, so you write `v3_add(a, v3_scale(b, 2))`; keep the names short.
+
+The operations you will use constantly:
+
+| Operation | Formula | Meaning |
+|---|---|---|
+| `dot(a, b)` | `ax bx + ay by + az bz` | `|a||b| cos θ`: how aligned two directions are; projection of `a` onto unit `b` |
+| `cross(a, b)` | `(ay bz - az by, az bx - ax bz, ax by - ay bx)` | perpendicular to both, length `|a||b| sin θ` (twice the triangle area); right-hand rule: `x × y = z` |
+| `length(a)` | `sqrt(dot(a, a))` | compare `dot(a, a)` against `r²` when you only need "closer than" |
+| `normalize(a)` | `a / length(a)` | unit direction; **guard the zero vector**, or you divide by zero and spread NaN through the frame |
+| `reflect(i, n)` | `i - 2 dot(i, n) n` | mirror direction `i` about unit normal `n`: bounces, specular highlights |
+
+Lambert's law, the basis of diffuse lighting, is one dot product: brightness `= max(0, dot(n, l))` with `n` the unit surface normal and `l` the unit direction *towards* the light. The first exercise uses exactly that to shade a sphere per pixel.
+
+> **Performance:** a `sqrtf` and a division per `normalize` are cheap today, but in per-pixel code avoid normalizing what is already unit length (normals from a normal map, directions you just normalized) and compare squared lengths instead of lengths. Multiply by `1.0f / len` once rather than dividing three times.
+
+## Matrices, column-major
+
+A 4×4 matrix transforms points in 3D with one multiply. We store it as 16 floats, **column-major**: element (row `r`, column `c`) lives at `m[c*4 + r]`. That is the layout OpenGL, WebGPU/WGSL (`mat4x4<f32>`), glm and most engines use, so a `mat4` can be copied straight into a GPU uniform buffer.
+
+```text
+         column 0   column 1   column 2   column 3
+row 0    m[0]       m[4]       m[8]       m[12]        | x' |   | Xx Yx Zx Tx | | x |
+row 1    m[1]       m[5]       m[9]       m[13]        | y' | = | Xy Yy Zy Ty | | y |
+row 2    m[2]       m[6]       m[10]      m[14]        | z' |   | Xz Yz Zz Tz | | z |
+row 3    m[3]       m[7]       m[11]      m[15]        | w' |   | 0  0  0  1  | | 1 |
+```
+
+The columns have a meaning: the first three are where the x, y and z axes go, and the fourth (`m[12..14]`) is the translation. Read a matrix by its columns and it tells you what it does.
+
+Vectors are columns and multiply on the right: `M v`. So `A B v = A (B v)`: **`B` is applied first**. A typical model matrix is `T * R * S`: scale the object, then rotate it, then move it into place. Reversing that order rotates the object around the world origin instead (an orbit, not a spin).
+
+### Points versus directions
+
+The fourth coordinate `w` separates them. A **point** has `w = 1`, so the translation column is added. A **direction** (a velocity, a normal, a light direction) has `w = 0` and only rotates and scales. Transforming a direction as a point is a classic bug: your light direction moves when the camera does.
+
+Normals have one more subtlety: under non-uniform scaling they must be transformed by the **inverse transpose** of the upper 3×3, or they stop being perpendicular to the surface. With only rotations and uniform scale the matrix itself works, and computing face normals from transformed positions (as the renderer here does) avoids the issue entirely.
+
+### The transforms
+
+```text
+translate(t):  identity with m[12], m[13], m[14] = t.x, t.y, t.z
+scale(s):      diagonal s.x, s.y, s.z, 1
+rotate_y(a):   x' =  cos a x + sin a z          right-handed: positive angles turn
+               z' = -sin a x + cos a z          counter-clockwise looking down the axis
+```
+
+Rotation about an arbitrary unit axis `(x, y, z)` is **Rodrigues' formula**; with `c = cos a`, `s = sin a`, `t = 1 - c`:
+
+```text
+| t x x + c     t x y - s z   t x z + s y |
+| t x y + s z   t y y + c     t y z - s x |
+| t x z - s y   t y z + s x   t z z + c   |
+```
+
+> **Performance:** a `mat4` is 64 bytes; passing it by value is fine for setup code, which runs a few times per object per frame. What matters is the per-vertex loop: compute `mvp = projection * view * model` **once**, then transform each vertex with one matrix-vector multiply. Multiplying three matrices per vertex is 3× the work for the same result. Hoisting invariant math out of loops is the most valuable habit in this chapter.
+
+## The camera: view, projection, viewport
+
+Rendering a point takes it through a chain of spaces:
+
+```text
+model space --model--> world space --view--> camera space --projection--> clip space
+   --divide by w--> NDC (-1..1, -1..1, 0..1) --viewport--> pixels
+```
+
+**View (lookAt).** The camera sits at `eye` and looks at `target`. Build an orthonormal basis: forward `f = normalize(target - eye)`, right `s = normalize(cross(f, up))`, true up `u = cross(s, f)`. The view matrix has `s`, `u`, `-f` as its *rows* (it is the inverse of the camera's own rotation) and a translation of `(-dot(s, eye), -dot(u, eye), dot(f, eye))`. In camera space the camera is at the origin looking down **-Z**, with +Y up: the right-handed convention of OpenGL and WebGPU.
+
+**Projection (perspective).** Things twice as far look half as big: divide x and y by the distance. A matrix can't divide, so it copies the distance `-z` into `w`, and the GPU divides by `w` afterwards (the *perspective divide*). With `f = 1 / tan(fovy / 2)`:
+
+```text
+| f/aspect  0    0                  0                |
+| 0         f    0                  0                |       w' = -z
+| 0         0    far/(near-far)     near*far/(near-far)|     depth = z'/w': 0 at near, 1 at far
+| 0         0   -1                  0                |
+```
+
+This is the WebGPU/Direct3D/Vulkan depth range, 0 to 1. (OpenGL's classic matrix maps to -1..1 instead; mixing the two up gives you a depth buffer that clips half the scene.) Depth is not linear in distance: most of the precision is near the near plane, so keep `near` as large as you can afford (0.1, not 0.0001).
+
+**Viewport.** NDC `x, y` in -1..1 become pixels: `sx = (x + 1)/2 * width`, and since image rows go *down*, `sy = (1 - y)/2 * height`.
+
+```c
+#include <math.h>
+#include <stdio.h>
+
+typedef struct { float x, y, z; } vec3;
+
+int main(void) {
+    /* Perspective by hand: a grid of points on the floor y = -1, camera at the origin looking down -Z. */
+    int w = 128, h = 96;
+    static unsigned char img[96][128];
+    float f = 1.0f / tanf(0.5f * 1.0f);                     /* fovy = 1 radian */
+    for (int i = -10; i <= 10; i++)
+        for (int k = 1; k <= 40; k++) {
+            vec3 p = { i * 0.5f, -1.0f, -k * 0.5f };
+            float ndc_x = f * (h / (float)w) * p.x / -p.z, ndc_y = f * p.y / -p.z;
+            int sx = (int)floorf((ndc_x + 1) * 0.5f * w), sy = (int)floorf((1 - ndc_y) * 0.5f * h);
+            if (sx >= 0 && sx < w && sy >= 0 && sy < h) img[sy][sx] = (unsigned char)(255 - k * 5);
+        }
+    printf("P2\n%d %d\n255\n", w, h);
+    for (int y = 0; y < h; y++) {
+        for (int x = 0; x < w; x++) printf("%d ", img[y][x]);
+        printf("\n");
+    }
+    return 0;
+}
+```
+
+The rows of dots crowd together toward the horizon line: that is the division by distance.
+
+## Quaternions
+
+Rotation matrices compose fine, but interpolating between two of them (an animation, a camera blend) by lerping their entries gives garbage, and Euler angles (yaw, pitch, roll) suffer gimbal lock. A **unit quaternion** `q = (axis sin(θ/2), cos(θ/2))` represents a rotation by `θ` about `axis` in four numbers:
+
+- compose: the Hamilton product `a * b` (rotate by `b`, then by `a`, like matrices);
+- rotate a vector: `t = 2 cross(q.xyz, v)`, `v' = v + q.w t + cross(q.xyz, t)`;
+- interpolate: **slerp**, constant angular speed along the shortest arc. `q` and `-q` are the same rotation, so if `dot(a, b) < 0` negate one to take the short way round; when they are nearly equal fall back to a normalized lerp to avoid dividing by `sin θ ≈ 0`.
+
+Engines store orientations as quaternions (cheaper to renormalize, smaller, interpolate well) and convert to a matrix once per object per frame for rendering.
+
+## Meshes are arrays
+
+A triangle mesh is a **vertex array** and an **index array**: three indices per triangle. Shared vertices are stored once, which is why GPUs take this format directly.
+
+```c
+typedef struct { vec3 *pos; int npos; int *idx; int nidx; } Mesh;   // nidx = 3 * triangles
+```
+
+Procedural models are parametric surfaces sampled on a grid. A **UV sphere** maps `(θ, φ)` (from the north pole down, and around) to `r (sin θ cos φ, cos θ, -sin θ sin φ)`; a **torus** maps `(u, v)` to `((R + r cos v) cos u, r sin v, -(R + r cos v) sin u)`. Sample a grid of `(i, j)`, generate vertices row by row, then two triangles per grid cell. The work is all in two details:
+
+- **Winding.** Triangles list their vertices counter-clockwise when seen from outside, so `cross(b - a, c - a)` points *outward*. The renderer uses that to skip back faces, and a mesh with mixed winding renders with holes.
+- **Seams and poles.** The sphere's grid has a seam where `φ` wraps (we duplicate that column, which texture coordinates will need later) and its first and last rows collapse to a point: those quads are triangles, so emit one triangle, not a degenerate one. The torus wraps in both directions, so it uses `(i + 1) % nu` and needs no duplicates.
+
+> **Performance:** compute the vertex and triangle counts first, allocate both arrays once, and fill them with a running index. Never `realloc` per vertex. Precompute the `cos`/`sin` of each column angle in a small table if you generate meshes per frame.
+
+## Rasterizing triangles
+
+**Wireframe** is the first view of any mesh: project every vertex once, then draw three lines per triangle.
+
+**Filling** uses **edge functions** (Pineda, 1988). For the edge from `a` to `b`,
+
+```text
+E_ab(p) = (b.x - a.x)(p.y - a.y) - (b.y - a.y)(p.x - a.x)
+```
+
+is twice the signed area of triangle `a, b, p`: positive on one side of the line, negative on the other. A pixel center `p` is inside the triangle when all three edge functions have the same sign as the triangle's area `E_ab(c)`. The three normalized values `E_bc(p)/area`, `E_ca(p)/area`, `E_ab(p)/area` are the **barycentric coordinates** of `p`: weights for interpolating anything across the triangle (depth now, colors and texture coordinates later).
+
+The algorithm is the same one GPUs implement in hardware:
+
+1. compute the triangle's bounding box, clipped to the image;
+2. for each pixel center in it, evaluate the three edge functions;
+3. if inside, interpolate depth, compare with the **z-buffer**, and write the pixel and depth if nearer.
+
+**The top-left rule.** A pixel center exactly on an edge shared by two triangles must be drawn by exactly one of them: drawing it twice double-blends transparent surfaces, drawing it zero times leaves cracks. The rule used by Direct3D, Vulkan and WebGPU: a center on an edge belongs to the triangle if that edge is a **top** edge (exactly horizontal, with the triangle below it) or a **left** edge (the triangle to its right). With vertices ordered so the area is positive in our y-down coordinates, a top edge has `dy == 0 && dx > 0` and a left edge has `dy < 0`.
+
+**Back-face culling.** After projection, triangles facing away from the camera have the opposite winding on screen. Skipping them halves the fill work for closed meshes and costs one cross product.
+
+**Flat shading.** One color per triangle, from its face normal: `base * (ambient + diffuse * max(0, dot(n, -light_dir)))`. Faceted, but it shows the form, and it is all you need to see your procedural meshes.
+
+> **Performance:** the bounding box keeps a small triangle from scanning the screen; the depth test before shading avoids work for hidden pixels; edge functions are linear, so a real rasterizer adds a constant per pixel instead of re-evaluating them (try it once your version passes). And transform each *vertex* once, not each triangle corner: a closed mesh shares every vertex between about six triangles.
+
+Further reading: Fabian Giesen's "A trip through the graphics pipeline" and his rasterization posts; Scratchapixel's rasterization lessons.
+
+=== exercise vm_vec
+title: Renderer, step 1: vec3 operations
+--- prompt
+The starter contains your image library from the previous chapter (trimmed to what the renderer needs) and the vector types. Write the `vec3` toolkit, all by value:
+
+- `v3_add`, `v3_sub`, `v3_scale(vec3 a, float s)`, `v3_lerp(vec3 a, vec3 b, float t)`
+- `float v3_dot(vec3 a, vec3 b)`, `vec3 v3_cross(vec3 a, vec3 b)` (right-handed: `cross(x, y) = z`), `float v3_length(vec3 a)`
+- `vec3 v3_normalize(vec3 a)`: unit vector in the direction of `a`; the **zero vector** (squared length below `1e-20`) returns `(0, 0, 0)` instead of NaNs.
+- `vec3 v3_reflect(vec3 i, vec3 n)`: `i - 2 dot(i, n) n` (`n` is unit length).
+
+Run shades a sphere per pixel with Lambert diffuse (`dot(n, l)`) and a Phong highlight (`reflect`) once your functions work.
+--- starter
+#include <math.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+/* ---------- From "Images from scratch" ---------- */
+typedef struct { float r, g, b; } Color;
+typedef struct { int w, h; Color *px; } Image;
+
+static inline Color rgb(float r, float g, float b) { return (Color){ r, g, b }; }
+static inline int clampi(int v, int lo, int hi) { return v < lo ? lo : v > hi ? hi : v; }
+static inline float clampf(float v, float lo, float hi) { return v < lo ? lo : v > hi ? hi : v; }
+static inline Color color_scale(Color c, float k) { return rgb(c.r * k, c.g * k, c.b * k); }
+
+Image image_new(int w, int h) {
+    Image im = { w, h, calloc((size_t)w * (size_t)h, sizeof(Color)) };
+    return im;
+}
+
+void image_free(Image *im) {
+    free(im->px);
+    im->px = NULL;
+    im->w = im->h = 0;
+}
+
+Color *image_at(Image *im, int x, int y) {
+    return &im->px[(size_t)y * im->w + x];
+}
+
+void image_fill(Image *im, Color c) {
+    size_t n = (size_t)im->w * im->h;
+    for (size_t i = 0; i < n; i++) im->px[i] = c;
+}
+
+uint8_t to_byte(float v) {
+    if (!(v > 0.0f)) return 0;
+    if (v >= 1.0f) return 255;
+    return (uint8_t)(v * 255.0f + 0.5f);
+}
+
+float srgb_encode(float l) {
+    if (!(l > 0.0f)) return 0.0f;
+    if (l >= 1.0f) return 1.0f;
+    return l <= 0.0031308f ? 12.92f * l : 1.055f * powf(l, 1.0f / 2.4f) - 0.055f;
+}
+
+void srgb_lut_init(uint8_t lut[4096]) {
+    for (int i = 0; i < 4096; i++) lut[i] = to_byte(srgb_encode(i / 4095.0f));
+}
+
+static inline int lut_index(float v) {
+    if (!(v > 0.0f)) return 0;
+    if (v >= 1.0f) return 4095;
+    return (int)(v * 4095.0f + 0.5f);
+}
+
+void image_write_ppm_srgb(const Image *im, FILE *f, const uint8_t lut[4096]) {
+    fprintf(f, "P3\n%d %d\n255\n", im->w, im->h);
+    for (int y = 0; y < im->h; y++) {
+        const Color *row = im->px + (size_t)y * im->w;
+        for (int x = 0; x < im->w; x++)
+            fprintf(f, x ? " %d %d %d" : "%d %d %d", lut[lut_index(row[x].r)], lut[lut_index(row[x].g)],
+                    lut[lut_index(row[x].b)]);
+        fputc('\n', f);
+    }
+}
+
+void put_pixel(Image *im, int x, int y, Color c) {
+    if (x < 0 || y < 0 || x >= im->w || y >= im->h) return;
+    im->px[(size_t)y * im->w + x] = c;
+}
+
+void draw_line(Image *im, int x0, int y0, int x1, int y1, Color c) {
+    int dx = abs(x1 - x0), sx = x0 < x1 ? 1 : -1;
+    int dy = -abs(y1 - y0), sy = y0 < y1 ? 1 : -1;
+    int err = dx + dy;
+    for (;;) {
+        put_pixel(im, x0, y0, c);
+        if (x0 == x1 && y0 == y1) break;
+        int e2 = 2 * err;
+        if (e2 >= dy) { err += dy; x0 += sx; }
+        if (e2 <= dx) { err += dx; y0 += sy; }
+    }
+}
+
+/* ---------- Vector math ---------- */
+typedef struct { float x, y; } vec2;
+typedef struct { float x, y, z; } vec3;
+typedef struct { float x, y, z, w; } vec4;
+
+static inline vec3 v3(float x, float y, float z) { return (vec3){ x, y, z }; }
+
+vec3 v3_add(vec3 a, vec3 b) { (void)b; return a; }
+vec3 v3_sub(vec3 a, vec3 b) { (void)b; return a; }
+vec3 v3_scale(vec3 a, float s) { (void)s; return a; }
+vec3 v3_lerp(vec3 a, vec3 b, float t) { (void)b; (void)t; return a; }
+float v3_dot(vec3 a, vec3 b) { (void)a; (void)b; return 0; }
+vec3 v3_cross(vec3 a, vec3 b) { (void)b; return a; }
+float v3_length(vec3 a) { (void)a; return 0; }
+vec3 v3_normalize(vec3 a) { return a; }
+vec3 v3_reflect(vec3 i, vec3 n) { (void)n; return i; }
+
+int main(void) {
+    static uint8_t lut[4096];
+    srgb_lut_init(lut);
+    Image im = image_new(128, 128);
+    if (!im.px) return 1;
+    vec3 light = v3_normalize(v3(-0.6f, 0.7f, 0.5f)), eye = v3(0, 0, 1);
+    for (int y = 0; y < im.h; y++)
+        for (int x = 0; x < im.w; x++) {
+            float px = (x + 0.5f) / 64 - 1, py = 1 - (y + 0.5f) / 64, r2 = px * px + py * py;
+            Color c = rgb(0.02f, 0.03f, 0.06f + 0.1f * (1 - py));
+            if (r2 < 0.81f) {
+                vec3 n = v3_normalize(v3(px, py, sqrtf(0.81f - r2)));
+                float diff = fmaxf(v3_dot(n, light), 0.0f);
+                vec3 refl = v3_reflect(v3_scale(light, -1), n);
+                float spec = powf(fmaxf(v3_dot(refl, eye), 0.0f), 40.0f);
+                c = rgb(0.02f + 0.8f * diff + spec, 0.01f + 0.3f * diff + spec, 0.01f + 0.1f * diff + spec);
+            }
+            *image_at(&im, x, y) = c;
+        }
+    image_write_ppm_srgb(&im, stdout, lut);
+    image_free(&im);
+    return 0;
+}
+--- solution
+#include <math.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+/* ---------- From "Images from scratch" ---------- */
+typedef struct { float r, g, b; } Color;
+typedef struct { int w, h; Color *px; } Image;
+
+static inline Color rgb(float r, float g, float b) { return (Color){ r, g, b }; }
+static inline int clampi(int v, int lo, int hi) { return v < lo ? lo : v > hi ? hi : v; }
+static inline float clampf(float v, float lo, float hi) { return v < lo ? lo : v > hi ? hi : v; }
+static inline Color color_scale(Color c, float k) { return rgb(c.r * k, c.g * k, c.b * k); }
+
+Image image_new(int w, int h) {
+    Image im = { w, h, calloc((size_t)w * (size_t)h, sizeof(Color)) };
+    return im;
+}
+
+void image_free(Image *im) {
+    free(im->px);
+    im->px = NULL;
+    im->w = im->h = 0;
+}
+
+Color *image_at(Image *im, int x, int y) {
+    return &im->px[(size_t)y * im->w + x];
+}
+
+void image_fill(Image *im, Color c) {
+    size_t n = (size_t)im->w * im->h;
+    for (size_t i = 0; i < n; i++) im->px[i] = c;
+}
+
+uint8_t to_byte(float v) {
+    if (!(v > 0.0f)) return 0;
+    if (v >= 1.0f) return 255;
+    return (uint8_t)(v * 255.0f + 0.5f);
+}
+
+float srgb_encode(float l) {
+    if (!(l > 0.0f)) return 0.0f;
+    if (l >= 1.0f) return 1.0f;
+    return l <= 0.0031308f ? 12.92f * l : 1.055f * powf(l, 1.0f / 2.4f) - 0.055f;
+}
+
+void srgb_lut_init(uint8_t lut[4096]) {
+    for (int i = 0; i < 4096; i++) lut[i] = to_byte(srgb_encode(i / 4095.0f));
+}
+
+static inline int lut_index(float v) {
+    if (!(v > 0.0f)) return 0;
+    if (v >= 1.0f) return 4095;
+    return (int)(v * 4095.0f + 0.5f);
+}
+
+void image_write_ppm_srgb(const Image *im, FILE *f, const uint8_t lut[4096]) {
+    fprintf(f, "P3\n%d %d\n255\n", im->w, im->h);
+    for (int y = 0; y < im->h; y++) {
+        const Color *row = im->px + (size_t)y * im->w;
+        for (int x = 0; x < im->w; x++)
+            fprintf(f, x ? " %d %d %d" : "%d %d %d", lut[lut_index(row[x].r)], lut[lut_index(row[x].g)],
+                    lut[lut_index(row[x].b)]);
+        fputc('\n', f);
+    }
+}
+
+void put_pixel(Image *im, int x, int y, Color c) {
+    if (x < 0 || y < 0 || x >= im->w || y >= im->h) return;
+    im->px[(size_t)y * im->w + x] = c;
+}
+
+void draw_line(Image *im, int x0, int y0, int x1, int y1, Color c) {
+    int dx = abs(x1 - x0), sx = x0 < x1 ? 1 : -1;
+    int dy = -abs(y1 - y0), sy = y0 < y1 ? 1 : -1;
+    int err = dx + dy;
+    for (;;) {
+        put_pixel(im, x0, y0, c);
+        if (x0 == x1 && y0 == y1) break;
+        int e2 = 2 * err;
+        if (e2 >= dy) { err += dy; x0 += sx; }
+        if (e2 <= dx) { err += dx; y0 += sy; }
+    }
+}
+
+/* ---------- Vector math ---------- */
+typedef struct { float x, y; } vec2;
+typedef struct { float x, y, z; } vec3;
+typedef struct { float x, y, z, w; } vec4;
+
+static inline vec3 v3(float x, float y, float z) { return (vec3){ x, y, z }; }
+
+vec3 v3_add(vec3 a, vec3 b) { return v3(a.x + b.x, a.y + b.y, a.z + b.z); }
+vec3 v3_sub(vec3 a, vec3 b) { return v3(a.x - b.x, a.y - b.y, a.z - b.z); }
+vec3 v3_scale(vec3 a, float s) { return v3(a.x * s, a.y * s, a.z * s); }
+vec3 v3_lerp(vec3 a, vec3 b, float t) { return v3(a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t, a.z + (b.z - a.z) * t); }
+float v3_dot(vec3 a, vec3 b) { return a.x * b.x + a.y * b.y + a.z * b.z; }
+vec3 v3_cross(vec3 a, vec3 b) { return v3(a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x); }
+float v3_length(vec3 a) { return sqrtf(v3_dot(a, a)); }
+
+vec3 v3_normalize(vec3 a) {
+    float l2 = v3_dot(a, a);
+    if (l2 < 1e-20f) return v3(0, 0, 0);
+    return v3_scale(a, 1.0f / sqrtf(l2));
+}
+
+vec3 v3_reflect(vec3 i, vec3 n) { return v3_sub(i, v3_scale(n, 2.0f * v3_dot(i, n))); }
+
+int main(void) {
+    static uint8_t lut[4096];
+    srgb_lut_init(lut);
+    Image im = image_new(128, 128);
+    if (!im.px) return 1;
+    vec3 light = v3_normalize(v3(-0.6f, 0.7f, 0.5f)), eye = v3(0, 0, 1);
+    for (int y = 0; y < im.h; y++)
+        for (int x = 0; x < im.w; x++) {
+            float px = (x + 0.5f) / 64 - 1, py = 1 - (y + 0.5f) / 64, r2 = px * px + py * py;
+            Color c = rgb(0.02f, 0.03f, 0.06f + 0.1f * (1 - py));
+            if (r2 < 0.81f) {
+                vec3 n = v3_normalize(v3(px, py, sqrtf(0.81f - r2)));
+                float diff = fmaxf(v3_dot(n, light), 0.0f);
+                vec3 refl = v3_reflect(v3_scale(light, -1), n);
+                float spec = powf(fmaxf(v3_dot(refl, eye), 0.0f), 40.0f);
+                c = rgb(0.02f + 0.8f * diff + spec, 0.01f + 0.3f * diff + spec, 0.01f + 0.1f * diff + spec);
+            }
+            *image_at(&im, x, y) = c;
+        }
+    image_write_ppm_srgb(&im, stdout, lut);
+    image_free(&im);
+    return 0;
+}
+--- hint
+`v3_normalize`: compute `l2 = v3_dot(a, a)` once, return the zero vector if it is tiny, otherwise scale by `1.0f / sqrtf(l2)`.
+--- hint
+Check your cross product with the right-hand rule: `cross((1,0,0), (0,1,0))` must be `(0,0,1)`.
+--- harness
+#define NEAR3(v, X, Y, Z) CHECK(fabsf((v).x - (X)) < 1e-5f && fabsf((v).y - (Y)) < 1e-5f && fabsf((v).z - (Z)) < 1e-5f)
+int main(void) {
+    vec3 a = v3(1, 2, 3), b = v3(-4, 0.5f, 2);
+    NEAR3(v3_add(a, b), -3, 2.5f, 5);
+    NEAR3(v3_sub(a, b), 5, 1.5f, 1);
+    NEAR3(v3_scale(a, -2), -2, -4, -6);
+    NEAR3(v3_lerp(a, b, 0.25f), -0.25f, 1.625f, 2.75f);
+    CHECK_DBL(v3_dot(a, b), 3.0);
+    NEAR3(v3_cross(v3(1, 0, 0), v3(0, 1, 0)), 0, 0, 1);
+    NEAR3(v3_cross(v3(0, 1, 0), v3(0, 0, 1)), 1, 0, 0);
+    NEAR3(v3_cross(v3(0, 0, 1), v3(1, 0, 0)), 0, 1, 0);
+    NEAR3(v3_cross(a, b), 2.5f, -14, 8.5f);
+    vec3 c = v3_cross(a, b);
+    CHECK(fabsf(v3_dot(c, a)) < 1e-4f && fabsf(v3_dot(c, b)) < 1e-4f);
+    NEAR3(v3_cross(a, a), 0, 0, 0);
+    CHECK_DBL(v3_length(v3(3, 4, 12)), 13.0);
+    NEAR3(v3_normalize(v3(3, 0, 4)), 0.6f, 0, 0.8f);
+    NEAR3(v3_normalize(v3(0, -7, 0)), 0, -1, 0);
+    CHECK(fabsf(v3_length(v3_normalize(v3(1e-3f, 2e-3f, -5e-4f))) - 1) < 1e-5f);
+    vec3 z = v3_normalize(v3(0, 0, 0));
+    CHECK(z.x == 0 && z.y == 0 && z.z == 0);
+    z = v3_normalize(v3(1e-12f, 0, 0));
+    CHECK(z.x == z.x && z.y == z.y && z.z == z.z);
+    NEAR3(v3_reflect(v3(1, -1, 0), v3(0, 1, 0)), 1, 1, 0);
+    NEAR3(v3_reflect(v3(0.6f, -0.8f, 0), v3(0, 1, 0)), 0.6f, 0.8f, 0);
+    vec3 n = v3_normalize(v3(1, 1, 0));
+    NEAR3(v3_reflect(v3(-1, 0, 0), n), 0, 1, 0);
+    return TEST_END();
+}
+
+=== exercise vm_mat
+title: Renderer, step 2: column-major mat4
+continues: vm_vec
+--- prompt
+Add the matrix type and its core operations. Put the type in your code:
+
+```c
+typedef struct { float m[16]; } mat4;   /* column-major: row r, column c is m[c * 4 + r] */
+```
+
+- `mat4 mat4_identity(void)`
+- `mat4 mat4_mul(mat4 a, mat4 b)`: the product `a * b` (apply `b` first, then `a`): `r[c][row] = sum over k of a[k][row] * b[c][k]`, where `[col][row]` means `m[col * 4 + row]`.
+- `vec4 mat4_mul_vec4(mat4 a, vec4 v)`: `a * v`, so `x' = m[0] x + m[4] y + m[8] z + m[12] w`, and so on.
+- `vec3 mat4_mul_point(mat4 a, vec3 p)`: `a * (p, 1)`, returning `x, y, z` (no division by `w`; for affine matrices `w` stays 1).
+- `vec3 mat4_mul_dir(mat4 a, vec3 d)`: `a * (d, 0)`: translation does not apply to directions.
+
+The tests fill a matrix with `m[c*4 + r] = 10*r + c` so that a row/column mix-up shows immediately.
+--- solution
+#include <math.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+/* ---------- From "Images from scratch" ---------- */
+typedef struct { float r, g, b; } Color;
+typedef struct { int w, h; Color *px; } Image;
+
+static inline Color rgb(float r, float g, float b) { return (Color){ r, g, b }; }
+static inline int clampi(int v, int lo, int hi) { return v < lo ? lo : v > hi ? hi : v; }
+static inline float clampf(float v, float lo, float hi) { return v < lo ? lo : v > hi ? hi : v; }
+static inline Color color_scale(Color c, float k) { return rgb(c.r * k, c.g * k, c.b * k); }
+
+Image image_new(int w, int h) {
+    Image im = { w, h, calloc((size_t)w * (size_t)h, sizeof(Color)) };
+    return im;
+}
+
+void image_free(Image *im) {
+    free(im->px);
+    im->px = NULL;
+    im->w = im->h = 0;
+}
+
+Color *image_at(Image *im, int x, int y) {
+    return &im->px[(size_t)y * im->w + x];
+}
+
+void image_fill(Image *im, Color c) {
+    size_t n = (size_t)im->w * im->h;
+    for (size_t i = 0; i < n; i++) im->px[i] = c;
+}
+
+uint8_t to_byte(float v) {
+    if (!(v > 0.0f)) return 0;
+    if (v >= 1.0f) return 255;
+    return (uint8_t)(v * 255.0f + 0.5f);
+}
+
+float srgb_encode(float l) {
+    if (!(l > 0.0f)) return 0.0f;
+    if (l >= 1.0f) return 1.0f;
+    return l <= 0.0031308f ? 12.92f * l : 1.055f * powf(l, 1.0f / 2.4f) - 0.055f;
+}
+
+void srgb_lut_init(uint8_t lut[4096]) {
+    for (int i = 0; i < 4096; i++) lut[i] = to_byte(srgb_encode(i / 4095.0f));
+}
+
+static inline int lut_index(float v) {
+    if (!(v > 0.0f)) return 0;
+    if (v >= 1.0f) return 4095;
+    return (int)(v * 4095.0f + 0.5f);
+}
+
+void image_write_ppm_srgb(const Image *im, FILE *f, const uint8_t lut[4096]) {
+    fprintf(f, "P3\n%d %d\n255\n", im->w, im->h);
+    for (int y = 0; y < im->h; y++) {
+        const Color *row = im->px + (size_t)y * im->w;
+        for (int x = 0; x < im->w; x++)
+            fprintf(f, x ? " %d %d %d" : "%d %d %d", lut[lut_index(row[x].r)], lut[lut_index(row[x].g)],
+                    lut[lut_index(row[x].b)]);
+        fputc('\n', f);
+    }
+}
+
+void put_pixel(Image *im, int x, int y, Color c) {
+    if (x < 0 || y < 0 || x >= im->w || y >= im->h) return;
+    im->px[(size_t)y * im->w + x] = c;
+}
+
+void draw_line(Image *im, int x0, int y0, int x1, int y1, Color c) {
+    int dx = abs(x1 - x0), sx = x0 < x1 ? 1 : -1;
+    int dy = -abs(y1 - y0), sy = y0 < y1 ? 1 : -1;
+    int err = dx + dy;
+    for (;;) {
+        put_pixel(im, x0, y0, c);
+        if (x0 == x1 && y0 == y1) break;
+        int e2 = 2 * err;
+        if (e2 >= dy) { err += dy; x0 += sx; }
+        if (e2 <= dx) { err += dx; y0 += sy; }
+    }
+}
+
+/* ---------- Vector math ---------- */
+typedef struct { float x, y; } vec2;
+typedef struct { float x, y, z; } vec3;
+typedef struct { float x, y, z, w; } vec4;
+
+static inline vec3 v3(float x, float y, float z) { return (vec3){ x, y, z }; }
+
+vec3 v3_add(vec3 a, vec3 b) { return v3(a.x + b.x, a.y + b.y, a.z + b.z); }
+vec3 v3_sub(vec3 a, vec3 b) { return v3(a.x - b.x, a.y - b.y, a.z - b.z); }
+vec3 v3_scale(vec3 a, float s) { return v3(a.x * s, a.y * s, a.z * s); }
+vec3 v3_lerp(vec3 a, vec3 b, float t) { return v3(a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t, a.z + (b.z - a.z) * t); }
+float v3_dot(vec3 a, vec3 b) { return a.x * b.x + a.y * b.y + a.z * b.z; }
+vec3 v3_cross(vec3 a, vec3 b) { return v3(a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x); }
+float v3_length(vec3 a) { return sqrtf(v3_dot(a, a)); }
+
+vec3 v3_normalize(vec3 a) {
+    float l2 = v3_dot(a, a);
+    if (l2 < 1e-20f) return v3(0, 0, 0);
+    return v3_scale(a, 1.0f / sqrtf(l2));
+}
+
+vec3 v3_reflect(vec3 i, vec3 n) { return v3_sub(i, v3_scale(n, 2.0f * v3_dot(i, n))); }
+
+typedef struct { float m[16]; } mat4;
+
+mat4 mat4_identity(void) {
+    mat4 r = { { 0 } };
+    r.m[0] = r.m[5] = r.m[10] = r.m[15] = 1.0f;
+    return r;
+}
+
+mat4 mat4_mul(mat4 a, mat4 b) {
+    mat4 r;
+    for (int c = 0; c < 4; c++)
+        for (int row = 0; row < 4; row++) {
+            float s = 0;
+            for (int k = 0; k < 4; k++) s += a.m[k * 4 + row] * b.m[c * 4 + k];
+            r.m[c * 4 + row] = s;
+        }
+    return r;
+}
+
+vec4 mat4_mul_vec4(mat4 a, vec4 v) {
+    const float *m = a.m;
+    return (vec4){ m[0] * v.x + m[4] * v.y + m[8] * v.z + m[12] * v.w,
+                   m[1] * v.x + m[5] * v.y + m[9] * v.z + m[13] * v.w,
+                   m[2] * v.x + m[6] * v.y + m[10] * v.z + m[14] * v.w,
+                   m[3] * v.x + m[7] * v.y + m[11] * v.z + m[15] * v.w };
+}
+
+vec3 mat4_mul_point(mat4 a, vec3 p) {
+    const float *m = a.m;
+    return v3(m[0] * p.x + m[4] * p.y + m[8] * p.z + m[12],
+              m[1] * p.x + m[5] * p.y + m[9] * p.z + m[13],
+              m[2] * p.x + m[6] * p.y + m[10] * p.z + m[14]);
+}
+
+vec3 mat4_mul_dir(mat4 a, vec3 d) {
+    const float *m = a.m;
+    return v3(m[0] * d.x + m[4] * d.y + m[8] * d.z,
+              m[1] * d.x + m[5] * d.y + m[9] * d.z,
+              m[2] * d.x + m[6] * d.y + m[10] * d.z);
+}
+
+int main(void) {
+    static uint8_t lut[4096];
+    srgb_lut_init(lut);
+    Image im = image_new(128, 128);
+    if (!im.px) return 1;
+    /* A spiral: one matrix that rotates by 0.15 rad, scales by 0.985 and drifts, applied repeatedly. */
+    float c = cosf(0.15f) * 0.985f, s = sinf(0.15f) * 0.985f;
+    mat4 step = mat4_identity();
+    step.m[0] = c; step.m[1] = s; step.m[4] = -s; step.m[5] = c;
+    step.m[12] = 0.01f;
+    for (int arm = 0; arm < 3; arm++) {
+        mat4 acc = mat4_identity();
+        float a0 = arm * 2.0944f;
+        vec3 start = v3(60 * cosf(a0), 60 * sinf(a0), 0), prev = start;
+        for (int i = 0; i < 260; i++) {
+            acc = mat4_mul(step, acc);
+            vec3 p = mat4_mul_point(acc, start);
+            Color col = rgb(0.2f + 0.8f * (arm == 0), 0.2f + 0.8f * (arm == 1), 0.2f + 0.8f * (arm == 2));
+            draw_line(&im, 64 + (int)prev.x, 64 - (int)prev.y, 64 + (int)p.x, 64 - (int)p.y, color_scale(col, 1 - i / 300.0f));
+            prev = p;
+        }
+    }
+    image_write_ppm_srgb(&im, stdout, lut);
+    image_free(&im);
+    return 0;
+}
+--- stubs
+typedef struct { float m[16]; } mat4;
+
+mat4 mat4_identity(void) { mat4 r = { { 0 } }; return r; }
+mat4 mat4_mul(mat4 a, mat4 b) { (void)b; return a; }
+vec4 mat4_mul_vec4(mat4 a, vec4 v) { (void)a; return v; }
+vec3 mat4_mul_point(mat4 a, vec3 p) { (void)a; return p; }
+vec3 mat4_mul_dir(mat4 a, vec3 d) { (void)a; return d; }
+--- hint
+In `mat4_mul`, loop over the result's column `c` and row `row`, and sum `a.m[k*4 + row] * b.m[c*4 + k]` over `k`.
+--- hint
+`mat4_mul_point` is `mat4_mul_vec4` with `w = 1`; `mat4_mul_dir` with `w = 0`. Writing them out avoids the multiplications by 0 and 1.
+--- harness
+#define NEAR3(v, X, Y, Z) CHECK(fabsf((v).x - (X)) < 1e-4f && fabsf((v).y - (Y)) < 1e-4f && fabsf((v).z - (Z)) < 1e-4f)
+int main(void) {
+    mat4 id = mat4_identity();
+    int ok = 1;
+    for (int i = 0; i < 16; i++) if (id.m[i] != ((i % 5 == 0) ? 1.0f : 0.0f)) ok = 0;
+    CHECK(ok);
+    mat4 a;
+    for (int c = 0; c < 4; c++) for (int r = 0; r < 4; r++) a.m[c * 4 + r] = 10.0f * r + c;
+    vec4 v = mat4_mul_vec4(a, (vec4){ 1, 0, 0, 0 });
+    CHECK(v.x == 0 && v.y == 10 && v.z == 20 && v.w == 30);
+    v = mat4_mul_vec4(a, (vec4){ 0, 0, 0, 1 });
+    CHECK(v.x == 3 && v.y == 13 && v.z == 23 && v.w == 33);
+    v = mat4_mul_vec4(a, (vec4){ 1, 2, 3, 4 });
+    CHECK(v.x == 20 && v.y == 120 && v.z == 220 && v.w == 320);
+    mat4 p = mat4_mul(a, id), q = mat4_mul(id, a);
+    ok = 1;
+    for (int i = 0; i < 16; i++) if (p.m[i] != a.m[i] || q.m[i] != a.m[i]) ok = 0;
+    CHECK(ok);
+    mat4 b = id;
+    b.m[12] = 5; b.m[13] = -1;
+    b.m[0] = 2;
+    mat4 ab = mat4_mul(a, b), ba = mat4_mul(b, a);
+    CHECK_DBL(ab.m[0], 0.0);
+    CHECK_DBL(ab.m[1], 20.0);
+    CHECK_DBL(ab.m[12], 2.0);
+    CHECK_DBL(ab.m[13], 52.0);
+    CHECK_DBL(ab.m[15], 152.0);
+    CHECK_DBL(ba.m[0], 150.0);
+    CHECK_DBL(ba.m[3], 30.0);
+    CHECK_DBL(ba.m[4], 157.0);
+    CHECK_DBL(ba.m[5], 11.0 - 31.0);
+    vec4 x = (vec4){ 0.5f, -1, 2, 1 };
+    vec4 lhs = mat4_mul_vec4(mat4_mul(a, b), x), rhs = mat4_mul_vec4(a, mat4_mul_vec4(b, x));
+    CHECK(fabsf(lhs.x - rhs.x) < 1e-3f && fabsf(lhs.y - rhs.y) < 1e-3f && fabsf(lhs.w - rhs.w) < 1e-3f);
+    NEAR3(mat4_mul_point(b, v3(1, 1, 1)), 7, 0, 1);
+    NEAR3(mat4_mul_dir(b, v3(1, 1, 1)), 2, 1, 1);
+    NEAR3(mat4_mul_point(a, v3(1, 2, 3)), 11, 81, 151);
+    NEAR3(mat4_mul_dir(a, v3(1, 2, 3)), 8, 68, 128);
+    return TEST_END();
+}
+
+=== exercise vm_xform
+title: Renderer, step 3: translate, rotate, scale
+continues: vm_mat
+--- prompt
+Add the transform builders. All rotations are right-handed (counter-clockwise when looking down the axis toward the origin), angles in radians:
+
+- `mat4 mat4_translate(vec3 t)`, `mat4 mat4_scale(vec3 s)`
+- `mat4 mat4_rotate_x(float a)`: `y' = c y - s z`, `z' = s y + c z`
+- `mat4 mat4_rotate_y(float a)`: `x' = c x + s z`, `z' = -s x + c z`
+- `mat4 mat4_rotate_z(float a)`: `x' = c x - s y`, `y' = s x + c y`
+- `mat4 mat4_rotate_axis(vec3 axis, float a)`: Rodrigues' formula (see the chapter text); normalize `axis` first, so callers can pass `(0, 2, 0)`.
+
+Remember the layout: the matrix entry in row `r`, column `c` goes to `m[c*4 + r]`. `rotate_z`, for example, has `m[0] = c, m[1] = s, m[4] = -s, m[5] = c`.
+
+Run draws a little orrery: each planet's square is transformed by `rotate(orbit) * translate(distance) * rotate(spin) * scale(size)`. Read it right to left.
+--- solution
+#include <math.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+/* ---------- From "Images from scratch" ---------- */
+typedef struct { float r, g, b; } Color;
+typedef struct { int w, h; Color *px; } Image;
+
+static inline Color rgb(float r, float g, float b) { return (Color){ r, g, b }; }
+static inline int clampi(int v, int lo, int hi) { return v < lo ? lo : v > hi ? hi : v; }
+static inline float clampf(float v, float lo, float hi) { return v < lo ? lo : v > hi ? hi : v; }
+static inline Color color_scale(Color c, float k) { return rgb(c.r * k, c.g * k, c.b * k); }
+
+Image image_new(int w, int h) {
+    Image im = { w, h, calloc((size_t)w * (size_t)h, sizeof(Color)) };
+    return im;
+}
+
+void image_free(Image *im) {
+    free(im->px);
+    im->px = NULL;
+    im->w = im->h = 0;
+}
+
+Color *image_at(Image *im, int x, int y) {
+    return &im->px[(size_t)y * im->w + x];
+}
+
+void image_fill(Image *im, Color c) {
+    size_t n = (size_t)im->w * im->h;
+    for (size_t i = 0; i < n; i++) im->px[i] = c;
+}
+
+uint8_t to_byte(float v) {
+    if (!(v > 0.0f)) return 0;
+    if (v >= 1.0f) return 255;
+    return (uint8_t)(v * 255.0f + 0.5f);
+}
+
+float srgb_encode(float l) {
+    if (!(l > 0.0f)) return 0.0f;
+    if (l >= 1.0f) return 1.0f;
+    return l <= 0.0031308f ? 12.92f * l : 1.055f * powf(l, 1.0f / 2.4f) - 0.055f;
+}
+
+void srgb_lut_init(uint8_t lut[4096]) {
+    for (int i = 0; i < 4096; i++) lut[i] = to_byte(srgb_encode(i / 4095.0f));
+}
+
+static inline int lut_index(float v) {
+    if (!(v > 0.0f)) return 0;
+    if (v >= 1.0f) return 4095;
+    return (int)(v * 4095.0f + 0.5f);
+}
+
+void image_write_ppm_srgb(const Image *im, FILE *f, const uint8_t lut[4096]) {
+    fprintf(f, "P3\n%d %d\n255\n", im->w, im->h);
+    for (int y = 0; y < im->h; y++) {
+        const Color *row = im->px + (size_t)y * im->w;
+        for (int x = 0; x < im->w; x++)
+            fprintf(f, x ? " %d %d %d" : "%d %d %d", lut[lut_index(row[x].r)], lut[lut_index(row[x].g)],
+                    lut[lut_index(row[x].b)]);
+        fputc('\n', f);
+    }
+}
+
+void put_pixel(Image *im, int x, int y, Color c) {
+    if (x < 0 || y < 0 || x >= im->w || y >= im->h) return;
+    im->px[(size_t)y * im->w + x] = c;
+}
+
+void draw_line(Image *im, int x0, int y0, int x1, int y1, Color c) {
+    int dx = abs(x1 - x0), sx = x0 < x1 ? 1 : -1;
+    int dy = -abs(y1 - y0), sy = y0 < y1 ? 1 : -1;
+    int err = dx + dy;
+    for (;;) {
+        put_pixel(im, x0, y0, c);
+        if (x0 == x1 && y0 == y1) break;
+        int e2 = 2 * err;
+        if (e2 >= dy) { err += dy; x0 += sx; }
+        if (e2 <= dx) { err += dx; y0 += sy; }
+    }
+}
+
+/* ---------- Vector math ---------- */
+typedef struct { float x, y; } vec2;
+typedef struct { float x, y, z; } vec3;
+typedef struct { float x, y, z, w; } vec4;
+
+static inline vec3 v3(float x, float y, float z) { return (vec3){ x, y, z }; }
+
+vec3 v3_add(vec3 a, vec3 b) { return v3(a.x + b.x, a.y + b.y, a.z + b.z); }
+vec3 v3_sub(vec3 a, vec3 b) { return v3(a.x - b.x, a.y - b.y, a.z - b.z); }
+vec3 v3_scale(vec3 a, float s) { return v3(a.x * s, a.y * s, a.z * s); }
+vec3 v3_lerp(vec3 a, vec3 b, float t) { return v3(a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t, a.z + (b.z - a.z) * t); }
+float v3_dot(vec3 a, vec3 b) { return a.x * b.x + a.y * b.y + a.z * b.z; }
+vec3 v3_cross(vec3 a, vec3 b) { return v3(a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x); }
+float v3_length(vec3 a) { return sqrtf(v3_dot(a, a)); }
+
+vec3 v3_normalize(vec3 a) {
+    float l2 = v3_dot(a, a);
+    if (l2 < 1e-20f) return v3(0, 0, 0);
+    return v3_scale(a, 1.0f / sqrtf(l2));
+}
+
+vec3 v3_reflect(vec3 i, vec3 n) { return v3_sub(i, v3_scale(n, 2.0f * v3_dot(i, n))); }
+
+typedef struct { float m[16]; } mat4;
+
+mat4 mat4_identity(void) {
+    mat4 r = { { 0 } };
+    r.m[0] = r.m[5] = r.m[10] = r.m[15] = 1.0f;
+    return r;
+}
+
+mat4 mat4_mul(mat4 a, mat4 b) {
+    mat4 r;
+    for (int c = 0; c < 4; c++)
+        for (int row = 0; row < 4; row++) {
+            float s = 0;
+            for (int k = 0; k < 4; k++) s += a.m[k * 4 + row] * b.m[c * 4 + k];
+            r.m[c * 4 + row] = s;
+        }
+    return r;
+}
+
+vec4 mat4_mul_vec4(mat4 a, vec4 v) {
+    const float *m = a.m;
+    return (vec4){ m[0] * v.x + m[4] * v.y + m[8] * v.z + m[12] * v.w,
+                   m[1] * v.x + m[5] * v.y + m[9] * v.z + m[13] * v.w,
+                   m[2] * v.x + m[6] * v.y + m[10] * v.z + m[14] * v.w,
+                   m[3] * v.x + m[7] * v.y + m[11] * v.z + m[15] * v.w };
+}
+
+vec3 mat4_mul_point(mat4 a, vec3 p) {
+    const float *m = a.m;
+    return v3(m[0] * p.x + m[4] * p.y + m[8] * p.z + m[12],
+              m[1] * p.x + m[5] * p.y + m[9] * p.z + m[13],
+              m[2] * p.x + m[6] * p.y + m[10] * p.z + m[14]);
+}
+
+vec3 mat4_mul_dir(mat4 a, vec3 d) {
+    const float *m = a.m;
+    return v3(m[0] * d.x + m[4] * d.y + m[8] * d.z,
+              m[1] * d.x + m[5] * d.y + m[9] * d.z,
+              m[2] * d.x + m[6] * d.y + m[10] * d.z);
+}
+
+mat4 mat4_translate(vec3 t) {
+    mat4 r = mat4_identity();
+    r.m[12] = t.x; r.m[13] = t.y; r.m[14] = t.z;
+    return r;
+}
+
+mat4 mat4_scale(vec3 s) {
+    mat4 r = mat4_identity();
+    r.m[0] = s.x; r.m[5] = s.y; r.m[10] = s.z;
+    return r;
+}
+
+mat4 mat4_rotate_x(float a) {
+    mat4 r = mat4_identity();
+    float c = cosf(a), s = sinf(a);
+    r.m[5] = c; r.m[6] = s; r.m[9] = -s; r.m[10] = c;
+    return r;
+}
+
+mat4 mat4_rotate_y(float a) {
+    mat4 r = mat4_identity();
+    float c = cosf(a), s = sinf(a);
+    r.m[0] = c; r.m[2] = -s; r.m[8] = s; r.m[10] = c;
+    return r;
+}
+
+mat4 mat4_rotate_z(float a) {
+    mat4 r = mat4_identity();
+    float c = cosf(a), s = sinf(a);
+    r.m[0] = c; r.m[1] = s; r.m[4] = -s; r.m[5] = c;
+    return r;
+}
+
+mat4 mat4_rotate_axis(vec3 axis, float a) {
+    vec3 n = v3_normalize(axis);
+    float c = cosf(a), s = sinf(a), t = 1.0f - c;
+    float x = n.x, y = n.y, z = n.z;
+    mat4 r = mat4_identity();
+    r.m[0] = t * x * x + c;     r.m[4] = t * x * y - s * z; r.m[8] = t * x * z + s * y;
+    r.m[1] = t * x * y + s * z; r.m[5] = t * y * y + c;     r.m[9] = t * y * z - s * x;
+    r.m[2] = t * x * z - s * y; r.m[6] = t * y * z + s * x; r.m[10] = t * z * z + c;
+    return r;
+}
+
+static void draw_square(Image *im, mat4 m, Color c) {
+    vec3 q[4] = { v3(-1, -1, 0), v3(1, -1, 0), v3(1, 1, 0), v3(-1, 1, 0) };
+    for (int i = 0; i < 4; i++) {
+        vec3 a = mat4_mul_point(m, q[i]), b = mat4_mul_point(m, q[(i + 1) % 4]);
+        draw_line(im, 64 + (int)lroundf(a.x), 64 - (int)lroundf(a.y), 64 + (int)lroundf(b.x), 64 - (int)lroundf(b.y), c);
+    }
+}
+
+int main(void) {
+    static uint8_t lut[4096];
+    srgb_lut_init(lut);
+    Image im = image_new(128, 128);
+    if (!im.px) return 1;
+    draw_square(&im, mat4_mul(mat4_rotate_z(0.3f), mat4_scale(v3(8, 8, 1))), rgb(1, 0.8f, 0.2f));
+    for (int p = 0; p < 5; p++) {
+        float dist = 18 + p * 10, size = 2 + p % 3;
+        for (int k = 0; k < 12; k++) {          /* 12 snapshots along the orbit */
+            float t = k / 12.0f;
+            mat4 m = mat4_mul(mat4_rotate_z(t * 6.2831853f + p), mat4_mul(mat4_translate(v3(dist, 0, 0)),
+                     mat4_mul(mat4_rotate_z(t * 20), mat4_scale(v3(size, size * 0.6f, 1)))));
+            draw_square(&im, m, rgb(0.2f + 0.15f * p, 0.9f - 0.15f * p, 0.5f + 0.4f * t));
+        }
+    }
+    image_write_ppm_srgb(&im, stdout, lut);
+    image_free(&im);
+    return 0;
+}
+--- stubs
+mat4 mat4_translate(vec3 t) { (void)t; return mat4_identity(); }
+mat4 mat4_scale(vec3 s) { (void)s; return mat4_identity(); }
+mat4 mat4_rotate_x(float a) { (void)a; return mat4_identity(); }
+mat4 mat4_rotate_y(float a) { (void)a; return mat4_identity(); }
+mat4 mat4_rotate_z(float a) { (void)a; return mat4_identity(); }
+mat4 mat4_rotate_axis(vec3 axis, float a) { (void)axis; (void)a; return mat4_identity(); }
+--- hint
+Write each rotation as a 3×3 block in row/column form first, then place each entry at `m[col*4 + row]`. `rotate_y` has `m[0] = c, m[2] = -s, m[8] = s, m[10] = c`.
+--- hint
+`rotate_axis` with axis `(0, 1, 0)` must equal `rotate_y`: a quick self-check.
+--- harness
+#define NEAR3(v, X, Y, Z) CHECK(fabsf((v).x - (X)) < 1e-5f && fabsf((v).y - (Y)) < 1e-5f && fabsf((v).z - (Z)) < 1e-5f)
+static int mat_near(mat4 a, mat4 b) {
+    for (int i = 0; i < 16; i++) if (fabsf(a.m[i] - b.m[i]) > 1e-5f) return 0;
+    return 1;
+}
+int main(void) {
+    const float H = 1.5707963f;
+    NEAR3(mat4_mul_point(mat4_translate(v3(1, 2, 3)), v3(1, 1, 1)), 2, 3, 4);
+    NEAR3(mat4_mul_dir(mat4_translate(v3(1, 2, 3)), v3(1, 1, 1)), 1, 1, 1);
+    NEAR3(mat4_mul_point(mat4_scale(v3(2, -1, 0.5f)), v3(1, 2, 3)), 2, -2, 1.5f);
+    NEAR3(mat4_mul_point(mat4_rotate_x(H), v3(0, 1, 0)), 0, 0, 1);
+    NEAR3(mat4_mul_point(mat4_rotate_x(H), v3(0, 0, 1)), 0, -1, 0);
+    NEAR3(mat4_mul_point(mat4_rotate_y(H), v3(1, 0, 0)), 0, 0, -1);
+    NEAR3(mat4_mul_point(mat4_rotate_y(H), v3(0, 0, 1)), 1, 0, 0);
+    NEAR3(mat4_mul_point(mat4_rotate_z(H), v3(1, 0, 0)), 0, 1, 0);
+    NEAR3(mat4_mul_point(mat4_rotate_z(H), v3(0, 1, 0)), -1, 0, 0);
+    NEAR3(mat4_mul_point(mat4_rotate_z(0.5f), v3(2, 0, 7)), 2 * cosf(0.5f), 2 * sinf(0.5f), 7);
+    CHECK(mat_near(mat4_rotate_axis(v3(0, 2, 0), 0.7f), mat4_rotate_y(0.7f)));
+    CHECK(mat_near(mat4_rotate_axis(v3(-3, 0, 0), 0.4f), mat4_rotate_x(-0.4f)));
+    CHECK(mat_near(mat4_rotate_axis(v3(0, 0, 1), -1.2f), mat4_rotate_z(-1.2f)));
+    mat4 r = mat4_rotate_axis(v3(1, 1, 1), 2.0943951f);
+    NEAR3(mat4_mul_point(r, v3(1, 0, 0)), 0, 1, 0);
+    NEAR3(mat4_mul_point(r, v3(0, 1, 0)), 0, 0, 1);
+    r = mat4_rotate_axis(v3(0.3f, -0.5f, 0.8f), 1.1f);
+    vec3 p = mat4_mul_point(r, v3(2, -1, 0.5f));
+    CHECK(fabsf(v3_length(p) - v3_length(v3(2, -1, 0.5f))) < 1e-5f);
+    vec3 ax = v3_normalize(v3(0.3f, -0.5f, 0.8f));
+    NEAR3(mat4_mul_point(r, ax), ax.x, ax.y, ax.z);
+    mat4 tr = mat4_mul(mat4_translate(v3(5, 0, 0)), mat4_rotate_z(H));
+    mat4 rt = mat4_mul(mat4_rotate_z(H), mat4_translate(v3(5, 0, 0)));
+    NEAR3(mat4_mul_point(tr, v3(1, 0, 0)), 5, 1, 0);
+    NEAR3(mat4_mul_point(rt, v3(1, 0, 0)), 0, 6, 0);
+    mat4 trs = mat4_mul(mat4_translate(v3(0, 0, -3)), mat4_mul(mat4_rotate_y(H), mat4_scale(v3(2, 2, 2))));
+    NEAR3(mat4_mul_point(trs, v3(1, 0, 0)), 0, 0, -5);
+    NEAR3(mat4_mul_dir(trs, v3(1, 0, 0)), 0, 0, -2);
+    return TEST_END();
+}
+
+=== exercise vm_camera
+title: Renderer, step 4: lookAt, perspective, viewport
+continues: vm_xform
+--- prompt
+Add the camera. Right-handed, the camera looks down **-Z** in view space, and depth maps to **0..1** (the WebGPU/Direct3D/Vulkan convention).
+
+- `mat4 mat4_look_at(vec3 eye, vec3 target, vec3 up)`: `f = normalize(target - eye)`, `s = normalize(cross(f, up))`, `u = cross(s, f)`. Rows 0, 1, 2 of the upper 3×3 are `s`, `u`, `-f` (so `m[0] = s.x, m[4] = s.y, m[8] = s.z`, and so on), and the translation column is `(-dot(s, eye), -dot(u, eye), dot(f, eye))`.
+- `mat4 mat4_perspective(float fovy, float aspect, float znear, float zfar)`: with `f = 1 / tanf(fovy / 2)`: `m[0] = f / aspect`, `m[5] = f`, `m[10] = zfar / (znear - zfar)`, `m[11] = -1`, `m[14] = znear * zfar / (znear - zfar)`, everything else 0. A view-space point at `z = -znear` gets depth 0, at `z = -zfar` depth 1.
+- `vec4 to_screen(mat4 mvp, vec3 p, int w, int h)`: transform `(p, 1)` to clip space `c`. If `c.w <= 1e-6` (at or behind the camera) return `(0, 0, -1, c.w)`. Otherwise divide by `c.w` and map to pixels: `x = (ndc.x * 0.5 + 0.5) * w`, `y = (0.5 - ndc.y * 0.5) * h` (rows go down), `z = ndc.z` (depth), and keep `c.w` in the result's `w`. The renderer will use `w` to know whether a vertex is usable.
+
+Run draws a perspective grid floor and a few wire boxes.
+--- solution
+#include <math.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+/* ---------- From "Images from scratch" ---------- */
+typedef struct { float r, g, b; } Color;
+typedef struct { int w, h; Color *px; } Image;
+
+static inline Color rgb(float r, float g, float b) { return (Color){ r, g, b }; }
+static inline int clampi(int v, int lo, int hi) { return v < lo ? lo : v > hi ? hi : v; }
+static inline float clampf(float v, float lo, float hi) { return v < lo ? lo : v > hi ? hi : v; }
+static inline Color color_scale(Color c, float k) { return rgb(c.r * k, c.g * k, c.b * k); }
+
+Image image_new(int w, int h) {
+    Image im = { w, h, calloc((size_t)w * (size_t)h, sizeof(Color)) };
+    return im;
+}
+
+void image_free(Image *im) {
+    free(im->px);
+    im->px = NULL;
+    im->w = im->h = 0;
+}
+
+Color *image_at(Image *im, int x, int y) {
+    return &im->px[(size_t)y * im->w + x];
+}
+
+void image_fill(Image *im, Color c) {
+    size_t n = (size_t)im->w * im->h;
+    for (size_t i = 0; i < n; i++) im->px[i] = c;
+}
+
+uint8_t to_byte(float v) {
+    if (!(v > 0.0f)) return 0;
+    if (v >= 1.0f) return 255;
+    return (uint8_t)(v * 255.0f + 0.5f);
+}
+
+float srgb_encode(float l) {
+    if (!(l > 0.0f)) return 0.0f;
+    if (l >= 1.0f) return 1.0f;
+    return l <= 0.0031308f ? 12.92f * l : 1.055f * powf(l, 1.0f / 2.4f) - 0.055f;
+}
+
+void srgb_lut_init(uint8_t lut[4096]) {
+    for (int i = 0; i < 4096; i++) lut[i] = to_byte(srgb_encode(i / 4095.0f));
+}
+
+static inline int lut_index(float v) {
+    if (!(v > 0.0f)) return 0;
+    if (v >= 1.0f) return 4095;
+    return (int)(v * 4095.0f + 0.5f);
+}
+
+void image_write_ppm_srgb(const Image *im, FILE *f, const uint8_t lut[4096]) {
+    fprintf(f, "P3\n%d %d\n255\n", im->w, im->h);
+    for (int y = 0; y < im->h; y++) {
+        const Color *row = im->px + (size_t)y * im->w;
+        for (int x = 0; x < im->w; x++)
+            fprintf(f, x ? " %d %d %d" : "%d %d %d", lut[lut_index(row[x].r)], lut[lut_index(row[x].g)],
+                    lut[lut_index(row[x].b)]);
+        fputc('\n', f);
+    }
+}
+
+void put_pixel(Image *im, int x, int y, Color c) {
+    if (x < 0 || y < 0 || x >= im->w || y >= im->h) return;
+    im->px[(size_t)y * im->w + x] = c;
+}
+
+void draw_line(Image *im, int x0, int y0, int x1, int y1, Color c) {
+    int dx = abs(x1 - x0), sx = x0 < x1 ? 1 : -1;
+    int dy = -abs(y1 - y0), sy = y0 < y1 ? 1 : -1;
+    int err = dx + dy;
+    for (;;) {
+        put_pixel(im, x0, y0, c);
+        if (x0 == x1 && y0 == y1) break;
+        int e2 = 2 * err;
+        if (e2 >= dy) { err += dy; x0 += sx; }
+        if (e2 <= dx) { err += dx; y0 += sy; }
+    }
+}
+
+/* ---------- Vector math ---------- */
+typedef struct { float x, y; } vec2;
+typedef struct { float x, y, z; } vec3;
+typedef struct { float x, y, z, w; } vec4;
+
+static inline vec3 v3(float x, float y, float z) { return (vec3){ x, y, z }; }
+
+vec3 v3_add(vec3 a, vec3 b) { return v3(a.x + b.x, a.y + b.y, a.z + b.z); }
+vec3 v3_sub(vec3 a, vec3 b) { return v3(a.x - b.x, a.y - b.y, a.z - b.z); }
+vec3 v3_scale(vec3 a, float s) { return v3(a.x * s, a.y * s, a.z * s); }
+vec3 v3_lerp(vec3 a, vec3 b, float t) { return v3(a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t, a.z + (b.z - a.z) * t); }
+float v3_dot(vec3 a, vec3 b) { return a.x * b.x + a.y * b.y + a.z * b.z; }
+vec3 v3_cross(vec3 a, vec3 b) { return v3(a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x); }
+float v3_length(vec3 a) { return sqrtf(v3_dot(a, a)); }
+
+vec3 v3_normalize(vec3 a) {
+    float l2 = v3_dot(a, a);
+    if (l2 < 1e-20f) return v3(0, 0, 0);
+    return v3_scale(a, 1.0f / sqrtf(l2));
+}
+
+vec3 v3_reflect(vec3 i, vec3 n) { return v3_sub(i, v3_scale(n, 2.0f * v3_dot(i, n))); }
+
+typedef struct { float m[16]; } mat4;
+
+mat4 mat4_identity(void) {
+    mat4 r = { { 0 } };
+    r.m[0] = r.m[5] = r.m[10] = r.m[15] = 1.0f;
+    return r;
+}
+
+mat4 mat4_mul(mat4 a, mat4 b) {
+    mat4 r;
+    for (int c = 0; c < 4; c++)
+        for (int row = 0; row < 4; row++) {
+            float s = 0;
+            for (int k = 0; k < 4; k++) s += a.m[k * 4 + row] * b.m[c * 4 + k];
+            r.m[c * 4 + row] = s;
+        }
+    return r;
+}
+
+vec4 mat4_mul_vec4(mat4 a, vec4 v) {
+    const float *m = a.m;
+    return (vec4){ m[0] * v.x + m[4] * v.y + m[8] * v.z + m[12] * v.w,
+                   m[1] * v.x + m[5] * v.y + m[9] * v.z + m[13] * v.w,
+                   m[2] * v.x + m[6] * v.y + m[10] * v.z + m[14] * v.w,
+                   m[3] * v.x + m[7] * v.y + m[11] * v.z + m[15] * v.w };
+}
+
+vec3 mat4_mul_point(mat4 a, vec3 p) {
+    const float *m = a.m;
+    return v3(m[0] * p.x + m[4] * p.y + m[8] * p.z + m[12],
+              m[1] * p.x + m[5] * p.y + m[9] * p.z + m[13],
+              m[2] * p.x + m[6] * p.y + m[10] * p.z + m[14]);
+}
+
+vec3 mat4_mul_dir(mat4 a, vec3 d) {
+    const float *m = a.m;
+    return v3(m[0] * d.x + m[4] * d.y + m[8] * d.z,
+              m[1] * d.x + m[5] * d.y + m[9] * d.z,
+              m[2] * d.x + m[6] * d.y + m[10] * d.z);
+}
+
+mat4 mat4_translate(vec3 t) {
+    mat4 r = mat4_identity();
+    r.m[12] = t.x; r.m[13] = t.y; r.m[14] = t.z;
+    return r;
+}
+
+mat4 mat4_scale(vec3 s) {
+    mat4 r = mat4_identity();
+    r.m[0] = s.x; r.m[5] = s.y; r.m[10] = s.z;
+    return r;
+}
+
+mat4 mat4_rotate_x(float a) {
+    mat4 r = mat4_identity();
+    float c = cosf(a), s = sinf(a);
+    r.m[5] = c; r.m[6] = s; r.m[9] = -s; r.m[10] = c;
+    return r;
+}
+
+mat4 mat4_rotate_y(float a) {
+    mat4 r = mat4_identity();
+    float c = cosf(a), s = sinf(a);
+    r.m[0] = c; r.m[2] = -s; r.m[8] = s; r.m[10] = c;
+    return r;
+}
+
+mat4 mat4_rotate_z(float a) {
+    mat4 r = mat4_identity();
+    float c = cosf(a), s = sinf(a);
+    r.m[0] = c; r.m[1] = s; r.m[4] = -s; r.m[5] = c;
+    return r;
+}
+
+mat4 mat4_rotate_axis(vec3 axis, float a) {
+    vec3 n = v3_normalize(axis);
+    float c = cosf(a), s = sinf(a), t = 1.0f - c;
+    float x = n.x, y = n.y, z = n.z;
+    mat4 r = mat4_identity();
+    r.m[0] = t * x * x + c;     r.m[4] = t * x * y - s * z; r.m[8] = t * x * z + s * y;
+    r.m[1] = t * x * y + s * z; r.m[5] = t * y * y + c;     r.m[9] = t * y * z - s * x;
+    r.m[2] = t * x * z - s * y; r.m[6] = t * y * z + s * x; r.m[10] = t * z * z + c;
+    return r;
+}
+
+mat4 mat4_look_at(vec3 eye, vec3 target, vec3 up) {
+    vec3 f = v3_normalize(v3_sub(target, eye));
+    vec3 s = v3_normalize(v3_cross(f, up));
+    vec3 u = v3_cross(s, f);
+    mat4 r = mat4_identity();
+    r.m[0] = s.x;  r.m[4] = s.y;  r.m[8] = s.z;
+    r.m[1] = u.x;  r.m[5] = u.y;  r.m[9] = u.z;
+    r.m[2] = -f.x; r.m[6] = -f.y; r.m[10] = -f.z;
+    r.m[12] = -v3_dot(s, eye);
+    r.m[13] = -v3_dot(u, eye);
+    r.m[14] = v3_dot(f, eye);
+    return r;
+}
+
+mat4 mat4_perspective(float fovy, float aspect, float znear, float zfar) {
+    float f = 1.0f / tanf(fovy * 0.5f);
+    mat4 r = { { 0 } };
+    r.m[0] = f / aspect;
+    r.m[5] = f;
+    r.m[10] = zfar / (znear - zfar);
+    r.m[11] = -1.0f;
+    r.m[14] = znear * zfar / (znear - zfar);
+    return r;
+}
+
+vec4 to_screen(mat4 mvp, vec3 p, int w, int h) {
+    vec4 c = mat4_mul_vec4(mvp, (vec4){ p.x, p.y, p.z, 1.0f });
+    if (c.w <= 1e-6f) return (vec4){ 0, 0, -1, c.w };
+    float iw = 1.0f / c.w;
+    return (vec4){ (c.x * iw * 0.5f + 0.5f) * w, (0.5f - c.y * iw * 0.5f) * h, c.z * iw, c.w };
+}
+
+static void wire_box(Image *im, mat4 mvp, vec3 lo, vec3 hi, Color c) {
+    static const int e[12][2] = { {0,1},{1,3},{3,2},{2,0},{4,5},{5,7},{7,6},{6,4},{0,4},{1,5},{2,6},{3,7} };
+    vec4 s[8];
+    for (int i = 0; i < 8; i++)
+        s[i] = to_screen(mvp, v3(i & 1 ? hi.x : lo.x, i & 2 ? hi.y : lo.y, i & 4 ? hi.z : lo.z), im->w, im->h);
+    for (int i = 0; i < 12; i++) {
+        vec4 a = s[e[i][0]], b = s[e[i][1]];
+        if (a.w > 0.01f && b.w > 0.01f)
+            draw_line(im, (int)floorf(a.x), (int)floorf(a.y), (int)floorf(b.x), (int)floorf(b.y), c);
+    }
+}
+
+int main(void) {
+    static uint8_t lut[4096];
+    srgb_lut_init(lut);
+    Image im = image_new(128, 96);
+    if (!im.px) return 1;
+    mat4 view = mat4_look_at(v3(4, 3, 7), v3(0, 0.5f, 0), v3(0, 1, 0));
+    mat4 vp = mat4_mul(mat4_perspective(0.9f, 128.0f / 96, 0.1f, 100), view);
+    for (int i = -8; i <= 8; i++) {
+        vec4 a = to_screen(vp, v3((float)i, 0, -8), 128, 96), b = to_screen(vp, v3((float)i, 0, 8), 128, 96);
+        vec4 c = to_screen(vp, v3(-8, 0, (float)i), 128, 96), d = to_screen(vp, v3(8, 0, (float)i), 128, 96);
+        draw_line(&im, (int)floorf(a.x), (int)floorf(a.y), (int)floorf(b.x), (int)floorf(b.y), rgb(0.1f, 0.15f, 0.3f));
+        draw_line(&im, (int)floorf(c.x), (int)floorf(c.y), (int)floorf(d.x), (int)floorf(d.y), rgb(0.1f, 0.15f, 0.3f));
+    }
+    wire_box(&im, vp, v3(-1, 0, -1), v3(1, 2, 1), rgb(1, 0.5f, 0.1f));
+    wire_box(&im, vp, v3(2, 0, -3), v3(3, 1, -2), rgb(0.2f, 1, 0.4f));
+    wire_box(&im, vp, v3(-4, 0, 1), v3(-2.5f, 3, 2.5f), rgb(0.3f, 0.6f, 1));
+    image_write_ppm_srgb(&im, stdout, lut);
+    image_free(&im);
+    return 0;
+}
+--- stubs
+mat4 mat4_look_at(vec3 eye, vec3 target, vec3 up) { (void)eye; (void)target; (void)up; return mat4_identity(); }
+mat4 mat4_perspective(float fovy, float aspect, float znear, float zfar) {
+    (void)fovy; (void)aspect; (void)znear; (void)zfar;
+    return mat4_identity();
+}
+vec4 to_screen(mat4 mvp, vec3 p, int w, int h) {
+    (void)mvp; (void)w; (void)h;
+    return (vec4){ p.x, p.y, p.z, 1 };
+}
+--- hint
+`look_at`: the upper 3×3 holds `s`, `u` and `-f` as **rows**, which in column-major storage means `m[0], m[4], m[8]` for `s`, `m[1], m[5], m[9]` for `u`, `m[2], m[6], m[10]` for `-f`.
+--- hint
+`to_screen`: one `mat4_mul_vec4`, one check on `w`, then `1.0f / c.w` once and three multiplies.
+--- harness
+#define NEAR3(v, X, Y, Z) CHECK(fabsf((v).x - (X)) < 1e-4f && fabsf((v).y - (Y)) < 1e-4f && fabsf((v).z - (Z)) < 1e-4f)
+int main(void) {
+    mat4 v = mat4_look_at(v3(0, 0, 5), v3(0, 0, 0), v3(0, 1, 0));
+    NEAR3(mat4_mul_point(v, v3(0, 0, 0)), 0, 0, -5);
+    NEAR3(mat4_mul_point(v, v3(1, 2, 0)), 1, 2, -5);
+    v = mat4_look_at(v3(3, 0, 0), v3(0, 0, 0), v3(0, 1, 0));
+    NEAR3(mat4_mul_point(v, v3(0, 0, 0)), 0, 0, -3);
+    NEAR3(mat4_mul_point(v, v3(0, 0, -1)), 1, 0, -3);
+    NEAR3(mat4_mul_point(v, v3(3, 0, 0)), 0, 0, 0);
+    v = mat4_look_at(v3(1, 2, 3), v3(4, -2, 3), v3(0, 1, 0));
+    NEAR3(mat4_mul_point(v, v3(1, 2, 3)), 0, 0, 0);
+    NEAR3(mat4_mul_point(v, v3(4, -2, 3)), 0, 0, -5);
+    vec3 d = mat4_mul_dir(v, v3(0, 0, 1));
+    CHECK(fabsf(v3_length(d) - 1) < 1e-5f);
+
+    mat4 p = mat4_perspective(1.5707963f, 2.0f, 0.5f, 50.0f);
+    CHECK(fabsf(p.m[0] - 0.5f) < 1e-5f);
+    CHECK(fabsf(p.m[5] - 1.0f) < 1e-5f);
+    CHECK_DBL(p.m[11], -1.0);
+    CHECK_DBL(p.m[15], 0.0);
+    CHECK_DBL(p.m[3], 0.0);
+    vec4 c = mat4_mul_vec4(p, (vec4){ 0, 0, -0.5f, 1 });
+    CHECK(fabsf(c.z / c.w) < 1e-5f);
+    c = mat4_mul_vec4(p, (vec4){ 0, 0, -50, 1 });
+    CHECK(fabsf(c.z / c.w - 1) < 1e-5f);
+    c = mat4_mul_vec4(p, (vec4){ 3, 1, -2, 1 });
+    CHECK(fabsf(c.w - 2) < 1e-6f);
+    CHECK(fabsf(c.x / c.w - 0.75f) < 1e-5f);
+    CHECK(fabsf(c.y / c.w - 0.5f) < 1e-5f);
+
+    mat4 vp = mat4_mul(mat4_perspective(1.5707963f, 1.0f, 0.1f, 100.0f), mat4_look_at(v3(0, 0, 5), v3(0, 0, 0), v3(0, 1, 0)));
+    vec4 s = to_screen(vp, v3(0, 0, 0), 100, 100);
+    CHECK(fabsf(s.x - 50) < 1e-3f && fabsf(s.y - 50) < 1e-3f);
+    CHECK(fabsf(s.w - 5) < 1e-4f);
+    float depth = 100.0f * (5 - 0.1f) / (5 * (100 - 0.1f));
+    CHECK(fabsf(s.z - depth) < 1e-4f);
+    s = to_screen(vp, v3(1, 1, 0), 100, 100);
+    CHECK(fabsf(s.x - 60) < 1e-3f && fabsf(s.y - 40) < 1e-3f);
+    s = to_screen(vp, v3(-2.5f, -1.25f, 2.5f), 200, 100);
+    CHECK(fabsf(s.x - 0) < 1e-3f && fabsf(s.y - 75) < 1e-3f);
+    s = to_screen(vp, v3(0, 0, 4.9f), 100, 100);
+    CHECK(fabsf(s.z) < 1e-4f);
+    s = to_screen(vp, v3(1, 1, 5), 100, 100);
+    CHECK(s.z == -1 && s.x == 0 && s.y == 0);
+    s = to_screen(vp, v3(1, 1, 9), 100, 100);
+    CHECK(s.z == -1 && fabsf(s.w + 4) < 1e-4f);
+    return TEST_END();
+}
+
+=== exercise vm_quat
+title: Renderer, step 5: quaternions
+continues: vm_camera
+--- prompt
+Add quaternions for orientation. Put the type in your code:
+
+```c
+typedef struct { float x, y, z, w; } quat;   /* (axis * sin(a/2), cos(a/2)) */
+```
+
+- `quat quat_from_axis_angle(vec3 axis, float angle)`: normalize `axis` first.
+- `quat quat_mul(quat a, quat b)`: the Hamilton product, rotating by `b` then by `a`:
+  `w = aw bw - ax bx - ay by - az bz`, `x = aw bx + ax bw + ay bz - az by`, `y = aw by - ax bz + ay bw + az bx`, `z = aw bz + ax by - ay bx + az bw`.
+- `vec3 quat_rotate(quat q, vec3 v)`: `t = 2 cross(q.xyz, v)`, `v + q.w t + cross(q.xyz, t)`.
+- `mat4 quat_to_mat4(quat q)`: the rotation matrix of a unit quaternion (row-major view; store it column-major):
+
+```text
+| 1-2(yy+zz)   2(xy-wz)     2(xz+wy)   |
+| 2(xy+wz)     1-2(xx+zz)   2(yz-wx)   |
+| 2(xz-wy)     2(yz+wx)     1-2(xx+yy) |
+```
+
+- `quat quat_slerp(quat a, quat b, float t)`: if `dot(a, b) < 0`, negate `b` (shortest arc). If the dot is then above `0.9995`, return the normalized component-wise lerp. Otherwise with `θ = acos(dot)`: `(sin((1-t)θ) a + sin(tθ) b) / sin θ`.
+
+Run spins a wire cube along a slerp between two orientations and leaves a trail.
+--- solution
+#include <math.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+/* ---------- From "Images from scratch" ---------- */
+typedef struct { float r, g, b; } Color;
+typedef struct { int w, h; Color *px; } Image;
+
+static inline Color rgb(float r, float g, float b) { return (Color){ r, g, b }; }
+static inline int clampi(int v, int lo, int hi) { return v < lo ? lo : v > hi ? hi : v; }
+static inline float clampf(float v, float lo, float hi) { return v < lo ? lo : v > hi ? hi : v; }
+static inline Color color_scale(Color c, float k) { return rgb(c.r * k, c.g * k, c.b * k); }
+
+Image image_new(int w, int h) {
+    Image im = { w, h, calloc((size_t)w * (size_t)h, sizeof(Color)) };
+    return im;
+}
+
+void image_free(Image *im) {
+    free(im->px);
+    im->px = NULL;
+    im->w = im->h = 0;
+}
+
+Color *image_at(Image *im, int x, int y) {
+    return &im->px[(size_t)y * im->w + x];
+}
+
+void image_fill(Image *im, Color c) {
+    size_t n = (size_t)im->w * im->h;
+    for (size_t i = 0; i < n; i++) im->px[i] = c;
+}
+
+uint8_t to_byte(float v) {
+    if (!(v > 0.0f)) return 0;
+    if (v >= 1.0f) return 255;
+    return (uint8_t)(v * 255.0f + 0.5f);
+}
+
+float srgb_encode(float l) {
+    if (!(l > 0.0f)) return 0.0f;
+    if (l >= 1.0f) return 1.0f;
+    return l <= 0.0031308f ? 12.92f * l : 1.055f * powf(l, 1.0f / 2.4f) - 0.055f;
+}
+
+void srgb_lut_init(uint8_t lut[4096]) {
+    for (int i = 0; i < 4096; i++) lut[i] = to_byte(srgb_encode(i / 4095.0f));
+}
+
+static inline int lut_index(float v) {
+    if (!(v > 0.0f)) return 0;
+    if (v >= 1.0f) return 4095;
+    return (int)(v * 4095.0f + 0.5f);
+}
+
+void image_write_ppm_srgb(const Image *im, FILE *f, const uint8_t lut[4096]) {
+    fprintf(f, "P3\n%d %d\n255\n", im->w, im->h);
+    for (int y = 0; y < im->h; y++) {
+        const Color *row = im->px + (size_t)y * im->w;
+        for (int x = 0; x < im->w; x++)
+            fprintf(f, x ? " %d %d %d" : "%d %d %d", lut[lut_index(row[x].r)], lut[lut_index(row[x].g)],
+                    lut[lut_index(row[x].b)]);
+        fputc('\n', f);
+    }
+}
+
+void put_pixel(Image *im, int x, int y, Color c) {
+    if (x < 0 || y < 0 || x >= im->w || y >= im->h) return;
+    im->px[(size_t)y * im->w + x] = c;
+}
+
+void draw_line(Image *im, int x0, int y0, int x1, int y1, Color c) {
+    int dx = abs(x1 - x0), sx = x0 < x1 ? 1 : -1;
+    int dy = -abs(y1 - y0), sy = y0 < y1 ? 1 : -1;
+    int err = dx + dy;
+    for (;;) {
+        put_pixel(im, x0, y0, c);
+        if (x0 == x1 && y0 == y1) break;
+        int e2 = 2 * err;
+        if (e2 >= dy) { err += dy; x0 += sx; }
+        if (e2 <= dx) { err += dx; y0 += sy; }
+    }
+}
+
+/* ---------- Vector math ---------- */
+typedef struct { float x, y; } vec2;
+typedef struct { float x, y, z; } vec3;
+typedef struct { float x, y, z, w; } vec4;
+
+static inline vec3 v3(float x, float y, float z) { return (vec3){ x, y, z }; }
+
+vec3 v3_add(vec3 a, vec3 b) { return v3(a.x + b.x, a.y + b.y, a.z + b.z); }
+vec3 v3_sub(vec3 a, vec3 b) { return v3(a.x - b.x, a.y - b.y, a.z - b.z); }
+vec3 v3_scale(vec3 a, float s) { return v3(a.x * s, a.y * s, a.z * s); }
+vec3 v3_lerp(vec3 a, vec3 b, float t) { return v3(a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t, a.z + (b.z - a.z) * t); }
+float v3_dot(vec3 a, vec3 b) { return a.x * b.x + a.y * b.y + a.z * b.z; }
+vec3 v3_cross(vec3 a, vec3 b) { return v3(a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x); }
+float v3_length(vec3 a) { return sqrtf(v3_dot(a, a)); }
+
+vec3 v3_normalize(vec3 a) {
+    float l2 = v3_dot(a, a);
+    if (l2 < 1e-20f) return v3(0, 0, 0);
+    return v3_scale(a, 1.0f / sqrtf(l2));
+}
+
+vec3 v3_reflect(vec3 i, vec3 n) { return v3_sub(i, v3_scale(n, 2.0f * v3_dot(i, n))); }
+
+typedef struct { float m[16]; } mat4;
+
+mat4 mat4_identity(void) {
+    mat4 r = { { 0 } };
+    r.m[0] = r.m[5] = r.m[10] = r.m[15] = 1.0f;
+    return r;
+}
+
+mat4 mat4_mul(mat4 a, mat4 b) {
+    mat4 r;
+    for (int c = 0; c < 4; c++)
+        for (int row = 0; row < 4; row++) {
+            float s = 0;
+            for (int k = 0; k < 4; k++) s += a.m[k * 4 + row] * b.m[c * 4 + k];
+            r.m[c * 4 + row] = s;
+        }
+    return r;
+}
+
+vec4 mat4_mul_vec4(mat4 a, vec4 v) {
+    const float *m = a.m;
+    return (vec4){ m[0] * v.x + m[4] * v.y + m[8] * v.z + m[12] * v.w,
+                   m[1] * v.x + m[5] * v.y + m[9] * v.z + m[13] * v.w,
+                   m[2] * v.x + m[6] * v.y + m[10] * v.z + m[14] * v.w,
+                   m[3] * v.x + m[7] * v.y + m[11] * v.z + m[15] * v.w };
+}
+
+vec3 mat4_mul_point(mat4 a, vec3 p) {
+    const float *m = a.m;
+    return v3(m[0] * p.x + m[4] * p.y + m[8] * p.z + m[12],
+              m[1] * p.x + m[5] * p.y + m[9] * p.z + m[13],
+              m[2] * p.x + m[6] * p.y + m[10] * p.z + m[14]);
+}
+
+vec3 mat4_mul_dir(mat4 a, vec3 d) {
+    const float *m = a.m;
+    return v3(m[0] * d.x + m[4] * d.y + m[8] * d.z,
+              m[1] * d.x + m[5] * d.y + m[9] * d.z,
+              m[2] * d.x + m[6] * d.y + m[10] * d.z);
+}
+
+mat4 mat4_translate(vec3 t) {
+    mat4 r = mat4_identity();
+    r.m[12] = t.x; r.m[13] = t.y; r.m[14] = t.z;
+    return r;
+}
+
+mat4 mat4_scale(vec3 s) {
+    mat4 r = mat4_identity();
+    r.m[0] = s.x; r.m[5] = s.y; r.m[10] = s.z;
+    return r;
+}
+
+mat4 mat4_rotate_x(float a) {
+    mat4 r = mat4_identity();
+    float c = cosf(a), s = sinf(a);
+    r.m[5] = c; r.m[6] = s; r.m[9] = -s; r.m[10] = c;
+    return r;
+}
+
+mat4 mat4_rotate_y(float a) {
+    mat4 r = mat4_identity();
+    float c = cosf(a), s = sinf(a);
+    r.m[0] = c; r.m[2] = -s; r.m[8] = s; r.m[10] = c;
+    return r;
+}
+
+mat4 mat4_rotate_z(float a) {
+    mat4 r = mat4_identity();
+    float c = cosf(a), s = sinf(a);
+    r.m[0] = c; r.m[1] = s; r.m[4] = -s; r.m[5] = c;
+    return r;
+}
+
+mat4 mat4_rotate_axis(vec3 axis, float a) {
+    vec3 n = v3_normalize(axis);
+    float c = cosf(a), s = sinf(a), t = 1.0f - c;
+    float x = n.x, y = n.y, z = n.z;
+    mat4 r = mat4_identity();
+    r.m[0] = t * x * x + c;     r.m[4] = t * x * y - s * z; r.m[8] = t * x * z + s * y;
+    r.m[1] = t * x * y + s * z; r.m[5] = t * y * y + c;     r.m[9] = t * y * z - s * x;
+    r.m[2] = t * x * z - s * y; r.m[6] = t * y * z + s * x; r.m[10] = t * z * z + c;
+    return r;
+}
+
+mat4 mat4_look_at(vec3 eye, vec3 target, vec3 up) {
+    vec3 f = v3_normalize(v3_sub(target, eye));
+    vec3 s = v3_normalize(v3_cross(f, up));
+    vec3 u = v3_cross(s, f);
+    mat4 r = mat4_identity();
+    r.m[0] = s.x;  r.m[4] = s.y;  r.m[8] = s.z;
+    r.m[1] = u.x;  r.m[5] = u.y;  r.m[9] = u.z;
+    r.m[2] = -f.x; r.m[6] = -f.y; r.m[10] = -f.z;
+    r.m[12] = -v3_dot(s, eye);
+    r.m[13] = -v3_dot(u, eye);
+    r.m[14] = v3_dot(f, eye);
+    return r;
+}
+
+mat4 mat4_perspective(float fovy, float aspect, float znear, float zfar) {
+    float f = 1.0f / tanf(fovy * 0.5f);
+    mat4 r = { { 0 } };
+    r.m[0] = f / aspect;
+    r.m[5] = f;
+    r.m[10] = zfar / (znear - zfar);
+    r.m[11] = -1.0f;
+    r.m[14] = znear * zfar / (znear - zfar);
+    return r;
+}
+
+vec4 to_screen(mat4 mvp, vec3 p, int w, int h) {
+    vec4 c = mat4_mul_vec4(mvp, (vec4){ p.x, p.y, p.z, 1.0f });
+    if (c.w <= 1e-6f) return (vec4){ 0, 0, -1, c.w };
+    float iw = 1.0f / c.w;
+    return (vec4){ (c.x * iw * 0.5f + 0.5f) * w, (0.5f - c.y * iw * 0.5f) * h, c.z * iw, c.w };
+}
+
+typedef struct { float x, y, z, w; } quat;
+
+quat quat_from_axis_angle(vec3 axis, float angle) {
+    vec3 n = v3_normalize(axis);
+    float s = sinf(angle * 0.5f);
+    return (quat){ n.x * s, n.y * s, n.z * s, cosf(angle * 0.5f) };
+}
+
+quat quat_mul(quat a, quat b) {
+    return (quat){ a.w * b.x + a.x * b.w + a.y * b.z - a.z * b.y,
+                   a.w * b.y - a.x * b.z + a.y * b.w + a.z * b.x,
+                   a.w * b.z + a.x * b.y - a.y * b.x + a.z * b.w,
+                   a.w * b.w - a.x * b.x - a.y * b.y - a.z * b.z };
+}
+
+vec3 quat_rotate(quat q, vec3 v) {
+    vec3 u = v3(q.x, q.y, q.z);
+    vec3 t = v3_scale(v3_cross(u, v), 2.0f);
+    return v3_add(v3_add(v, v3_scale(t, q.w)), v3_cross(u, t));
+}
+
+mat4 quat_to_mat4(quat q) {
+    float x = q.x, y = q.y, z = q.z, w = q.w;
+    mat4 r = mat4_identity();
+    r.m[0] = 1 - 2 * (y * y + z * z); r.m[4] = 2 * (x * y - w * z);     r.m[8] = 2 * (x * z + w * y);
+    r.m[1] = 2 * (x * y + w * z);     r.m[5] = 1 - 2 * (x * x + z * z); r.m[9] = 2 * (y * z - w * x);
+    r.m[2] = 2 * (x * z - w * y);     r.m[6] = 2 * (y * z + w * x);     r.m[10] = 1 - 2 * (x * x + y * y);
+    return r;
+}
+
+quat quat_slerp(quat a, quat b, float t) {
+    float d = a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w;
+    if (d < 0) { b = (quat){ -b.x, -b.y, -b.z, -b.w }; d = -d; }
+    float wa, wb;
+    if (d > 0.9995f) {
+        wa = 1 - t; wb = t;
+    } else {
+        float th = acosf(d), s = sinf(th);
+        wa = sinf((1 - t) * th) / s; wb = sinf(t * th) / s;
+    }
+    quat r = { wa * a.x + wb * b.x, wa * a.y + wb * b.y, wa * a.z + wb * b.z, wa * a.w + wb * b.w };
+    float len = sqrtf(r.x * r.x + r.y * r.y + r.z * r.z + r.w * r.w);
+    return (quat){ r.x / len, r.y / len, r.z / len, r.w / len };
+}
+
+static void wire_cube(Image *im, mat4 mvp, Color c) {
+    static const int e[12][2] = { {0,1},{1,3},{3,2},{2,0},{4,5},{5,7},{7,6},{6,4},{0,4},{1,5},{2,6},{3,7} };
+    vec4 s[8];
+    for (int i = 0; i < 8; i++)
+        s[i] = to_screen(mvp, v3(i & 1 ? 1 : -1, i & 2 ? 1 : -1, i & 4 ? 1 : -1), im->w, im->h);
+    for (int i = 0; i < 12; i++) {
+        vec4 a = s[e[i][0]], b = s[e[i][1]];
+        draw_line(im, (int)floorf(a.x), (int)floorf(a.y), (int)floorf(b.x), (int)floorf(b.y), c);
+    }
+}
+
+int main(void) {
+    static uint8_t lut[4096];
+    srgb_lut_init(lut);
+    Image im = image_new(128, 96);
+    if (!im.px) return 1;
+    mat4 vp = mat4_mul(mat4_perspective(0.8f, 128.0f / 96, 0.1f, 100), mat4_look_at(v3(0, 2, 12), v3(0, 0, 0), v3(0, 1, 0)));
+    quat a = quat_from_axis_angle(v3(1, 0.3f, 0), 0.2f);
+    quat b = quat_mul(quat_from_axis_angle(v3(0, 1, 0), 2.6f), quat_from_axis_angle(v3(1, 0, 1), 1.9f));
+    for (int i = 0; i <= 8; i++) {
+        float t = i / 8.0f;
+        mat4 model = mat4_mul(mat4_translate(v3(-6 + 12 * t, 0, 0)), quat_to_mat4(quat_slerp(a, b, t)));
+        wire_cube(&im, mat4_mul(vp, model), rgb(0.2f + 0.8f * t, 0.4f, 1.0f - 0.7f * t));
+    }
+    image_write_ppm_srgb(&im, stdout, lut);
+    image_free(&im);
+    return 0;
+}
+--- stubs
+typedef struct { float x, y, z, w; } quat;
+
+quat quat_from_axis_angle(vec3 axis, float angle) { (void)axis; (void)angle; return (quat){ 0, 0, 0, 1 }; }
+quat quat_mul(quat a, quat b) { (void)b; return a; }
+vec3 quat_rotate(quat q, vec3 v) { (void)q; return v; }
+mat4 quat_to_mat4(quat q) { (void)q; return mat4_identity(); }
+quat quat_slerp(quat a, quat b, float t) { (void)b; (void)t; return a; }
+--- hint
+`quat_rotate` needs only cross products: `vec3 u = v3(q.x, q.y, q.z)`, `t = 2 * cross(u, v)`, result `v + q.w * t + cross(u, t)`.
+--- hint
+For slerp, compute the weights `wa`, `wb` in either branch, combine, then normalize: one code path for the combination.
+--- harness
+#define NEAR3(v, X, Y, Z) CHECK(fabsf((v).x - (X)) < 1e-4f && fabsf((v).y - (Y)) < 1e-4f && fabsf((v).z - (Z)) < 1e-4f)
+static int qnear(quat a, quat b) {
+    return fabsf(a.x - b.x) < 1e-4f && fabsf(a.y - b.y) < 1e-4f && fabsf(a.z - b.z) < 1e-4f && fabsf(a.w - b.w) < 1e-4f;
+}
+static int mat_near(mat4 a, mat4 b) {
+    for (int i = 0; i < 16; i++) if (fabsf(a.m[i] - b.m[i]) > 1e-4f) return 0;
+    return 1;
+}
+int main(void) {
+    quat q = quat_from_axis_angle(v3(0, 3, 0), 1.5707963f);
+    CHECK(qnear(q, (quat){ 0, 0.70710678f, 0, 0.70710678f }));
+    NEAR3(quat_rotate(q, v3(1, 0, 0)), 0, 0, -1);
+    NEAR3(quat_rotate(quat_from_axis_angle(v3(1, 0, 0), 1.5707963f), v3(0, 1, 0)), 0, 0, 1);
+    vec3 axis = v3(0.3f, -0.5f, 0.8f);
+    quat r = quat_from_axis_angle(axis, 1.1f);
+    vec3 p = v3(2, -1, 0.5f), a = quat_rotate(r, p), b = mat4_mul_point(mat4_rotate_axis(axis, 1.1f), p);
+    NEAR3(a, b.x, b.y, b.z);
+    CHECK(mat_near(quat_to_mat4(r), mat4_rotate_axis(axis, 1.1f)));
+    CHECK(mat_near(quat_to_mat4(quat_from_axis_angle(v3(0, 0, 1), -0.6f)), mat4_rotate_z(-0.6f)));
+    quat q1 = quat_from_axis_angle(v3(1, 0, 0), 0.7f), q2 = quat_from_axis_angle(v3(0, 1, 1), -1.3f);
+    quat q12 = quat_mul(q1, q2);
+    a = quat_rotate(q12, p);
+    b = quat_rotate(q1, quat_rotate(q2, p));
+    NEAR3(a, b.x, b.y, b.z);
+    CHECK(mat_near(quat_to_mat4(q12), mat4_mul(quat_to_mat4(q1), quat_to_mat4(q2))));
+    quat id = { 0, 0, 0, 1 };
+    CHECK(qnear(quat_mul(id, q2), q2));
+    CHECK(qnear(quat_mul(q2, id), q2));
+
+    quat y90 = quat_from_axis_angle(v3(0, 1, 0), 1.5707963f);
+    CHECK(qnear(quat_slerp(id, y90, 0.5f), quat_from_axis_angle(v3(0, 1, 0), 0.78539816f)));
+    CHECK(qnear(quat_slerp(id, y90, 0.25f), quat_from_axis_angle(v3(0, 1, 0), 0.39269908f)));
+    CHECK(qnear(quat_slerp(id, y90, 0.0f), id));
+    CHECK(qnear(quat_slerp(id, y90, 1.0f), y90));
+    quat neg = { -y90.x, -y90.y, -y90.z, -y90.w };
+    CHECK(qnear(quat_slerp(id, neg, 0.5f), quat_from_axis_angle(v3(0, 1, 0), 0.78539816f)));
+    quat close = quat_from_axis_angle(v3(0, 1, 0), 0.001f);
+    quat m = quat_slerp(id, close, 0.5f);
+    CHECK(m.w == m.w && fabsf(m.x * m.x + m.y * m.y + m.z * m.z + m.w * m.w - 1) < 1e-5f);
+    CHECK(qnear(quat_slerp(q1, q1, 0.3f), q1));
+    quat s = quat_slerp(q1, q2, 0.3f);
+    CHECK(fabsf(s.x * s.x + s.y * s.y + s.z * s.z + s.w * s.w - 1) < 1e-5f);
+    CHECK(qnear(s, (quat){ 0.251334f, -0.139285f, -0.139285f, 0.947645f }));
+    return TEST_END();
+}
+
+=== exercise vm_mesh
+title: Renderer, step 6: meshes, a cube and a UV sphere
+continues: vm_quat
+--- prompt
+Add indexed triangle meshes. Put the type in your code:
+
+```c
+typedef struct { vec3 *pos; int npos; int *idx; int nidx; } Mesh;   /* nidx = 3 * triangles */
+```
+
+- `void mesh_free(Mesh *m)`: free both arrays, zero the struct.
+- `Mesh mesh_cube(float half)`: 8 vertices, vertex `i` at `(i&1 ? half : -half, i&2 ? half : -half, i&4 ? half : -half)`, and 12 triangles, two per face.
+- `Mesh mesh_uv_sphere(int slices, int stacks, float r)` (`slices >= 3`, `stacks >= 2`): `(stacks + 1) * (slices + 1)` vertices; vertex `i * (slices + 1) + j` for `i = 0..stacks`, `j = 0..slices` is at `θ = π i / stacks`, `φ = 2π j / slices`, position `r (sin θ cos φ, cos θ, -sin θ sin φ)`. For each grid cell `(i, j)` with `a = (i, j)`, `b = (i+1, j)`, `c = (i+1, j+1)`, `d = (i, j+1)` emit triangles `(a, b, c)` and `(a, c, d)`, except that the top row (`i = 0`) emits only `(a, b, c)` and the bottom row (`i = stacks - 1`) only `(a, c, d)`: the other one would have zero area. That makes `2 * slices * (stacks - 1)` triangles.
+
+Every triangle must wind **counter-clockwise seen from outside**: `cross(b - a, c - a)` points away from the center. The tests check that for every triangle, that indices are in range, that the cube is closed (every edge shared by exactly two triangles, in opposite directions), and the sphere's surface area.
+
+Allocate each array once with the exact size, computed up front. Run shows both meshes' vertices as dots.
+--- solution
+#include <math.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+/* ---------- From "Images from scratch" ---------- */
+typedef struct { float r, g, b; } Color;
+typedef struct { int w, h; Color *px; } Image;
+
+static inline Color rgb(float r, float g, float b) { return (Color){ r, g, b }; }
+static inline int clampi(int v, int lo, int hi) { return v < lo ? lo : v > hi ? hi : v; }
+static inline float clampf(float v, float lo, float hi) { return v < lo ? lo : v > hi ? hi : v; }
+static inline Color color_scale(Color c, float k) { return rgb(c.r * k, c.g * k, c.b * k); }
+
+Image image_new(int w, int h) {
+    Image im = { w, h, calloc((size_t)w * (size_t)h, sizeof(Color)) };
+    return im;
+}
+
+void image_free(Image *im) {
+    free(im->px);
+    im->px = NULL;
+    im->w = im->h = 0;
+}
+
+Color *image_at(Image *im, int x, int y) {
+    return &im->px[(size_t)y * im->w + x];
+}
+
+void image_fill(Image *im, Color c) {
+    size_t n = (size_t)im->w * im->h;
+    for (size_t i = 0; i < n; i++) im->px[i] = c;
+}
+
+uint8_t to_byte(float v) {
+    if (!(v > 0.0f)) return 0;
+    if (v >= 1.0f) return 255;
+    return (uint8_t)(v * 255.0f + 0.5f);
+}
+
+float srgb_encode(float l) {
+    if (!(l > 0.0f)) return 0.0f;
+    if (l >= 1.0f) return 1.0f;
+    return l <= 0.0031308f ? 12.92f * l : 1.055f * powf(l, 1.0f / 2.4f) - 0.055f;
+}
+
+void srgb_lut_init(uint8_t lut[4096]) {
+    for (int i = 0; i < 4096; i++) lut[i] = to_byte(srgb_encode(i / 4095.0f));
+}
+
+static inline int lut_index(float v) {
+    if (!(v > 0.0f)) return 0;
+    if (v >= 1.0f) return 4095;
+    return (int)(v * 4095.0f + 0.5f);
+}
+
+void image_write_ppm_srgb(const Image *im, FILE *f, const uint8_t lut[4096]) {
+    fprintf(f, "P3\n%d %d\n255\n", im->w, im->h);
+    for (int y = 0; y < im->h; y++) {
+        const Color *row = im->px + (size_t)y * im->w;
+        for (int x = 0; x < im->w; x++)
+            fprintf(f, x ? " %d %d %d" : "%d %d %d", lut[lut_index(row[x].r)], lut[lut_index(row[x].g)],
+                    lut[lut_index(row[x].b)]);
+        fputc('\n', f);
+    }
+}
+
+void put_pixel(Image *im, int x, int y, Color c) {
+    if (x < 0 || y < 0 || x >= im->w || y >= im->h) return;
+    im->px[(size_t)y * im->w + x] = c;
+}
+
+void draw_line(Image *im, int x0, int y0, int x1, int y1, Color c) {
+    int dx = abs(x1 - x0), sx = x0 < x1 ? 1 : -1;
+    int dy = -abs(y1 - y0), sy = y0 < y1 ? 1 : -1;
+    int err = dx + dy;
+    for (;;) {
+        put_pixel(im, x0, y0, c);
+        if (x0 == x1 && y0 == y1) break;
+        int e2 = 2 * err;
+        if (e2 >= dy) { err += dy; x0 += sx; }
+        if (e2 <= dx) { err += dx; y0 += sy; }
+    }
+}
+
+/* ---------- Vector math ---------- */
+typedef struct { float x, y; } vec2;
+typedef struct { float x, y, z; } vec3;
+typedef struct { float x, y, z, w; } vec4;
+
+static inline vec3 v3(float x, float y, float z) { return (vec3){ x, y, z }; }
+
+vec3 v3_add(vec3 a, vec3 b) { return v3(a.x + b.x, a.y + b.y, a.z + b.z); }
+vec3 v3_sub(vec3 a, vec3 b) { return v3(a.x - b.x, a.y - b.y, a.z - b.z); }
+vec3 v3_scale(vec3 a, float s) { return v3(a.x * s, a.y * s, a.z * s); }
+vec3 v3_lerp(vec3 a, vec3 b, float t) { return v3(a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t, a.z + (b.z - a.z) * t); }
+float v3_dot(vec3 a, vec3 b) { return a.x * b.x + a.y * b.y + a.z * b.z; }
+vec3 v3_cross(vec3 a, vec3 b) { return v3(a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x); }
+float v3_length(vec3 a) { return sqrtf(v3_dot(a, a)); }
+
+vec3 v3_normalize(vec3 a) {
+    float l2 = v3_dot(a, a);
+    if (l2 < 1e-20f) return v3(0, 0, 0);
+    return v3_scale(a, 1.0f / sqrtf(l2));
+}
+
+vec3 v3_reflect(vec3 i, vec3 n) { return v3_sub(i, v3_scale(n, 2.0f * v3_dot(i, n))); }
+
+typedef struct { float m[16]; } mat4;
+
+mat4 mat4_identity(void) {
+    mat4 r = { { 0 } };
+    r.m[0] = r.m[5] = r.m[10] = r.m[15] = 1.0f;
+    return r;
+}
+
+mat4 mat4_mul(mat4 a, mat4 b) {
+    mat4 r;
+    for (int c = 0; c < 4; c++)
+        for (int row = 0; row < 4; row++) {
+            float s = 0;
+            for (int k = 0; k < 4; k++) s += a.m[k * 4 + row] * b.m[c * 4 + k];
+            r.m[c * 4 + row] = s;
+        }
+    return r;
+}
+
+vec4 mat4_mul_vec4(mat4 a, vec4 v) {
+    const float *m = a.m;
+    return (vec4){ m[0] * v.x + m[4] * v.y + m[8] * v.z + m[12] * v.w,
+                   m[1] * v.x + m[5] * v.y + m[9] * v.z + m[13] * v.w,
+                   m[2] * v.x + m[6] * v.y + m[10] * v.z + m[14] * v.w,
+                   m[3] * v.x + m[7] * v.y + m[11] * v.z + m[15] * v.w };
+}
+
+vec3 mat4_mul_point(mat4 a, vec3 p) {
+    const float *m = a.m;
+    return v3(m[0] * p.x + m[4] * p.y + m[8] * p.z + m[12],
+              m[1] * p.x + m[5] * p.y + m[9] * p.z + m[13],
+              m[2] * p.x + m[6] * p.y + m[10] * p.z + m[14]);
+}
+
+vec3 mat4_mul_dir(mat4 a, vec3 d) {
+    const float *m = a.m;
+    return v3(m[0] * d.x + m[4] * d.y + m[8] * d.z,
+              m[1] * d.x + m[5] * d.y + m[9] * d.z,
+              m[2] * d.x + m[6] * d.y + m[10] * d.z);
+}
+
+mat4 mat4_translate(vec3 t) {
+    mat4 r = mat4_identity();
+    r.m[12] = t.x; r.m[13] = t.y; r.m[14] = t.z;
+    return r;
+}
+
+mat4 mat4_scale(vec3 s) {
+    mat4 r = mat4_identity();
+    r.m[0] = s.x; r.m[5] = s.y; r.m[10] = s.z;
+    return r;
+}
+
+mat4 mat4_rotate_x(float a) {
+    mat4 r = mat4_identity();
+    float c = cosf(a), s = sinf(a);
+    r.m[5] = c; r.m[6] = s; r.m[9] = -s; r.m[10] = c;
+    return r;
+}
+
+mat4 mat4_rotate_y(float a) {
+    mat4 r = mat4_identity();
+    float c = cosf(a), s = sinf(a);
+    r.m[0] = c; r.m[2] = -s; r.m[8] = s; r.m[10] = c;
+    return r;
+}
+
+mat4 mat4_rotate_z(float a) {
+    mat4 r = mat4_identity();
+    float c = cosf(a), s = sinf(a);
+    r.m[0] = c; r.m[1] = s; r.m[4] = -s; r.m[5] = c;
+    return r;
+}
+
+mat4 mat4_rotate_axis(vec3 axis, float a) {
+    vec3 n = v3_normalize(axis);
+    float c = cosf(a), s = sinf(a), t = 1.0f - c;
+    float x = n.x, y = n.y, z = n.z;
+    mat4 r = mat4_identity();
+    r.m[0] = t * x * x + c;     r.m[4] = t * x * y - s * z; r.m[8] = t * x * z + s * y;
+    r.m[1] = t * x * y + s * z; r.m[5] = t * y * y + c;     r.m[9] = t * y * z - s * x;
+    r.m[2] = t * x * z - s * y; r.m[6] = t * y * z + s * x; r.m[10] = t * z * z + c;
+    return r;
+}
+
+mat4 mat4_look_at(vec3 eye, vec3 target, vec3 up) {
+    vec3 f = v3_normalize(v3_sub(target, eye));
+    vec3 s = v3_normalize(v3_cross(f, up));
+    vec3 u = v3_cross(s, f);
+    mat4 r = mat4_identity();
+    r.m[0] = s.x;  r.m[4] = s.y;  r.m[8] = s.z;
+    r.m[1] = u.x;  r.m[5] = u.y;  r.m[9] = u.z;
+    r.m[2] = -f.x; r.m[6] = -f.y; r.m[10] = -f.z;
+    r.m[12] = -v3_dot(s, eye);
+    r.m[13] = -v3_dot(u, eye);
+    r.m[14] = v3_dot(f, eye);
+    return r;
+}
+
+mat4 mat4_perspective(float fovy, float aspect, float znear, float zfar) {
+    float f = 1.0f / tanf(fovy * 0.5f);
+    mat4 r = { { 0 } };
+    r.m[0] = f / aspect;
+    r.m[5] = f;
+    r.m[10] = zfar / (znear - zfar);
+    r.m[11] = -1.0f;
+    r.m[14] = znear * zfar / (znear - zfar);
+    return r;
+}
+
+vec4 to_screen(mat4 mvp, vec3 p, int w, int h) {
+    vec4 c = mat4_mul_vec4(mvp, (vec4){ p.x, p.y, p.z, 1.0f });
+    if (c.w <= 1e-6f) return (vec4){ 0, 0, -1, c.w };
+    float iw = 1.0f / c.w;
+    return (vec4){ (c.x * iw * 0.5f + 0.5f) * w, (0.5f - c.y * iw * 0.5f) * h, c.z * iw, c.w };
+}
+
+typedef struct { float x, y, z, w; } quat;
+
+quat quat_from_axis_angle(vec3 axis, float angle) {
+    vec3 n = v3_normalize(axis);
+    float s = sinf(angle * 0.5f);
+    return (quat){ n.x * s, n.y * s, n.z * s, cosf(angle * 0.5f) };
+}
+
+quat quat_mul(quat a, quat b) {
+    return (quat){ a.w * b.x + a.x * b.w + a.y * b.z - a.z * b.y,
+                   a.w * b.y - a.x * b.z + a.y * b.w + a.z * b.x,
+                   a.w * b.z + a.x * b.y - a.y * b.x + a.z * b.w,
+                   a.w * b.w - a.x * b.x - a.y * b.y - a.z * b.z };
+}
+
+vec3 quat_rotate(quat q, vec3 v) {
+    vec3 u = v3(q.x, q.y, q.z);
+    vec3 t = v3_scale(v3_cross(u, v), 2.0f);
+    return v3_add(v3_add(v, v3_scale(t, q.w)), v3_cross(u, t));
+}
+
+mat4 quat_to_mat4(quat q) {
+    float x = q.x, y = q.y, z = q.z, w = q.w;
+    mat4 r = mat4_identity();
+    r.m[0] = 1 - 2 * (y * y + z * z); r.m[4] = 2 * (x * y - w * z);     r.m[8] = 2 * (x * z + w * y);
+    r.m[1] = 2 * (x * y + w * z);     r.m[5] = 1 - 2 * (x * x + z * z); r.m[9] = 2 * (y * z - w * x);
+    r.m[2] = 2 * (x * z - w * y);     r.m[6] = 2 * (y * z + w * x);     r.m[10] = 1 - 2 * (x * x + y * y);
+    return r;
+}
+
+quat quat_slerp(quat a, quat b, float t) {
+    float d = a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w;
+    if (d < 0) { b = (quat){ -b.x, -b.y, -b.z, -b.w }; d = -d; }
+    float wa, wb;
+    if (d > 0.9995f) {
+        wa = 1 - t; wb = t;
+    } else {
+        float th = acosf(d), s = sinf(th);
+        wa = sinf((1 - t) * th) / s; wb = sinf(t * th) / s;
+    }
+    quat r = { wa * a.x + wb * b.x, wa * a.y + wb * b.y, wa * a.z + wb * b.z, wa * a.w + wb * b.w };
+    float len = sqrtf(r.x * r.x + r.y * r.y + r.z * r.z + r.w * r.w);
+    return (quat){ r.x / len, r.y / len, r.z / len, r.w / len };
+}
+
+typedef struct { vec3 *pos; int npos; int *idx; int nidx; } Mesh;
+
+static Mesh mesh_alloc(int npos, int ntri) {
+    Mesh m = { malloc(sizeof(vec3) * (size_t)npos), npos, malloc(sizeof(int) * 3 * (size_t)ntri), 3 * ntri };
+    if (!m.pos || !m.idx) {
+        free(m.pos);
+        free(m.idx);
+        Mesh empty = { 0 };
+        return empty;
+    }
+    return m;
+}
+
+void mesh_free(Mesh *m) {
+    free(m->pos);
+    free(m->idx);
+    Mesh empty = { 0 };
+    *m = empty;
+}
+
+Mesh mesh_cube(float half) {
+    static const int quads[6][4] = { { 0, 4, 6, 2 }, { 1, 3, 7, 5 }, { 0, 1, 5, 4 },
+                                     { 2, 6, 7, 3 }, { 0, 2, 3, 1 }, { 4, 5, 7, 6 } };
+    Mesh m = mesh_alloc(8, 12);
+    if (!m.pos) return m;
+    for (int i = 0; i < 8; i++) m.pos[i] = v3(i & 1 ? half : -half, i & 2 ? half : -half, i & 4 ? half : -half);
+    int *t = m.idx;
+    for (int f = 0; f < 6; f++) {
+        const int *q = quads[f];
+        *t++ = q[0]; *t++ = q[1]; *t++ = q[2];
+        *t++ = q[0]; *t++ = q[2]; *t++ = q[3];
+    }
+    return m;
+}
+
+Mesh mesh_uv_sphere(int slices, int stacks, float r) {
+    Mesh m = mesh_alloc((stacks + 1) * (slices + 1), 2 * slices * (stacks - 1));
+    if (!m.pos) return m;
+    const float PI = 3.14159265f;
+    for (int i = 0; i <= stacks; i++) {
+        float th = PI * i / stacks, st = sinf(th), ct = cosf(th);
+        for (int j = 0; j <= slices; j++) {
+            float ph = 2 * PI * j / slices;
+            m.pos[i * (slices + 1) + j] = v3(r * st * cosf(ph), r * ct, -r * st * sinf(ph));
+        }
+    }
+    int *t = m.idx;
+    for (int i = 0; i < stacks; i++)
+        for (int j = 0; j < slices; j++) {
+            int a = i * (slices + 1) + j, b = a + slices + 1, c = b + 1, d = a + 1;
+            if (i != stacks - 1) { *t++ = a; *t++ = b; *t++ = c; }
+            if (i != 0) { *t++ = a; *t++ = c; *t++ = d; }
+        }
+    return m;
+}
+
+static void dots(Image *im, const Mesh *m, mat4 mvp, Color c) {
+    for (int i = 0; i < m->npos; i++) {
+        vec4 s = to_screen(mvp, m->pos[i], im->w, im->h);
+        if (s.w > 0) put_pixel(im, (int)floorf(s.x), (int)floorf(s.y), c);
+    }
+}
+
+int main(void) {
+    static uint8_t lut[4096];
+    srgb_lut_init(lut);
+    Image im = image_new(128, 96);
+    if (!im.px) return 1;
+    mat4 vp = mat4_mul(mat4_perspective(0.8f, 128.0f / 96, 0.1f, 100), mat4_look_at(v3(0, 2, 9), v3(0, 0, 0), v3(0, 1, 0)));
+    Mesh cube = mesh_cube(1.2f), sphere = mesh_uv_sphere(32, 16, 1.7f);
+    if (cube.pos && sphere.pos) {
+        dots(&im, &cube, mat4_mul(vp, mat4_mul(mat4_translate(v3(-2.6f, 0, 0)), mat4_rotate_y(0.6f))), rgb(1, 0.6f, 0.2f));
+        dots(&im, &sphere, mat4_mul(vp, mat4_mul(mat4_translate(v3(2, 0, 0)), mat4_rotate_x(0.4f))), rgb(0.3f, 0.8f, 1));
+    }
+    mesh_free(&cube);
+    mesh_free(&sphere);
+    image_write_ppm_srgb(&im, stdout, lut);
+    image_free(&im);
+    return 0;
+}
+--- stubs
+typedef struct { vec3 *pos; int npos; int *idx; int nidx; } Mesh;
+
+void mesh_free(Mesh *m) { (void)m; }
+Mesh mesh_cube(float half) { (void)half; Mesh m = { 0 }; return m; }
+Mesh mesh_uv_sphere(int slices, int stacks, float r) { (void)slices; (void)stacks; (void)r; Mesh m = { 0 }; return m; }
+--- hint
+For the cube, list the six faces as quads of vertex numbers ordered counter-clockwise seen from outside, and split each quad `(p, q, r, s)` into `(p, q, r)` and `(p, r, s)`. Check one face by hand with the cross product.
+--- hint
+For the sphere, write a single double loop over cells and two `if`s: emit `(a, b, c)` unless it's the bottom row, `(a, c, d)` unless it's the top row.
+--- harness
+static int outward_ok(const Mesh *m, vec3 center) {
+    for (int t = 0; t < m->nidx; t += 3) {
+        int i0 = m->idx[t], i1 = m->idx[t + 1], i2 = m->idx[t + 2];
+        if (i0 < 0 || i1 < 0 || i2 < 0 || i0 >= m->npos || i1 >= m->npos || i2 >= m->npos) return 0;
+        vec3 a = m->pos[i0], b = m->pos[i1], c = m->pos[i2];
+        vec3 n = v3_cross(v3_sub(b, a), v3_sub(c, a));
+        if (v3_length(n) < 1e-9f) return 0;
+        vec3 mid = v3_scale(v3_add(v3_add(a, b), c), 1.0f / 3);
+        if (v3_dot(n, v3_sub(mid, center)) <= 0) return 0;
+    }
+    return 1;
+}
+
+static int closed_ok(const Mesh *m) {
+    int n = m->npos, *cnt = calloc((size_t)n * n, sizeof(int)), ok = 1;
+    if (!cnt) return 0;
+    for (int t = 0; t < m->nidx; t += 3)
+        for (int k = 0; k < 3; k++) cnt[m->idx[t + k] * n + m->idx[t + (k + 1) % 3]]++;
+    for (int i = 0; i < n; i++)
+        for (int j = 0; j < n; j++)
+            if (cnt[i * n + j] > 1 || cnt[i * n + j] != cnt[j * n + i]) ok = 0;
+    free(cnt);
+    return ok;
+}
+
+static double area(const Mesh *m) {
+    double s = 0;
+    for (int t = 0; t < m->nidx; t += 3) {
+        vec3 a = m->pos[m->idx[t]], b = m->pos[m->idx[t + 1]], c = m->pos[m->idx[t + 2]];
+        s += 0.5 * v3_length(v3_cross(v3_sub(b, a), v3_sub(c, a)));
+    }
+    return s;
+}
+
+int main(void) {
+    Mesh c = mesh_cube(0.5f);
+    CHECK_INT(c.npos, 8);
+    CHECK_INT(c.nidx, 36);
+    if (c.pos && c.idx && c.npos == 8 && c.nidx == 36) {
+        CHECK(c.pos[0].x == -0.5f && c.pos[0].y == -0.5f && c.pos[0].z == -0.5f);
+        CHECK(c.pos[6].x == -0.5f && c.pos[6].y == 0.5f && c.pos[6].z == 0.5f);
+        CHECK(c.pos[7].x == 0.5f && c.pos[7].y == 0.5f && c.pos[7].z == 0.5f);
+        CHECK(outward_ok(&c, v3(0, 0, 0)));
+        CHECK(closed_ok(&c));
+        CHECK(fabs(area(&c) - 6.0) < 1e-5);
+    }
+    mesh_free(&c);
+    CHECK(c.pos == NULL && c.idx == NULL && c.npos == 0);
+
+    Mesh s = mesh_uv_sphere(12, 6, 2.0f);
+    CHECK_INT(s.npos, 7 * 13);
+    CHECK_INT(s.nidx, 3 * 2 * 12 * 5);
+    if (s.pos && s.idx && s.npos == 91 && s.nidx == 360) {
+        CHECK(fabsf(s.pos[0].y - 2) < 1e-5f && fabsf(s.pos[0].x) < 1e-5f);
+        CHECK(fabsf(s.pos[90].y + 2) < 1e-5f);
+        vec3 p = s.pos[3 * 13 + 3];
+        CHECK(fabsf(p.x) < 1e-5f && fabsf(p.y) < 1e-5f && fabsf(p.z + 2) < 1e-5f);
+        p = s.pos[2 * 13 + 2];
+        CHECK(fabsf(p.x - 2 * 0.8660254f * 0.5f) < 1e-5f && fabsf(p.y - 1) < 1e-5f && fabsf(p.z + 2 * 0.8660254f * 0.8660254f) < 1e-5f);
+        p = s.pos[4 * 13 + 12];
+        CHECK(fabsf(p.x - 2 * 0.8660254f) < 1e-4f && fabsf(p.z) < 1e-4f);
+        int on = 1;
+        for (int i = 0; i < s.npos; i++) if (fabsf(v3_length(s.pos[i]) - 2) > 1e-5f) on = 0;
+        CHECK(on);
+        CHECK(outward_ok(&s, v3(0, 0, 0)));
+    }
+    mesh_free(&s);
+    s = mesh_uv_sphere(64, 32, 1.0f);
+    CHECK_INT(s.nidx, 3 * 2 * 64 * 31);
+    if (s.pos && s.idx && s.nidx == 3 * 2 * 64 * 31) {
+        CHECK(outward_ok(&s, v3(0, 0, 0)));
+        CHECK(fabs(area(&s) - 12.541154) < 1e-3);
+    }
+    mesh_free(&s);
+    s = mesh_uv_sphere(3, 2, 1.0f);
+    CHECK_INT(s.nidx, 18);
+    if (s.pos && s.idx && s.nidx == 18) CHECK(outward_ok(&s, v3(0, 0, 0)));
+    mesh_free(&s);
+    return TEST_END();
+}
+
+=== exercise vm_torus
+title: Renderer, step 7: a parametric torus
+continues: vm_mesh
+--- prompt
+Add `Mesh mesh_torus(float R, float r, int nu, int nv)`: a torus lying in the XZ plane, `R` the distance from the center to the middle of the tube, `r` the tube radius, `nu` segments around the ring, `nv` around the tube.
+
+- `nu * nv` vertices, **no duplicates**: vertex `i * nv + j` (`i < nu`, `j < nv`) at `u = 2π i / nu`, `v = 2π j / nv`, position `((R + r cos v) cos u, r sin v, -(R + r cos v) sin u)`.
+- For each `(i, j)`, with `i1 = (i + 1) % nu` and `j1 = (j + 1) % nv`: `a = (i, j)`, `b = (i1, j)`, `c = (i1, j1)`, `d = (i, j1)`, triangles `(a, b, c)` and `(a, c, d)`: `2 * nu * nv` triangles, outward-facing.
+
+Because the grid wraps in both directions with `%`, the torus is a closed surface with no seam vertices: every edge is shared by two triangles. The tests check closure, outward winding (away from the tube's center circle) and positions.
+
+The same grid-and-wrap pattern gives you cylinders, tubes along curves, and (in a later chapter) terrain patches: learn it here.
+--- solution
+#include <math.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+/* ---------- From "Images from scratch" ---------- */
+typedef struct { float r, g, b; } Color;
+typedef struct { int w, h; Color *px; } Image;
+
+static inline Color rgb(float r, float g, float b) { return (Color){ r, g, b }; }
+static inline int clampi(int v, int lo, int hi) { return v < lo ? lo : v > hi ? hi : v; }
+static inline float clampf(float v, float lo, float hi) { return v < lo ? lo : v > hi ? hi : v; }
+static inline Color color_scale(Color c, float k) { return rgb(c.r * k, c.g * k, c.b * k); }
+
+Image image_new(int w, int h) {
+    Image im = { w, h, calloc((size_t)w * (size_t)h, sizeof(Color)) };
+    return im;
+}
+
+void image_free(Image *im) {
+    free(im->px);
+    im->px = NULL;
+    im->w = im->h = 0;
+}
+
+Color *image_at(Image *im, int x, int y) {
+    return &im->px[(size_t)y * im->w + x];
+}
+
+void image_fill(Image *im, Color c) {
+    size_t n = (size_t)im->w * im->h;
+    for (size_t i = 0; i < n; i++) im->px[i] = c;
+}
+
+uint8_t to_byte(float v) {
+    if (!(v > 0.0f)) return 0;
+    if (v >= 1.0f) return 255;
+    return (uint8_t)(v * 255.0f + 0.5f);
+}
+
+float srgb_encode(float l) {
+    if (!(l > 0.0f)) return 0.0f;
+    if (l >= 1.0f) return 1.0f;
+    return l <= 0.0031308f ? 12.92f * l : 1.055f * powf(l, 1.0f / 2.4f) - 0.055f;
+}
+
+void srgb_lut_init(uint8_t lut[4096]) {
+    for (int i = 0; i < 4096; i++) lut[i] = to_byte(srgb_encode(i / 4095.0f));
+}
+
+static inline int lut_index(float v) {
+    if (!(v > 0.0f)) return 0;
+    if (v >= 1.0f) return 4095;
+    return (int)(v * 4095.0f + 0.5f);
+}
+
+void image_write_ppm_srgb(const Image *im, FILE *f, const uint8_t lut[4096]) {
+    fprintf(f, "P3\n%d %d\n255\n", im->w, im->h);
+    for (int y = 0; y < im->h; y++) {
+        const Color *row = im->px + (size_t)y * im->w;
+        for (int x = 0; x < im->w; x++)
+            fprintf(f, x ? " %d %d %d" : "%d %d %d", lut[lut_index(row[x].r)], lut[lut_index(row[x].g)],
+                    lut[lut_index(row[x].b)]);
+        fputc('\n', f);
+    }
+}
+
+void put_pixel(Image *im, int x, int y, Color c) {
+    if (x < 0 || y < 0 || x >= im->w || y >= im->h) return;
+    im->px[(size_t)y * im->w + x] = c;
+}
+
+void draw_line(Image *im, int x0, int y0, int x1, int y1, Color c) {
+    int dx = abs(x1 - x0), sx = x0 < x1 ? 1 : -1;
+    int dy = -abs(y1 - y0), sy = y0 < y1 ? 1 : -1;
+    int err = dx + dy;
+    for (;;) {
+        put_pixel(im, x0, y0, c);
+        if (x0 == x1 && y0 == y1) break;
+        int e2 = 2 * err;
+        if (e2 >= dy) { err += dy; x0 += sx; }
+        if (e2 <= dx) { err += dx; y0 += sy; }
+    }
+}
+
+/* ---------- Vector math ---------- */
+typedef struct { float x, y; } vec2;
+typedef struct { float x, y, z; } vec3;
+typedef struct { float x, y, z, w; } vec4;
+
+static inline vec3 v3(float x, float y, float z) { return (vec3){ x, y, z }; }
+
+vec3 v3_add(vec3 a, vec3 b) { return v3(a.x + b.x, a.y + b.y, a.z + b.z); }
+vec3 v3_sub(vec3 a, vec3 b) { return v3(a.x - b.x, a.y - b.y, a.z - b.z); }
+vec3 v3_scale(vec3 a, float s) { return v3(a.x * s, a.y * s, a.z * s); }
+vec3 v3_lerp(vec3 a, vec3 b, float t) { return v3(a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t, a.z + (b.z - a.z) * t); }
+float v3_dot(vec3 a, vec3 b) { return a.x * b.x + a.y * b.y + a.z * b.z; }
+vec3 v3_cross(vec3 a, vec3 b) { return v3(a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x); }
+float v3_length(vec3 a) { return sqrtf(v3_dot(a, a)); }
+
+vec3 v3_normalize(vec3 a) {
+    float l2 = v3_dot(a, a);
+    if (l2 < 1e-20f) return v3(0, 0, 0);
+    return v3_scale(a, 1.0f / sqrtf(l2));
+}
+
+vec3 v3_reflect(vec3 i, vec3 n) { return v3_sub(i, v3_scale(n, 2.0f * v3_dot(i, n))); }
+
+typedef struct { float m[16]; } mat4;
+
+mat4 mat4_identity(void) {
+    mat4 r = { { 0 } };
+    r.m[0] = r.m[5] = r.m[10] = r.m[15] = 1.0f;
+    return r;
+}
+
+mat4 mat4_mul(mat4 a, mat4 b) {
+    mat4 r;
+    for (int c = 0; c < 4; c++)
+        for (int row = 0; row < 4; row++) {
+            float s = 0;
+            for (int k = 0; k < 4; k++) s += a.m[k * 4 + row] * b.m[c * 4 + k];
+            r.m[c * 4 + row] = s;
+        }
+    return r;
+}
+
+vec4 mat4_mul_vec4(mat4 a, vec4 v) {
+    const float *m = a.m;
+    return (vec4){ m[0] * v.x + m[4] * v.y + m[8] * v.z + m[12] * v.w,
+                   m[1] * v.x + m[5] * v.y + m[9] * v.z + m[13] * v.w,
+                   m[2] * v.x + m[6] * v.y + m[10] * v.z + m[14] * v.w,
+                   m[3] * v.x + m[7] * v.y + m[11] * v.z + m[15] * v.w };
+}
+
+vec3 mat4_mul_point(mat4 a, vec3 p) {
+    const float *m = a.m;
+    return v3(m[0] * p.x + m[4] * p.y + m[8] * p.z + m[12],
+              m[1] * p.x + m[5] * p.y + m[9] * p.z + m[13],
+              m[2] * p.x + m[6] * p.y + m[10] * p.z + m[14]);
+}
+
+vec3 mat4_mul_dir(mat4 a, vec3 d) {
+    const float *m = a.m;
+    return v3(m[0] * d.x + m[4] * d.y + m[8] * d.z,
+              m[1] * d.x + m[5] * d.y + m[9] * d.z,
+              m[2] * d.x + m[6] * d.y + m[10] * d.z);
+}
+
+mat4 mat4_translate(vec3 t) {
+    mat4 r = mat4_identity();
+    r.m[12] = t.x; r.m[13] = t.y; r.m[14] = t.z;
+    return r;
+}
+
+mat4 mat4_scale(vec3 s) {
+    mat4 r = mat4_identity();
+    r.m[0] = s.x; r.m[5] = s.y; r.m[10] = s.z;
+    return r;
+}
+
+mat4 mat4_rotate_x(float a) {
+    mat4 r = mat4_identity();
+    float c = cosf(a), s = sinf(a);
+    r.m[5] = c; r.m[6] = s; r.m[9] = -s; r.m[10] = c;
+    return r;
+}
+
+mat4 mat4_rotate_y(float a) {
+    mat4 r = mat4_identity();
+    float c = cosf(a), s = sinf(a);
+    r.m[0] = c; r.m[2] = -s; r.m[8] = s; r.m[10] = c;
+    return r;
+}
+
+mat4 mat4_rotate_z(float a) {
+    mat4 r = mat4_identity();
+    float c = cosf(a), s = sinf(a);
+    r.m[0] = c; r.m[1] = s; r.m[4] = -s; r.m[5] = c;
+    return r;
+}
+
+mat4 mat4_rotate_axis(vec3 axis, float a) {
+    vec3 n = v3_normalize(axis);
+    float c = cosf(a), s = sinf(a), t = 1.0f - c;
+    float x = n.x, y = n.y, z = n.z;
+    mat4 r = mat4_identity();
+    r.m[0] = t * x * x + c;     r.m[4] = t * x * y - s * z; r.m[8] = t * x * z + s * y;
+    r.m[1] = t * x * y + s * z; r.m[5] = t * y * y + c;     r.m[9] = t * y * z - s * x;
+    r.m[2] = t * x * z - s * y; r.m[6] = t * y * z + s * x; r.m[10] = t * z * z + c;
+    return r;
+}
+
+mat4 mat4_look_at(vec3 eye, vec3 target, vec3 up) {
+    vec3 f = v3_normalize(v3_sub(target, eye));
+    vec3 s = v3_normalize(v3_cross(f, up));
+    vec3 u = v3_cross(s, f);
+    mat4 r = mat4_identity();
+    r.m[0] = s.x;  r.m[4] = s.y;  r.m[8] = s.z;
+    r.m[1] = u.x;  r.m[5] = u.y;  r.m[9] = u.z;
+    r.m[2] = -f.x; r.m[6] = -f.y; r.m[10] = -f.z;
+    r.m[12] = -v3_dot(s, eye);
+    r.m[13] = -v3_dot(u, eye);
+    r.m[14] = v3_dot(f, eye);
+    return r;
+}
+
+mat4 mat4_perspective(float fovy, float aspect, float znear, float zfar) {
+    float f = 1.0f / tanf(fovy * 0.5f);
+    mat4 r = { { 0 } };
+    r.m[0] = f / aspect;
+    r.m[5] = f;
+    r.m[10] = zfar / (znear - zfar);
+    r.m[11] = -1.0f;
+    r.m[14] = znear * zfar / (znear - zfar);
+    return r;
+}
+
+vec4 to_screen(mat4 mvp, vec3 p, int w, int h) {
+    vec4 c = mat4_mul_vec4(mvp, (vec4){ p.x, p.y, p.z, 1.0f });
+    if (c.w <= 1e-6f) return (vec4){ 0, 0, -1, c.w };
+    float iw = 1.0f / c.w;
+    return (vec4){ (c.x * iw * 0.5f + 0.5f) * w, (0.5f - c.y * iw * 0.5f) * h, c.z * iw, c.w };
+}
+
+typedef struct { float x, y, z, w; } quat;
+
+quat quat_from_axis_angle(vec3 axis, float angle) {
+    vec3 n = v3_normalize(axis);
+    float s = sinf(angle * 0.5f);
+    return (quat){ n.x * s, n.y * s, n.z * s, cosf(angle * 0.5f) };
+}
+
+quat quat_mul(quat a, quat b) {
+    return (quat){ a.w * b.x + a.x * b.w + a.y * b.z - a.z * b.y,
+                   a.w * b.y - a.x * b.z + a.y * b.w + a.z * b.x,
+                   a.w * b.z + a.x * b.y - a.y * b.x + a.z * b.w,
+                   a.w * b.w - a.x * b.x - a.y * b.y - a.z * b.z };
+}
+
+vec3 quat_rotate(quat q, vec3 v) {
+    vec3 u = v3(q.x, q.y, q.z);
+    vec3 t = v3_scale(v3_cross(u, v), 2.0f);
+    return v3_add(v3_add(v, v3_scale(t, q.w)), v3_cross(u, t));
+}
+
+mat4 quat_to_mat4(quat q) {
+    float x = q.x, y = q.y, z = q.z, w = q.w;
+    mat4 r = mat4_identity();
+    r.m[0] = 1 - 2 * (y * y + z * z); r.m[4] = 2 * (x * y - w * z);     r.m[8] = 2 * (x * z + w * y);
+    r.m[1] = 2 * (x * y + w * z);     r.m[5] = 1 - 2 * (x * x + z * z); r.m[9] = 2 * (y * z - w * x);
+    r.m[2] = 2 * (x * z - w * y);     r.m[6] = 2 * (y * z + w * x);     r.m[10] = 1 - 2 * (x * x + y * y);
+    return r;
+}
+
+quat quat_slerp(quat a, quat b, float t) {
+    float d = a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w;
+    if (d < 0) { b = (quat){ -b.x, -b.y, -b.z, -b.w }; d = -d; }
+    float wa, wb;
+    if (d > 0.9995f) {
+        wa = 1 - t; wb = t;
+    } else {
+        float th = acosf(d), s = sinf(th);
+        wa = sinf((1 - t) * th) / s; wb = sinf(t * th) / s;
+    }
+    quat r = { wa * a.x + wb * b.x, wa * a.y + wb * b.y, wa * a.z + wb * b.z, wa * a.w + wb * b.w };
+    float len = sqrtf(r.x * r.x + r.y * r.y + r.z * r.z + r.w * r.w);
+    return (quat){ r.x / len, r.y / len, r.z / len, r.w / len };
+}
+
+typedef struct { vec3 *pos; int npos; int *idx; int nidx; } Mesh;
+
+static Mesh mesh_alloc(int npos, int ntri) {
+    Mesh m = { malloc(sizeof(vec3) * (size_t)npos), npos, malloc(sizeof(int) * 3 * (size_t)ntri), 3 * ntri };
+    if (!m.pos || !m.idx) {
+        free(m.pos);
+        free(m.idx);
+        Mesh empty = { 0 };
+        return empty;
+    }
+    return m;
+}
+
+void mesh_free(Mesh *m) {
+    free(m->pos);
+    free(m->idx);
+    Mesh empty = { 0 };
+    *m = empty;
+}
+
+Mesh mesh_cube(float half) {
+    static const int quads[6][4] = { { 0, 4, 6, 2 }, { 1, 3, 7, 5 }, { 0, 1, 5, 4 },
+                                     { 2, 6, 7, 3 }, { 0, 2, 3, 1 }, { 4, 5, 7, 6 } };
+    Mesh m = mesh_alloc(8, 12);
+    if (!m.pos) return m;
+    for (int i = 0; i < 8; i++) m.pos[i] = v3(i & 1 ? half : -half, i & 2 ? half : -half, i & 4 ? half : -half);
+    int *t = m.idx;
+    for (int f = 0; f < 6; f++) {
+        const int *q = quads[f];
+        *t++ = q[0]; *t++ = q[1]; *t++ = q[2];
+        *t++ = q[0]; *t++ = q[2]; *t++ = q[3];
+    }
+    return m;
+}
+
+Mesh mesh_uv_sphere(int slices, int stacks, float r) {
+    Mesh m = mesh_alloc((stacks + 1) * (slices + 1), 2 * slices * (stacks - 1));
+    if (!m.pos) return m;
+    const float PI = 3.14159265f;
+    for (int i = 0; i <= stacks; i++) {
+        float th = PI * i / stacks, st = sinf(th), ct = cosf(th);
+        for (int j = 0; j <= slices; j++) {
+            float ph = 2 * PI * j / slices;
+            m.pos[i * (slices + 1) + j] = v3(r * st * cosf(ph), r * ct, -r * st * sinf(ph));
+        }
+    }
+    int *t = m.idx;
+    for (int i = 0; i < stacks; i++)
+        for (int j = 0; j < slices; j++) {
+            int a = i * (slices + 1) + j, b = a + slices + 1, c = b + 1, d = a + 1;
+            if (i != stacks - 1) { *t++ = a; *t++ = b; *t++ = c; }
+            if (i != 0) { *t++ = a; *t++ = c; *t++ = d; }
+        }
+    return m;
+}
+
+Mesh mesh_torus(float R, float r, int nu, int nv) {
+    Mesh m = mesh_alloc(nu * nv, 2 * nu * nv);
+    if (!m.pos) return m;
+    const float TAU = 6.2831853f;
+    for (int i = 0; i < nu; i++) {
+        float u = TAU * i / nu, cu = cosf(u), su = sinf(u);
+        for (int j = 0; j < nv; j++) {
+            float v = TAU * j / nv, ring = R + r * cosf(v);
+            m.pos[i * nv + j] = v3(ring * cu, r * sinf(v), -ring * su);
+        }
+    }
+    int *t = m.idx;
+    for (int i = 0; i < nu; i++) {
+        int i1 = (i + 1) % nu;
+        for (int j = 0; j < nv; j++) {
+            int j1 = (j + 1) % nv;
+            int a = i * nv + j, b = i1 * nv + j, c = i1 * nv + j1, d = i * nv + j1;
+            *t++ = a; *t++ = b; *t++ = c;
+            *t++ = a; *t++ = c; *t++ = d;
+        }
+    }
+    return m;
+}
+
+static void wire(Image *im, const Mesh *m, mat4 mvp, Color col) {
+    for (int t = 0; t < m->nidx; t += 3)
+        for (int k = 0; k < 3; k++) {
+            vec4 a = to_screen(mvp, m->pos[m->idx[t + k]], im->w, im->h);
+            vec4 b = to_screen(mvp, m->pos[m->idx[t + (k + 1) % 3]], im->w, im->h);
+            if (a.w > 0.1f && b.w > 0.1f)
+                draw_line(im, (int)floorf(a.x), (int)floorf(a.y), (int)floorf(b.x), (int)floorf(b.y), col);
+        }
+}
+
+int main(void) {
+    static uint8_t lut[4096];
+    srgb_lut_init(lut);
+    Image im = image_new(128, 96);
+    if (!im.px) return 1;
+    mat4 vp = mat4_mul(mat4_perspective(0.8f, 128.0f / 96, 0.1f, 100), mat4_look_at(v3(0, 4, 8), v3(0, 0, 0), v3(0, 1, 0)));
+    Mesh t = mesh_torus(2.2f, 0.8f, 24, 10);
+    if (t.pos) wire(&im, &t, mat4_mul(vp, mat4_rotate_x(0.5f)), rgb(1, 0.4f, 0.8f));
+    mesh_free(&t);
+    image_write_ppm_srgb(&im, stdout, lut);
+    image_free(&im);
+    return 0;
+}
+--- stubs
+Mesh mesh_torus(float R, float r, int nu, int nv) { (void)R; (void)r; (void)nu; (void)nv; Mesh m = { 0 }; return m; }
+--- hint
+Same structure as the sphere: one loop writing positions, one loop writing six indices per cell, with `% nu` and `% nv` for the neighbors.
+--- harness
+static int closed_ok(const Mesh *m) {
+    int n = m->npos, *cnt = calloc((size_t)n * n, sizeof(int)), ok = 1;
+    if (!cnt) return 0;
+    for (int t = 0; t < m->nidx; t += 3)
+        for (int k = 0; k < 3; k++) cnt[m->idx[t + k] * n + m->idx[t + (k + 1) % 3]]++;
+    for (int i = 0; i < n; i++)
+        for (int j = 0; j < n; j++)
+            if (cnt[i * n + j] > 1 || cnt[i * n + j] != cnt[j * n + i]) ok = 0;
+    free(cnt);
+    return ok;
+}
+
+int main(void) {
+    float R = 3, r = 1;
+    Mesh m = mesh_torus(R, r, 16, 8);
+    CHECK_INT(m.npos, 128);
+    CHECK_INT(m.nidx, 3 * 2 * 128);
+    if (m.pos && m.idx && m.npos == 128 && m.nidx == 768) {
+        CHECK(fabsf(m.pos[0].x - 4) < 1e-5f && fabsf(m.pos[0].y) < 1e-5f && fabsf(m.pos[0].z) < 1e-5f);
+        CHECK(fabsf(m.pos[2].x - 3) < 1e-5f && fabsf(m.pos[2].y - 1) < 1e-5f);
+        vec3 p = m.pos[4 * 8 + 4];
+        CHECK(fabsf(p.x) < 1e-5f && fabsf(p.y) < 1e-5f && fabsf(p.z + 2) < 1e-5f);
+        p = m.pos[2 * 8 + 1];
+        float ring = 3 + 0.70710678f;
+        CHECK(fabsf(p.x - ring * 0.70710678f) < 1e-5f && fabsf(p.y - 0.70710678f) < 1e-5f && fabsf(p.z + ring * 0.70710678f) < 1e-5f);
+        int ok = 1;
+        for (int t = 0; t < m.nidx; t += 3) {
+            int i0 = m.idx[t], i1 = m.idx[t + 1], i2 = m.idx[t + 2];
+            if (i0 < 0 || i1 < 0 || i2 < 0 || i0 >= 128 || i1 >= 128 || i2 >= 128) { ok = 0; break; }
+            vec3 a = m.pos[i0], b = m.pos[i1], c = m.pos[i2];
+            vec3 n = v3_cross(v3_sub(b, a), v3_sub(c, a));
+            vec3 mid = v3_scale(v3_add(v3_add(a, b), c), 1.0f / 3);
+            float rho = sqrtf(mid.x * mid.x + mid.z * mid.z);
+            vec3 center = v3(mid.x / rho * R, 0, mid.z / rho * R);
+            if (v3_length(n) < 1e-6f || v3_dot(n, v3_sub(mid, center)) <= 0) ok = 0;
+        }
+        CHECK(ok);
+        CHECK(closed_ok(&m));
+        ok = 1;
+        for (int i = 0; i < m.npos; i++) {
+            vec3 q = m.pos[i];
+            float rho = sqrtf(q.x * q.x + q.z * q.z);
+            if (fabsf((rho - R) * (rho - R) + q.y * q.y - r * r) > 1e-4f) ok = 0;
+        }
+        CHECK(ok);
+    }
+    mesh_free(&m);
+    m = mesh_torus(1.0f, 0.25f, 3, 3);
+    CHECK_INT(m.nidx, 54);
+    if (m.idx && m.nidx == 54) CHECK(closed_ok(&m));
+    mesh_free(&m);
+    return TEST_END();
+}
+
+=== exercise vm_wire
+title: Renderer, step 8: wireframe rendering
+continues: vm_torus
+--- prompt
+Add `void draw_wireframe(Image *im, const Mesh *m, mat4 mvp, Color c, vec4 *screen)`.
+
+1. Project **every vertex once** into the caller's scratch array: `screen[i] = to_screen(mvp, m->pos[i], im->w, im->h)`. A closed mesh shares each vertex between about six triangles; projecting per triangle corner does the same work six times.
+2. For each triangle, if all three vertices are usable, draw its three edges with `draw_line`, converting coordinates with `(int)floorf(...)`.
+
+A vertex is usable when `w > 1e-6`, `z >= 0` (not in front of the near plane) and its screen position lies inside a **guard band** of four image sizes around the image: `-4w < x < 5w` and `-4h < y < 5h`. Write this as a helper `int screen_ok(vec4 s, int w, int h)`; the filled renderer reuses it.
+
+Why the guard band: a vertex just in front of the camera's near plane can project millions of pixels off-screen. `draw_line` would walk every one of them, and converting a float beyond `INT_MAX` to `int` is undefined behavior. Real renderers *clip* triangles against the near plane (Sutherland-Hodgman); skipping the triangle is the simple version, good enough here.
+
+The tests draw a cube from a known camera, put the camera inside a torus (half its vertices behind the camera), and draw a mesh entirely behind the camera.
+--- solution
+#include <math.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+/* ---------- From "Images from scratch" ---------- */
+typedef struct { float r, g, b; } Color;
+typedef struct { int w, h; Color *px; } Image;
+
+static inline Color rgb(float r, float g, float b) { return (Color){ r, g, b }; }
+static inline int clampi(int v, int lo, int hi) { return v < lo ? lo : v > hi ? hi : v; }
+static inline float clampf(float v, float lo, float hi) { return v < lo ? lo : v > hi ? hi : v; }
+static inline Color color_scale(Color c, float k) { return rgb(c.r * k, c.g * k, c.b * k); }
+
+Image image_new(int w, int h) {
+    Image im = { w, h, calloc((size_t)w * (size_t)h, sizeof(Color)) };
+    return im;
+}
+
+void image_free(Image *im) {
+    free(im->px);
+    im->px = NULL;
+    im->w = im->h = 0;
+}
+
+Color *image_at(Image *im, int x, int y) {
+    return &im->px[(size_t)y * im->w + x];
+}
+
+void image_fill(Image *im, Color c) {
+    size_t n = (size_t)im->w * im->h;
+    for (size_t i = 0; i < n; i++) im->px[i] = c;
+}
+
+uint8_t to_byte(float v) {
+    if (!(v > 0.0f)) return 0;
+    if (v >= 1.0f) return 255;
+    return (uint8_t)(v * 255.0f + 0.5f);
+}
+
+float srgb_encode(float l) {
+    if (!(l > 0.0f)) return 0.0f;
+    if (l >= 1.0f) return 1.0f;
+    return l <= 0.0031308f ? 12.92f * l : 1.055f * powf(l, 1.0f / 2.4f) - 0.055f;
+}
+
+void srgb_lut_init(uint8_t lut[4096]) {
+    for (int i = 0; i < 4096; i++) lut[i] = to_byte(srgb_encode(i / 4095.0f));
+}
+
+static inline int lut_index(float v) {
+    if (!(v > 0.0f)) return 0;
+    if (v >= 1.0f) return 4095;
+    return (int)(v * 4095.0f + 0.5f);
+}
+
+void image_write_ppm_srgb(const Image *im, FILE *f, const uint8_t lut[4096]) {
+    fprintf(f, "P3\n%d %d\n255\n", im->w, im->h);
+    for (int y = 0; y < im->h; y++) {
+        const Color *row = im->px + (size_t)y * im->w;
+        for (int x = 0; x < im->w; x++)
+            fprintf(f, x ? " %d %d %d" : "%d %d %d", lut[lut_index(row[x].r)], lut[lut_index(row[x].g)],
+                    lut[lut_index(row[x].b)]);
+        fputc('\n', f);
+    }
+}
+
+void put_pixel(Image *im, int x, int y, Color c) {
+    if (x < 0 || y < 0 || x >= im->w || y >= im->h) return;
+    im->px[(size_t)y * im->w + x] = c;
+}
+
+void draw_line(Image *im, int x0, int y0, int x1, int y1, Color c) {
+    int dx = abs(x1 - x0), sx = x0 < x1 ? 1 : -1;
+    int dy = -abs(y1 - y0), sy = y0 < y1 ? 1 : -1;
+    int err = dx + dy;
+    for (;;) {
+        put_pixel(im, x0, y0, c);
+        if (x0 == x1 && y0 == y1) break;
+        int e2 = 2 * err;
+        if (e2 >= dy) { err += dy; x0 += sx; }
+        if (e2 <= dx) { err += dx; y0 += sy; }
+    }
+}
+
+/* ---------- Vector math ---------- */
+typedef struct { float x, y; } vec2;
+typedef struct { float x, y, z; } vec3;
+typedef struct { float x, y, z, w; } vec4;
+
+static inline vec3 v3(float x, float y, float z) { return (vec3){ x, y, z }; }
+
+vec3 v3_add(vec3 a, vec3 b) { return v3(a.x + b.x, a.y + b.y, a.z + b.z); }
+vec3 v3_sub(vec3 a, vec3 b) { return v3(a.x - b.x, a.y - b.y, a.z - b.z); }
+vec3 v3_scale(vec3 a, float s) { return v3(a.x * s, a.y * s, a.z * s); }
+vec3 v3_lerp(vec3 a, vec3 b, float t) { return v3(a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t, a.z + (b.z - a.z) * t); }
+float v3_dot(vec3 a, vec3 b) { return a.x * b.x + a.y * b.y + a.z * b.z; }
+vec3 v3_cross(vec3 a, vec3 b) { return v3(a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x); }
+float v3_length(vec3 a) { return sqrtf(v3_dot(a, a)); }
+
+vec3 v3_normalize(vec3 a) {
+    float l2 = v3_dot(a, a);
+    if (l2 < 1e-20f) return v3(0, 0, 0);
+    return v3_scale(a, 1.0f / sqrtf(l2));
+}
+
+vec3 v3_reflect(vec3 i, vec3 n) { return v3_sub(i, v3_scale(n, 2.0f * v3_dot(i, n))); }
+
+typedef struct { float m[16]; } mat4;
+
+mat4 mat4_identity(void) {
+    mat4 r = { { 0 } };
+    r.m[0] = r.m[5] = r.m[10] = r.m[15] = 1.0f;
+    return r;
+}
+
+mat4 mat4_mul(mat4 a, mat4 b) {
+    mat4 r;
+    for (int c = 0; c < 4; c++)
+        for (int row = 0; row < 4; row++) {
+            float s = 0;
+            for (int k = 0; k < 4; k++) s += a.m[k * 4 + row] * b.m[c * 4 + k];
+            r.m[c * 4 + row] = s;
+        }
+    return r;
+}
+
+vec4 mat4_mul_vec4(mat4 a, vec4 v) {
+    const float *m = a.m;
+    return (vec4){ m[0] * v.x + m[4] * v.y + m[8] * v.z + m[12] * v.w,
+                   m[1] * v.x + m[5] * v.y + m[9] * v.z + m[13] * v.w,
+                   m[2] * v.x + m[6] * v.y + m[10] * v.z + m[14] * v.w,
+                   m[3] * v.x + m[7] * v.y + m[11] * v.z + m[15] * v.w };
+}
+
+vec3 mat4_mul_point(mat4 a, vec3 p) {
+    const float *m = a.m;
+    return v3(m[0] * p.x + m[4] * p.y + m[8] * p.z + m[12],
+              m[1] * p.x + m[5] * p.y + m[9] * p.z + m[13],
+              m[2] * p.x + m[6] * p.y + m[10] * p.z + m[14]);
+}
+
+vec3 mat4_mul_dir(mat4 a, vec3 d) {
+    const float *m = a.m;
+    return v3(m[0] * d.x + m[4] * d.y + m[8] * d.z,
+              m[1] * d.x + m[5] * d.y + m[9] * d.z,
+              m[2] * d.x + m[6] * d.y + m[10] * d.z);
+}
+
+mat4 mat4_translate(vec3 t) {
+    mat4 r = mat4_identity();
+    r.m[12] = t.x; r.m[13] = t.y; r.m[14] = t.z;
+    return r;
+}
+
+mat4 mat4_scale(vec3 s) {
+    mat4 r = mat4_identity();
+    r.m[0] = s.x; r.m[5] = s.y; r.m[10] = s.z;
+    return r;
+}
+
+mat4 mat4_rotate_x(float a) {
+    mat4 r = mat4_identity();
+    float c = cosf(a), s = sinf(a);
+    r.m[5] = c; r.m[6] = s; r.m[9] = -s; r.m[10] = c;
+    return r;
+}
+
+mat4 mat4_rotate_y(float a) {
+    mat4 r = mat4_identity();
+    float c = cosf(a), s = sinf(a);
+    r.m[0] = c; r.m[2] = -s; r.m[8] = s; r.m[10] = c;
+    return r;
+}
+
+mat4 mat4_rotate_z(float a) {
+    mat4 r = mat4_identity();
+    float c = cosf(a), s = sinf(a);
+    r.m[0] = c; r.m[1] = s; r.m[4] = -s; r.m[5] = c;
+    return r;
+}
+
+mat4 mat4_rotate_axis(vec3 axis, float a) {
+    vec3 n = v3_normalize(axis);
+    float c = cosf(a), s = sinf(a), t = 1.0f - c;
+    float x = n.x, y = n.y, z = n.z;
+    mat4 r = mat4_identity();
+    r.m[0] = t * x * x + c;     r.m[4] = t * x * y - s * z; r.m[8] = t * x * z + s * y;
+    r.m[1] = t * x * y + s * z; r.m[5] = t * y * y + c;     r.m[9] = t * y * z - s * x;
+    r.m[2] = t * x * z - s * y; r.m[6] = t * y * z + s * x; r.m[10] = t * z * z + c;
+    return r;
+}
+
+mat4 mat4_look_at(vec3 eye, vec3 target, vec3 up) {
+    vec3 f = v3_normalize(v3_sub(target, eye));
+    vec3 s = v3_normalize(v3_cross(f, up));
+    vec3 u = v3_cross(s, f);
+    mat4 r = mat4_identity();
+    r.m[0] = s.x;  r.m[4] = s.y;  r.m[8] = s.z;
+    r.m[1] = u.x;  r.m[5] = u.y;  r.m[9] = u.z;
+    r.m[2] = -f.x; r.m[6] = -f.y; r.m[10] = -f.z;
+    r.m[12] = -v3_dot(s, eye);
+    r.m[13] = -v3_dot(u, eye);
+    r.m[14] = v3_dot(f, eye);
+    return r;
+}
+
+mat4 mat4_perspective(float fovy, float aspect, float znear, float zfar) {
+    float f = 1.0f / tanf(fovy * 0.5f);
+    mat4 r = { { 0 } };
+    r.m[0] = f / aspect;
+    r.m[5] = f;
+    r.m[10] = zfar / (znear - zfar);
+    r.m[11] = -1.0f;
+    r.m[14] = znear * zfar / (znear - zfar);
+    return r;
+}
+
+vec4 to_screen(mat4 mvp, vec3 p, int w, int h) {
+    vec4 c = mat4_mul_vec4(mvp, (vec4){ p.x, p.y, p.z, 1.0f });
+    if (c.w <= 1e-6f) return (vec4){ 0, 0, -1, c.w };
+    float iw = 1.0f / c.w;
+    return (vec4){ (c.x * iw * 0.5f + 0.5f) * w, (0.5f - c.y * iw * 0.5f) * h, c.z * iw, c.w };
+}
+
+typedef struct { float x, y, z, w; } quat;
+
+quat quat_from_axis_angle(vec3 axis, float angle) {
+    vec3 n = v3_normalize(axis);
+    float s = sinf(angle * 0.5f);
+    return (quat){ n.x * s, n.y * s, n.z * s, cosf(angle * 0.5f) };
+}
+
+quat quat_mul(quat a, quat b) {
+    return (quat){ a.w * b.x + a.x * b.w + a.y * b.z - a.z * b.y,
+                   a.w * b.y - a.x * b.z + a.y * b.w + a.z * b.x,
+                   a.w * b.z + a.x * b.y - a.y * b.x + a.z * b.w,
+                   a.w * b.w - a.x * b.x - a.y * b.y - a.z * b.z };
+}
+
+vec3 quat_rotate(quat q, vec3 v) {
+    vec3 u = v3(q.x, q.y, q.z);
+    vec3 t = v3_scale(v3_cross(u, v), 2.0f);
+    return v3_add(v3_add(v, v3_scale(t, q.w)), v3_cross(u, t));
+}
+
+mat4 quat_to_mat4(quat q) {
+    float x = q.x, y = q.y, z = q.z, w = q.w;
+    mat4 r = mat4_identity();
+    r.m[0] = 1 - 2 * (y * y + z * z); r.m[4] = 2 * (x * y - w * z);     r.m[8] = 2 * (x * z + w * y);
+    r.m[1] = 2 * (x * y + w * z);     r.m[5] = 1 - 2 * (x * x + z * z); r.m[9] = 2 * (y * z - w * x);
+    r.m[2] = 2 * (x * z - w * y);     r.m[6] = 2 * (y * z + w * x);     r.m[10] = 1 - 2 * (x * x + y * y);
+    return r;
+}
+
+quat quat_slerp(quat a, quat b, float t) {
+    float d = a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w;
+    if (d < 0) { b = (quat){ -b.x, -b.y, -b.z, -b.w }; d = -d; }
+    float wa, wb;
+    if (d > 0.9995f) {
+        wa = 1 - t; wb = t;
+    } else {
+        float th = acosf(d), s = sinf(th);
+        wa = sinf((1 - t) * th) / s; wb = sinf(t * th) / s;
+    }
+    quat r = { wa * a.x + wb * b.x, wa * a.y + wb * b.y, wa * a.z + wb * b.z, wa * a.w + wb * b.w };
+    float len = sqrtf(r.x * r.x + r.y * r.y + r.z * r.z + r.w * r.w);
+    return (quat){ r.x / len, r.y / len, r.z / len, r.w / len };
+}
+
+typedef struct { vec3 *pos; int npos; int *idx; int nidx; } Mesh;
+
+static Mesh mesh_alloc(int npos, int ntri) {
+    Mesh m = { malloc(sizeof(vec3) * (size_t)npos), npos, malloc(sizeof(int) * 3 * (size_t)ntri), 3 * ntri };
+    if (!m.pos || !m.idx) {
+        free(m.pos);
+        free(m.idx);
+        Mesh empty = { 0 };
+        return empty;
+    }
+    return m;
+}
+
+void mesh_free(Mesh *m) {
+    free(m->pos);
+    free(m->idx);
+    Mesh empty = { 0 };
+    *m = empty;
+}
+
+Mesh mesh_cube(float half) {
+    static const int quads[6][4] = { { 0, 4, 6, 2 }, { 1, 3, 7, 5 }, { 0, 1, 5, 4 },
+                                     { 2, 6, 7, 3 }, { 0, 2, 3, 1 }, { 4, 5, 7, 6 } };
+    Mesh m = mesh_alloc(8, 12);
+    if (!m.pos) return m;
+    for (int i = 0; i < 8; i++) m.pos[i] = v3(i & 1 ? half : -half, i & 2 ? half : -half, i & 4 ? half : -half);
+    int *t = m.idx;
+    for (int f = 0; f < 6; f++) {
+        const int *q = quads[f];
+        *t++ = q[0]; *t++ = q[1]; *t++ = q[2];
+        *t++ = q[0]; *t++ = q[2]; *t++ = q[3];
+    }
+    return m;
+}
+
+Mesh mesh_uv_sphere(int slices, int stacks, float r) {
+    Mesh m = mesh_alloc((stacks + 1) * (slices + 1), 2 * slices * (stacks - 1));
+    if (!m.pos) return m;
+    const float PI = 3.14159265f;
+    for (int i = 0; i <= stacks; i++) {
+        float th = PI * i / stacks, st = sinf(th), ct = cosf(th);
+        for (int j = 0; j <= slices; j++) {
+            float ph = 2 * PI * j / slices;
+            m.pos[i * (slices + 1) + j] = v3(r * st * cosf(ph), r * ct, -r * st * sinf(ph));
+        }
+    }
+    int *t = m.idx;
+    for (int i = 0; i < stacks; i++)
+        for (int j = 0; j < slices; j++) {
+            int a = i * (slices + 1) + j, b = a + slices + 1, c = b + 1, d = a + 1;
+            if (i != stacks - 1) { *t++ = a; *t++ = b; *t++ = c; }
+            if (i != 0) { *t++ = a; *t++ = c; *t++ = d; }
+        }
+    return m;
+}
+
+Mesh mesh_torus(float R, float r, int nu, int nv) {
+    Mesh m = mesh_alloc(nu * nv, 2 * nu * nv);
+    if (!m.pos) return m;
+    const float TAU = 6.2831853f;
+    for (int i = 0; i < nu; i++) {
+        float u = TAU * i / nu, cu = cosf(u), su = sinf(u);
+        for (int j = 0; j < nv; j++) {
+            float v = TAU * j / nv, ring = R + r * cosf(v);
+            m.pos[i * nv + j] = v3(ring * cu, r * sinf(v), -ring * su);
+        }
+    }
+    int *t = m.idx;
+    for (int i = 0; i < nu; i++) {
+        int i1 = (i + 1) % nu;
+        for (int j = 0; j < nv; j++) {
+            int j1 = (j + 1) % nv;
+            int a = i * nv + j, b = i1 * nv + j, c = i1 * nv + j1, d = i * nv + j1;
+            *t++ = a; *t++ = b; *t++ = c;
+            *t++ = a; *t++ = c; *t++ = d;
+        }
+    }
+    return m;
+}
+
+int screen_ok(vec4 s, int w, int h) {
+    return s.w > 1e-6f && s.z >= 0.0f && s.x > -4.0f * w && s.x < 5.0f * w && s.y > -4.0f * h && s.y < 5.0f * h;
+}
+
+void draw_wireframe(Image *im, const Mesh *m, mat4 mvp, Color c, vec4 *screen) {
+    for (int i = 0; i < m->npos; i++) screen[i] = to_screen(mvp, m->pos[i], im->w, im->h);
+    for (int t = 0; t < m->nidx; t += 3) {
+        vec4 a = screen[m->idx[t]], b = screen[m->idx[t + 1]], d = screen[m->idx[t + 2]];
+        if (!screen_ok(a, im->w, im->h) || !screen_ok(b, im->w, im->h) || !screen_ok(d, im->w, im->h)) continue;
+        int ax = (int)floorf(a.x), ay = (int)floorf(a.y), bx = (int)floorf(b.x), by = (int)floorf(b.y);
+        int dx = (int)floorf(d.x), dy = (int)floorf(d.y);
+        draw_line(im, ax, ay, bx, by, c);
+        draw_line(im, bx, by, dx, dy, c);
+        draw_line(im, dx, dy, ax, ay, c);
+    }
+}
+
+int main(void) {
+    static uint8_t lut[4096];
+    srgb_lut_init(lut);
+    Image im = image_new(128, 128);
+    Mesh cube = mesh_cube(0.9f), sphere = mesh_uv_sphere(20, 10, 1.1f), torus = mesh_torus(1.1f, 0.4f, 24, 10);
+    vec4 *screen = malloc(sizeof(vec4) * 512);
+    if (im.px && cube.pos && sphere.pos && torus.pos && screen) {
+        mat4 vp = mat4_mul(mat4_perspective(0.9f, 1, 0.1f, 100), mat4_look_at(v3(0, 3, 7.5f), v3(0, 0, 0), v3(0, 1, 0)));
+        quat q = quat_from_axis_angle(v3(1, 1, 0), 0.8f);
+        draw_wireframe(&im, &cube, mat4_mul(vp, mat4_mul(mat4_translate(v3(-2.2f, 0, 0)), quat_to_mat4(q))), rgb(1, 0.6f, 0.2f), screen);
+        draw_wireframe(&im, &sphere, mat4_mul(vp, mat4_translate(v3(0.6f, 0, -2.5f))), rgb(0.3f, 0.8f, 1), screen);
+        draw_wireframe(&im, &torus, mat4_mul(vp, mat4_mul(mat4_translate(v3(2, 0, 1)), mat4_rotate_x(1.0f))), rgb(1, 0.3f, 0.7f), screen);
+        image_write_ppm_srgb(&im, stdout, lut);
+    }
+    free(screen);
+    mesh_free(&cube); mesh_free(&sphere); mesh_free(&torus);
+    image_free(&im);
+    return 0;
+}
+--- stubs
+int screen_ok(vec4 s, int w, int h) { (void)s; (void)w; (void)h; return 0; }
+
+void draw_wireframe(Image *im, const Mesh *m, mat4 mvp, Color c, vec4 *screen) {
+    (void)im; (void)m; (void)mvp; (void)c; (void)screen;
+}
+--- hint
+Two loops: one over vertices filling `screen`, one over triangles reading three entries of `screen`.
+--- hint
+`screen_ok` is a single boolean expression: `s.w > 1e-6f && s.z >= 0 && s.x > -4.0f * w && ...`.
+--- harness
+static int count_lit(const Image *im) {
+    int n = 0;
+    for (int i = 0; i < im->w * im->h; i++) n += im->px[i].r > 0.5f;
+    return n;
+}
+
+int main(void) {
+    CHECK(screen_ok((vec4){ 10, 10, 0.5f, 3 }, 64, 64));
+    CHECK(!screen_ok((vec4){ 10, 10, 0.5f, 0 }, 64, 64));
+    CHECK(!screen_ok((vec4){ 10, 10, -0.01f, 3 }, 64, 64));
+    CHECK(!screen_ok((vec4){ -300, 10, 0.5f, 3 }, 64, 64));
+    CHECK(screen_ok((vec4){ -250, 300, 0.5f, 3 }, 64, 64));
+    CHECK(!screen_ok((vec4){ 10, 330, 0.5f, 3 }, 64, 64));
+    CHECK(screen_ok((vec4){ 10, 10, 1.5f, 3 }, 64, 64));
+
+    Image im = image_new(64, 64);
+    Mesh cube = mesh_cube(1.0f), torus = mesh_torus(3, 1, 24, 12);
+    vec4 *screen = calloc(400, sizeof(vec4));
+    if (!im.px || !cube.pos || !torus.pos || !screen) { CHECK(!"allocation failed"); goto done; }
+    mat4 vp = mat4_mul(mat4_perspective(1.0f, 1, 0.1f, 100), mat4_look_at(v3(3, 2, 4), v3(0, 0, 0), v3(0, 1, 0)));
+    draw_wireframe(&im, &cube, vp, rgb(1, 1, 1), screen);
+    int ok = 1;
+    for (int i = 0; i < 8; i++) {
+        vec4 s = to_screen(vp, cube.pos[i], 64, 64);
+        if (fabsf(screen[i].x - s.x) > 1e-4f || fabsf(screen[i].y - s.y) > 1e-4f || fabsf(screen[i].z - s.z) > 1e-6f) ok = 0;
+        if (image_at(&im, (int)floorf(s.x), (int)floorf(s.y))->r != 1) ok = 0;
+    }
+    CHECK(ok);
+    CHECK_INT(count_lit(&im), 281);
+    CHECK_DBL(image_at(&im, 0, 0)->r, 0.0);
+    CHECK_DBL(image_at(&im, 63, 63)->r, 0.0);
+
+    image_fill(&im, rgb(0, 0, 0));
+    mat4 inside = mat4_mul(mat4_perspective(1.2f, 1, 0.1f, 100), mat4_look_at(v3(3, 0, 0), v3(3, 0, -2), v3(0, 1, 0)));
+    draw_wireframe(&im, &torus, inside, rgb(1, 1, 1), screen);
+    CHECK_INT(count_lit(&im), 968);
+
+    image_fill(&im, rgb(0, 0, 0));
+    mat4 behind = mat4_mul(vp, mat4_translate(v3(6, 4, 8)));
+    draw_wireframe(&im, &cube, behind, rgb(1, 1, 1), screen);
+    CHECK_INT(count_lit(&im), 0);
+done:
+    free(screen);
+    mesh_free(&cube); mesh_free(&torus);
+    image_free(&im);
+    return TEST_END();
+}
+
+=== exercise vm_fill
+title: Renderer, step 9: filled triangles, top-left rule, z-buffer
+continues: vm_wire
+--- prompt
+Add the triangle rasterizer: `void fill_triangle(Image *im, float *zbuf, vec4 a, vec4 b, vec4 c, Color col)`. The vertices are screen-space (`x`, `y` in pixels, `z` depth 0..1; `w` is ignored). `zbuf` holds one float per pixel, the depth of what is drawn there (callers clear it to `1.0f` or `INFINITY`).
+
+1. `area = E(a, b, c)` with the edge function `E(a, b, p) = (b.x - a.x)(p.y - a.y) - (b.y - a.y)(p.x - a.x)`. If `area == 0` return. If `area < 0`, swap `b` and `c` (and negate `area`) so both windings work.
+2. Bounding box of the three vertices, clipped to the image: `floorf(min x)` to `ceilf(max x)`, and the same for `y`.
+3. For each pixel center `p = (x + 0.5, y + 0.5)` in the box: `w0 = E(b, c, p)`, `w1 = E(c, a, p)`, `w2 = E(a, b, p)`. The pixel is inside if each `w` is `> 0`, or is `== 0` on a **top-left** edge. With this orientation, the edge from `u` to `v` is top-left when `(v.y - u.y < 0) || (v.y == u.y && v.x - u.x > 0)`; `w0` belongs to edge `b → c`, `w1` to `c → a`, `w2` to `a → b`.
+4. Depth `z = (w0 a.z + w1 b.z + w2 c.z) / area`. If `z < zbuf[i]`, write `col` and `z`.
+
+The tests split squares and fans into triangles whose edges pass exactly through pixel centers and require that **every pixel is drawn exactly once**: `>= 0` everywhere double-draws shared edges, `> 0` everywhere leaves cracks. They also draw 200,000 small triangles on a 1024×1024 image: without the clipped bounding box that times out.
+--- solution
+#include <math.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+/* ---------- From "Images from scratch" ---------- */
+typedef struct { float r, g, b; } Color;
+typedef struct { int w, h; Color *px; } Image;
+
+static inline Color rgb(float r, float g, float b) { return (Color){ r, g, b }; }
+static inline int clampi(int v, int lo, int hi) { return v < lo ? lo : v > hi ? hi : v; }
+static inline float clampf(float v, float lo, float hi) { return v < lo ? lo : v > hi ? hi : v; }
+static inline Color color_scale(Color c, float k) { return rgb(c.r * k, c.g * k, c.b * k); }
+
+Image image_new(int w, int h) {
+    Image im = { w, h, calloc((size_t)w * (size_t)h, sizeof(Color)) };
+    return im;
+}
+
+void image_free(Image *im) {
+    free(im->px);
+    im->px = NULL;
+    im->w = im->h = 0;
+}
+
+Color *image_at(Image *im, int x, int y) {
+    return &im->px[(size_t)y * im->w + x];
+}
+
+void image_fill(Image *im, Color c) {
+    size_t n = (size_t)im->w * im->h;
+    for (size_t i = 0; i < n; i++) im->px[i] = c;
+}
+
+uint8_t to_byte(float v) {
+    if (!(v > 0.0f)) return 0;
+    if (v >= 1.0f) return 255;
+    return (uint8_t)(v * 255.0f + 0.5f);
+}
+
+float srgb_encode(float l) {
+    if (!(l > 0.0f)) return 0.0f;
+    if (l >= 1.0f) return 1.0f;
+    return l <= 0.0031308f ? 12.92f * l : 1.055f * powf(l, 1.0f / 2.4f) - 0.055f;
+}
+
+void srgb_lut_init(uint8_t lut[4096]) {
+    for (int i = 0; i < 4096; i++) lut[i] = to_byte(srgb_encode(i / 4095.0f));
+}
+
+static inline int lut_index(float v) {
+    if (!(v > 0.0f)) return 0;
+    if (v >= 1.0f) return 4095;
+    return (int)(v * 4095.0f + 0.5f);
+}
+
+void image_write_ppm_srgb(const Image *im, FILE *f, const uint8_t lut[4096]) {
+    fprintf(f, "P3\n%d %d\n255\n", im->w, im->h);
+    for (int y = 0; y < im->h; y++) {
+        const Color *row = im->px + (size_t)y * im->w;
+        for (int x = 0; x < im->w; x++)
+            fprintf(f, x ? " %d %d %d" : "%d %d %d", lut[lut_index(row[x].r)], lut[lut_index(row[x].g)],
+                    lut[lut_index(row[x].b)]);
+        fputc('\n', f);
+    }
+}
+
+void put_pixel(Image *im, int x, int y, Color c) {
+    if (x < 0 || y < 0 || x >= im->w || y >= im->h) return;
+    im->px[(size_t)y * im->w + x] = c;
+}
+
+void draw_line(Image *im, int x0, int y0, int x1, int y1, Color c) {
+    int dx = abs(x1 - x0), sx = x0 < x1 ? 1 : -1;
+    int dy = -abs(y1 - y0), sy = y0 < y1 ? 1 : -1;
+    int err = dx + dy;
+    for (;;) {
+        put_pixel(im, x0, y0, c);
+        if (x0 == x1 && y0 == y1) break;
+        int e2 = 2 * err;
+        if (e2 >= dy) { err += dy; x0 += sx; }
+        if (e2 <= dx) { err += dx; y0 += sy; }
+    }
+}
+
+/* ---------- Vector math ---------- */
+typedef struct { float x, y; } vec2;
+typedef struct { float x, y, z; } vec3;
+typedef struct { float x, y, z, w; } vec4;
+
+static inline vec3 v3(float x, float y, float z) { return (vec3){ x, y, z }; }
+
+vec3 v3_add(vec3 a, vec3 b) { return v3(a.x + b.x, a.y + b.y, a.z + b.z); }
+vec3 v3_sub(vec3 a, vec3 b) { return v3(a.x - b.x, a.y - b.y, a.z - b.z); }
+vec3 v3_scale(vec3 a, float s) { return v3(a.x * s, a.y * s, a.z * s); }
+vec3 v3_lerp(vec3 a, vec3 b, float t) { return v3(a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t, a.z + (b.z - a.z) * t); }
+float v3_dot(vec3 a, vec3 b) { return a.x * b.x + a.y * b.y + a.z * b.z; }
+vec3 v3_cross(vec3 a, vec3 b) { return v3(a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x); }
+float v3_length(vec3 a) { return sqrtf(v3_dot(a, a)); }
+
+vec3 v3_normalize(vec3 a) {
+    float l2 = v3_dot(a, a);
+    if (l2 < 1e-20f) return v3(0, 0, 0);
+    return v3_scale(a, 1.0f / sqrtf(l2));
+}
+
+vec3 v3_reflect(vec3 i, vec3 n) { return v3_sub(i, v3_scale(n, 2.0f * v3_dot(i, n))); }
+
+typedef struct { float m[16]; } mat4;
+
+mat4 mat4_identity(void) {
+    mat4 r = { { 0 } };
+    r.m[0] = r.m[5] = r.m[10] = r.m[15] = 1.0f;
+    return r;
+}
+
+mat4 mat4_mul(mat4 a, mat4 b) {
+    mat4 r;
+    for (int c = 0; c < 4; c++)
+        for (int row = 0; row < 4; row++) {
+            float s = 0;
+            for (int k = 0; k < 4; k++) s += a.m[k * 4 + row] * b.m[c * 4 + k];
+            r.m[c * 4 + row] = s;
+        }
+    return r;
+}
+
+vec4 mat4_mul_vec4(mat4 a, vec4 v) {
+    const float *m = a.m;
+    return (vec4){ m[0] * v.x + m[4] * v.y + m[8] * v.z + m[12] * v.w,
+                   m[1] * v.x + m[5] * v.y + m[9] * v.z + m[13] * v.w,
+                   m[2] * v.x + m[6] * v.y + m[10] * v.z + m[14] * v.w,
+                   m[3] * v.x + m[7] * v.y + m[11] * v.z + m[15] * v.w };
+}
+
+vec3 mat4_mul_point(mat4 a, vec3 p) {
+    const float *m = a.m;
+    return v3(m[0] * p.x + m[4] * p.y + m[8] * p.z + m[12],
+              m[1] * p.x + m[5] * p.y + m[9] * p.z + m[13],
+              m[2] * p.x + m[6] * p.y + m[10] * p.z + m[14]);
+}
+
+vec3 mat4_mul_dir(mat4 a, vec3 d) {
+    const float *m = a.m;
+    return v3(m[0] * d.x + m[4] * d.y + m[8] * d.z,
+              m[1] * d.x + m[5] * d.y + m[9] * d.z,
+              m[2] * d.x + m[6] * d.y + m[10] * d.z);
+}
+
+mat4 mat4_translate(vec3 t) {
+    mat4 r = mat4_identity();
+    r.m[12] = t.x; r.m[13] = t.y; r.m[14] = t.z;
+    return r;
+}
+
+mat4 mat4_scale(vec3 s) {
+    mat4 r = mat4_identity();
+    r.m[0] = s.x; r.m[5] = s.y; r.m[10] = s.z;
+    return r;
+}
+
+mat4 mat4_rotate_x(float a) {
+    mat4 r = mat4_identity();
+    float c = cosf(a), s = sinf(a);
+    r.m[5] = c; r.m[6] = s; r.m[9] = -s; r.m[10] = c;
+    return r;
+}
+
+mat4 mat4_rotate_y(float a) {
+    mat4 r = mat4_identity();
+    float c = cosf(a), s = sinf(a);
+    r.m[0] = c; r.m[2] = -s; r.m[8] = s; r.m[10] = c;
+    return r;
+}
+
+mat4 mat4_rotate_z(float a) {
+    mat4 r = mat4_identity();
+    float c = cosf(a), s = sinf(a);
+    r.m[0] = c; r.m[1] = s; r.m[4] = -s; r.m[5] = c;
+    return r;
+}
+
+mat4 mat4_rotate_axis(vec3 axis, float a) {
+    vec3 n = v3_normalize(axis);
+    float c = cosf(a), s = sinf(a), t = 1.0f - c;
+    float x = n.x, y = n.y, z = n.z;
+    mat4 r = mat4_identity();
+    r.m[0] = t * x * x + c;     r.m[4] = t * x * y - s * z; r.m[8] = t * x * z + s * y;
+    r.m[1] = t * x * y + s * z; r.m[5] = t * y * y + c;     r.m[9] = t * y * z - s * x;
+    r.m[2] = t * x * z - s * y; r.m[6] = t * y * z + s * x; r.m[10] = t * z * z + c;
+    return r;
+}
+
+mat4 mat4_look_at(vec3 eye, vec3 target, vec3 up) {
+    vec3 f = v3_normalize(v3_sub(target, eye));
+    vec3 s = v3_normalize(v3_cross(f, up));
+    vec3 u = v3_cross(s, f);
+    mat4 r = mat4_identity();
+    r.m[0] = s.x;  r.m[4] = s.y;  r.m[8] = s.z;
+    r.m[1] = u.x;  r.m[5] = u.y;  r.m[9] = u.z;
+    r.m[2] = -f.x; r.m[6] = -f.y; r.m[10] = -f.z;
+    r.m[12] = -v3_dot(s, eye);
+    r.m[13] = -v3_dot(u, eye);
+    r.m[14] = v3_dot(f, eye);
+    return r;
+}
+
+mat4 mat4_perspective(float fovy, float aspect, float znear, float zfar) {
+    float f = 1.0f / tanf(fovy * 0.5f);
+    mat4 r = { { 0 } };
+    r.m[0] = f / aspect;
+    r.m[5] = f;
+    r.m[10] = zfar / (znear - zfar);
+    r.m[11] = -1.0f;
+    r.m[14] = znear * zfar / (znear - zfar);
+    return r;
+}
+
+vec4 to_screen(mat4 mvp, vec3 p, int w, int h) {
+    vec4 c = mat4_mul_vec4(mvp, (vec4){ p.x, p.y, p.z, 1.0f });
+    if (c.w <= 1e-6f) return (vec4){ 0, 0, -1, c.w };
+    float iw = 1.0f / c.w;
+    return (vec4){ (c.x * iw * 0.5f + 0.5f) * w, (0.5f - c.y * iw * 0.5f) * h, c.z * iw, c.w };
+}
+
+typedef struct { float x, y, z, w; } quat;
+
+quat quat_from_axis_angle(vec3 axis, float angle) {
+    vec3 n = v3_normalize(axis);
+    float s = sinf(angle * 0.5f);
+    return (quat){ n.x * s, n.y * s, n.z * s, cosf(angle * 0.5f) };
+}
+
+quat quat_mul(quat a, quat b) {
+    return (quat){ a.w * b.x + a.x * b.w + a.y * b.z - a.z * b.y,
+                   a.w * b.y - a.x * b.z + a.y * b.w + a.z * b.x,
+                   a.w * b.z + a.x * b.y - a.y * b.x + a.z * b.w,
+                   a.w * b.w - a.x * b.x - a.y * b.y - a.z * b.z };
+}
+
+vec3 quat_rotate(quat q, vec3 v) {
+    vec3 u = v3(q.x, q.y, q.z);
+    vec3 t = v3_scale(v3_cross(u, v), 2.0f);
+    return v3_add(v3_add(v, v3_scale(t, q.w)), v3_cross(u, t));
+}
+
+mat4 quat_to_mat4(quat q) {
+    float x = q.x, y = q.y, z = q.z, w = q.w;
+    mat4 r = mat4_identity();
+    r.m[0] = 1 - 2 * (y * y + z * z); r.m[4] = 2 * (x * y - w * z);     r.m[8] = 2 * (x * z + w * y);
+    r.m[1] = 2 * (x * y + w * z);     r.m[5] = 1 - 2 * (x * x + z * z); r.m[9] = 2 * (y * z - w * x);
+    r.m[2] = 2 * (x * z - w * y);     r.m[6] = 2 * (y * z + w * x);     r.m[10] = 1 - 2 * (x * x + y * y);
+    return r;
+}
+
+quat quat_slerp(quat a, quat b, float t) {
+    float d = a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w;
+    if (d < 0) { b = (quat){ -b.x, -b.y, -b.z, -b.w }; d = -d; }
+    float wa, wb;
+    if (d > 0.9995f) {
+        wa = 1 - t; wb = t;
+    } else {
+        float th = acosf(d), s = sinf(th);
+        wa = sinf((1 - t) * th) / s; wb = sinf(t * th) / s;
+    }
+    quat r = { wa * a.x + wb * b.x, wa * a.y + wb * b.y, wa * a.z + wb * b.z, wa * a.w + wb * b.w };
+    float len = sqrtf(r.x * r.x + r.y * r.y + r.z * r.z + r.w * r.w);
+    return (quat){ r.x / len, r.y / len, r.z / len, r.w / len };
+}
+
+typedef struct { vec3 *pos; int npos; int *idx; int nidx; } Mesh;
+
+static Mesh mesh_alloc(int npos, int ntri) {
+    Mesh m = { malloc(sizeof(vec3) * (size_t)npos), npos, malloc(sizeof(int) * 3 * (size_t)ntri), 3 * ntri };
+    if (!m.pos || !m.idx) {
+        free(m.pos);
+        free(m.idx);
+        Mesh empty = { 0 };
+        return empty;
+    }
+    return m;
+}
+
+void mesh_free(Mesh *m) {
+    free(m->pos);
+    free(m->idx);
+    Mesh empty = { 0 };
+    *m = empty;
+}
+
+Mesh mesh_cube(float half) {
+    static const int quads[6][4] = { { 0, 4, 6, 2 }, { 1, 3, 7, 5 }, { 0, 1, 5, 4 },
+                                     { 2, 6, 7, 3 }, { 0, 2, 3, 1 }, { 4, 5, 7, 6 } };
+    Mesh m = mesh_alloc(8, 12);
+    if (!m.pos) return m;
+    for (int i = 0; i < 8; i++) m.pos[i] = v3(i & 1 ? half : -half, i & 2 ? half : -half, i & 4 ? half : -half);
+    int *t = m.idx;
+    for (int f = 0; f < 6; f++) {
+        const int *q = quads[f];
+        *t++ = q[0]; *t++ = q[1]; *t++ = q[2];
+        *t++ = q[0]; *t++ = q[2]; *t++ = q[3];
+    }
+    return m;
+}
+
+Mesh mesh_uv_sphere(int slices, int stacks, float r) {
+    Mesh m = mesh_alloc((stacks + 1) * (slices + 1), 2 * slices * (stacks - 1));
+    if (!m.pos) return m;
+    const float PI = 3.14159265f;
+    for (int i = 0; i <= stacks; i++) {
+        float th = PI * i / stacks, st = sinf(th), ct = cosf(th);
+        for (int j = 0; j <= slices; j++) {
+            float ph = 2 * PI * j / slices;
+            m.pos[i * (slices + 1) + j] = v3(r * st * cosf(ph), r * ct, -r * st * sinf(ph));
+        }
+    }
+    int *t = m.idx;
+    for (int i = 0; i < stacks; i++)
+        for (int j = 0; j < slices; j++) {
+            int a = i * (slices + 1) + j, b = a + slices + 1, c = b + 1, d = a + 1;
+            if (i != stacks - 1) { *t++ = a; *t++ = b; *t++ = c; }
+            if (i != 0) { *t++ = a; *t++ = c; *t++ = d; }
+        }
+    return m;
+}
+
+Mesh mesh_torus(float R, float r, int nu, int nv) {
+    Mesh m = mesh_alloc(nu * nv, 2 * nu * nv);
+    if (!m.pos) return m;
+    const float TAU = 6.2831853f;
+    for (int i = 0; i < nu; i++) {
+        float u = TAU * i / nu, cu = cosf(u), su = sinf(u);
+        for (int j = 0; j < nv; j++) {
+            float v = TAU * j / nv, ring = R + r * cosf(v);
+            m.pos[i * nv + j] = v3(ring * cu, r * sinf(v), -ring * su);
+        }
+    }
+    int *t = m.idx;
+    for (int i = 0; i < nu; i++) {
+        int i1 = (i + 1) % nu;
+        for (int j = 0; j < nv; j++) {
+            int j1 = (j + 1) % nv;
+            int a = i * nv + j, b = i1 * nv + j, c = i1 * nv + j1, d = i * nv + j1;
+            *t++ = a; *t++ = b; *t++ = c;
+            *t++ = a; *t++ = c; *t++ = d;
+        }
+    }
+    return m;
+}
+
+int screen_ok(vec4 s, int w, int h) {
+    return s.w > 1e-6f && s.z >= 0.0f && s.x > -4.0f * w && s.x < 5.0f * w && s.y > -4.0f * h && s.y < 5.0f * h;
+}
+
+void draw_wireframe(Image *im, const Mesh *m, mat4 mvp, Color c, vec4 *screen) {
+    for (int i = 0; i < m->npos; i++) screen[i] = to_screen(mvp, m->pos[i], im->w, im->h);
+    for (int t = 0; t < m->nidx; t += 3) {
+        vec4 a = screen[m->idx[t]], b = screen[m->idx[t + 1]], d = screen[m->idx[t + 2]];
+        if (!screen_ok(a, im->w, im->h) || !screen_ok(b, im->w, im->h) || !screen_ok(d, im->w, im->h)) continue;
+        int ax = (int)floorf(a.x), ay = (int)floorf(a.y), bx = (int)floorf(b.x), by = (int)floorf(b.y);
+        int dx = (int)floorf(d.x), dy = (int)floorf(d.y);
+        draw_line(im, ax, ay, bx, by, c);
+        draw_line(im, bx, by, dx, dy, c);
+        draw_line(im, dx, dy, ax, ay, c);
+    }
+}
+
+static inline float edge_fn(vec4 a, vec4 b, float px, float py) {
+    return (b.x - a.x) * (py - a.y) - (b.y - a.y) * (px - a.x);
+}
+
+static inline int top_left(vec4 u, vec4 v) {
+    return (v.y - u.y < 0) || (v.y == u.y && v.x - u.x > 0);
+}
+
+void fill_triangle(Image *im, float *zbuf, vec4 a, vec4 b, vec4 c, Color col) {
+    float area = edge_fn(a, b, c.x, c.y);
+    if (area == 0.0f) return;
+    if (area < 0) { vec4 t = b; b = c; c = t; area = -area; }
+    int x0 = clampi((int)floorf(fminf(a.x, fminf(b.x, c.x))), 0, im->w);
+    int x1 = clampi((int)ceilf(fmaxf(a.x, fmaxf(b.x, c.x))), -1, im->w - 1);
+    int y0 = clampi((int)floorf(fminf(a.y, fminf(b.y, c.y))), 0, im->h);
+    int y1 = clampi((int)ceilf(fmaxf(a.y, fmaxf(b.y, c.y))), -1, im->h - 1);
+    int tl0 = top_left(b, c), tl1 = top_left(c, a), tl2 = top_left(a, b);
+    float inv = 1.0f / area;
+    for (int y = y0; y <= y1; y++) {
+        float py = y + 0.5f;
+        for (int x = x0; x <= x1; x++) {
+            float px = x + 0.5f;
+            float w0 = edge_fn(b, c, px, py), w1 = edge_fn(c, a, px, py), w2 = edge_fn(a, b, px, py);
+            if (w0 < 0 || w1 < 0 || w2 < 0) continue;
+            if ((w0 == 0 && !tl0) || (w1 == 0 && !tl1) || (w2 == 0 && !tl2)) continue;
+            float z = (w0 * a.z + w1 * b.z + w2 * c.z) * inv;
+            size_t i = (size_t)y * im->w + x;
+            if (z < zbuf[i]) {
+                zbuf[i] = z;
+                im->px[i] = col;
+            }
+        }
+    }
+}
+
+int main(void) {
+    static uint8_t lut[4096];
+    srgb_lut_init(lut);
+    Image im = image_new(128, 128);
+    float *z = malloc(sizeof(float) * 128 * 128);
+    if (!im.px || !z) { free(z); image_free(&im); return 1; }
+    for (int i = 0; i < 128 * 128; i++) z[i] = 1.0f;
+    /* A fan of triangles around the center: shared edges, no gaps, no double draws. */
+    for (int k = 0; k < 24; k++) {
+        float a0 = k * 6.2831853f / 24, a1 = (k + 1) * 6.2831853f / 24;
+        vec4 c = { 64, 64, 0.5f, 1 };
+        vec4 p = { 64 + 60 * cosf(a0), 64 + 60 * sinf(a0), 0.5f, 1 }, q = { 64 + 60 * cosf(a1), 64 + 60 * sinf(a1), 0.5f, 1 };
+        fill_triangle(&im, z, c, p, q, rgb(0.5f + 0.5f * cosf(a0), 0.5f + 0.5f * cosf(a0 + 2.1f), 0.5f + 0.5f * cosf(a0 + 4.2f)));
+    }
+    /* Two triangles that intersect in depth: the z-buffer resolves it per pixel. */
+    fill_triangle(&im, z, (vec4){ 10, 20, 0.1f, 1 }, (vec4){ 118, 40, 0.9f, 1 }, (vec4){ 30, 110, 0.1f, 1 }, rgb(0.9f, 0.9f, 0.9f));
+    fill_triangle(&im, z, (vec4){ 118, 20, 0.1f, 1 }, (vec4){ 100, 110, 0.1f, 1 }, (vec4){ 10, 60, 0.9f, 1 }, rgb(0.1f, 0.1f, 0.1f));
+    image_write_ppm_srgb(&im, stdout, lut);
+    free(z);
+    image_free(&im);
+    return 0;
+}
+--- stubs
+void fill_triangle(Image *im, float *zbuf, vec4 a, vec4 b, vec4 c, Color col) {
+    (void)zbuf;
+    draw_line(im, (int)a.x, (int)a.y, (int)b.x, (int)b.y, col);
+    draw_line(im, (int)b.x, (int)b.y, (int)c.x, (int)c.y, col);
+    draw_line(im, (int)c.x, (int)c.y, (int)a.x, (int)a.y, col);
+}
+--- hint
+Compute the three top-left flags once per triangle, outside the pixel loops. Inside, reject with `w < 0`, then reject `w == 0` on an edge that isn't top-left.
+--- hint
+Clip the box with your `clampi`: `x0 = clampi(floor(min), 0, w)` and `x1 = clampi(ceil(max), -1, w - 1)` makes the loop empty for off-screen triangles.
+--- harness
+static Image IM;
+static float *ZB;
+
+static void clear(void) {
+    image_fill(&IM, rgb(0, 0, 0));
+    for (int i = 0; i < IM.w * IM.h; i++) ZB[i] = 1.0f;
+}
+static int count(void) {
+    int n = 0;
+    for (int i = 0; i < IM.w * IM.h; i++) n += IM.px[i].r > 0;
+    return n;
+}
+static vec4 P(float x, float y) { return (vec4){ x, y, 0.5f, 1 }; }
+
+/* Draws each triangle alone and all together: equal totals mean no pixel was drawn twice. */
+static int exactly_once(vec4 (*tri)[3], int n, int want) {
+    int sum = 0;
+    for (int i = 0; i < n; i++) {
+        clear();
+        fill_triangle(&IM, ZB, tri[i][0], tri[i][1], tri[i][2], rgb(1, 1, 1));
+        sum += count();
+    }
+    clear();
+    for (int i = 0; i < n; i++) fill_triangle(&IM, ZB, tri[i][0], tri[i][1], tri[i][2], rgb(1, 1, 1));
+    return sum == want && count() == want;
+}
+
+int main(void) {
+    IM = image_new(32, 32);
+    ZB = malloc(sizeof(float) * 32 * 32);
+    if (!IM.px || !ZB) { CHECK(!"allocation failed"); free(ZB); image_free(&IM); return TEST_END(); }
+
+    vec4 sq[2][3] = { { P(2.5f, 2.5f), P(6.5f, 2.5f), P(6.5f, 6.5f) }, { P(2.5f, 2.5f), P(6.5f, 6.5f), P(2.5f, 6.5f) } };
+    CHECK(exactly_once(sq, 2, 16));
+    clear();
+    fill_triangle(&IM, ZB, sq[0][0], sq[0][1], sq[0][2], rgb(1, 1, 1));
+    CHECK_INT(count(), 10);
+    CHECK(image_at(&IM, 2, 2)->r > 0);
+    CHECK(image_at(&IM, 6, 2)->r == 0);
+    CHECK(image_at(&IM, 5, 5)->r > 0);
+    CHECK(image_at(&IM, 5, 6)->r == 0);
+    vec4 sq2[2][3] = { { P(2.5f, 2.5f), P(6.5f, 6.5f), P(6.5f, 2.5f) }, { P(2.5f, 2.5f), P(2.5f, 6.5f), P(6.5f, 6.5f) } };
+    CHECK(exactly_once(sq2, 2, 16));
+    vec4 fan[8][3];
+    float px[9] = { 10.5f, 15.5f, 20.5f, 20.5f, 20.5f, 15.5f, 10.5f, 10.5f, 10.5f };
+    float py[9] = { 10.5f, 10.5f, 10.5f, 15.5f, 20.5f, 20.5f, 20.5f, 15.5f, 10.5f };
+    for (int i = 0; i < 8; i++) {
+        fan[i][0] = P(15.5f, 15.5f);
+        fan[i][1] = P(px[i], py[i]);
+        fan[i][2] = P(px[i + 1], py[i + 1]);
+    }
+    CHECK(exactly_once(fan, 8, 100));
+    vec4 odd[4][3] = { { P(3.5f, 3.5f), P(20.5f, 7.5f), P(9.5f, 25.5f) }, { P(20.5f, 7.5f), P(28.5f, 22.5f), P(9.5f, 25.5f) },
+                       { P(3.5f, 3.5f), P(9.5f, 25.5f), P(1.5f, 29.5f) }, { P(20.5f, 7.5f), P(30.5f, 1.5f), P(28.5f, 22.5f) } };
+    clear();
+    for (int i = 0; i < 4; i++) fill_triangle(&IM, ZB, odd[i][0], odd[i][1], odd[i][2], rgb(1, 1, 1));
+    int all = count();
+    CHECK(exactly_once(odd, 4, all));
+    CHECK_INT(all, 527);
+
+    clear();
+    fill_triangle(&IM, ZB, P(5, 5), P(10, 10), P(15, 15), rgb(1, 1, 1));
+    CHECK_INT(count(), 0);
+    fill_triangle(&IM, ZB, P(-50, -50), P(-10, -60), P(-20, -5), rgb(1, 1, 1));
+    fill_triangle(&IM, ZB, P(40, 5), P(90, 5), P(60, 30), rgb(1, 1, 1));
+    CHECK_INT(count(), 0);
+    fill_triangle(&IM, ZB, P(-100, -100), P(300, -100), P(-100, 300), rgb(1, 1, 1));
+    CHECK_INT(count(), 1024);
+
+    clear();
+    vec4 n0 = { 2, 2, 0.2f, 1 }, n1 = { 30, 2, 0.2f, 1 }, n2 = { 2, 30, 0.2f, 1 };
+    vec4 f0 = { 2, 2, 0.8f, 1 }, f1 = { 30, 30, 0.8f, 1 }, f2 = { 2, 30, 0.8f, 1 };
+    fill_triangle(&IM, ZB, n0, n1, n2, rgb(1, 0, 0));
+    fill_triangle(&IM, ZB, f0, f1, f2, rgb(0, 0, 1));
+    Color near_first = *image_at(&IM, 5, 20);
+    float zfirst = ZB[20 * 32 + 5];
+    clear();
+    fill_triangle(&IM, ZB, f0, f1, f2, rgb(0, 0, 1));
+    fill_triangle(&IM, ZB, n0, n1, n2, rgb(1, 0, 0));
+    CHECK(near_first.r == 1 && image_at(&IM, 5, 20)->r == 1);
+    CHECK_DBL(zfirst, 0.2);
+    CHECK_DBL(image_at(&IM, 28, 29)->b, 1.0);
+    clear();
+    fill_triangle(&IM, ZB, (vec4){ 0, 0, 0.0f, 1 }, (vec4){ 32, 0, 1.0f, 1 }, (vec4){ 0, 32, 0.5f, 1 }, rgb(1, 1, 1));
+    CHECK(fabsf(ZB[4 * 32 + 8] - (8.5f / 32 + 0.5f * 4.5f / 32)) < 1e-5f);
+    CHECK(fabsf(ZB[0] - (0.5f / 32 + 0.25f / 32)) < 1e-5f);
+    free(ZB);
+    image_free(&IM);
+
+    int n = 1024;
+    Image big = image_new(n, n);
+    float *zb = malloc(sizeof(float) * n * n);
+    if (big.px && zb) {
+        for (int i = 0; i < n * n; i++) zb[i] = 1.0f;
+        uint32_t s = 5;
+        for (int i = 0; i < 200000; i++) {
+            s = s * 1664525u + 1013904223u; float x = (float)((s >> 8) % 1100) - 40;
+            s = s * 1664525u + 1013904223u; float y = (float)((s >> 8) % 1100) - 40;
+            s = s * 1664525u + 1013904223u; float z = (s >> 8) / 16777216.0f;
+            fill_triangle(&big, zb, (vec4){ x, y, z, 1 }, (vec4){ x + 6, y + 1, z, 1 }, (vec4){ x + 2, y + 7, z, 1 }, rgb(z, 1, 0));
+        }
+        double sum = 0;
+        for (int i = 0; i < n * n; i++) sum += big.px[i].r;
+        CHECK(fabs(sum - 268520.08) < 1);
+    } else CHECK(!"allocation failed");
+    free(zb);
+    image_free(&big);
+    return TEST_END();
+}
+
+=== exercise vm_scene
+title: Renderer, step 10: flat-shaded meshes and a 3D scene
+continues: vm_fill
+--- prompt
+Put it all together: `void render_mesh(Image *im, float *zbuf, const Mesh *m, mat4 model, mat4 viewproj, vec3 light_dir, Color base, vec4 *screen)`.
+
+1. `mvp = viewproj * model`, computed **once**. Project every vertex once into `screen` (as in the wireframe).
+2. For each triangle `(i0, i1, i2)`: skip it unless all three vertices pass `screen_ok`.
+3. **Back-face culling:** with `E` the edge function from the previous step, a triangle that winds counter-clockwise in world space (seen from outside) has `E(s0, s1, s2) < 0` on screen (the y axis flipped). Skip triangles with `E >= 0`.
+4. **Flat shading:** world-space corners `p = mat4_mul_point(model, pos)`, face normal `n = normalize(cross(p1 - p0, p2 - p0))`, `L = normalize(light_dir)` (the direction light travels), intensity `k = 0.15 + 0.85 * max(0, dot(n, -L))`, color `base * k`.
+5. `fill_triangle` with the three screen vertices.
+
+Run renders a lit scene: a torus, a sphere, a rotated cube and a floor, all from your generators. Change the camera, the light, the mesh resolution.
+--- solution
+#include <math.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+/* ---------- From "Images from scratch" ---------- */
+typedef struct { float r, g, b; } Color;
+typedef struct { int w, h; Color *px; } Image;
+
+static inline Color rgb(float r, float g, float b) { return (Color){ r, g, b }; }
+static inline int clampi(int v, int lo, int hi) { return v < lo ? lo : v > hi ? hi : v; }
+static inline float clampf(float v, float lo, float hi) { return v < lo ? lo : v > hi ? hi : v; }
+static inline Color color_scale(Color c, float k) { return rgb(c.r * k, c.g * k, c.b * k); }
+
+Image image_new(int w, int h) {
+    Image im = { w, h, calloc((size_t)w * (size_t)h, sizeof(Color)) };
+    return im;
+}
+
+void image_free(Image *im) {
+    free(im->px);
+    im->px = NULL;
+    im->w = im->h = 0;
+}
+
+Color *image_at(Image *im, int x, int y) {
+    return &im->px[(size_t)y * im->w + x];
+}
+
+void image_fill(Image *im, Color c) {
+    size_t n = (size_t)im->w * im->h;
+    for (size_t i = 0; i < n; i++) im->px[i] = c;
+}
+
+uint8_t to_byte(float v) {
+    if (!(v > 0.0f)) return 0;
+    if (v >= 1.0f) return 255;
+    return (uint8_t)(v * 255.0f + 0.5f);
+}
+
+float srgb_encode(float l) {
+    if (!(l > 0.0f)) return 0.0f;
+    if (l >= 1.0f) return 1.0f;
+    return l <= 0.0031308f ? 12.92f * l : 1.055f * powf(l, 1.0f / 2.4f) - 0.055f;
+}
+
+void srgb_lut_init(uint8_t lut[4096]) {
+    for (int i = 0; i < 4096; i++) lut[i] = to_byte(srgb_encode(i / 4095.0f));
+}
+
+static inline int lut_index(float v) {
+    if (!(v > 0.0f)) return 0;
+    if (v >= 1.0f) return 4095;
+    return (int)(v * 4095.0f + 0.5f);
+}
+
+void image_write_ppm_srgb(const Image *im, FILE *f, const uint8_t lut[4096]) {
+    fprintf(f, "P3\n%d %d\n255\n", im->w, im->h);
+    for (int y = 0; y < im->h; y++) {
+        const Color *row = im->px + (size_t)y * im->w;
+        for (int x = 0; x < im->w; x++)
+            fprintf(f, x ? " %d %d %d" : "%d %d %d", lut[lut_index(row[x].r)], lut[lut_index(row[x].g)],
+                    lut[lut_index(row[x].b)]);
+        fputc('\n', f);
+    }
+}
+
+void put_pixel(Image *im, int x, int y, Color c) {
+    if (x < 0 || y < 0 || x >= im->w || y >= im->h) return;
+    im->px[(size_t)y * im->w + x] = c;
+}
+
+void draw_line(Image *im, int x0, int y0, int x1, int y1, Color c) {
+    int dx = abs(x1 - x0), sx = x0 < x1 ? 1 : -1;
+    int dy = -abs(y1 - y0), sy = y0 < y1 ? 1 : -1;
+    int err = dx + dy;
+    for (;;) {
+        put_pixel(im, x0, y0, c);
+        if (x0 == x1 && y0 == y1) break;
+        int e2 = 2 * err;
+        if (e2 >= dy) { err += dy; x0 += sx; }
+        if (e2 <= dx) { err += dx; y0 += sy; }
+    }
+}
+
+/* ---------- Vector math ---------- */
+typedef struct { float x, y; } vec2;
+typedef struct { float x, y, z; } vec3;
+typedef struct { float x, y, z, w; } vec4;
+
+static inline vec3 v3(float x, float y, float z) { return (vec3){ x, y, z }; }
+
+vec3 v3_add(vec3 a, vec3 b) { return v3(a.x + b.x, a.y + b.y, a.z + b.z); }
+vec3 v3_sub(vec3 a, vec3 b) { return v3(a.x - b.x, a.y - b.y, a.z - b.z); }
+vec3 v3_scale(vec3 a, float s) { return v3(a.x * s, a.y * s, a.z * s); }
+vec3 v3_lerp(vec3 a, vec3 b, float t) { return v3(a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t, a.z + (b.z - a.z) * t); }
+float v3_dot(vec3 a, vec3 b) { return a.x * b.x + a.y * b.y + a.z * b.z; }
+vec3 v3_cross(vec3 a, vec3 b) { return v3(a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x); }
+float v3_length(vec3 a) { return sqrtf(v3_dot(a, a)); }
+
+vec3 v3_normalize(vec3 a) {
+    float l2 = v3_dot(a, a);
+    if (l2 < 1e-20f) return v3(0, 0, 0);
+    return v3_scale(a, 1.0f / sqrtf(l2));
+}
+
+vec3 v3_reflect(vec3 i, vec3 n) { return v3_sub(i, v3_scale(n, 2.0f * v3_dot(i, n))); }
+
+typedef struct { float m[16]; } mat4;
+
+mat4 mat4_identity(void) {
+    mat4 r = { { 0 } };
+    r.m[0] = r.m[5] = r.m[10] = r.m[15] = 1.0f;
+    return r;
+}
+
+mat4 mat4_mul(mat4 a, mat4 b) {
+    mat4 r;
+    for (int c = 0; c < 4; c++)
+        for (int row = 0; row < 4; row++) {
+            float s = 0;
+            for (int k = 0; k < 4; k++) s += a.m[k * 4 + row] * b.m[c * 4 + k];
+            r.m[c * 4 + row] = s;
+        }
+    return r;
+}
+
+vec4 mat4_mul_vec4(mat4 a, vec4 v) {
+    const float *m = a.m;
+    return (vec4){ m[0] * v.x + m[4] * v.y + m[8] * v.z + m[12] * v.w,
+                   m[1] * v.x + m[5] * v.y + m[9] * v.z + m[13] * v.w,
+                   m[2] * v.x + m[6] * v.y + m[10] * v.z + m[14] * v.w,
+                   m[3] * v.x + m[7] * v.y + m[11] * v.z + m[15] * v.w };
+}
+
+vec3 mat4_mul_point(mat4 a, vec3 p) {
+    const float *m = a.m;
+    return v3(m[0] * p.x + m[4] * p.y + m[8] * p.z + m[12],
+              m[1] * p.x + m[5] * p.y + m[9] * p.z + m[13],
+              m[2] * p.x + m[6] * p.y + m[10] * p.z + m[14]);
+}
+
+vec3 mat4_mul_dir(mat4 a, vec3 d) {
+    const float *m = a.m;
+    return v3(m[0] * d.x + m[4] * d.y + m[8] * d.z,
+              m[1] * d.x + m[5] * d.y + m[9] * d.z,
+              m[2] * d.x + m[6] * d.y + m[10] * d.z);
+}
+
+mat4 mat4_translate(vec3 t) {
+    mat4 r = mat4_identity();
+    r.m[12] = t.x; r.m[13] = t.y; r.m[14] = t.z;
+    return r;
+}
+
+mat4 mat4_scale(vec3 s) {
+    mat4 r = mat4_identity();
+    r.m[0] = s.x; r.m[5] = s.y; r.m[10] = s.z;
+    return r;
+}
+
+mat4 mat4_rotate_x(float a) {
+    mat4 r = mat4_identity();
+    float c = cosf(a), s = sinf(a);
+    r.m[5] = c; r.m[6] = s; r.m[9] = -s; r.m[10] = c;
+    return r;
+}
+
+mat4 mat4_rotate_y(float a) {
+    mat4 r = mat4_identity();
+    float c = cosf(a), s = sinf(a);
+    r.m[0] = c; r.m[2] = -s; r.m[8] = s; r.m[10] = c;
+    return r;
+}
+
+mat4 mat4_rotate_z(float a) {
+    mat4 r = mat4_identity();
+    float c = cosf(a), s = sinf(a);
+    r.m[0] = c; r.m[1] = s; r.m[4] = -s; r.m[5] = c;
+    return r;
+}
+
+mat4 mat4_rotate_axis(vec3 axis, float a) {
+    vec3 n = v3_normalize(axis);
+    float c = cosf(a), s = sinf(a), t = 1.0f - c;
+    float x = n.x, y = n.y, z = n.z;
+    mat4 r = mat4_identity();
+    r.m[0] = t * x * x + c;     r.m[4] = t * x * y - s * z; r.m[8] = t * x * z + s * y;
+    r.m[1] = t * x * y + s * z; r.m[5] = t * y * y + c;     r.m[9] = t * y * z - s * x;
+    r.m[2] = t * x * z - s * y; r.m[6] = t * y * z + s * x; r.m[10] = t * z * z + c;
+    return r;
+}
+
+mat4 mat4_look_at(vec3 eye, vec3 target, vec3 up) {
+    vec3 f = v3_normalize(v3_sub(target, eye));
+    vec3 s = v3_normalize(v3_cross(f, up));
+    vec3 u = v3_cross(s, f);
+    mat4 r = mat4_identity();
+    r.m[0] = s.x;  r.m[4] = s.y;  r.m[8] = s.z;
+    r.m[1] = u.x;  r.m[5] = u.y;  r.m[9] = u.z;
+    r.m[2] = -f.x; r.m[6] = -f.y; r.m[10] = -f.z;
+    r.m[12] = -v3_dot(s, eye);
+    r.m[13] = -v3_dot(u, eye);
+    r.m[14] = v3_dot(f, eye);
+    return r;
+}
+
+mat4 mat4_perspective(float fovy, float aspect, float znear, float zfar) {
+    float f = 1.0f / tanf(fovy * 0.5f);
+    mat4 r = { { 0 } };
+    r.m[0] = f / aspect;
+    r.m[5] = f;
+    r.m[10] = zfar / (znear - zfar);
+    r.m[11] = -1.0f;
+    r.m[14] = znear * zfar / (znear - zfar);
+    return r;
+}
+
+vec4 to_screen(mat4 mvp, vec3 p, int w, int h) {
+    vec4 c = mat4_mul_vec4(mvp, (vec4){ p.x, p.y, p.z, 1.0f });
+    if (c.w <= 1e-6f) return (vec4){ 0, 0, -1, c.w };
+    float iw = 1.0f / c.w;
+    return (vec4){ (c.x * iw * 0.5f + 0.5f) * w, (0.5f - c.y * iw * 0.5f) * h, c.z * iw, c.w };
+}
+
+typedef struct { float x, y, z, w; } quat;
+
+quat quat_from_axis_angle(vec3 axis, float angle) {
+    vec3 n = v3_normalize(axis);
+    float s = sinf(angle * 0.5f);
+    return (quat){ n.x * s, n.y * s, n.z * s, cosf(angle * 0.5f) };
+}
+
+quat quat_mul(quat a, quat b) {
+    return (quat){ a.w * b.x + a.x * b.w + a.y * b.z - a.z * b.y,
+                   a.w * b.y - a.x * b.z + a.y * b.w + a.z * b.x,
+                   a.w * b.z + a.x * b.y - a.y * b.x + a.z * b.w,
+                   a.w * b.w - a.x * b.x - a.y * b.y - a.z * b.z };
+}
+
+vec3 quat_rotate(quat q, vec3 v) {
+    vec3 u = v3(q.x, q.y, q.z);
+    vec3 t = v3_scale(v3_cross(u, v), 2.0f);
+    return v3_add(v3_add(v, v3_scale(t, q.w)), v3_cross(u, t));
+}
+
+mat4 quat_to_mat4(quat q) {
+    float x = q.x, y = q.y, z = q.z, w = q.w;
+    mat4 r = mat4_identity();
+    r.m[0] = 1 - 2 * (y * y + z * z); r.m[4] = 2 * (x * y - w * z);     r.m[8] = 2 * (x * z + w * y);
+    r.m[1] = 2 * (x * y + w * z);     r.m[5] = 1 - 2 * (x * x + z * z); r.m[9] = 2 * (y * z - w * x);
+    r.m[2] = 2 * (x * z - w * y);     r.m[6] = 2 * (y * z + w * x);     r.m[10] = 1 - 2 * (x * x + y * y);
+    return r;
+}
+
+quat quat_slerp(quat a, quat b, float t) {
+    float d = a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w;
+    if (d < 0) { b = (quat){ -b.x, -b.y, -b.z, -b.w }; d = -d; }
+    float wa, wb;
+    if (d > 0.9995f) {
+        wa = 1 - t; wb = t;
+    } else {
+        float th = acosf(d), s = sinf(th);
+        wa = sinf((1 - t) * th) / s; wb = sinf(t * th) / s;
+    }
+    quat r = { wa * a.x + wb * b.x, wa * a.y + wb * b.y, wa * a.z + wb * b.z, wa * a.w + wb * b.w };
+    float len = sqrtf(r.x * r.x + r.y * r.y + r.z * r.z + r.w * r.w);
+    return (quat){ r.x / len, r.y / len, r.z / len, r.w / len };
+}
+
+typedef struct { vec3 *pos; int npos; int *idx; int nidx; } Mesh;
+
+static Mesh mesh_alloc(int npos, int ntri) {
+    Mesh m = { malloc(sizeof(vec3) * (size_t)npos), npos, malloc(sizeof(int) * 3 * (size_t)ntri), 3 * ntri };
+    if (!m.pos || !m.idx) {
+        free(m.pos);
+        free(m.idx);
+        Mesh empty = { 0 };
+        return empty;
+    }
+    return m;
+}
+
+void mesh_free(Mesh *m) {
+    free(m->pos);
+    free(m->idx);
+    Mesh empty = { 0 };
+    *m = empty;
+}
+
+Mesh mesh_cube(float half) {
+    static const int quads[6][4] = { { 0, 4, 6, 2 }, { 1, 3, 7, 5 }, { 0, 1, 5, 4 },
+                                     { 2, 6, 7, 3 }, { 0, 2, 3, 1 }, { 4, 5, 7, 6 } };
+    Mesh m = mesh_alloc(8, 12);
+    if (!m.pos) return m;
+    for (int i = 0; i < 8; i++) m.pos[i] = v3(i & 1 ? half : -half, i & 2 ? half : -half, i & 4 ? half : -half);
+    int *t = m.idx;
+    for (int f = 0; f < 6; f++) {
+        const int *q = quads[f];
+        *t++ = q[0]; *t++ = q[1]; *t++ = q[2];
+        *t++ = q[0]; *t++ = q[2]; *t++ = q[3];
+    }
+    return m;
+}
+
+Mesh mesh_uv_sphere(int slices, int stacks, float r) {
+    Mesh m = mesh_alloc((stacks + 1) * (slices + 1), 2 * slices * (stacks - 1));
+    if (!m.pos) return m;
+    const float PI = 3.14159265f;
+    for (int i = 0; i <= stacks; i++) {
+        float th = PI * i / stacks, st = sinf(th), ct = cosf(th);
+        for (int j = 0; j <= slices; j++) {
+            float ph = 2 * PI * j / slices;
+            m.pos[i * (slices + 1) + j] = v3(r * st * cosf(ph), r * ct, -r * st * sinf(ph));
+        }
+    }
+    int *t = m.idx;
+    for (int i = 0; i < stacks; i++)
+        for (int j = 0; j < slices; j++) {
+            int a = i * (slices + 1) + j, b = a + slices + 1, c = b + 1, d = a + 1;
+            if (i != stacks - 1) { *t++ = a; *t++ = b; *t++ = c; }
+            if (i != 0) { *t++ = a; *t++ = c; *t++ = d; }
+        }
+    return m;
+}
+
+Mesh mesh_torus(float R, float r, int nu, int nv) {
+    Mesh m = mesh_alloc(nu * nv, 2 * nu * nv);
+    if (!m.pos) return m;
+    const float TAU = 6.2831853f;
+    for (int i = 0; i < nu; i++) {
+        float u = TAU * i / nu, cu = cosf(u), su = sinf(u);
+        for (int j = 0; j < nv; j++) {
+            float v = TAU * j / nv, ring = R + r * cosf(v);
+            m.pos[i * nv + j] = v3(ring * cu, r * sinf(v), -ring * su);
+        }
+    }
+    int *t = m.idx;
+    for (int i = 0; i < nu; i++) {
+        int i1 = (i + 1) % nu;
+        for (int j = 0; j < nv; j++) {
+            int j1 = (j + 1) % nv;
+            int a = i * nv + j, b = i1 * nv + j, c = i1 * nv + j1, d = i * nv + j1;
+            *t++ = a; *t++ = b; *t++ = c;
+            *t++ = a; *t++ = c; *t++ = d;
+        }
+    }
+    return m;
+}
+
+int screen_ok(vec4 s, int w, int h) {
+    return s.w > 1e-6f && s.z >= 0.0f && s.x > -4.0f * w && s.x < 5.0f * w && s.y > -4.0f * h && s.y < 5.0f * h;
+}
+
+void draw_wireframe(Image *im, const Mesh *m, mat4 mvp, Color c, vec4 *screen) {
+    for (int i = 0; i < m->npos; i++) screen[i] = to_screen(mvp, m->pos[i], im->w, im->h);
+    for (int t = 0; t < m->nidx; t += 3) {
+        vec4 a = screen[m->idx[t]], b = screen[m->idx[t + 1]], d = screen[m->idx[t + 2]];
+        if (!screen_ok(a, im->w, im->h) || !screen_ok(b, im->w, im->h) || !screen_ok(d, im->w, im->h)) continue;
+        int ax = (int)floorf(a.x), ay = (int)floorf(a.y), bx = (int)floorf(b.x), by = (int)floorf(b.y);
+        int dx = (int)floorf(d.x), dy = (int)floorf(d.y);
+        draw_line(im, ax, ay, bx, by, c);
+        draw_line(im, bx, by, dx, dy, c);
+        draw_line(im, dx, dy, ax, ay, c);
+    }
+}
+
+static inline float edge_fn(vec4 a, vec4 b, float px, float py) {
+    return (b.x - a.x) * (py - a.y) - (b.y - a.y) * (px - a.x);
+}
+
+static inline int top_left(vec4 u, vec4 v) {
+    return (v.y - u.y < 0) || (v.y == u.y && v.x - u.x > 0);
+}
+
+void fill_triangle(Image *im, float *zbuf, vec4 a, vec4 b, vec4 c, Color col) {
+    float area = edge_fn(a, b, c.x, c.y);
+    if (area == 0.0f) return;
+    if (area < 0) { vec4 t = b; b = c; c = t; area = -area; }
+    int x0 = clampi((int)floorf(fminf(a.x, fminf(b.x, c.x))), 0, im->w);
+    int x1 = clampi((int)ceilf(fmaxf(a.x, fmaxf(b.x, c.x))), -1, im->w - 1);
+    int y0 = clampi((int)floorf(fminf(a.y, fminf(b.y, c.y))), 0, im->h);
+    int y1 = clampi((int)ceilf(fmaxf(a.y, fmaxf(b.y, c.y))), -1, im->h - 1);
+    int tl0 = top_left(b, c), tl1 = top_left(c, a), tl2 = top_left(a, b);
+    float inv = 1.0f / area;
+    for (int y = y0; y <= y1; y++) {
+        float py = y + 0.5f;
+        for (int x = x0; x <= x1; x++) {
+            float px = x + 0.5f;
+            float w0 = edge_fn(b, c, px, py), w1 = edge_fn(c, a, px, py), w2 = edge_fn(a, b, px, py);
+            if (w0 < 0 || w1 < 0 || w2 < 0) continue;
+            if ((w0 == 0 && !tl0) || (w1 == 0 && !tl1) || (w2 == 0 && !tl2)) continue;
+            float z = (w0 * a.z + w1 * b.z + w2 * c.z) * inv;
+            size_t i = (size_t)y * im->w + x;
+            if (z < zbuf[i]) {
+                zbuf[i] = z;
+                im->px[i] = col;
+            }
+        }
+    }
+}
+
+void render_mesh(Image *im, float *zbuf, const Mesh *m, mat4 model, mat4 viewproj, vec3 light_dir, Color base, vec4 *screen) {
+    mat4 mvp = mat4_mul(viewproj, model);
+    vec3 L = v3_normalize(light_dir);
+    for (int i = 0; i < m->npos; i++) screen[i] = to_screen(mvp, m->pos[i], im->w, im->h);
+    for (int t = 0; t < m->nidx; t += 3) {
+        int i0 = m->idx[t], i1 = m->idx[t + 1], i2 = m->idx[t + 2];
+        vec4 s0 = screen[i0], s1 = screen[i1], s2 = screen[i2];
+        if (!screen_ok(s0, im->w, im->h) || !screen_ok(s1, im->w, im->h) || !screen_ok(s2, im->w, im->h)) continue;
+        if (edge_fn(s0, s1, s2.x, s2.y) >= 0) continue;
+        vec3 p0 = mat4_mul_point(model, m->pos[i0]), p1 = mat4_mul_point(model, m->pos[i1]), p2 = mat4_mul_point(model, m->pos[i2]);
+        vec3 n = v3_normalize(v3_cross(v3_sub(p1, p0), v3_sub(p2, p0)));
+        float k = 0.15f + 0.85f * fmaxf(0.0f, -v3_dot(n, L));
+        fill_triangle(im, zbuf, s0, s1, s2, color_scale(base, k));
+    }
+}
+
+int main(void) {
+    static uint8_t lut[4096];
+    srgb_lut_init(lut);
+    int W = 128, H = 128;
+    Image im = image_new(W, H);
+    float *z = malloc(sizeof(float) * W * H);
+    vec4 *screen = malloc(sizeof(vec4) * 4096);
+    Mesh torus = mesh_torus(1.0f, 0.38f, 48, 20), sphere = mesh_uv_sphere(40, 20, 0.9f), cube = mesh_cube(0.7f), floor = mesh_cube(1.0f);
+    if (im.px && z && screen && torus.pos && sphere.pos && cube.pos && floor.pos) {
+        for (int y = 0; y < H; y++)
+            for (int x = 0; x < W; x++) *image_at(&im, x, y) = rgb(0.02f, 0.03f + 0.05f * y / H, 0.08f + 0.1f * y / H);
+        for (int i = 0; i < W * H; i++) z[i] = 1.0f;
+        mat4 vp = mat4_mul(mat4_perspective(0.75f, 1, 0.1f, 50), mat4_look_at(v3(0, 3.2f, 7), v3(0, 0.2f, 0), v3(0, 1, 0)));
+        vec3 light = v3(-0.6f, -1.0f, -0.5f);
+        render_mesh(&im, z, &floor, mat4_mul(mat4_translate(v3(0, -1.1f, 0)), mat4_scale(v3(3.4f, 0.1f, 2.2f))), vp, light, rgb(0.28f, 0.25f, 0.22f), screen);
+        render_mesh(&im, z, &torus, mat4_mul(mat4_translate(v3(-1.9f, 0, 0)), mat4_rotate_x(1.1f)), vp, light, rgb(1, 0.35f, 0.1f), screen);
+        render_mesh(&im, z, &sphere, mat4_translate(v3(0.2f, -0.15f, -0.8f)), vp, light, rgb(0.2f, 0.6f, 1.0f), screen);
+        quat q = quat_mul(quat_from_axis_angle(v3(0, 1, 0), 0.7f), quat_from_axis_angle(v3(1, 0, 1), 0.6f));
+        render_mesh(&im, z, &cube, mat4_mul(mat4_translate(v3(2.0f, -0.2f, 0.6f)), quat_to_mat4(q)), vp, light, rgb(0.3f, 0.9f, 0.3f), screen);
+        image_write_ppm_srgb(&im, stdout, lut);
+    }
+    mesh_free(&torus); mesh_free(&sphere); mesh_free(&cube); mesh_free(&floor);
+    free(screen);
+    free(z);
+    image_free(&im);
+    return 0;
+}
+--- stubs
+void render_mesh(Image *im, float *zbuf, const Mesh *m, mat4 model, mat4 viewproj, vec3 light_dir, Color base, vec4 *screen) {
+    (void)zbuf; (void)light_dir;
+    draw_wireframe(im, m, mat4_mul(viewproj, model), base, screen);
+}
+--- hint
+Reuse `edge_fn` from your rasterizer for the culling test: `if (edge_fn(s0, s1, s2.x, s2.y) >= 0) continue;`.
+--- hint
+The light direction points *from* the light, so the surface faces the light when `dot(n, L)` is negative: use `fmaxf(0, -dot(n, L))`.
+--- harness
+int main(void) {
+    int W = 64, H = 64;
+    Image im = image_new(W, H);
+    float *zb = malloc(sizeof(float) * W * H);
+    vec4 *screen = malloc(sizeof(vec4) * 2000);
+    Mesh sphere = mesh_uv_sphere(32, 16, 1.0f);
+    if (!im.px || !zb || !screen || !sphere.pos) { CHECK(!"allocation failed"); goto done; }
+    mat4 vp = mat4_mul(mat4_perspective(0.8f, 1, 0.5f, 20), mat4_look_at(v3(0, 0, 4), v3(0, 0, 0), v3(0, 1, 0)));
+    Color base = rgb(1, 0.5f, 0.25f);
+    for (int i = 0; i < W * H; i++) zb[i] = 1.0f;
+    render_mesh(&im, zb, &sphere, mat4_identity(), vp, v3(0, 0, -2), base, screen);
+    Color c = *image_at(&im, 32, 32);
+    CHECK(c.r > 0.97f && c.r <= 1.0f);
+    CHECK(fabsf(c.g - c.r * 0.5f) < 1e-5f);
+    float zc = zb[32 * W + 32];
+    vec4 front = to_screen(vp, v3(0, 0, 1), W, H);
+    CHECK(zc > front.z - 2e-3f && zc < front.z + 2e-3f);
+    CHECK_DBL(image_at(&im, 1, 1)->r, 0.0);
+    CHECK_DBL(zb[0], 1.0);
+    Color edge = *image_at(&im, 32, 50);
+    CHECK(edge.r > 0.15f && edge.r < 0.8f);
+    int lit = 0;
+    for (int i = 0; i < W * H; i++) lit += im.px[i].r > 0;
+    
+    CHECK_INT(lit, 1176);
+
+    image_fill(&im, rgb(0, 0, 0));
+    for (int i = 0; i < W * H; i++) zb[i] = 1.0f;
+    render_mesh(&im, zb, &sphere, mat4_identity(), vp, v3(0, 0, 1), base, screen);
+    CHECK(fabsf(image_at(&im, 32, 32)->r - 0.15f) < 1e-5f);
+    CHECK(fabsf(image_at(&im, 32, 32)->b - 0.0375f) < 1e-5f);
+
+    image_fill(&im, rgb(0, 0, 0));
+    for (int i = 0; i < W * H; i++) zb[i] = 1.0f;
+    render_mesh(&im, zb, &sphere, mat4_mul(mat4_translate(v3(0.5f, 0, 0)), mat4_scale(v3(0.5f, 0.5f, 0.5f))), vp, v3(-1, 0, 0), base, screen);
+    Color right = *image_at(&im, 49, 32), left = *image_at(&im, 34, 32);
+    CHECK(right.r > 0.6f);
+    CHECK(fabsf(left.r - 0.15f) < 1e-5f);
+    CHECK(image_at(&im, 31, 32)->r == 0 && image_at(&im, 52, 32)->r == 0);
+    CHECK_DBL(image_at(&im, 25, 32)->r, 0.0);
+
+    vec3 tri_pos[3] = { v3(-1, -1, 0), v3(1, -1, 0), v3(0, 1, 0) };
+    int ccw[3] = { 0, 1, 2 }, cw[3] = { 0, 2, 1 };
+    Mesh t1 = { tri_pos, 3, ccw, 3 }, t2 = { tri_pos, 3, cw, 3 };
+    image_fill(&im, rgb(0, 0, 0));
+    for (int i = 0; i < W * H; i++) zb[i] = 1.0f;
+    render_mesh(&im, zb, &t2, mat4_identity(), vp, v3(0, 0, -1), base, screen);
+    CHECK_DBL(image_at(&im, 32, 32)->r, 0.0);
+    render_mesh(&im, zb, &t1, mat4_identity(), vp, v3(0, 0, -1), base, screen);
+    CHECK_DBL(image_at(&im, 32, 32)->r, 1.0);
+done:
+    mesh_free(&sphere);
+    free(screen);
+    free(zb);
+    image_free(&im);
+    return TEST_END();
+}
+
+=== quiz
+--- q
+A model matrix is built as `M = T * R * S` (column vectors, `M v`). In what order are the transforms applied to a vertex?
+--- answer
+Scale, then rotate, then translate.
+--- choice
+Translate, then rotate, then scale.
+--- choice
+All at once; matrix multiplication is commutative.
+--- choice
+Rotate, then scale, then translate.
+--- explain
+`T R S v = T (R (S v))`: the matrix closest to the vector applies first. That's why a model matrix scales the object around its own origin, spins it, then places it.
+
+=== quiz
+run: yes
+--- q
+`m` is a column-major `mat4` (element row `r`, column `c` at `m[c*4 + r]`). What does this print?
+--- code
+#include <stdio.h>
+
+int main(void) {
+    float m[16] = { 1, 0, 0, 0,  0, 1, 0, 0,  0, 0, 1, 0,  5, 6, 7, 1 };
+    float p[4] = { 1, 1, 1, 1 }, d[4] = { 1, 1, 1, 0 }, rp[4], rd[4];
+    for (int r = 0; r < 4; r++) {
+        rp[r] = rd[r] = 0;
+        for (int c = 0; c < 4; c++) { rp[r] += m[c * 4 + r] * p[c]; rd[r] += m[c * 4 + r] * d[c]; }
+    }
+    printf("%g %g %g | %g %g %g\n", rp[0], rp[1], rp[2], rd[0], rd[1], rd[2]);
+    return 0;
+}
+--- choice
+6 7 8 | 6 7 8
+--- answer
+6 7 8 | 1 1 1
+--- choice
+1 1 1 | 1 1 1
+--- choice
+6 6 6 | 1 1 1
+--- explain
+`m[12..14]` is the translation column. A point (`w = 1`) picks it up; a direction (`w = 0`) does not.
+
+=== quiz
+--- q
+Your rasterizer draws the pixel when all three edge functions are `>= 0`. Two triangles share an edge that passes exactly through some pixel centers. What goes wrong, and what fixes it?
+--- choice
+Nothing; `>= 0` is the correct test.
+--- choice
+Those pixels are skipped by both triangles, leaving a crack; use `> 0`.
+--- answer
+Those pixels are drawn by both triangles (double blending with transparency, wasted work); the top-left rule assigns each such pixel to exactly one triangle.
+--- choice
+The z-buffer fails on those pixels; clear it to `INFINITY` instead of 1.
+--- explain
+With `>= 0` both triangles claim the shared pixels; with `> 0` neither does. The top-left rule (D3D, Vulkan, WebGPU) breaks the tie consistently.
+
+=== quiz
+--- q
+Why are quaternions preferred over Euler angles or lerped matrices for animating orientation?
+--- choice
+They are faster to apply to a vertex than a matrix.
+--- answer
+Slerp between two unit quaternions gives a constant-speed rotation along the shortest arc, with no gimbal lock, and a unit quaternion is cheap to renormalize.
+--- choice
+They can represent translation as well as rotation.
+--- choice
+GPUs only accept quaternions for rotation.
+--- explain
+Applying a quaternion to many vertices is actually slower than a matrix; engines convert to a matrix once per object. The win is composition and interpolation.
+
+=== quiz
+--- q
+With the perspective matrix from this chapter (depth 0 at `near`, 1 at `far`), roughly where does a point halfway between `near = 0.1` and `far = 100` land in depth?
+--- choice
+Near 0.5: depth is linear in distance.
+--- answer
+Very close to 1 (about 0.999): depth is proportional to `1/distance`, so most of the 0..1 range is spent near the camera.
+--- choice
+Near 0.001.
+--- choice
+Exactly 1, because it is beyond the far plane.
+--- explain
+`depth = far (d - near) / (d (far - near))`; at `d = 50` that is about 0.999. That non-linearity is why a tiny `near` value wrecks depth precision for distant objects.

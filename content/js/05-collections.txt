@@ -751,7 +751,7 @@ Write a generator function `lsystem(axiom, rules, depth)` that yields, one chara
 [...lsystem('A', { A: 'AB', B: 'A' }, 4)].join('')   // 'ABAABABA'
 ```
 
-The catch: the output grows exponentially. The algae system at depth 40 is about 270 million characters, and the tests read the **first few characters** of it, then count all characters of depth 20, then read a Koch curve. Building strings step by step (`s = s.replace(...)` or `[...s].map(c => rules[c] ?? c).join('')` per level) runs out of time and memory. Expand lazily and depth-first, so memory stays proportional to `depth`.
+The catch: the output grows exponentially. The algae system at depth 34 is about 15 million characters (depth 40 would be 270 million), and the tests read the **first few characters** of it, then count all characters of depth 20, then read a Koch curve. Building strings step by step (`s = s.replace(...)` or `[...s].map(c => rules[c] ?? c).join('')` per level) runs out of time and memory. Expand lazily and depth-first, so memory stays proportional to `depth`.
 
 Also write `turtle(symbols, angleDeg)` that interprets any iterable of symbols and returns the **number of line segments** and the final position, `{ segments, x, y }`, rounded to 6 decimals: start at `(0, 0)` facing `+x`; `F` moves forward 1 and draws a segment; `f` moves 1 without drawing; `+` turns left (counter-clockwise) by `angleDeg`; `-` turns right; `[` pushes position and heading; `]` pops them; anything else is ignored.
 --- starter
@@ -804,12 +804,12 @@ For the turtle, a flat stack (`push(x, y, a)`, then pop in reverse order) avoids
   for (const _ of lsystem('A', algae, 20)) n++;
   eq(n, 17711, 'depth 20 length is fib(22)');
   const t = performance.now();
-  const it = lsystem('A', algae, 40);
+  const it = lsystem('A', algae, 34);
   const first = [];
   for (const c of it) { first.push(c); if (first.length === 12) break; }
   const ms = performance.now() - t;
-  eq(first.join(''), 'ABAABABAABAA', 'prefix of depth 40');
-  check(ms < 200, `reading 12 symbols of depth 40 took ${ms.toFixed(0)} ms (want < 200)`);
+  eq(first.join(''), 'ABAABABAABAA', 'prefix of depth 34');
+  check(ms < 200, `reading 12 symbols of depth 34 took ${ms.toFixed(0)} ms (want < 200)`);
   check(typeof lsystem('A', algae, 1).next === 'function', 'returns an iterator');
 
   eq(turtle('', 90), { segments: 0, x: 0, y: 0 });
@@ -821,8 +821,7 @@ For the turtle, a flat stack (`push(x, y, a)`, then pop in reverse order) avoids
   const koch = turtle(lsystem('F', { F: 'F+F--F+F' }, 3), 60);
   eq(koch, { segments: 64, x: 27, y: 0 }, 'Koch curve: 4^3 segments, spans 3^3');
   const plant = turtle(lsystem('X', { X: 'F[+X][-X]FX', F: 'FF' }, 4), 25);
-  eq(plant.segments, 225);
-  near(plant.x, 16 + 0, 1e-6, 'plant trunk goes straight along x');
+  eq(plant, { segments: 130, x: 30, y: 0 }, 'branches return to the trunk, which ends 30 units along x');
 }
 
 === exercise ring

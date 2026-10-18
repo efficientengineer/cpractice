@@ -24,7 +24,7 @@ Procedural texture tools let users type formulas: `smoothstep(0.3, 0.7, fract(u 
 
 Generated textures are expensive to make and big to keep: a 2048 by 2048 RGBA8 texture is 16 MiB. A cache keeps the most recently used ones under a memory budget, evicts the least recently used when it is over, and tells you which ones it evicted so you can release their GPU memory (`texture.destroy()` in WebGPU). It must also deduplicate concurrent requests: if two materials ask for the same texture while it is being generated, it must be generated once.
 
-> **Performance:** every operation must be O(1). A JavaScript `Map` iterates in insertion order, so deleting and re-inserting a key moves it to the "most recent" end, and the first key is always the least recent: a complete LRU with no linked list. The naive version (`array.indexOf` plus `splice` to reorder) is O(n) per access and collapses at a few thousand entries.
+> **Performance:** every operation must be O(1). The naive version (`array.indexOf` plus `splice` to reorder) is O(n) per access and collapses at a few thousand entries. A widely shared shortcut uses a bare `Map`, whose iteration order is insertion order, as the recency list; it is elegant and in V8 it degrades badly when the cache evicts on every insert, because deleted entries linger in the table and finding the oldest live one becomes a scan. A `Map` for lookup plus a doubly linked list for order is the structure that is O(1) on every engine. It is a good reminder to measure the clever version before trusting it.
 
 ## 4. A node-graph texture compositor
 
@@ -391,7 +391,7 @@ Write `parse(src)` that turns a texture formula into an abstract syntax tree. No
 Grammar, from lowest to highest precedence:
 
 1. `test ? a : b` (right associative: `a ? b : c ? d : e` is `a ? b : (c ? d : e)`)
-2. comparisons `<` `>` `<=` `>=` `==` `!=` (left associative)
+2. comparisons `<` `>` `<=` `>=` `==` `!=`, all at one level (left associative; unlike C, equality does not bind looser than `<`)
 3. `+` `-` (left associative)
 4. `*` `/` `%` (left associative)
 5. unary `-` (may repeat: `--u`)
@@ -510,7 +510,7 @@ Right associativity falls out of recursion: `power()` parses a primary, and if i
     '--u': '(-(-u))',
     '-u * v': '((-u) * v)',
     '1 < 2 == 1': '((1 < 2) == 1)',
-    'u <= .5 != v >= 1e-3': '((u <= 0.5) != (v >= 0.001))',
+    'u <= .5 != v >= 1e-3': '(((u <= 0.5) != v) >= 0.001)',
     'u < 0.5 ? 1 : v > .2 ? 2 : 3': '((u < 0.5) ? 1 : ((v > 0.2) ? 2 : 3))',
     'a ? b ? 1 : 2 : 3': '(a ? (b ? 1 : 2) : 3)',
     'mix(a, b, smoothstep(0, 1, u))': 'mix(a, b, smoothstep(0, 1, u))',
@@ -720,7 +720,7 @@ Look names up with `Object.hasOwn(env, name)` so that `toString` or `constructor
   eq(ev('smoothstep(0, 1, 0.5)'), 0.5);
   eq(ev('smoothstep(0.2, 0.4, 0.1) + smoothstep(0.2, 0.4, 0.9)'), 1);
   near(ev('smoothstep(0, 2, 0.5)'), 0.15625, 1e-12);
-  eq(ev('min(3, 4) + max(3, 4) + pow(2, 10) + abs(-2) + floor(2.7) + sqrt(16)'), 1037);
+  eq(ev('min(3, 4) + max(3, 4) + pow(2, 10) + abs(-2) + floor(2.7) + sqrt(16)'), 1039);
   let calls = 0;
   const watched = { get u() { calls++; return 1; } };
   ev('u > 0 ? 1 : u', watched);
@@ -1020,7 +1020,7 @@ Write `class LRUCache` with constructor options `{ maxEntries = Infinity, onEvic
 - `delete(key)`: removes it and returns whether it existed (no `onEvict`: the caller is deleting on purpose). `clear()` removes everything, also without `onEvict`.
 - `size` (getter) and `keys()`: an array of keys from least to most recently used.
 
-Every operation must be O(1) (except `keys`): the harness runs a million operations on a 10,000-entry cache under a time limit. Hint: a `Map` remembers insertion order.
+Every operation must be O(1) (except `keys`): the harness runs two million operations on a 10,000-entry cache under a time limit, including a pattern that evicts on every access.
 --- starter
 class LRUCache {
   constructor({ maxEntries = Infinity, onEvict = null } = {}) {
@@ -1051,7 +1051,9 @@ class LRUCache {
 }
 --- solution
 class LRUCache {
-  #map = new Map();                  // insertion order = recency order, least recent first
+  #map = new Map();                  // key -> node { key, value, prev, next }
+  #head = null;                      // least recently used
+  #tail = null;                      // most recently used
   #max;
   #onEvict;
   constructor({ maxEntries = Infinity, onEvict = null } = {}) {
@@ -1059,38 +1061,63 @@ class LRUCache {
     this.#max = maxEntries;
     this.#onEvict = onEvict;
   }
+  #unlink(n) {
+    if (n.prev) n.prev.next = n.next; else this.#head = n.next;
+    if (n.next) n.next.prev = n.prev; else this.#tail = n.prev;
+    n.prev = n.next = null;
+  }
+  #append(n) {
+    n.prev = this.#tail;
+    n.next = null;
+    if (this.#tail) this.#tail.next = n; else this.#head = n;
+    this.#tail = n;
+  }
   get size() { return this.#map.size; }
   has(key) { return this.#map.has(key); }
-  peek(key) { return this.#map.get(key); }
+  peek(key) { return this.#map.get(key)?.value; }
   get(key) {
-    if (!this.#map.has(key)) return undefined;
-    const v = this.#map.get(key);
-    this.#map.delete(key);
-    this.#map.set(key, v);
-    return v;
+    const n = this.#map.get(key);
+    if (!n) return undefined;
+    if (n !== this.#tail) { this.#unlink(n); this.#append(n); }
+    return n.value;
   }
   set(key, value) {
-    if (this.#map.has(key)) {
-      const old = this.#map.get(key);
-      this.#map.delete(key);
+    let n = this.#map.get(key);
+    if (n) {
+      const old = n.value;
+      n.value = value;
+      if (n !== this.#tail) { this.#unlink(n); this.#append(n); }
       if (old !== value && this.#onEvict) this.#onEvict(key, old);
+    } else {
+      n = { key, value, prev: null, next: null };
+      this.#map.set(key, n);
+      this.#append(n);
     }
-    this.#map.set(key, value);
     while (this.#map.size > this.#max) {
-      const [k, v] = this.#map.entries().next().value;
-      this.#map.delete(k);
-      if (this.#onEvict) this.#onEvict(k, v);
+      const lru = this.#head;
+      this.#unlink(lru);
+      this.#map.delete(lru.key);
+      if (this.#onEvict) this.#onEvict(lru.key, lru.value);
     }
     return this;
   }
-  delete(key) { return this.#map.delete(key); }
-  clear() { this.#map.clear(); }
-  keys() { return [...this.#map.keys()]; }
+  delete(key) {
+    const n = this.#map.get(key);
+    if (!n) return false;
+    this.#unlink(n);
+    return this.#map.delete(key);
+  }
+  clear() { this.#map.clear(); this.#head = this.#tail = null; }
+  keys() {
+    const out = [];
+    for (let n = this.#head; n; n = n.next) out.push(n.key);
+    return out;
+  }
 }
 --- hint
-Keep one `Map`. To mark a key as most recent, `delete` it and `set` it again: it moves to the end of the iteration order. The least recent key is then `map.keys().next().value`.
+The textbook structure is a `Map` from key to a node `{ key, value, prev, next }` plus a doubly linked list of nodes from least to most recently used. Moving a node to the tail and removing the head are a few pointer updates.
 --- hint
-Fire `onEvict` after updating the map, so a callback that inspects the cache sees a consistent state. Keep the fields private (`#map`) so nobody reorders it from outside.
+The popular shortcut is a bare `Map` (delete and re-insert a key to make it most recent; `map.keys().next()` is the least recent). Measure it: V8 leaves deleted entries in place until the table is rebuilt, so under constant eviction finding the first live key scans over a growing run of holes, and the harness's thrashing pattern takes seconds.
 --- harness
 {
   const ev = [];
@@ -1129,20 +1156,23 @@ Fire `onEvict` after updating the map, so a callback that inspects the cache see
   eq(inf.size, 1000, 'default is unbounded');
   throws(() => new LRUCache({ maxEntries: 0 }), 'maxEntries 0');
 
-  const big = new LRUCache({ maxEntries: 10000 });
   let evicted = 0;
-  const big2 = new LRUCache({ maxEntries: 10000, onEvict: () => evicted++ });
+  const big = new LRUCache({ maxEntries: 10000, onEvict: () => evicted++ });
   const t0 = performance.now();
-  let hits = 0;
-  for (let i = 0; i < 1e6; i++) {
+  for (let i = 0; i < 1e6; i++) {             // cyclic over 15000 keys: every access misses and evicts
     const k = (i * 7919) % 15000;
-    if (big2.get(k) !== undefined) hits++; else big2.set(k, i);
+    if (big.get(k) === undefined) big.set(k, i);
+  }
+  let hits = 0, s = 1;
+  for (let i = 0; i < 1e6; i++) {             // random keys: a mix of hits and evictions
+    s = (s * 16807) % 2147483647;
+    const k = s % 14000;
+    if (big.get(k) !== undefined) hits++; else big.set(k, i);
   }
   const ms = performance.now() - t0;
-  eq(big2.size, 10000);
-  check(evicted > 0 && hits > 0, 'cache used');
-  check(ms < 1500, 'a million operations took ' + Math.round(ms) + 'ms');
-  big.set(1, 1);
+  eq(big.size, 10000);
+  check(evicted > 1e6 && hits > 500000, 'cache used: ' + evicted + ' evictions, ' + hits + ' hits');
+  check(ms < 1500, 'two million operations took ' + Math.round(ms) + 'ms');
 }
 
 === exercise lru2
@@ -1172,7 +1202,9 @@ class TextureCache {
 }
 --- solution
 class LRUCache {
-  #map = new Map();                  // insertion order = recency order, least recent first
+  #map = new Map();                  // key -> node { key, value, prev, next }
+  #head = null;                      // least recently used
+  #tail = null;                      // most recently used
   #max;
   #onEvict;
   constructor({ maxEntries = Infinity, onEvict = null } = {}) {
@@ -1180,33 +1212,58 @@ class LRUCache {
     this.#max = maxEntries;
     this.#onEvict = onEvict;
   }
+  #unlink(n) {
+    if (n.prev) n.prev.next = n.next; else this.#head = n.next;
+    if (n.next) n.next.prev = n.prev; else this.#tail = n.prev;
+    n.prev = n.next = null;
+  }
+  #append(n) {
+    n.prev = this.#tail;
+    n.next = null;
+    if (this.#tail) this.#tail.next = n; else this.#head = n;
+    this.#tail = n;
+  }
   get size() { return this.#map.size; }
   has(key) { return this.#map.has(key); }
-  peek(key) { return this.#map.get(key); }
+  peek(key) { return this.#map.get(key)?.value; }
   get(key) {
-    if (!this.#map.has(key)) return undefined;
-    const v = this.#map.get(key);
-    this.#map.delete(key);
-    this.#map.set(key, v);
-    return v;
+    const n = this.#map.get(key);
+    if (!n) return undefined;
+    if (n !== this.#tail) { this.#unlink(n); this.#append(n); }
+    return n.value;
   }
   set(key, value) {
-    if (this.#map.has(key)) {
-      const old = this.#map.get(key);
-      this.#map.delete(key);
+    let n = this.#map.get(key);
+    if (n) {
+      const old = n.value;
+      n.value = value;
+      if (n !== this.#tail) { this.#unlink(n); this.#append(n); }
       if (old !== value && this.#onEvict) this.#onEvict(key, old);
+    } else {
+      n = { key, value, prev: null, next: null };
+      this.#map.set(key, n);
+      this.#append(n);
     }
-    this.#map.set(key, value);
     while (this.#map.size > this.#max) {
-      const [k, v] = this.#map.entries().next().value;
-      this.#map.delete(k);
-      if (this.#onEvict) this.#onEvict(k, v);
+      const lru = this.#head;
+      this.#unlink(lru);
+      this.#map.delete(lru.key);
+      if (this.#onEvict) this.#onEvict(lru.key, lru.value);
     }
     return this;
   }
-  delete(key) { return this.#map.delete(key); }
-  clear() { this.#map.clear(); }
-  keys() { return [...this.#map.keys()]; }
+  delete(key) {
+    const n = this.#map.get(key);
+    if (!n) return false;
+    this.#unlink(n);
+    return this.#map.delete(key);
+  }
+  clear() { this.#map.clear(); this.#head = this.#tail = null; }
+  keys() {
+    const out = [];
+    for (let n = this.#head; n; n = n.next) out.push(n.key);
+    return out;
+  }
 }
 class TextureCache {
   #lru = new LRUCache();
@@ -1347,7 +1404,7 @@ Write a top-level object `OPS` with these operations. Each is a function `(out, 
 
 Then:
 
-- `topoOrder(nodes, outputId)`: the ids needed to compute `outputId`, each exactly once, every node after all of its inputs (depth-first, visiting inputs in order, so `{ m: inputs [g, c, inv], inv: inputs [g] }` gives `['g', 'c', 'inv', 'm']`). Nodes the output does not depend on are left out. A cycle throws an `Error` whose message contains `cycle`; a reference to a missing node (or a missing output) throws a `ReferenceError`.
+- `topoOrder(nodes, outputId)`: the ids needed to compute `outputId`, each exactly once, every node after all of its inputs (depth-first, visiting inputs in order, so `{ m: inputs [g, c, inv], inv: inputs [g] }` gives `['g', 'c', 'inv', 'm']`). Nodes the output does not depend on are left out. Graphs can be deep (the harness has a chain of 20,000 nodes), so use an explicit stack instead of recursion (chapter 09). A cycle throws an `Error` whose message contains `cycle`; a reference to a missing node (or a missing output) throws a `ReferenceError`.
 - `evaluateGraph(nodes, outputId, size, customOps = {})`: evaluates the needed nodes in that order, **each exactly once** even when several nodes share it, and returns the output's array. `customOps` adds or overrides operations. An unknown op throws a `TypeError`.
 --- starter
 const OPS = {};
@@ -1378,18 +1435,30 @@ const OPS = {
 };
 
 function topoOrder(nodes, outputId) {
-  const order = [], state = new Map();          // id -> 'visiting' | 'done'
-  const visit = id => {
+  const need = id => {
     if (!Object.hasOwn(nodes, id)) throw new ReferenceError(`missing node: ${id}`);
-    const s = state.get(id);
-    if (s === 'done') return;
-    if (s === 'visiting') throw new Error(`cycle through node ${id}`);
-    state.set(id, 'visiting');
-    for (const src of nodes[id].inputs ?? []) visit(src);
-    state.set(id, 'done');
-    order.push(id);
   };
-  visit(outputId);
+  need(outputId);
+  const order = [], state = new Map();            // id -> 'visiting' | 'done'
+  const stack = [[outputId, 0]];                   // [id, index of the next input to visit]
+  state.set(outputId, 'visiting');
+  while (stack.length) {
+    const top = stack[stack.length - 1];
+    const inputs = nodes[top[0]].inputs ?? [];
+    if (top[1] < inputs.length) {
+      const src = inputs[top[1]++];
+      need(src);
+      const s = state.get(src);
+      if (s === 'visiting') throw new Error(`cycle through node ${src}`);
+      if (s === 'done') continue;
+      state.set(src, 'visiting');
+      stack.push([src, 0]);
+    } else {
+      stack.pop();
+      state.set(top[0], 'done');
+      order.push(top[0]);
+    }
+  }
   return order;
 }
 
@@ -1406,7 +1475,7 @@ function evaluateGraph(nodes, outputId, size, customOps = {}) {
   return buffers.get(outputId);
 }
 --- hint
-Depth-first search with three states per node (unvisited, visiting, done) finds cycles: reaching a node that is still "visiting" means you came back to it along the current path. Push a node onto the order when you finish visiting it (post-order).
+Depth-first search with three states per node (unvisited, visiting, done) finds cycles: reaching a node that is still "visiting" means you came back to it along the current path. Push a node onto the order when you finish visiting it (post-order). Without recursion, keep stack entries `[id, nextInputIndex]`: look at the top entry, visit its next input, or pop it when all inputs are done.
 --- hint
 Keep a `Map` from id to output buffer during `evaluateGraph`; a node's inputs are `node.inputs.map(id => buffers.get(id))`, and topological order guarantees they are already computed.
 --- harness
@@ -1463,10 +1532,10 @@ Keep a `Map` from id to output buffer during `evaluateGraph`; a node's inputs ar
   check(!('unused' in Object.fromEntries(topoOrder(nodes, 'm').map(k => [k, 1]))), 'unrelated nodes skipped');
 
   const deep = { n0: { op: 'gradient', params: { axis: 'u' } } };
-  for (let i = 1; i <= 3000; i++) deep['n' + i] = { op: 'invert', inputs: ['n' + (i - 1)] };
+  for (let i = 1; i <= 20000; i++) deep['n' + i] = { op: 'invert', inputs: ['n' + (i - 1)] };
   let order;
-  try { order = topoOrder(deep, 'n3000'); } catch (x) { order = null; }
-  eq(order && order.length, 3001, 'a 3000-node chain');
+  try { order = topoOrder(deep, 'n20000'); } catch (x) { order = null; }
+  eq(order && order.length, 20001, 'a 20000-node chain (recursion would overflow the stack)');
 
   const big = {
     g: { op: 'gradient', params: { axis: 'u' } }, h: { op: 'gradient', params: { axis: 'v' } },
@@ -1526,18 +1595,30 @@ const OPS = {
 };
 
 function topoOrder(nodes, outputId) {
-  const order = [], state = new Map();          // id -> 'visiting' | 'done'
-  const visit = id => {
+  const need = id => {
     if (!Object.hasOwn(nodes, id)) throw new ReferenceError(`missing node: ${id}`);
-    const s = state.get(id);
-    if (s === 'done') return;
-    if (s === 'visiting') throw new Error(`cycle through node ${id}`);
-    state.set(id, 'visiting');
-    for (const src of nodes[id].inputs ?? []) visit(src);
-    state.set(id, 'done');
-    order.push(id);
   };
-  visit(outputId);
+  need(outputId);
+  const order = [], state = new Map();            // id -> 'visiting' | 'done'
+  const stack = [[outputId, 0]];                   // [id, index of the next input to visit]
+  state.set(outputId, 'visiting');
+  while (stack.length) {
+    const top = stack[stack.length - 1];
+    const inputs = nodes[top[0]].inputs ?? [];
+    if (top[1] < inputs.length) {
+      const src = inputs[top[1]++];
+      need(src);
+      const s = state.get(src);
+      if (s === 'visiting') throw new Error(`cycle through node ${src}`);
+      if (s === 'done') continue;
+      state.set(src, 'visiting');
+      stack.push([src, 0]);
+    } else {
+      stack.pop();
+      state.set(top[0], 'done');
+      order.push(top[0]);
+    }
+  }
   return order;
 }
 
@@ -1597,12 +1678,13 @@ class Compositor {
   connect(id, index, srcId) {
     if (!Object.hasOwn(this.nodes, id)) throw new ReferenceError(`missing node: ${id}`);
     if (!Object.hasOwn(this.nodes, srcId)) throw new ReferenceError(`missing node: ${srcId}`);
-    const inputs = this.nodes[id].inputs, old = inputs[index];
-    inputs[index] = srcId;
+    const node = this.nodes[id], saved = node.inputs;
+    node.inputs = saved.slice();
+    node.inputs[index] = srcId;
     try {
       topoOrder(this.nodes, id);
     } catch (e) {
-      inputs[index] = old;
+      node.inputs = saved;                   // exactly as it was, length included
       throw e;
     }
     this.#markDirty(id);
@@ -1611,7 +1693,7 @@ class Compositor {
 --- hint
 Keep a `Set` of dirty ids. Marking dirty walks *downstream*: the nodes whose `inputs` include the changed node, then theirs, and so on (a stack and a scan over the nodes is fine for editor-sized graphs).
 --- hint
-For `connect`, make the change, call `topoOrder(this.nodes, id)` inside `try`, and on error put the old input back before rethrowing.
+For `connect`, replace the node's `inputs` with a modified copy, call `topoOrder(this.nodes, id)` inside `try`, and on error restore the original array before rethrowing (assigning the old value back to `inputs[index]` is not enough when `index` was past the end).
 --- harness
 {
   const nodes = {
@@ -1655,7 +1737,7 @@ For `connect`, make the change, call `topoOrder(this.nodes, id)` inside `try`, a
   eq(Array.from(comp.output('m')), Array.from(evaluateGraph(changed, 'm', 4)), 'correct after connect');
 
   let e = null;
-  try { comp.connect('inv', 0, 'm'); } catch (x) { e = x; }
+  try { comp.connect('g', 0, 'm'); } catch (x) { e = x; }
   check(e && /cycle/.test(e.message), 'cycle rejected');
   eq(comp.output('m'), out, 'graph still works after a rejected connect');
   eq(comp.evaluations, 10, 'rejected connect dirtied nothing that matters');
@@ -1737,18 +1819,17 @@ function cubicBezier(x1, y1, x2, y2) {
     let s = t;
     for (let i = 0; i < 8; i++) {                   // Newton's method
       const err = X(s) - t, d = dX(s);
-      if (Math.abs(err) < 1e-9) return Y(s);
-      if (Math.abs(d) < 1e-9) break;
+      if (Math.abs(err) < 1e-12) return Y(s);
+      if (Math.abs(d) < 1e-6) break;               // too flat: Newton would jump far
       s -= err / d;
+      if (s < 0 || s > 1) break;
     }
-    let lo = 0, hi = 1;                             // bisection fallback
-    s = t;
-    for (let i = 0; i < 60; i++) {
-      const x = X(s);
-      if (Math.abs(x - t) < 1e-9) break;
-      if (x < t) lo = s; else hi = s;
+    let lo = 0, hi = 1;                             // bisection fallback: always converges
+    for (let i = 0; i < 52; i++) {
       s = (lo + hi) / 2;
+      if (X(s) < t) lo = s; else hi = s;
     }
+    s = (lo + hi) / 2;
     return Y(s);
   };
 }
@@ -1791,7 +1872,7 @@ For the track, handle the before-first and after-last cases first, then binary s
     for (let i = 0; i < 200; i++) { const mid = (lo + hi) / 2; if (B(x1, x2, mid) < t) lo = mid; else hi = mid; }
     return B(y1, y2, (lo + hi) / 2);
   };
-  const curves = [[0.25, 0.1, 0.25, 1], [0.42, 0, 0.58, 1], [0, 0, 1, 1], [0.9, 0, 0.1, 1], [0.68, -0.6, 0.32, 1.6], [1, 0, 0, 1], [0, 1, 1, 0], [0.5, 2, 0.5, -1]];
+  const curves = [[0.25, 0.1, 0.25, 1], [0.42, 0, 0.58, 1], [0, 0, 1, 1], [0.9, 0, 0.1, 1], [0.68, -0.6, 0.32, 1.6], [0.9, 0.1, 0.1, 0.9], [0, 1, 1, 0], [0.5, 2, 0.5, -1]];
   for (const c of curves) {
     const f = cubicBezier(...c);
     let worst = 0;
