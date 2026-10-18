@@ -1,0 +1,934 @@
+=== chapter compute
+title: Compute shaders
+blurb: Pipelines and bind group layouts, workgroups and invocation ids, parallel map, reductions with shared memory, atomics, prefix sums, matrix multiply, and timing.
+--- body
+## The compute pipeline, again, slower
+
+```text
+shader module ──┐
+                ├─ createComputePipeline({ layout, compute: { module, entryPoint, constants } })
+pipeline layout ┘        │
+  └ bind group layouts   └─ pass.setPipeline(p); pass.setBindGroup(0, bg); pass.dispatchWorkgroups(x, y, z)
+```
+
+`entryPoint` can be omitted when the module has exactly one compute entry point. A module can hold several (`fn clear`, `fn step`, `fn draw`), and each pipeline picks one.
+
+## Bind group layouts: 'auto' vs explicit
+
+With `layout: 'auto'`, WebGPU reads the shader and builds the bind group layouts for you; `pipeline.getBindGroupLayout(n)` returns them. It's convenient but has two traps:
+
+- **An auto layout only fits its own pipeline.** A bind group made from pipeline A's auto layout can't be used with pipeline B, even if the shaders declare identical bindings.
+- **Bindings the entry point doesn't use are left out.** If your shader declares `@binding(2)` but the code never reads it, the auto layout has no binding 2, and a bind group that provides one is a validation error.
+
+An explicit layout fixes both. You describe each binding: its number, which stages see it, and what kind of resource it is:
+
+```js
+const device = await getDevice();
+const layout = device.createBindGroupLayout({ entries: [
+  { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },  // var<storage, read>
+  { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },            // var<storage, read_write>
+  { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },            // var<uniform>
+]});
+const pipelineLayout = device.createPipelineLayout({ bindGroupLayouts: [layout] });
+const module = device.createShaderModule({ code: `
+@group(0) @binding(0) var<storage, read> src: array<f32>;
+@group(0) @binding(1) var<storage, read_write> dst: array<f32>;
+@group(0) @binding(2) var<uniform> scale: f32;
+@compute @workgroup_size(64) fn double(@builtin(global_invocation_id) id: vec3u) {
+  if (id.x < arrayLength(&dst)) { dst[id.x] = src[id.x] * scale; }
+}
+@compute @workgroup_size(64) fn negate(@builtin(global_invocation_id) id: vec3u) {
+  if (id.x < arrayLength(&dst)) { dst[id.x] = -src[id.x]; }    // doesn't use scale
+}` });
+// Two pipelines, one layout: one bind group works with both.
+const pDouble = device.createComputePipeline({ layout: pipelineLayout, compute: { module, entryPoint: 'double' } });
+const pNegate = device.createComputePipeline({ layout: pipelineLayout, compute: { module, entryPoint: 'negate' } });
+const mk = (size, usage) => device.createBuffer({ size, usage });
+const src = mk(16, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST);
+const dst = mk(16, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC);
+const uni = mk(16, GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST);
+device.queue.writeBuffer(src, 0, new Float32Array([1, 2, 3, 4]));
+device.queue.writeBuffer(uni, 0, new Float32Array([10]));
+const bindGroup = device.createBindGroup({ layout, entries: [
+  { binding: 0, resource: { buffer: src } }, { binding: 1, resource: { buffer: dst } }, { binding: 2, resource: { buffer: uni } }] });
+for (const p of [pDouble, pNegate]) {
+  const enc = device.createCommandEncoder(), pass = enc.beginComputePass();
+  pass.setPipeline(p); pass.setBindGroup(0, bindGroup); pass.dispatchWorkgroups(1); pass.end();
+  device.queue.submit([enc.finish()]);
+  console.log(new Float32Array(await readBuffer(device, dst)));
+}
+```
+
+Real engines use explicit layouts and organize bind groups by how often they change: group 0 for per-frame data (camera, time), group 1 for per-material, group 2 for per-object. Switching a bind group is cheap, but switching fewer is cheaper.
+
+## Workgroups and invocation ids
+
+`@workgroup_size(x, y, z)` sets the shape of one workgroup (missing dimensions are 1). `dispatchWorkgroups(X, Y, Z)` launches an X×Y×Z grid of them. Invocations in the same workgroup run together on one compute unit and can share `var<workgroup>` memory and synchronize with barriers; different workgroups can't talk to each other within a dispatch.
+
+| Built-in | Type | Meaning |
+|---|---|---|
+| `local_invocation_id` | `vec3u` | position inside the workgroup, `0..workgroup_size-1` |
+| `local_invocation_index` | `u32` | the same, flattened: `x + y*sx + z*sx*sy` |
+| `workgroup_id` | `vec3u` | which workgroup in the dispatch grid |
+| `global_invocation_id` | `vec3u` | `workgroup_id * workgroup_size + local_invocation_id` |
+| `num_workgroups` | `vec3u` | the dispatch size you passed |
+
+Default limits (`device.limits`): at most **256 invocations per workgroup** (`x*y*z`), at most 256×256×64 per dimension, **16 KiB** of workgroup memory, and at most **65535 workgroups per dimension** of a dispatch. For more than 65535 × 64 ≈ 4 million elements in 1D, dispatch a 2D grid and compute a flat index.
+
+For 2D data (images, tile maps) use 2D workgroups like `@workgroup_size(8, 8)` (64 invocations) and `dispatchWorkgroups(ceil(w / 8), ceil(h / 8))`, and bounds-check both coordinates.
+
+> **Performance:** 64 invocations per workgroup is the safe default (8×8 in 2D). Hardware runs invocations in groups of 32 or 64 lanes; a workgroup of 1 or 7 leaves most lanes idle, and the extra invocations of an oversized grid cost almost nothing when they exit at the bounds check. Go bigger (128, 256) only when shared memory algorithms benefit, and measure.
+
+## Parallel map: one invocation per element
+
+The simplest and most common pattern: each invocation reads its element, computes, writes its element. No invocation depends on another, so nothing needs synchronizing. A bullet system:
+
+```js
+const device = await getDevice();
+const N = 100000;
+// INIT (once): shader, pipeline, buffers, bind group.
+const module = device.createShaderModule({ code: `
+struct Params { dt: f32, width: f32, height: f32 }
+@group(0) @binding(0) var<storage, read_write> pos: array<vec2f>;
+@group(0) @binding(1) var<storage, read> vel: array<vec2f>;
+@group(0) @binding(2) var<uniform> params: Params;
+@compute @workgroup_size(64) fn main(@builtin(global_invocation_id) id: vec3u) {
+  let i = id.x;
+  if (i >= arrayLength(&pos)) { return; }
+  var p = pos[i] + vel[i] * params.dt;
+  let size = vec2f(params.width, params.height);
+  p = p - floor(p / size) * size;            // wrap around the screen edges
+  pos[i] = p;
+}` });
+const pipeline = device.createComputePipeline({ layout: 'auto', compute: { module } });
+const pos = new Float32Array(N * 2), vel = new Float32Array(N * 2);
+for (let i = 0; i < N; i++) {
+  pos[i * 2] = Math.random() * 640; pos[i * 2 + 1] = Math.random() * 480;
+  const a = Math.random() * Math.PI * 2;
+  vel[i * 2] = Math.cos(a) * 200; vel[i * 2 + 1] = Math.sin(a) * 200;
+}
+const posBuf = device.createBuffer({ size: pos.byteLength, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC });
+const velBuf = device.createBuffer({ size: vel.byteLength, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+const paramBuf = device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+device.queue.writeBuffer(posBuf, 0, pos);
+device.queue.writeBuffer(velBuf, 0, vel);
+const bindGroup = device.createBindGroup({ layout: pipeline.getBindGroupLayout(0), entries: [
+  { binding: 0, resource: { buffer: posBuf } }, { binding: 1, resource: { buffer: velBuf } }, { binding: 2, resource: { buffer: paramBuf } }] });
+const params = new Float32Array([1 / 60, 640, 480, 0]);
+
+// PER FRAME: one small upload, one pass. 60 frames here, then one readback to check.
+for (let frame = 0; frame < 60; frame++) {
+  device.queue.writeBuffer(paramBuf, 0, params);
+  const enc = device.createCommandEncoder(), pass = enc.beginComputePass();
+  pass.setPipeline(pipeline); pass.setBindGroup(0, bindGroup);
+  pass.dispatchWorkgroups(Math.ceil(N / 64));
+  pass.end();
+  device.queue.submit([enc.finish()]);
+}
+const after = new Float32Array(await readBuffer(device, posBuf, 16));
+console.log('bullet 0 moved from', pos[0].toFixed(1), pos[1].toFixed(1), 'to', after[0].toFixed(1), after[1].toFixed(1));
+```
+
+The bullets never come back to the CPU during the loop. In a real game the render pass would read `posBuf` directly as instance data (chapter on vertices).
+
+## Reduction: workgroup memory and barriers
+
+Summing an array (total gold, the number of live enemies, the max height) doesn't map one-to-one. The standard GPU approach is a **tree**: each workgroup loads 64 values into `var<workgroup>` memory, then repeatedly adds the upper half onto the lower half: 64 → 32 → 16 → ... → 1. That's 6 steps instead of 63 sequential adds, and each workgroup writes one partial sum.
+
+```wgsl
+var<workgroup> scratch: array<u32, 64>;
+
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3u,
+        @builtin(local_invocation_id) lid: vec3u,
+        @builtin(workgroup_id) wid: vec3u) {
+  var v = 0u;
+  if (gid.x < arrayLength(&data)) { v = data[gid.x]; }
+  scratch[lid.x] = v;
+  workgroupBarrier();                      // all 64 loads are done
+  for (var stride = 32u; stride > 0u; stride /= 2u) {
+    if (lid.x < stride) {
+      scratch[lid.x] += scratch[lid.x + stride];
+    }
+    workgroupBarrier();                    // this level is done before the next reads it
+  }
+  if (lid.x == 0u) { partial[wid.x] = scratch[0]; }
+}
+```
+
+**`workgroupBarrier()`** waits until every invocation in the workgroup reaches it, and makes their `var<workgroup>` writes visible to each other. Without it, an invocation could read `scratch[lid.x + stride]` before its neighbor wrote it: a data race, and wrong answers that change from run to run.
+
+Two rules come with barriers:
+
+- **Every invocation of the workgroup must reach the same barrier.** A barrier inside `if (lid.x < stride)` would deadlock or worse, so WGSL forbids it: the compiler's *uniformity analysis* rejects a barrier in control flow that depends on per-invocation values. Note how the loop above has a uniform trip count and the barrier sits outside the `if`.
+- Barriers only synchronize *within a workgroup*. To combine partial sums from different workgroups, run a second dispatch (or sum the few partials on the CPU, or use atomics). Separate dispatches in a pass, and separate passes, see each other's storage writes in order.
+
+## Atomics: a histogram
+
+When many invocations update the same location, plain `+=` loses updates (two invocations read 5, both write 6). **Atomics** make read-modify-write indivisible:
+
+```wgsl
+@group(0) @binding(1) var<storage, read_write> bins: array<atomic<u32>, 16>;
+// ...
+atomicAdd(&bins[bucket], 1u);
+```
+
+`atomic<u32>` and `atomic<i32>` exist only in `storage` (read_write) and `workgroup` memory. Operations: `atomicLoad`, `atomicStore`, `atomicAdd`, `atomicSub`, `atomicMax`, `atomicMin`, `atomicAnd`, `atomicOr`, `atomicXor`, `atomicExchange`, `atomicCompareExchangeWeak`. On the JS side the buffer is just `u32`s.
+
+Atomics on the same address serialize. With a million invocations hitting 16 bins, global atomics get slow; the fix is a per-workgroup histogram in `var<workgroup>` atomics, then one global `atomicAdd` per bin per workgroup:
+
+```js
+const device = await getDevice();
+const module = device.createShaderModule({ code: `
+@group(0) @binding(0) var<storage, read> damage: array<u32>;
+@group(0) @binding(1) var<storage, read_write> bins: array<atomic<u32>, 8>;
+var<workgroup> local: array<atomic<u32>, 8>;
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3u, @builtin(local_invocation_index) li: u32) {
+  if (gid.x < arrayLength(&damage)) {
+    atomicAdd(&local[min(damage[gid.x] / 10u, 7u)], 1u);   // buckets 0-9, 10-19, ..., 70+
+  }
+  workgroupBarrier();
+  if (li < 8u) { atomicAdd(&bins[li], atomicLoad(&local[li])); }
+}` });
+const pipeline = device.createComputePipeline({ layout: 'auto', compute: { module } });
+const hits = new Uint32Array(10000).map((_, i) => (i * 37) % 90);
+const hitBuf = device.createBuffer({ size: hits.byteLength, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+device.queue.writeBuffer(hitBuf, 0, hits);
+const binBuf = device.createBuffer({ size: 32, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
+const enc = device.createCommandEncoder(), pass = enc.beginComputePass();
+pass.setPipeline(pipeline);
+pass.setBindGroup(0, device.createBindGroup({ layout: pipeline.getBindGroupLayout(0), entries: [
+  { binding: 0, resource: { buffer: hitBuf } }, { binding: 1, resource: { buffer: binBuf } }] }));
+pass.dispatchWorkgroups(Math.ceil(hits.length / 64)); pass.end();
+device.queue.submit([enc.finish()]);
+console.log(new Uint32Array(await readBuffer(device, binBuf)));
+```
+
+The barrier sits outside the bounds check (it must be reached by everyone), and workgroup memory starts zeroed in each workgroup.
+
+## Prefix sum (scan)
+
+An *inclusive scan* turns `[3, 1, 4, 1, 5]` into running totals `[3, 4, 8, 9, 14]`. It sounds serial, but it's one of the most useful parallel building blocks. The classic game use is **stream compaction**: given an `alive` flag per particle, the exclusive scan of the flags is each live particle's index in a packed output array, so a compute pass can remove dead particles without any CPU work. It also builds spatial hash grids (count per cell, scan, scatter).
+
+The simple parallel scan within one workgroup (Hillis-Steele) runs `log2(n)` steps. At step `k` with `offset = 2^k`, every element adds the value `offset` positions to its left:
+
+```text
+start        3  1  4  1  5  9  2  6
+offset 1     3  4  5  5  6 14 11  8
+offset 2     3  4  8  9 11 19 17 22
+offset 4     3  4  8  9 14 23 25 31
+```
+
+The trap: within a step, every invocation must *read* the old value before anyone *writes* the new one. So each step is read, barrier, write, barrier. Scans over more than one workgroup scan each block, scan the block totals, and add them back: three dispatches.
+
+## Matrix multiply
+
+`C = A × B` for n×n matrices: each output element is a dot product of a row of A and a column of B. One invocation per output element, on a 2D grid:
+
+```wgsl
+@compute @workgroup_size(8, 8)
+fn main(@builtin(global_invocation_id) id: vec3u) {
+  let row = id.y; let col = id.x;
+  if (row >= n || col >= n) { return; }
+  var sum = 0.0;
+  for (var k = 0u; k < n; k++) { sum += a[row * n + k] * b[k * n + col]; }
+  c[row * n + col] = sum;
+}
+```
+
+This naive version reads every element of A and B `n` times from global memory. Fast implementations *tile*: each 8×8 workgroup loads 8×8 blocks of A and B into `var<workgroup>` memory, barriers, multiplies from shared memory, and repeats along k, cutting global reads by 8×. The same "load a tile into shared memory, then compute" pattern drives image blurs and other neighborhood operations.
+
+## Timing and when the GPU wins
+
+- **Overhead first.** Encoding, submitting and reading back costs tens to hundreds of microseconds regardless of size. For small arrays the CPU wins; the crossover is often around 10,000 to 100,000 elements, and depends heavily on how much work each element does.
+- **Measure GPU work, not JavaScript.** `submit` returns instantly, so `performance.now()` around it measures nothing. Wait with `await device.queue.onSubmittedWorkDone()` (which includes some latency), or for precise numbers request the `'timestamp-query'` feature and write timestamps at the start and end of a pass.
+- **Warm up.** The first run includes pipeline compilation and memory allocation. Time the second and later runs, and average many.
+- **Keep data resident.** The win comes from leaving data on the GPU across many steps. Uploading, computing once and reading back is dominated by transfer.
+
+```js
+const device = await getDevice();
+const module = device.createShaderModule({ code: `
+@group(0) @binding(0) var<storage, read_write> d: array<f32>;
+@compute @workgroup_size(64) fn main(@builtin(global_invocation_id) id: vec3u) {
+  if (id.x < arrayLength(&d)) { d[id.x] = sqrt(d[id.x] * d[id.x] + 1.0); }
+}` });
+const pipeline = device.createComputePipeline({ layout: 'auto', compute: { module } });
+const N = 1 << 20;
+const buf = device.createBuffer({ size: N * 4, usage: GPUBufferUsage.STORAGE });
+const bg = device.createBindGroup({ layout: pipeline.getBindGroupLayout(0), entries: [{ binding: 0, resource: { buffer: buf } }] });
+async function run(times) {
+  const enc = device.createCommandEncoder(), pass = enc.beginComputePass();
+  pass.setPipeline(pipeline); pass.setBindGroup(0, bg);
+  for (let i = 0; i < times; i++) pass.dispatchWorkgroups(Math.ceil(N / 64));   // many dispatches, one submit
+  pass.end();
+  device.queue.submit([enc.finish()]);
+  await device.queue.onSubmittedWorkDone();
+}
+await run(1);                                   // warm-up
+let t = performance.now(); await run(1);  const one = performance.now() - t;
+t = performance.now();     await run(10); const ten = performance.now() - t;
+console.log(`1 dispatch: ${one.toFixed(2)} ms, 10 dispatches in one submit: ${ten.toFixed(2)} ms`);
+console.log('(numbers vary a lot by GPU; on software rendering they are slow)');
+```
+
+> **Performance:** record many dispatches into one pass and one submit rather than submitting each separately, and never read back inside the loop. Each `await` on the GPU idles one side while the other works.
+
+=== exercise bullets
+title: Move the bullets
+--- prompt
+Write `async function stepBullets(device, pos, vel, dt)`: `pos` and `vel` are `Float32Array`s of `vec2f`s (x, y pairs), the same length. Return the new positions `pos + vel * dt` as a `Float32Array`, computed on the GPU.
+
+The starter has the buffers, bind group and readback. Fill in the shader's body, the uniform data, and the dispatch size. Use one invocation per bullet (not per float).
+--- starter
+async function stepBullets(device, pos, vel, dt) {
+  const module = device.createShaderModule({ code: `
+    @group(0) @binding(0) var<storage, read_write> pos: array<vec2f>;
+    @group(0) @binding(1) var<storage, read> vel: array<vec2f>;
+    @group(0) @binding(2) var<uniform> dt: f32;
+
+    @compute @workgroup_size(64)
+    fn main(@builtin(global_invocation_id) id: vec3u) {
+      // TODO: bounds check, then move bullet id.x
+      _ = vel[0]; _ = dt;   // (keeps the bindings in the auto layout; delete when you use them)
+    }` });
+  const pipeline = device.createComputePipeline({ layout: 'auto', compute: { module } });
+  const posBuf = device.createBuffer({ size: pos.byteLength, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC });
+  const velBuf = device.createBuffer({ size: vel.byteLength, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+  const dtBuf = device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+  device.queue.writeBuffer(posBuf, 0, pos);
+  device.queue.writeBuffer(velBuf, 0, vel);
+  // TODO: write dt into dtBuf
+  const bindGroup = device.createBindGroup({ layout: pipeline.getBindGroupLayout(0), entries: [
+    { binding: 0, resource: { buffer: posBuf } },
+    { binding: 1, resource: { buffer: velBuf } },
+    { binding: 2, resource: { buffer: dtBuf } },
+  ] });
+  const encoder = device.createCommandEncoder();
+  const pass = encoder.beginComputePass();
+  pass.setPipeline(pipeline);
+  pass.setBindGroup(0, bindGroup);
+  pass.dispatchWorkgroups(1);  // TODO: enough for every bullet
+  pass.end();
+  device.queue.submit([encoder.finish()]);
+  return new Float32Array(await readBuffer(device, posBuf));
+}
+--- solution
+async function stepBullets(device, pos, vel, dt) {
+  const module = device.createShaderModule({ code: `
+    @group(0) @binding(0) var<storage, read_write> pos: array<vec2f>;
+    @group(0) @binding(1) var<storage, read> vel: array<vec2f>;
+    @group(0) @binding(2) var<uniform> dt: f32;
+
+    @compute @workgroup_size(64)
+    fn main(@builtin(global_invocation_id) id: vec3u) {
+      let i = id.x;
+      if (i >= arrayLength(&pos)) { return; }
+      pos[i] += vel[i] * dt;
+    }` });
+  const pipeline = device.createComputePipeline({ layout: 'auto', compute: { module } });
+  const posBuf = device.createBuffer({ size: pos.byteLength, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC });
+  const velBuf = device.createBuffer({ size: vel.byteLength, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+  const dtBuf = device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+  device.queue.writeBuffer(posBuf, 0, pos);
+  device.queue.writeBuffer(velBuf, 0, vel);
+  device.queue.writeBuffer(dtBuf, 0, new Float32Array([dt]));
+  const bindGroup = device.createBindGroup({ layout: pipeline.getBindGroupLayout(0), entries: [
+    { binding: 0, resource: { buffer: posBuf } },
+    { binding: 1, resource: { buffer: velBuf } },
+    { binding: 2, resource: { buffer: dtBuf } },
+  ] });
+  const encoder = device.createCommandEncoder();
+  const pass = encoder.beginComputePass();
+  pass.setPipeline(pipeline);
+  pass.setBindGroup(0, bindGroup);
+  pass.dispatchWorkgroups(Math.ceil(pos.length / 2 / 64));
+  pass.end();
+  device.queue.submit([encoder.finish()]);
+  return new Float32Array(await readBuffer(device, posBuf));
+}
+--- hint
+`pos[i] += vel[i] * dt;` after `if (i >= arrayLength(&pos)) { return; }`.
+--- hint
+There are `pos.length / 2` bullets: `Math.ceil(pos.length / 2 / 64)` workgroups. Write dt with `device.queue.writeBuffer(dtBuf, 0, new Float32Array([dt]))`.
+--- harness
+{
+  const device = await getDevice();
+  const got = await stepBullets(device, new Float32Array([0, 0, 10, 20]), new Float32Array([100, -50, 1, 2]), 0.5);
+  eq([...got], [50, -25, 10.5, 21], 'two bullets');
+  const N = 3000;
+  const pos = new Float32Array(N * 2).map((_, i) => i);
+  const vel = new Float32Array(N * 2).map((_, i) => (i % 7) - 3);
+  const got2 = await stepBullets(device, pos, vel, 2);
+  check(got2.every((v, i) => v === pos[i] + vel[i] * 2), `${N} bullets all moved`);
+}
+
+=== exercise layout
+title: An explicit bind group layout
+--- prompt
+Write `function makeLayout(device)` returning a `GPUBindGroupLayout` for this shader's group 0, usable from compute shaders:
+
+```wgsl
+@group(0) @binding(0) var<storage, read> enemies: array<vec2f>;
+@group(0) @binding(1) var<storage, read_write> dist: array<f32>;
+@group(0) @binding(2) var<uniform> player: vec2f;
+```
+
+The tests build a pipeline layout from it, compile a shader that computes each enemy's distance to the player, and run it.
+--- starter
+function makeLayout(device) {
+  return device.createBindGroupLayout({ entries: [
+    { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+    { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+    { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+  ] });
+}
+--- solution
+function makeLayout(device) {
+  return device.createBindGroupLayout({ entries: [
+    { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+    { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+    { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
+  ] });
+}
+--- hint
+`var<storage, read>` is `'read-only-storage'`, `var<storage, read_write>` is `'storage'`, `var<uniform>` is `'uniform'`.
+--- harness
+{
+  const device = await getDevice();
+  const layout = makeLayout(device);
+  device.pushErrorScope('validation');
+  const module = device.createShaderModule({ code: `
+@group(0) @binding(0) var<storage, read> enemies: array<vec2f>;
+@group(0) @binding(1) var<storage, read_write> dist: array<f32>;
+@group(0) @binding(2) var<uniform> player: vec2f;
+@compute @workgroup_size(64) fn main(@builtin(global_invocation_id) id: vec3u) {
+  if (id.x < arrayLength(&dist)) { dist[id.x] = distance(enemies[id.x], player); }
+}` });
+  const pipeline = device.createComputePipeline({ layout: device.createPipelineLayout({ bindGroupLayouts: [layout] }), compute: { module } });
+  const en = device.createBuffer({ size: 24, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+  device.queue.writeBuffer(en, 0, new Float32Array([3, 4, 0, 0, 6, 8]));
+  const dist = device.createBuffer({ size: 12, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
+  const pl = device.createBuffer({ size: 8, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+  device.queue.writeBuffer(pl, 0, new Float32Array([0, 0]));
+  const bg = device.createBindGroup({ layout, entries: [
+    { binding: 0, resource: { buffer: en } }, { binding: 1, resource: { buffer: dist } }, { binding: 2, resource: { buffer: pl } }] });
+  const enc = device.createCommandEncoder(), pass = enc.beginComputePass();
+  pass.setPipeline(pipeline); pass.setBindGroup(0, bg); pass.dispatchWorkgroups(1); pass.end();
+  device.queue.submit([enc.finish()]);
+  const err = await device.popErrorScope();
+  if (err) console.log('GPU error: ' + err.message.split('\n')[0]);
+  eq(err, null, 'layout matches the shader');
+  eq([...new Float32Array(await readBuffer(device, dist))], [5, 0, 10], 'distances');
+}
+
+=== exercise grid
+title: A 2D dispatch over a tile map
+--- prompt
+Write `async function tileCoords(device, w, h)` that runs a compute shader over a `w` × `h` tile map and returns a `Uint32Array` of `w * h` elements, row by row, where the element for tile `(x, y)` is `x * 1000 + y`.
+
+Use `@workgroup_size(8, 8)`, a 2D dispatch that covers the whole map, and a bounds check on both coordinates. The map width reaches the shader through a uniform. The tests use sizes that aren't multiples of 8.
+--- starter
+async function tileCoords(device, w, h) {
+  const module = device.createShaderModule({ code: `
+    @group(0) @binding(0) var<storage, read_write> out: array<u32>;
+    @group(0) @binding(1) var<uniform> size: vec2u;   // (w, h)
+
+    @compute @workgroup_size(8, 8)
+    fn main(@builtin(global_invocation_id) id: vec3u) {
+      // TODO
+      _ = size;
+    }` });
+  const pipeline = device.createComputePipeline({ layout: 'auto', compute: { module } });
+  const out = device.createBuffer({ size: w * h * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
+  const sizeBuf = device.createBuffer({ size: 8, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+  device.queue.writeBuffer(sizeBuf, 0, new Uint32Array([w, h]));
+  const bindGroup = device.createBindGroup({ layout: pipeline.getBindGroupLayout(0), entries: [
+    { binding: 0, resource: { buffer: out } }, { binding: 1, resource: { buffer: sizeBuf } }] });
+  const encoder = device.createCommandEncoder();
+  const pass = encoder.beginComputePass();
+  pass.setPipeline(pipeline);
+  pass.setBindGroup(0, bindGroup);
+  pass.dispatchWorkgroups(1, 1);  // TODO
+  pass.end();
+  device.queue.submit([encoder.finish()]);
+  return new Uint32Array(await readBuffer(device, out));
+}
+--- solution
+async function tileCoords(device, w, h) {
+  const module = device.createShaderModule({ code: `
+    @group(0) @binding(0) var<storage, read_write> out: array<u32>;
+    @group(0) @binding(1) var<uniform> size: vec2u;   // (w, h)
+
+    @compute @workgroup_size(8, 8)
+    fn main(@builtin(global_invocation_id) id: vec3u) {
+      if (id.x >= size.x || id.y >= size.y) { return; }
+      out[id.y * size.x + id.x] = id.x * 1000u + id.y;
+    }` });
+  const pipeline = device.createComputePipeline({ layout: 'auto', compute: { module } });
+  const out = device.createBuffer({ size: w * h * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
+  const sizeBuf = device.createBuffer({ size: 8, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+  device.queue.writeBuffer(sizeBuf, 0, new Uint32Array([w, h]));
+  const bindGroup = device.createBindGroup({ layout: pipeline.getBindGroupLayout(0), entries: [
+    { binding: 0, resource: { buffer: out } }, { binding: 1, resource: { buffer: sizeBuf } }] });
+  const encoder = device.createCommandEncoder();
+  const pass = encoder.beginComputePass();
+  pass.setPipeline(pipeline);
+  pass.setBindGroup(0, bindGroup);
+  pass.dispatchWorkgroups(Math.ceil(w / 8), Math.ceil(h / 8));
+  pass.end();
+  device.queue.submit([encoder.finish()]);
+  return new Uint32Array(await readBuffer(device, out));
+}
+--- hint
+Both coordinates need a check: `if (id.x >= size.x || id.y >= size.y) { return; }`. Checking only the flat index would let column `w` wrap into the next row.
+--- hint
+`pass.dispatchWorkgroups(Math.ceil(w / 8), Math.ceil(h / 8))`.
+--- harness
+{
+  const device = await getDevice();
+  for (const [w, h] of [[3, 2], [20, 13], [8, 8], [33, 5]]) {
+    const got = await tileCoords(device, w, h);
+    let ok = got.length === w * h;
+    for (let y = 0; y < h && ok; y++) for (let x = 0; x < w; x++) if (got[y * w + x] !== x * 1000 + y) { ok = false; break; }
+    check(ok, `${w} x ${h} map`);
+  }
+}
+
+=== exercise gold
+title: Total gold (reduction)
+--- prompt
+Every enemy drops some gold; add it all up. Write `async function totalGold(device, gold)` that returns the sum of a `Uint32Array` (tens of thousands of elements), using a workgroup reduction: each workgroup of 64 sums its 64 values in `var<workgroup>` memory and writes one partial sum; the starter adds the partials on the CPU.
+
+The starter has everything except the reduction loop in the shader.
+--- starter
+async function totalGold(device, gold) {
+  const module = device.createShaderModule({ code: `
+    @group(0) @binding(0) var<storage, read> data: array<u32>;
+    @group(0) @binding(1) var<storage, read_write> partial: array<u32>;
+    var<workgroup> scratch: array<u32, 64>;
+
+    @compute @workgroup_size(64)
+    fn main(@builtin(global_invocation_id) gid: vec3u,
+            @builtin(local_invocation_id) lid: vec3u,
+            @builtin(workgroup_id) wid: vec3u) {
+      var v = 0u;
+      if (gid.x < arrayLength(&data)) { v = data[gid.x]; }
+      scratch[lid.x] = v;
+      workgroupBarrier();
+      // TODO: tree reduction: strides 32, 16, 8, 4, 2, 1, with a barrier after each step
+      if (lid.x == 0u) { partial[wid.x] = scratch[0]; }
+    }` });
+  const pipeline = device.createComputePipeline({ layout: 'auto', compute: { module } });
+  const groups = Math.ceil(gold.length / 64);
+  const dataBuf = device.createBuffer({ size: gold.byteLength, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+  device.queue.writeBuffer(dataBuf, 0, gold);
+  const partBuf = device.createBuffer({ size: groups * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
+  const bindGroup = device.createBindGroup({ layout: pipeline.getBindGroupLayout(0), entries: [
+    { binding: 0, resource: { buffer: dataBuf } }, { binding: 1, resource: { buffer: partBuf } }] });
+  const encoder = device.createCommandEncoder();
+  const pass = encoder.beginComputePass();
+  pass.setPipeline(pipeline);
+  pass.setBindGroup(0, bindGroup);
+  pass.dispatchWorkgroups(groups);
+  pass.end();
+  device.queue.submit([encoder.finish()]);
+  const partials = new Uint32Array(await readBuffer(device, partBuf));
+  return partials.reduce((a, b) => a + b, 0);
+}
+--- solution
+async function totalGold(device, gold) {
+  const module = device.createShaderModule({ code: `
+    @group(0) @binding(0) var<storage, read> data: array<u32>;
+    @group(0) @binding(1) var<storage, read_write> partial: array<u32>;
+    var<workgroup> scratch: array<u32, 64>;
+
+    @compute @workgroup_size(64)
+    fn main(@builtin(global_invocation_id) gid: vec3u,
+            @builtin(local_invocation_id) lid: vec3u,
+            @builtin(workgroup_id) wid: vec3u) {
+      var v = 0u;
+      if (gid.x < arrayLength(&data)) { v = data[gid.x]; }
+      scratch[lid.x] = v;
+      workgroupBarrier();
+      for (var stride = 32u; stride > 0u; stride /= 2u) {
+        if (lid.x < stride) { scratch[lid.x] += scratch[lid.x + stride]; }
+        workgroupBarrier();
+      }
+      if (lid.x == 0u) { partial[wid.x] = scratch[0]; }
+    }` });
+  const pipeline = device.createComputePipeline({ layout: 'auto', compute: { module } });
+  const groups = Math.ceil(gold.length / 64);
+  const dataBuf = device.createBuffer({ size: gold.byteLength, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+  device.queue.writeBuffer(dataBuf, 0, gold);
+  const partBuf = device.createBuffer({ size: groups * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
+  const bindGroup = device.createBindGroup({ layout: pipeline.getBindGroupLayout(0), entries: [
+    { binding: 0, resource: { buffer: dataBuf } }, { binding: 1, resource: { buffer: partBuf } }] });
+  const encoder = device.createCommandEncoder();
+  const pass = encoder.beginComputePass();
+  pass.setPipeline(pipeline);
+  pass.setBindGroup(0, bindGroup);
+  pass.dispatchWorkgroups(groups);
+  pass.end();
+  device.queue.submit([encoder.finish()]);
+  const partials = new Uint32Array(await readBuffer(device, partBuf));
+  return partials.reduce((a, b) => a + b, 0);
+}
+--- hint
+`for (var stride = 32u; stride > 0u; stride /= 2u) { ... }`
+--- hint
+Inside: `if (lid.x < stride) { scratch[lid.x] += scratch[lid.x + stride]; }` then `workgroupBarrier();` outside the `if`.
+--- harness
+{
+  const device = await getDevice();
+  eq(await totalGold(device, new Uint32Array([5, 10, 20])), 35, 'three enemies');
+  const gold = new Uint32Array(50000).map((_, i) => (i * 13) % 100);
+  eq(await totalGold(device, gold), gold.reduce((a, b) => a + b, 0), '50000 enemies');
+}
+
+=== exercise histogram
+title: Damage histogram (atomics)
+--- prompt
+For balancing, count how many hits fall in each damage range. Write `async function damageHistogram(device, hits)`: `hits` is a `Uint32Array` of damage values from 0 to 255. Return a `Uint32Array` of 16 bins where bin `b` counts the hits with `damage / 16 == b` (0-15 in bin 0, 16-31 in bin 1, and so on).
+
+Thousands of invocations increment the same 16 counters, so the shader needs `atomicAdd`. The starter's shader uses a plain `+=` and loses updates; fix the declaration and the update.
+--- starter
+async function damageHistogram(device, hits) {
+  const module = device.createShaderModule({ code: `
+    @group(0) @binding(0) var<storage, read> hits: array<u32>;
+    @group(0) @binding(1) var<storage, read_write> bins: array<u32, 16>;
+
+    @compute @workgroup_size(64)
+    fn main(@builtin(global_invocation_id) id: vec3u) {
+      if (id.x >= arrayLength(&hits)) { return; }
+      bins[hits[id.x] / 16u] += 1u;    // races: concurrent increments get lost
+    }` });
+  const pipeline = device.createComputePipeline({ layout: 'auto', compute: { module } });
+  const hitBuf = device.createBuffer({ size: hits.byteLength, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+  device.queue.writeBuffer(hitBuf, 0, hits);
+  const binBuf = device.createBuffer({ size: 64, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
+  const bindGroup = device.createBindGroup({ layout: pipeline.getBindGroupLayout(0), entries: [
+    { binding: 0, resource: { buffer: hitBuf } }, { binding: 1, resource: { buffer: binBuf } }] });
+  const encoder = device.createCommandEncoder();
+  const pass = encoder.beginComputePass();
+  pass.setPipeline(pipeline);
+  pass.setBindGroup(0, bindGroup);
+  pass.dispatchWorkgroups(Math.ceil(hits.length / 64));
+  pass.end();
+  device.queue.submit([encoder.finish()]);
+  return new Uint32Array(await readBuffer(device, binBuf));
+}
+--- solution
+async function damageHistogram(device, hits) {
+  const module = device.createShaderModule({ code: `
+    @group(0) @binding(0) var<storage, read> hits: array<u32>;
+    @group(0) @binding(1) var<storage, read_write> bins: array<atomic<u32>, 16>;
+
+    @compute @workgroup_size(64)
+    fn main(@builtin(global_invocation_id) id: vec3u) {
+      if (id.x >= arrayLength(&hits)) { return; }
+      atomicAdd(&bins[hits[id.x] / 16u], 1u);
+    }` });
+  const pipeline = device.createComputePipeline({ layout: 'auto', compute: { module } });
+  const hitBuf = device.createBuffer({ size: hits.byteLength, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+  device.queue.writeBuffer(hitBuf, 0, hits);
+  const binBuf = device.createBuffer({ size: 64, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
+  const bindGroup = device.createBindGroup({ layout: pipeline.getBindGroupLayout(0), entries: [
+    { binding: 0, resource: { buffer: hitBuf } }, { binding: 1, resource: { buffer: binBuf } }] });
+  const encoder = device.createCommandEncoder();
+  const pass = encoder.beginComputePass();
+  pass.setPipeline(pipeline);
+  pass.setBindGroup(0, bindGroup);
+  pass.dispatchWorkgroups(Math.ceil(hits.length / 64));
+  pass.end();
+  device.queue.submit([encoder.finish()]);
+  return new Uint32Array(await readBuffer(device, binBuf));
+}
+--- hint
+Declare the bins as `array<atomic<u32>, 16>`.
+--- hint
+`atomicAdd(&bins[hits[id.x] / 16u], 1u);` (atomics take a pointer).
+--- harness
+{
+  const device = await getDevice();
+  const small = await damageHistogram(device, new Uint32Array([0, 15, 16, 255, 254, 100]));
+  eq([...small], [2, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 2], 'six hits');
+  const hits = new Uint32Array(40000).map((_, i) => (i * 7919) % 256);
+  const want = new Array(16).fill(0);
+  for (const h of hits) want[h >> 4]++;
+  eq([...await damageHistogram(device, hits)], want, '40000 hits');
+}
+
+=== exercise scan
+title: Prefix sum
+--- prompt
+Write `async function inclusiveScan(device, values)` for up to 256 `u32` values: return the running totals (`[3, 1, 4]` gives `[3, 4, 8]`). One workgroup of 256 does it all in `var<workgroup>` memory with the Hillis-Steele scan from the chapter:
+
+for `offset` = 1, 2, 4, ..., 128: each invocation reads the value `offset` to its left (if there is one), **barrier**, adds it to its own slot, **barrier**.
+
+The loading and storing are written; write the loop.
+--- starter
+async function inclusiveScan(device, values) {
+  const module = device.createShaderModule({ code: `
+    @group(0) @binding(0) var<storage, read_write> data: array<u32>;
+    var<workgroup> s: array<u32, 256>;
+
+    @compute @workgroup_size(256)
+    fn main(@builtin(local_invocation_index) i: u32) {
+      let n = arrayLength(&data);
+      if (i < n) { s[i] = data[i]; }    // s starts zeroed, so slots past n hold 0
+      workgroupBarrier();
+      // TODO: the scan loop
+      if (i < n) { data[i] = s[i]; }
+    }` });
+  const pipeline = device.createComputePipeline({ layout: 'auto', compute: { module } });
+  const buf = device.createBuffer({ size: values.byteLength, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC });
+  device.queue.writeBuffer(buf, 0, values);
+  const bindGroup = device.createBindGroup({ layout: pipeline.getBindGroupLayout(0), entries: [{ binding: 0, resource: { buffer: buf } }] });
+  const encoder = device.createCommandEncoder();
+  const pass = encoder.beginComputePass();
+  pass.setPipeline(pipeline);
+  pass.setBindGroup(0, bindGroup);
+  pass.dispatchWorkgroups(1);
+  pass.end();
+  device.queue.submit([encoder.finish()]);
+  return new Uint32Array(await readBuffer(device, buf));
+}
+--- solution
+async function inclusiveScan(device, values) {
+  const module = device.createShaderModule({ code: `
+    @group(0) @binding(0) var<storage, read_write> data: array<u32>;
+    var<workgroup> s: array<u32, 256>;
+
+    @compute @workgroup_size(256)
+    fn main(@builtin(local_invocation_index) i: u32) {
+      let n = arrayLength(&data);
+      if (i < n) { s[i] = data[i]; }
+      workgroupBarrier();
+      for (var offset = 1u; offset < 256u; offset *= 2u) {
+        var left = 0u;
+        if (i >= offset) { left = s[i - offset]; }
+        workgroupBarrier();
+        s[i] += left;
+        workgroupBarrier();
+      }
+      if (i < n) { data[i] = s[i]; }
+    }` });
+  const pipeline = device.createComputePipeline({ layout: 'auto', compute: { module } });
+  const buf = device.createBuffer({ size: values.byteLength, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC });
+  device.queue.writeBuffer(buf, 0, values);
+  const bindGroup = device.createBindGroup({ layout: pipeline.getBindGroupLayout(0), entries: [{ binding: 0, resource: { buffer: buf } }] });
+  const encoder = device.createCommandEncoder();
+  const pass = encoder.beginComputePass();
+  pass.setPipeline(pipeline);
+  pass.setBindGroup(0, bindGroup);
+  pass.dispatchWorkgroups(1);
+  pass.end();
+  device.queue.submit([encoder.finish()]);
+  return new Uint32Array(await readBuffer(device, buf));
+}
+--- hint
+`for (var offset = 1u; offset < 256u; offset *= 2u) { ... }` The loop bound is the same for every invocation, so barriers inside it are allowed.
+--- hint
+Read into a local first: `var left = 0u; if (i >= offset) { left = s[i - offset]; }`, then `workgroupBarrier();`, then `s[i] += left;`, then another barrier.
+--- harness
+{
+  const device = await getDevice();
+  eq([...await inclusiveScan(device, new Uint32Array([3, 1, 4, 1, 5, 9, 2, 6]))], [3, 4, 8, 9, 14, 23, 25, 31], 'eight values');
+  const alive = new Uint32Array(256).map((_, i) => (i * 5) % 3 === 0 ? 1 : 0);
+  const want = []; let t = 0; for (const a of alive) want.push(t += a);
+  eq([...await inclusiveScan(device, alive)], want, '256 alive flags');
+  const odd = new Uint32Array(100).map((_, i) => i);
+  eq([...await inclusiveScan(device, odd)].at(-1), 4950, '100 values, last total');
+}
+
+=== exercise matmul
+title: Matrix multiply
+--- prompt
+Write `async function matmul(device, a, b, n)`: `a` and `b` are `n` × `n` matrices stored row-major in `Float32Array`s (element `(row, col)` is at `row * n + col`). Return `a × b` in the same layout.
+
+Use one invocation per output element on a 2D grid with `@workgroup_size(8, 8)`: `id.x` is the column, `id.y` the row. The starter passes `n` in a uniform and reads back; write the shader body and the dispatch.
+--- starter
+async function matmul(device, a, b, n) {
+  const module = device.createShaderModule({ code: `
+    @group(0) @binding(0) var<storage, read> a: array<f32>;
+    @group(0) @binding(1) var<storage, read> b: array<f32>;
+    @group(0) @binding(2) var<storage, read_write> c: array<f32>;
+    @group(0) @binding(3) var<uniform> n: u32;
+
+    @compute @workgroup_size(8, 8)
+    fn main(@builtin(global_invocation_id) id: vec3u) {
+      // TODO: c[row * n + col] = dot of row 'row' of a and column 'col' of b
+      _ = a[0]; _ = b[0]; _ = c[0]; _ = n;
+    }` });
+  const pipeline = device.createComputePipeline({ layout: 'auto', compute: { module } });
+  const mk = (data, usage) => { const buf = device.createBuffer({ size: data.byteLength, usage }); device.queue.writeBuffer(buf, 0, data); return buf; };
+  const aBuf = mk(a, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST);
+  const bBuf = mk(b, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST);
+  const cBuf = device.createBuffer({ size: n * n * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
+  const nBuf = mk(new Uint32Array([n]), GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST);
+  const bindGroup = device.createBindGroup({ layout: pipeline.getBindGroupLayout(0), entries: [
+    { binding: 0, resource: { buffer: aBuf } }, { binding: 1, resource: { buffer: bBuf } },
+    { binding: 2, resource: { buffer: cBuf } }, { binding: 3, resource: { buffer: nBuf } }] });
+  const encoder = device.createCommandEncoder();
+  const pass = encoder.beginComputePass();
+  pass.setPipeline(pipeline);
+  pass.setBindGroup(0, bindGroup);
+  // TODO: dispatch
+  pass.end();
+  device.queue.submit([encoder.finish()]);
+  return new Float32Array(await readBuffer(device, cBuf));
+}
+--- solution
+async function matmul(device, a, b, n) {
+  const module = device.createShaderModule({ code: `
+    @group(0) @binding(0) var<storage, read> a: array<f32>;
+    @group(0) @binding(1) var<storage, read> b: array<f32>;
+    @group(0) @binding(2) var<storage, read_write> c: array<f32>;
+    @group(0) @binding(3) var<uniform> n: u32;
+
+    @compute @workgroup_size(8, 8)
+    fn main(@builtin(global_invocation_id) id: vec3u) {
+      let row = id.y;
+      let col = id.x;
+      if (row >= n || col >= n) { return; }
+      var sum = 0.0;
+      for (var k = 0u; k < n; k++) {
+        sum += a[row * n + k] * b[k * n + col];
+      }
+      c[row * n + col] = sum;
+    }` });
+  const pipeline = device.createComputePipeline({ layout: 'auto', compute: { module } });
+  const mk = (data, usage) => { const buf = device.createBuffer({ size: data.byteLength, usage }); device.queue.writeBuffer(buf, 0, data); return buf; };
+  const aBuf = mk(a, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST);
+  const bBuf = mk(b, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST);
+  const cBuf = device.createBuffer({ size: n * n * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
+  const nBuf = mk(new Uint32Array([n]), GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST);
+  const bindGroup = device.createBindGroup({ layout: pipeline.getBindGroupLayout(0), entries: [
+    { binding: 0, resource: { buffer: aBuf } }, { binding: 1, resource: { buffer: bBuf } },
+    { binding: 2, resource: { buffer: cBuf } }, { binding: 3, resource: { buffer: nBuf } }] });
+  const encoder = device.createCommandEncoder();
+  const pass = encoder.beginComputePass();
+  pass.setPipeline(pipeline);
+  pass.setBindGroup(0, bindGroup);
+  pass.dispatchWorkgroups(Math.ceil(n / 8), Math.ceil(n / 8));
+  pass.end();
+  device.queue.submit([encoder.finish()]);
+  return new Float32Array(await readBuffer(device, cBuf));
+}
+--- hint
+`let row = id.y; let col = id.x;` then bounds-check both against `n`.
+--- hint
+`for (var k = 0u; k < n; k++) { sum += a[row * n + k] * b[k * n + col]; }` and dispatch `Math.ceil(n / 8)` in both dimensions.
+--- harness
+{
+  const device = await getDevice();
+  eq([...await matmul(device, new Float32Array([1, 2, 3, 4]), new Float32Array([5, 6, 7, 8]), 2)], [19, 22, 43, 50], '2x2');
+  const n = 37;
+  const a = new Float32Array(n * n).map((_, i) => (i % 5) - 2), b = new Float32Array(n * n).map((_, i) => (i % 3) * 0.5);
+  const got = await matmul(device, a, b, n);
+  let ok = got.length === n * n;
+  for (let r = 0; r < n && ok; r++) for (let c = 0; c < n; c++) {
+    let s = 0; for (let k = 0; k < n; k++) s += a[r * n + k] * b[k * n + c];
+    if (Math.abs(got[r * n + c] - s) > 1e-3) { ok = false; console.log(`c[${r}][${c}] = ${got[r * n + c]}, expected ${s}`); break; }
+  }
+  check(ok, '37x37');
+}
+
+=== quiz
+--- q
+A shader has `@workgroup_size(8, 8)` and you call `dispatchWorkgroups(4, 2)`. How many invocations run?
+--- choice
+64
+--- choice
+8
+--- answer
+512
+--- choice
+128
+--- explain
+Each workgroup has 8 × 8 = 64 invocations, and there are 4 × 2 = 8 workgroups.
+
+=== quiz
+--- q
+With `@workgroup_size(64)`, what is `global_invocation_id.x` for the invocation with `local_invocation_id.x == 5` in workgroup 3?
+--- choice
+8
+--- choice
+68
+--- answer
+197
+--- choice
+15
+--- explain
+`global = workgroup_id * workgroup_size + local = 3 * 64 + 5 = 197`.
+
+=== quiz
+--- q
+Why does WGSL reject `if (lid.x < 16u) { workgroupBarrier(); }`?
+--- choice
+Barriers can only be called from helper functions
+--- answer
+Every invocation in the workgroup must reach the same barrier; one inside a per-invocation condition might be skipped by some
+--- choice
+Barriers are only allowed in fragment shaders
+--- choice
+`lid.x` can't be compared to a `u32`
+--- explain
+Uniformity analysis ensures barriers are only in control flow that is the same for the whole workgroup. Otherwise invocations would wait forever for ones that never arrive.
+
+=== quiz
+--- q
+Pipeline A uses `layout: 'auto'`. Can you use a bind group made from `pipelineA.getBindGroupLayout(0)` with pipeline B, whose shader declares identical bindings?
+--- choice
+Yes, layouts are compared by structure
+--- answer
+No: auto layouts are only compatible with the pipeline that created them; use an explicit shared layout
+--- choice
+Only if both pipelines use the same shader module
+--- choice
+Yes, but only for compute pipelines
+--- explain
+Each `'auto'` layout is unique to its pipeline. Explicit `createBindGroupLayout` + `createPipelineLayout` let several pipelines share bind groups.
+
+=== quiz
+--- q
+Thousands of invocations count enemies per tile with `counts[tile] += 1u;` on a plain `array<u32>`. What goes wrong?
+--- choice
+Nothing, GPU memory writes are always atomic
+--- answer
+Concurrent read-modify-writes to the same tile lose updates; the counts come out too low
+--- choice
+It's a compile error
+--- choice
+The counts come out too high
+--- explain
+Two invocations can both read 5 and both write 6. Use `array<atomic<u32>>` and `atomicAdd`.
+
+=== quiz
+--- q
+Can invocations in *different* workgroups of one dispatch exchange data through `var<workgroup>` memory?
+--- choice
+Yes, after a `workgroupBarrier()`
+--- choice
+Yes, if they have the same `local_invocation_id`
+--- answer
+No; each workgroup has its own copy. Combine results across workgroups with storage buffers, atomics, or a second dispatch
+--- choice
+Only with `storageBarrier()`
+--- explain
+Workgroup memory is private to one workgroup, and there is no barrier across workgroups within a dispatch. Dispatches later in the queue see earlier ones' storage writes.
+
+=== quiz
+--- q
+You time `device.queue.submit(...)` with `performance.now()` before and after: 0.05 ms for a 10-million-element compute pass. What did you measure?
+--- choice
+The GPU is incredibly fast
+--- answer
+Almost only the cost of queuing the work; submit returns before the GPU runs it
+--- choice
+The time including the readback
+--- choice
+The shader compile time
+--- explain
+GPU work is asynchronous. Wait with `onSubmittedWorkDone()` (or use timestamp queries), and warm up first so pipeline compilation isn't included.
