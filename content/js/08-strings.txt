@@ -28,7 +28,7 @@ Things that differ from C#:
 - Comparison with `<` compares UTF-16 code units, which is ordinal: `'Z' < 'a'` is true. For human sorting use `localeCompare` or `Intl.Collator`.
 - String concatenation in a loop is fine. Engines use ropes, so there is no need for a `StringBuilder`; building an array and calling `join` is also idiomatic.
 
-> **Performance:** strings are immutable, so every `+`, template literal, `slice`, `split` and `toUpperCase` allocates a new string. That is fine at load time and a bad habit in a frame loop: a HUD that rebuilds `` `Score: ${score}` `` sixty times a second makes garbage for the collector even when the score did not change. Rebuild text only when its value changes (keep the last value and compare), and never `split` or regex-parse data per frame: parse level files, configs and dialogue once at load into numbers, arrays and objects.
+> **Performance:** strings are immutable, so every `+`, template literal, `slice`, `split` and `toUpperCase` allocates a new string. That is fine at load time and a bad habit in per-frame, per-vertex or per-pixel code: an overlay that rebuilds `` `FPS: ${fps}` `` sixty times a second makes garbage for the collector even when the value did not change, and building a `` `${x},${y}` `` key per pixel to look something up in a `Map` is far slower than an integer index `y * width + x`. Rebuild text only when its value changes, and never `split` or regex-parse data in a hot loop: parse scene files, shader sources, presets and OBJ meshes once at load into numbers, arrays and typed arrays.
 
 ## UTF-16: code units, code points and graphemes
 
@@ -133,7 +133,7 @@ for (const x of 'a1b22c333'.matchAll(/[a-z](\d+)/g)) console.log(x[0], x[1], x.i
 console.log('one  two   three'.split(/\s+/), 'a1b2c'.split(/(\d)/));
 ```
 
-> **Performance:** a regex literal is compiled once and the compiled form is cached, but `new RegExp(...)` inside a function called per frame or per item recompiles every time: hoist it to the top level. `match`, `matchAll`, `exec` and `split` allocate result arrays; when you only need a yes/no, `test` allocates nothing.
+> **Performance:** a regex literal is compiled once and the compiled form is cached, but `new RegExp(...)` inside a function called per frame or per line of a big file recompiles every time: hoist it to the top level. `match`, `matchAll`, `exec` and `split` allocate result arrays; when you only need a yes/no, `test` allocates nothing.
 
 The `g` flag makes a regex object stateful: `test` and `exec` start from `lastIndex` and store where they stopped. Reusing a global regex across different strings with `test` is a classic bug, so do not put `g` on a regex you only `test` with.
 
@@ -201,6 +201,34 @@ console.log(String.raw`C:\new\table ${1 + 1}`);
 ```
 
 `strings` always has exactly one more element than `values`. `strings.raw` holds the source text with escapes unprocessed, which is what `String.raw` returns. The `strings` array is frozen and is the *same object* every time a given call site runs, so tags can cache work per call site (lit-html does this).
+
+## Rewriting strings: L-systems
+
+An **L-system** grows structure by string rewriting: start from an *axiom*, and in each generation replace **every symbol at once** according to a rule table. Interpreted as drawing commands (`F` draw forward, `+`/`-` turn, `[`/`]` push and pop the turtle state), the strings become plants, trees and fractals; the procedural generation track draws them. Here we care about the string side:
+
+```js
+function step(s, rules) {
+  let out = '';
+  for (const ch of s) out += rules[ch] ?? ch;      // symbols without a rule are copied
+  return out;
+}
+const algae = { A: 'AB', B: 'A' };
+let s = 'A';
+for (let i = 0; i < 6; i++) { console.log(i, s); s = step(s, algae); }
+
+// The classic bug: applying the rules one after another instead of simultaneously.
+const wrong = 'AB'.replaceAll('A', 'AB').replaceAll('B', 'A');
+console.log(wrong, step('AB', algae));
+
+const plant = { X: 'F+[[X]-X]-F[-FX]+X', F: 'FF' };
+let p = 'X';
+for (let i = 0; i < 6; i++) p = step(p, plant);
+console.log(p.length, p.slice(-24));
+```
+
+The sequential version lets the `B` rule rewrite the `B`s that the `A` rule just produced. Rules must be applied in one pass over the *old* string.
+
+> **Performance:** L-system strings grow exponentially (the plant above multiplies its length by about 4 per generation), so always cap generations or total length and check the cap *while* building, not after. For deep systems, do not materialize the final string at all: interpret it recursively (expand a symbol only when the turtle reaches it, with recursion depth equal to the generation count), which needs memory proportional to the depth instead of the length.
 
 ## Building a tokenizer with a sticky regex
 
@@ -300,7 +328,7 @@ eq(countCodePoints('\uD83D'), 1, 'a lone surrogate counts as one');
 === exercise casing
 title: Case conversions
 --- prompt
-Asset pipelines constantly convert names between styles (`PlayerShip_v2.png`, `player-ship`, `playerShip`). Write `words(s)` that splits an identifier in any common style into lowercase words, then `camelCase(s)`, `snakeCase(s)` and `kebabCase(s)` built on it.
+Asset pipelines constantly convert names between styles (`BrickWall_v2.png`, `brick-wall`, `brickWall`, a shader uniform `uBrickWall`). Write `words(s)` that splits an identifier in any common style into lowercase words, then `camelCase(s)`, `snakeCase(s)` and `kebabCase(s)` built on it.
 
 `words` must handle:
 
@@ -382,7 +410,7 @@ eq(kebabCase('io.SocketV2Ready'), 'io-socket-v2-ready');
 === exercise kv
 title: Parsing key=value pairs
 --- prompt
-A game's developer console accepts commands like `spawn type=orc hp=30 name="Big Bob"`. Write `parseKV(s)` that parses the `key=value` pairs of such a line into an object, using `matchAll` and named groups.
+A scene description format declares materials with lines like `material name="Rusty metal" roughness=0.8 tint=#aa5533`. Write `parseKV(s)` that parses the `key=value` pairs of such a line into an object, using `matchAll` and named groups.
 
 - Keys are `[A-Za-z_][\w.-]*` and must start at the beginning of the line or after whitespace.
 - A value is either double-quoted (may contain spaces and `\"` or `\\` escapes, which you unescape), single-quoted (no escapes; anything up to the next `'`), or bare (a run of non-whitespace characters, possibly empty).
@@ -509,61 +537,58 @@ Make a tiny class whose instances hold a string and whose `toString()` returns i
 }
 
 === exercise table
-title: A padded leaderboard
+title: A texture memory report
 --- prompt
-Print this end-of-match leaderboard using `padStart`/`padEnd` (and `toFixed`), computing column widths from the data rather than hard-coding them. The player name is left aligned, the numbers right aligned; each column is as wide as its widest cell (header included), and columns are separated by ` | `. The separator line uses `-` for each column and `-+-` between them.
+Print this report of how much memory a set of RGBA8 textures needs, using `padStart`/`padEnd` and `toFixed`, computing column widths from the data rather than hard-coding them. A texture of size `n` is `n` by `n` pixels at 4 bytes per pixel; MiB is bytes divided by 2^20, printed with two decimals. The name is left aligned, the numbers right aligned; each column is as wide as its widest cell (header included), and columns are separated by ` | `. The separator line uses `-` for each column and `-+-` between them. The last line is the total.
 
 ```text
-player     | kills |   acc%
------------+-------+-------
-zed        |     3 |  50.00
-blackwidow |    17 |   8.25
-ox         |  1200 | 100.00
+texture       | size |   MiB
+--------------+------+------
+noise         |  256 |  0.25
+marble_veined | 2048 | 16.00
+moss          |  512 |  1.00
+total         |      | 17.25
 ```
 
-The starter has the data. Accuracy is printed with two decimals. This is load-time or end-of-round code, so building strings freely is fine here.
+This is load-time reporting code, so building strings freely is fine here.
 --- starter
-const header = ['player', 'kills', 'acc%'];
-const rows = [
-  ['zed', 3, 50],
-  ['blackwidow', 17, 8.25],
-  ['ox', 1200, 100],
-];
-console.log(header.join(' | '));
-for (const r of rows) console.log(r.join(' | '));
+const textures = [['noise', 256], ['marble_veined', 2048], ['moss', 512]];
+for (const [name, size] of textures) console.log(name, size, size * size * 4);
 --- solution
-const header = ['player', 'kills', 'acc%'];
-const rows = [
-  ['zed', 3, 50],
-  ['blackwidow', 17, 8.25],
-  ['ox', 1200, 100],
+const textures = [['noise', 256], ['marble_veined', 2048], ['moss', 512]];
+const mib = n => n * n * 4 / 2 ** 20;
+const total = textures.reduce((s, [, n]) => s + mib(n), 0);
+const cells = [
+  ['texture', 'size', 'MiB'],
+  ...textures.map(([name, n]) => [name, String(n), mib(n).toFixed(2)]),
+  ['total', '', total.toFixed(2)],
 ];
-const cells = [header, ...rows.map(([n, q, p]) => [n, String(q), p.toFixed(2)])];
-const widths = header.map((_, c) => Math.max(...cells.map(r => r[c].length)));
+const widths = cells[0].map((_, c) => Math.max(...cells.map(r => r[c].length)));
 const line = r => r.map((cell, c) => c === 0 ? cell.padEnd(widths[c]) : cell.padStart(widths[c])).join(' | ');
 console.log(line(cells[0]));
 console.log(widths.map(w => '-'.repeat(w)).join('-+-'));
 for (const r of cells.slice(1)) console.log(line(r));
 --- hint
-Convert every cell to its final string first (including `toFixed(2)`), then compute each column's width with `Math.max(...cells.map(r => r[c].length))`.
+Convert every cell to its final string first (including `toFixed(2)` and the empty size cell of the total row), then compute each column's width with `Math.max(...cells.map(r => r[c].length))`.
 --- test
 --- out
-player     | kills |   acc%
------------+-------+-------
-zed        |     3 |  50.00
-blackwidow |    17 |   8.25
-ox         |  1200 | 100.00
+texture       | size |   MiB
+--------------+------+------
+noise         |  256 |  0.25
+marble_veined | 2048 | 16.00
+moss          |  512 |  1.00
+total         |      | 17.25
 
 === exercise lexer
 title: A tokenizer for a small language
 --- prompt
-Games often embed a small scripting language for quests and cutscenes. Write `tokenize(src)` for such a C-like mini language. It returns an array of `{ type, value, line, col }` tokens (line and col are 1-based, pointing at the token's first character; col counts UTF-16 units) and skips whitespace and `//` comments to end of line.
+Graphics tools are full of small languages: shader snippets, material graphs saved as text, scene scripts. Write `tokenize(src)` for a tiny C-like shading language. It returns an array of `{ type, value, line, col }` tokens (line and col are 1-based, pointing at the token's first character; col counts UTF-16 units) and skips whitespace and `//` comments to end of line.
 
 | type | matches | value |
 |---|---|---|
 | `'num'` | `12`, `3.5`, `.5`, `1e9`, `2.5e-3` | the number (`Number`) |
 | `'str'` | double-quoted, with escapes `\n` `\t` `\"` `\\` | the unescaped string |
-| `'kw'` | `let`, `if`, `else`, `while`, `return`, `fn` | the word |
+| `'kw'` | `let`, `if`, `else`, `uniform`, `return`, `fn` | the word |
 | `'id'` | a letter or `_` (any Unicode letter, use `\p{L}`) then letters, digits, `_` | the word |
 | `'op'` | `== != <= >= && \|\| => + - * / % = < > ! ( ) { } , ;` | the operator |
 
@@ -575,7 +600,7 @@ function tokenize(src) {
 --- solution
 function tokenize(src) {
   const re = /(?<nl>\n)|(?<ws>[ \t\r]+)|(?<comment>\/\/[^\n]*)|(?<num>(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?)|(?<str>"(?:[^"\\\n]|\\.)*")|(?<word>[\p{L}_][\p{L}\p{N}_]*)|(?<op>==|!=|<=|>=|&&|\|\||=>|[-+*\/%=<>!(){},;])/uy;
-  const KW = new Set(['let', 'if', 'else', 'while', 'return', 'fn']);
+  const KW = new Set(['let', 'if', 'else', 'uniform', 'return', 'fn']);
   const ESC = { n: '\n', t: '\t', '"': '"', '\\': '\\' };
   const out = [];
   let line = 1, lineStart = 0;
@@ -632,6 +657,97 @@ Match keywords as identifiers, then check them against a `Set`. Put the two-char
   check(e instanceof SyntaxError, 'raw newline inside a string');
   e = errOf('a @ b');
   check(e && /1:3/.test(e.message), '@ at 1:3');
+}
+
+=== exercise lsystem
+title: L-system expansion
+--- prompt
+Write `expand(axiom, rules, n, options)` that applies L-system `rules` to `axiom` for `n` generations, rewriting every symbol simultaneously, and returns the resulting string. Symbols are single characters; a symbol with no rule is copied unchanged.
+
+A rule's value is either a replacement string, or (for a *stochastic* rule) an array of `[weight, replacement]` choices. For a stochastic symbol, draw `r = rng() * totalWeight` and pick the first choice whose cumulative weight is greater than `r`. `options` is `{ maxLength = 1e6, rng }`:
+
+- If a stochastic rule is used and no `rng` function was given, throw a `TypeError`.
+- If any generation would exceed `maxLength` characters, throw a `RangeError`, and do it **while building** that generation: `expand('A', { A: 'AAAA' }, 30)` must fail fast, not after trying to build a 4^30 string.
+- Only own properties of `rules` count (a symbol `'c'` must not pick up anything inherited).
+
+```js
+expand('A', { A: 'AB', B: 'A' }, 5)            // 'ABAABABAABAAB'
+expand('F', { F: [[1, 'F+F'], [1, 'F-F']] }, 1, { rng: () => 0.7 })   // 'F-F'
+```
+--- starter
+function expand(axiom, rules, n, options = {}) {
+  let s = axiom;
+  for (let i = 0; i < n; i++) {
+    for (const [k, v] of Object.entries(rules)) s = s.replaceAll(k, v);
+  }
+  return s;
+}
+--- solution
+function expand(axiom, rules, n, { maxLength = 1e6, rng } = {}) {
+  let s = axiom;
+  for (let gen = 0; gen < n; gen++) {
+    const parts = [];
+    let len = 0;
+    for (const ch of s) {
+      let out = ch;
+      if (Object.hasOwn(rules, ch)) {
+        const r = rules[ch];
+        if (typeof r === 'string') out = r;
+        else {
+          if (typeof rng !== 'function') throw new TypeError('stochastic rule needs an rng');
+          const total = r.reduce((t, [w]) => t + w, 0);
+          const x = rng() * total;
+          let acc = 0;
+          out = r[r.length - 1][1];
+          for (const [w, rep] of r) { acc += w; if (x < acc) { out = rep; break; } }
+        }
+      }
+      len += out.length;
+      if (len > maxLength) throw new RangeError(`L-system exceeded ${maxLength} characters`);
+      parts.push(out);
+    }
+    s = parts.join('');
+  }
+  return s;
+}
+--- hint
+Build each generation from the previous one in a single pass: loop over the old string's characters and collect each replacement into an array, then `join('')` once.
+--- hint
+Keep a running length while you collect the pieces and throw as soon as it passes `maxLength`. For a stochastic rule, sum the weights, scale `rng()` by the sum, and walk the cumulative weights.
+--- harness
+{
+  const algae = { A: 'AB', B: 'A' };
+  eq(expand('A', algae, 0), 'A', 'zero generations');
+  eq(expand('A', algae, 1), 'AB');
+  eq(expand('A', algae, 5), 'ABAABABAABAAB');
+  eq(expand('AB', algae, 1), 'ABA', 'simultaneous rewriting');
+  eq(expand('F+F', { F: 'F-F' }, 2), 'F-F-F-F+F-F-F-F', 'symbols without rules are copied');
+  eq(expand('ca', { a: 'b' }, 1), 'cb', 'inherited properties are not rules');
+  eq(expand('X', { X: 'F+[[X]-X]-F[-FX]+X', F: 'FF' }, 4).length, 1551, 'plant length');
+  eq(expand('', algae, 10), '');
+  eq(expand('F', { F: [[1, 'F+F'], [1, 'F-F']] }, 1, { rng: () => 0.7 }), 'F-F');
+  eq(expand('F', { F: [[1, 'F+F'], [1, 'F-F']] }, 1, { rng: () => 0.2 }), 'F+F');
+  {
+    const seq = [0.1, 0.5, 0.7, 0.75];
+    let i = 0;
+    const rng = () => seq[i++ % seq.length];
+    eq(expand('AAAA', { A: [[3, 'x'], [1, 'y']] }, 1, { rng }), 'xxxy', 'weights 3:1, boundary at 0.75');
+  }
+  throws(() => expand('F', { F: [[1, 'G']] }, 1), 'stochastic rule without rng');
+  {
+    let e; try { expand('F', { F: [[1, 'G']] }, 1); } catch (x) { e = x; }
+    check(e instanceof TypeError, 'TypeError');
+  }
+  const t0 = performance.now();
+  eq(expand('A', algae, 27).length, 514229, 'Fibonacci length');
+  check(performance.now() - t0 < 2000, 'large expansion is fast');
+  const t1 = performance.now();
+  let err;
+  try { expand('A', { A: 'AAAA' }, 30); } catch (x) { err = x; }
+  check(err instanceof RangeError, 'RangeError past maxLength');
+  check(performance.now() - t1 < 1000, 'fails fast');
+  throws(() => expand('A', { A: 'AA' }, 5, { maxLength: 31 }), 'custom maxLength: 32 > 31');
+  eq(expand('A', { A: 'AA' }, 5, { maxLength: 32 }).length, 32, 'exactly maxLength is allowed');
 }
 
 === quiz

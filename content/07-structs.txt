@@ -169,6 +169,8 @@ int main(void) {
 
 The rule that gets you the minimum size almost every time: **order fields from largest alignment to smallest**. It matters when you have a million of them in an array, or when the struct crosses a boundary (a file format, a network packet, a GPU buffer). For those cases never assume a layout: write fields out one by one, and check with `sizeof` and `offsetof` (or `_Static_assert(sizeof(struct good) == 16, "layout")`).
 
+> **Performance:** padding is wasted cache. A vertex declared as `{ char flags; float pos[3]; char material; float uv[2]; }` is 28 bytes, of which 6 carry nothing; reordered largest-first it is 24. Across a million vertices that is 4 MB of memory traffic per pass for no information. Before shipping a struct you store by the thousand, print its `sizeof`, and pin the size with `_Static_assert` so a later edit cannot quietly grow it. Also choose field types for storage: a normal often fits in three `int8_t`s or a packed 32-bit value, a color in four `uint8_t`s, a UV in two `uint16_t`s.
+
 ## Nesting and arrays of structs
 
 Structs nest by value (the inner struct is stored inline, not as a reference), and arrays of structs are contiguous:
@@ -204,6 +206,45 @@ int main(void) {
 ```
 
 `char name[16]` puts the characters inside the struct, so copying the struct copies the name. A `const char *name` field would only copy the pointer, with both copies pointing at the same characters. That distinction (deep vs shallow copy) is the same one you know from C#, just more visible.
+
+### Array of structs, or struct of arrays?
+
+An array of structs (AoS) keeps each object's fields together. A struct of arrays (SoA) keeps each *field* together, one array per field:
+
+```c
+#include <stdio.h>
+
+#define MAXP 4
+
+typedef struct { float x, y, vx, vy, life; unsigned color; } Particle;   // AoS element: 24 bytes
+Particle aos[MAXP];
+
+typedef struct {                                                       // SoA: one array per field
+    float x[MAXP], y[MAXP], vx[MAXP], vy[MAXP], life[MAXP];
+    unsigned color[MAXP];
+} Particles;
+Particles soa;
+
+int main(void) {
+    for (int i = 0; i < MAXP; i++) {
+        aos[i] = (Particle){.vx = 1, .vy = 2};
+        soa.vx[i] = 1; soa.vy[i] = 2;
+    }
+    float dt = 0.5f;
+    for (int i = 0; i < MAXP; i++) {      // AoS: reads all 24 bytes of each particle
+        aos[i].x += aos[i].vx * dt;
+        aos[i].y += aos[i].vy * dt;
+    }
+    for (int i = 0; i < MAXP; i++) {      // SoA: four tight streams, nothing else touched
+        soa.x[i] += soa.vx[i] * dt;
+        soa.y[i] += soa.vy[i] * dt;
+    }
+    printf("%.1f %.1f | %.1f %.1f\n", aos[3].x, aos[3].y, soa.x[3], soa.y[3]);
+    return 0;
+}
+```
+
+> **Performance:** the movement loop needs 16 of the 24 bytes per particle. With AoS the other 8 (life, color) still come through the cache; with SoA every byte loaded is used, and the loop is exactly the shape the compiler vectorizes (8 floats per instruction). Use AoS for things you handle one at a time or always use whole (a GPU vertex, a config record), and SoA for big collections that hot loops sweep a few fields of (particles, positions for culling, pixels split into channels). Splitting rarely used ("cold") fields out of a hot struct is the halfway house.
 
 ## Enums are ints
 
@@ -275,6 +316,8 @@ int main(void) {
 
 Nothing enforces the tag: reading `v->d` when `kind` is `VAL_INT` compiles fine. Keep the tag and the data in sync by only building values through small constructor functions, and always `switch` on the tag. This pattern is everywhere: interpreter values, JSON nodes, events, AST nodes, network messages.
 
+> **Performance:** a tagged union is the right shape for a *description* (a node in a procedural texture graph, a command in a render queue, a parsed value). It is the wrong shape for a million items processed in a tight loop, because the `switch` per element defeats branch prediction and vectorization, and every element is as big as the largest variant. Evaluate the tag once and run a specialized loop per kind (one loop for all spheres, another for all boxes), or keep each kind in its own array.
+
 ## Flexible array members
 
 The last field of a struct may be an array with no size. The struct then acts as a header, and you allocate it with as much extra room as you need, in a single block:
@@ -310,37 +353,43 @@ C has no methods, but the pattern is easy to fake and is how every large C codeb
 #include <stdio.h>
 
 typedef struct {
-    int balance;
-    int tx_count;
-} Account;
+    unsigned state;     // xorshift32 state: must never be 0
+    unsigned draws;
+} Rng;
 
-void account_init(Account *a, int opening) {   // the "constructor"
-    a->balance = opening;
-    a->tx_count = 0;
+void rng_init(Rng *r, unsigned seed) {         // the "constructor"
+    r->state = seed ? seed : 0x9E3779B9u;
+    r->draws = 0;
 }
 
-int account_withdraw(Account *a, int amount) { // returns 0 on failure, no exceptions
-    if (amount <= 0 || amount > a->balance) return 0;
-    a->balance -= amount;
-    a->tx_count++;
-    return 1;
+unsigned rng_next(Rng *r) {                    // a mutating "method"
+    unsigned x = r->state;
+    x ^= x << 13;
+    x ^= x >> 17;
+    x ^= x << 5;
+    r->draws++;
+    return r->state = x;
 }
 
-int account_balance(const Account *a) {        // const "this": a read-only method
-    return a->balance;
+float rng_float01(Rng *r) {                    // [0, 1): the top 24 bits / 2^24
+    return (rng_next(r) >> 8) * (1.0f / 16777216.0f);
+}
+
+unsigned rng_draws(const Rng *r) {             // const "this": a read-only method
+    return r->draws;
 }
 
 int main(void) {
-    Account acc;
-    account_init(&acc, 100);
-    printf("%d ", account_withdraw(&acc, 30));
-    printf("%d ", account_withdraw(&acc, 500));
-    printf("%d %d\n", account_balance(&acc), acc.tx_count);
+    Rng terrain, foliage;                      // independent streams, same seed: same world
+    rng_init(&terrain, 42);
+    rng_init(&foliage, 42);
+    float a = rng_float01(&terrain), b = rng_float01(&foliage);
+    printf("%d %u\n", a == b, rng_draws(&terrain));   // 1 1: deterministic per seed
     return 0;
 }
 ```
 
-The `typename_verb` prefix stands in for both the class and the namespace. Taking `const Account *` is the equivalent of a method that does not mutate `this`. Encapsulation, when you want it, comes from declaring only `typedef struct account Account;` in a header and keeping the field list in the `.c` file, so that other files can only hold pointers and call your functions (an *opaque type*, covered with multi-file programs).
+The `typename_verb` prefix stands in for both the class and the namespace. Taking `const Rng *` is the equivalent of a method that does not mutate `this`. An RNG is also the best argument for explicit state: with the generator in a struct you pass around, every procedural generator draws from the stream you give it, and the same seed rebuilds the same world, which a hidden global `rand()` cannot promise. Encapsulation, when you want it, comes from declaring only `typedef struct rng Rng;` in a header and keeping the field list in the `.c` file, so that other files can only hold pointers and call your functions (an *opaque type*, covered with multi-file programs).
 
 === exercise geometry
 title: Points by value
@@ -1022,6 +1071,465 @@ int main(void) {
     Str *h = str_new("hellO");
     if (h) CHECK_INT(str_equal(a, h), 0);
     free(a); free(b); free(c); free(d); free(e); free(f); free(g); free(h);
+    return TEST_END();
+}
+
+=== exercise vec3
+title: Vec3 and triangle normals
+--- prompt
+3D graphics starts with a three-component vector. The starter defines `typedef struct { float x, y, z; } Vec3;`. Write, all by value:
+
+- `Vec3 v3(float x, float y, float z)`, `Vec3 v3_add(Vec3 a, Vec3 b)`, `Vec3 v3_sub(Vec3 a, Vec3 b)`, `Vec3 v3_scale(Vec3 a, float k)`,
+- `float v3_dot(Vec3 a, Vec3 b)`,
+- `Vec3 v3_cross(Vec3 a, Vec3 b)`: `(a.y*b.z - a.z*b.y, a.z*b.x - a.x*b.z, a.x*b.y - a.y*b.x)`, a vector perpendicular to both, whose length is twice the area of the triangle they span,
+- `Vec3 v3_normalize(Vec3 a)`: length 1, or `(0, 0, 0)` for the zero vector,
+- `Vec3 tri_normal(Vec3 a, Vec3 b, Vec3 c)`: the unit normal of triangle `abc`, `normalize(cross(b - a, c - a))`. With counter-clockwise vertices seen from the front, it points toward the viewer.
+
+A 12-byte struct is still cheap to pass by value. The next two exercises use this to build vertex normals for a mesh.
+--- starter
+#include <math.h>
+
+typedef struct { float x, y, z; } Vec3;
+
+Vec3 v3(float x, float y, float z) { Vec3 r = {0, 0, 0}; return r; }
+Vec3 v3_add(Vec3 a, Vec3 b) { return a; }
+Vec3 v3_sub(Vec3 a, Vec3 b) { return a; }
+Vec3 v3_scale(Vec3 a, float k) { return a; }
+float v3_dot(Vec3 a, Vec3 b) { return 0; }
+Vec3 v3_cross(Vec3 a, Vec3 b) { return a; }
+Vec3 v3_normalize(Vec3 a) { return a; }
+Vec3 tri_normal(Vec3 a, Vec3 b, Vec3 c) { return a; }
+--- solution
+#include <math.h>
+
+typedef struct { float x, y, z; } Vec3;
+
+Vec3 v3(float x, float y, float z) { Vec3 r = {x, y, z}; return r; }
+Vec3 v3_add(Vec3 a, Vec3 b) { return v3(a.x + b.x, a.y + b.y, a.z + b.z); }
+Vec3 v3_sub(Vec3 a, Vec3 b) { return v3(a.x - b.x, a.y - b.y, a.z - b.z); }
+Vec3 v3_scale(Vec3 a, float k) { return v3(a.x * k, a.y * k, a.z * k); }
+float v3_dot(Vec3 a, Vec3 b) { return a.x * b.x + a.y * b.y + a.z * b.z; }
+
+Vec3 v3_cross(Vec3 a, Vec3 b) {
+    return v3(a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x);
+}
+
+Vec3 v3_normalize(Vec3 a) {
+    float len = sqrtf(v3_dot(a, a));
+    return len > 0 ? v3_scale(a, 1.0f / len) : v3(0, 0, 0);
+}
+
+Vec3 tri_normal(Vec3 a, Vec3 b, Vec3 c) {
+    return v3_normalize(v3_cross(v3_sub(b, a), v3_sub(c, a)));
+}
+--- hint
+Build every result with `v3(...)`. Normalizing multiplies by `1.0f / len` (one division instead of three).
+--- harness
+int main(void) {
+    Vec3 a = v3(1, 2, 3), b = v3(4, -5, 6);
+    Vec3 s = v3_add(a, b);
+    CHECK_DBL(s.x, 5); CHECK_DBL(s.y, -3); CHECK_DBL(s.z, 9);
+    Vec3 d = v3_sub(a, b);
+    CHECK_DBL(d.x, -3); CHECK_DBL(d.y, 7); CHECK_DBL(d.z, -3);
+    Vec3 k = v3_scale(a, 2);
+    CHECK_DBL(k.z, 6);
+    CHECK_DBL(v3_dot(a, b), 12);
+    Vec3 c = v3_cross(v3(1, 0, 0), v3(0, 1, 0));
+    CHECK_DBL(c.x, 0); CHECK_DBL(c.y, 0); CHECK_DBL(c.z, 1);
+    c = v3_cross(a, b);
+    CHECK_DBL(c.x, 27); CHECK_DBL(c.y, 6); CHECK_DBL(c.z, -13);
+    CHECK_DBL(v3_dot(c, a), 0);
+    Vec3 n = v3_normalize(v3(0, 3, 4));
+    CHECK_DBL(n.x, 0); CHECK_DBL(n.y, 0.6); CHECK_DBL(n.z, 0.8);
+    n = v3_normalize(v3(0, 0, 0));
+    CHECK(n.x == 0 && n.y == 0 && n.z == 0);
+    n = tri_normal(v3(0, 0, 0), v3(1, 0, 0), v3(0, 1, 0));
+    CHECK_DBL(n.z, 1);
+    n = tri_normal(v3(0, 0, 0), v3(0, 1, 0), v3(1, 0, 0));   // clockwise: flipped
+    CHECK_DBL(n.z, -1);
+    n = tri_normal(v3(0, 0, 0), v3(0, 0, 2), v3(3, 0, 0));
+    CHECK_DBL(n.x, 0); CHECK_DBL(n.y, 1); CHECK_DBL(n.z, 0);
+    n = tri_normal(v3(1, 1, 1), v3(2, 2, 2), v3(3, 3, 3));   // degenerate
+    CHECK(n.x == 0 && n.y == 0 && n.z == 0);
+    return TEST_END();
+}
+
+=== exercise normals
+title: Smooth vertex normals
+continues: vec3
+--- prompt
+A mesh is an array of vertices plus an **index buffer**: every three indices name the vertices of one triangle, so a vertex shared by six triangles is stored once. Lighting needs a normal per vertex. The standard *smooth normal* is: for every triangle, add its (unnormalized) cross product to the normal of each of its three vertices, then normalize every vertex normal. Using the unnormalized cross product weights each face by its area, which is what you want.
+
+The stubs add
+
+```c
+typedef struct { Vec3 pos; Vec3 normal; } Vertex;
+void compute_normals(Vertex *verts, int nv, const unsigned *idx, int ni);
+```
+
+`ni` is a multiple of 3. Overwrite every `normal` (zero them first: they may hold garbage), and leave vertices that are in no triangle at `(0, 0, 0)`.
+
+The shape of this loop matters: one pass over the index buffer, accumulating, then one pass over the vertices, normalizing. Searching for "all triangles that touch vertex v" for each vertex would be O(vertices x triangles); the tests use a 300x300 height-field grid with 178,802 triangles.
+--- stubs
+typedef struct { Vec3 pos; Vec3 normal; } Vertex;
+
+void compute_normals(Vertex *verts, int nv, const unsigned *idx, int ni) {
+}
+--- solution
+#include <math.h>
+
+typedef struct { float x, y, z; } Vec3;
+
+Vec3 v3(float x, float y, float z) { Vec3 r = {x, y, z}; return r; }
+Vec3 v3_add(Vec3 a, Vec3 b) { return v3(a.x + b.x, a.y + b.y, a.z + b.z); }
+Vec3 v3_sub(Vec3 a, Vec3 b) { return v3(a.x - b.x, a.y - b.y, a.z - b.z); }
+Vec3 v3_scale(Vec3 a, float k) { return v3(a.x * k, a.y * k, a.z * k); }
+float v3_dot(Vec3 a, Vec3 b) { return a.x * b.x + a.y * b.y + a.z * b.z; }
+
+Vec3 v3_cross(Vec3 a, Vec3 b) {
+    return v3(a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x);
+}
+
+Vec3 v3_normalize(Vec3 a) {
+    float len = sqrtf(v3_dot(a, a));
+    return len > 0 ? v3_scale(a, 1.0f / len) : v3(0, 0, 0);
+}
+
+Vec3 tri_normal(Vec3 a, Vec3 b, Vec3 c) {
+    return v3_normalize(v3_cross(v3_sub(b, a), v3_sub(c, a)));
+}
+
+typedef struct { Vec3 pos; Vec3 normal; } Vertex;
+
+void compute_normals(Vertex *verts, int nv, const unsigned *idx, int ni) {
+    for (int i = 0; i < nv; i++) verts[i].normal = v3(0, 0, 0);
+    for (int t = 0; t + 2 < ni; t += 3) {
+        Vertex *a = &verts[idx[t]], *b = &verts[idx[t + 1]], *c = &verts[idx[t + 2]];
+        Vec3 n = v3_cross(v3_sub(b->pos, a->pos), v3_sub(c->pos, a->pos));
+        a->normal = v3_add(a->normal, n);
+        b->normal = v3_add(b->normal, n);
+        c->normal = v3_add(c->normal, n);
+    }
+    for (int i = 0; i < nv; i++) verts[i].normal = v3_normalize(verts[i].normal);
+}
+--- hint
+Three loops: zero all normals; for each triangle `t` (step 3), compute the cross product once and add it to all three vertices; normalize all normals.
+--- harness
+static Vertex vx(float x, float y, float z) { Vertex v = {{x, y, z}, {99, 99, 99}}; return v; }
+int main(void) {
+    // a flat quad, two CCW triangles, plus one unused vertex
+    Vertex q[5] = {vx(0, 0, 0), vx(1, 0, 0), vx(1, 1, 0), vx(0, 1, 0), vx(5, 5, 5)};
+    unsigned qi[6] = {0, 1, 2, 0, 2, 3};
+    compute_normals(q, 5, qi, 6);
+    for (int i = 0; i < 4; i++) { CHECK_DBL(q[i].normal.x, 0); CHECK_DBL(q[i].normal.y, 0); CHECK_DBL(q[i].normal.z, 1); }
+    CHECK(q[4].normal.x == 0 && q[4].normal.y == 0 && q[4].normal.z == 0);
+    // a roof: two faces meeting at a ridge; ridge vertices point straight up
+    Vertex r[6] = {vx(0, 0, 0), vx(1, 1, 0), vx(1, 1, 1), vx(0, 0, 1), vx(2, 0, 0), vx(2, 0, 1)};
+    unsigned ri[12] = {0, 2, 1, 0, 3, 2, 1, 2, 4, 2, 5, 4};
+    compute_normals(r, 6, ri, 12);
+    CHECK_DBL(r[1].normal.x, 0); CHECK_DBL(r[1].normal.y, 1); CHECK_DBL(r[1].normal.z, 0);
+    CHECK_DBL(r[0].normal.x, -sqrt(0.5)); CHECK_DBL(r[0].normal.y, sqrt(0.5));
+    CHECK_DBL(r[4].normal.x, sqrt(0.5)); CHECK_DBL(r[4].normal.y, sqrt(0.5));
+    // a 300x300 height field
+    int N = 300, nv = N * N, ni = (N - 1) * (N - 1) * 6;
+    Vertex *g = malloc((size_t)nv * sizeof *g);
+    unsigned *gi = malloc((size_t)ni * sizeof *gi);
+    for (int z = 0; z < N; z++)
+        for (int x = 0; x < N; x++)
+            g[z * N + x] = vx((float)x, sinf(x * 0.1f) * cosf(z * 0.07f) * 3, (float)z);
+    int k = 0;
+    for (int z = 0; z + 1 < N; z++)
+        for (int x = 0; x + 1 < N; x++) {
+            unsigned i0 = (unsigned)(z * N + x), i1 = i0 + 1, i2 = i0 + (unsigned)N, i3 = i2 + 1;
+            gi[k++] = i0; gi[k++] = i2; gi[k++] = i1;
+            gi[k++] = i1; gi[k++] = i2; gi[k++] = i3;
+        }
+    compute_normals(g, nv, gi, ni);
+    int bad = 0;
+    for (int i = 0; i < nv; i += 97) {
+        Vec3 n = g[i].normal;
+        float len = sqrtf(n.x * n.x + n.y * n.y + n.z * n.z);
+        if (fabsf(len - 1) > 1e-4f || n.y <= 0) bad++;
+    }
+    CHECK_INT(bad, 0);
+    Vec3 c = g[150 * N + 150].normal;            // interior: compare with the gradient
+    float h = 3, x = 150, z = 150;
+    Vec3 want = v3_normalize(v3(-h * 0.1f * cosf(x * 0.1f) * cosf(z * 0.07f), 1,
+                                h * 0.07f * sinf(x * 0.1f) * sinf(z * 0.07f)));
+    CHECK(fabsf(c.x - want.x) < 0.02f && fabsf(c.y - want.y) < 0.02f && fabsf(c.z - want.z) < 0.02f);
+    free(g); free(gi);
+    return TEST_END();
+}
+
+=== exercise soabounds
+title: Bounds over struct-of-arrays
+continues: normals
+--- prompt
+Your `Vertex` is an *array of structs* (AoS): position and normal side by side, 24 bytes per vertex, often more once UVs and colors join. A pass that only needs positions still drags every normal through the cache. The alternative layout is a *struct of arrays* (SoA): one array per component.
+
+Add:
+
+- `void split_positions(const Vertex *v, int n, float *xs, float *ys, float *zs)`: copy the positions out into three arrays.
+- `typedef struct { Vec3 min, max; } Box3;` (in the stubs) and `Box3 bounds_soa(const float *xs, const float *ys, const float *zs, int n)`: the axis-aligned bounding box of `n >= 1` points.
+
+> **Performance:** in the SoA loop each of the three streams is read in order, every byte fetched is used, and the compiler can process 8 floats per instruction with AVX. The AoS loop over the same data reads 24 bytes to use 12. AoS is still the right layout for data that is always used together (a GPU vertex buffer is usually interleaved for that reason); SoA wins for hot loops that touch one or two fields of many elements: bounds, culling, particle physics.
+--- stubs
+typedef struct { Vec3 min, max; } Box3;
+
+void split_positions(const Vertex *v, int n, float *xs, float *ys, float *zs) {
+}
+
+Box3 bounds_soa(const float *xs, const float *ys, const float *zs, int n) {
+    Box3 b = {{0, 0, 0}, {0, 0, 0}};
+    return b;
+}
+--- solution
+#include <math.h>
+
+typedef struct { float x, y, z; } Vec3;
+
+Vec3 v3(float x, float y, float z) { Vec3 r = {x, y, z}; return r; }
+Vec3 v3_add(Vec3 a, Vec3 b) { return v3(a.x + b.x, a.y + b.y, a.z + b.z); }
+Vec3 v3_sub(Vec3 a, Vec3 b) { return v3(a.x - b.x, a.y - b.y, a.z - b.z); }
+Vec3 v3_scale(Vec3 a, float k) { return v3(a.x * k, a.y * k, a.z * k); }
+float v3_dot(Vec3 a, Vec3 b) { return a.x * b.x + a.y * b.y + a.z * b.z; }
+
+Vec3 v3_cross(Vec3 a, Vec3 b) {
+    return v3(a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x);
+}
+
+Vec3 v3_normalize(Vec3 a) {
+    float len = sqrtf(v3_dot(a, a));
+    return len > 0 ? v3_scale(a, 1.0f / len) : v3(0, 0, 0);
+}
+
+Vec3 tri_normal(Vec3 a, Vec3 b, Vec3 c) {
+    return v3_normalize(v3_cross(v3_sub(b, a), v3_sub(c, a)));
+}
+
+typedef struct { Vec3 pos; Vec3 normal; } Vertex;
+
+void compute_normals(Vertex *verts, int nv, const unsigned *idx, int ni) {
+    for (int i = 0; i < nv; i++) verts[i].normal = v3(0, 0, 0);
+    for (int t = 0; t + 2 < ni; t += 3) {
+        Vertex *a = &verts[idx[t]], *b = &verts[idx[t + 1]], *c = &verts[idx[t + 2]];
+        Vec3 n = v3_cross(v3_sub(b->pos, a->pos), v3_sub(c->pos, a->pos));
+        a->normal = v3_add(a->normal, n);
+        b->normal = v3_add(b->normal, n);
+        c->normal = v3_add(c->normal, n);
+    }
+    for (int i = 0; i < nv; i++) verts[i].normal = v3_normalize(verts[i].normal);
+}
+
+typedef struct { Vec3 min, max; } Box3;
+
+void split_positions(const Vertex *v, int n, float *xs, float *ys, float *zs) {
+    for (int i = 0; i < n; i++) {
+        xs[i] = v[i].pos.x;
+        ys[i] = v[i].pos.y;
+        zs[i] = v[i].pos.z;
+    }
+}
+
+static void range(const float *a, int n, float *lo, float *hi) {
+    float l = a[0], h = a[0];
+    for (int i = 1; i < n; i++) {
+        l = a[i] < l ? a[i] : l;
+        h = a[i] > h ? a[i] : h;
+    }
+    *lo = l;
+    *hi = h;
+}
+
+Box3 bounds_soa(const float *xs, const float *ys, const float *zs, int n) {
+    Box3 b;
+    range(xs, n, &b.min.x, &b.max.x);       // one stream at a time
+    range(ys, n, &b.min.y, &b.max.y);
+    range(zs, n, &b.min.z, &b.max.z);
+    return b;
+}
+--- hint
+Start min and max at the first element, not at 0 (a mesh entirely at negative x would otherwise get `max.x = 0`).
+--- hint
+A helper that finds the range of one array, called three times, is both simple and the fastest shape: each call is one sequential stream.
+--- harness
+static Vertex vx(float x, float y, float z) { Vertex v = {{x, y, z}, {0, 0, 0}}; return v; }
+int main(void) {
+    Vertex v[4] = {vx(1, -2, 3), vx(-4, 5, 6), vx(7, 8, -9), vx(0, 0, 0)};
+    float xs[4], ys[4], zs[4];
+    split_positions(v, 4, xs, ys, zs);
+    CHECK_DBL(xs[1], -4); CHECK_DBL(ys[2], 8); CHECK_DBL(zs[2], -9); CHECK_DBL(zs[0], 3);
+    Box3 b = bounds_soa(xs, ys, zs, 4);
+    CHECK_DBL(b.min.x, -4); CHECK_DBL(b.min.y, -2); CHECK_DBL(b.min.z, -9);
+    CHECK_DBL(b.max.x, 7); CHECK_DBL(b.max.y, 8); CHECK_DBL(b.max.z, 6);
+    float nx[2] = {-5, -3}, ny[2] = {-1, -2}, nz[2] = {-7, -7};
+    b = bounds_soa(nx, ny, nz, 2);
+    CHECK_DBL(b.max.x, -3); CHECK_DBL(b.max.y, -1); CHECK_DBL(b.max.z, -7); CHECK_DBL(b.min.x, -5);
+    b = bounds_soa(xs + 2, ys + 2, zs + 2, 1);
+    CHECK_DBL(b.min.x, 7); CHECK_DBL(b.max.x, 7); CHECK_DBL(b.min.z, -9);
+    int n = 1000000;
+    Vertex *big = malloc((size_t)n * sizeof *big);
+    float *X = malloc(n * sizeof *X), *Y = malloc(n * sizeof *Y), *Z = malloc(n * sizeof *Z);
+    for (int i = 0; i < n; i++) big[i] = vx(sinf((float)i) * 10, (float)(i % 1000) - 500, (float)i * 0.001f);
+    split_positions(big, n, X, Y, Z);
+    b = bounds_soa(X, Y, Z, n);
+    CHECK_DBL(b.min.y, -500); CHECK_DBL(b.max.y, 499);
+    CHECK_DBL(b.min.z, 0); CHECK(fabsf(b.max.z - 999.999f) < 1e-3f);
+    CHECK(b.max.x > 9.99f && b.max.x <= 10.0f && b.min.x < -9.99f);
+    free(big); free(X); free(Y); free(Z);
+    return TEST_END();
+}
+
+=== exercise texnode
+title: Procedural textures as a tagged union
+--- prompt
+A procedural texture is a small description, not a stored image. Describe a few kinds with a tagged union (the starter has the types):
+
+```c
+typedef enum { TEX_SOLID, TEX_CHECKER, TEX_STRIPES } TexKind;
+typedef struct {
+    TexKind kind;
+    uint32_t a, b;         // colors; SOLID uses only a
+    int size;              // CHECKER: square size, STRIPES: stripe height (both >= 1)
+} Tex;
+```
+
+(No union is needed when every kind shares the same fields; real texture nodes have different parameters per kind, which is when the union in the body text pays off.) Write:
+
+- `uint32_t tex_sample(const Tex *t, int x, int y)`: SOLID is `a`. CHECKER is `a` when `floor(x / size) + floor(y / size)` is even, else `b`. STRIPES is `a` when `floor(y / size)` is even, else `b`.
+- `void tex_fill(const Tex *t, uint32_t *img, int w, int h, int ox, int oy)`: fill a row-major `w x h` image with the texture sampled at `(ox + x, oy + y)`.
+
+The trap is **negative coordinates**: textures tile across the origin, and C's `/` truncates toward zero, so `-1 / 4` is 0, the same square as `1 / 4`, and the checker pattern gets a double-wide row at the axis. Write a `floor_div` helper.
+
+> **Performance:** `tex_fill` touches millions of pixels. Put the `switch` on the kind *outside* the pixel loops (one tight loop per kind), not inside `tex_sample` for every pixel. The starter's `main` prints a 32x32 P3 image so you can look at the result with **Run**.
+--- starter
+#include <stdio.h>
+#include <stdint.h>
+
+typedef enum { TEX_SOLID, TEX_CHECKER, TEX_STRIPES } TexKind;
+typedef struct {
+    TexKind kind;
+    uint32_t a, b;
+    int size;
+} Tex;
+
+uint32_t tex_sample(const Tex *t, int x, int y) {
+    return t->a;
+}
+
+void tex_fill(const Tex *t, uint32_t *img, int w, int h, int ox, int oy) {
+}
+
+int main(void) {
+    Tex t = {TEX_CHECKER, 0xFF2020E0u, 0xFFF0F0F0u, 4};
+    static uint32_t img[32 * 32];
+    tex_fill(&t, img, 32, 32, -16, -16);
+    printf("P3\n32 32\n255\n");
+    for (int i = 0; i < 32 * 32; i++)
+        printf("%u %u %u\n", img[i] & 255, img[i] >> 8 & 255, img[i] >> 16 & 255);
+    return 0;
+}
+--- solution
+#include <stdio.h>
+#include <stdint.h>
+
+typedef enum { TEX_SOLID, TEX_CHECKER, TEX_STRIPES } TexKind;
+typedef struct {
+    TexKind kind;
+    uint32_t a, b;
+    int size;
+} Tex;
+
+static int floor_div(int a, int b) {           // b > 0
+    int q = a / b;
+    return (a % b != 0 && a < 0) ? q - 1 : q;
+}
+
+uint32_t tex_sample(const Tex *t, int x, int y) {
+    switch (t->kind) {
+    case TEX_CHECKER:
+        return ((floor_div(x, t->size) + floor_div(y, t->size)) & 1) ? t->b : t->a;
+    case TEX_STRIPES:
+        return (floor_div(y, t->size) & 1) ? t->b : t->a;
+    case TEX_SOLID:
+    default:
+        return t->a;
+    }
+}
+
+void tex_fill(const Tex *t, uint32_t *img, int w, int h, int ox, int oy) {
+    switch (t->kind) {
+    case TEX_CHECKER:
+        for (int y = 0; y < h; y++) {
+            int cy = floor_div(oy + y, t->size);
+            for (int x = 0; x < w; x++)
+                img[y * w + x] = ((floor_div(ox + x, t->size) + cy) & 1) ? t->b : t->a;
+        }
+        break;
+    case TEX_STRIPES:
+        for (int y = 0; y < h; y++) {
+            uint32_t c = (floor_div(oy + y, t->size) & 1) ? t->b : t->a;   // one color per row
+            for (int x = 0; x < w; x++) img[y * w + x] = c;
+        }
+        break;
+    case TEX_SOLID:
+    default:
+        for (int i = 0; i < w * h; i++) img[i] = t->a;
+        break;
+    }
+}
+
+int main(void) {
+    Tex t = {TEX_CHECKER, 0xFF2020E0u, 0xFFF0F0F0u, 4};
+    static uint32_t img[32 * 32];
+    tex_fill(&t, img, 32, 32, -16, -16);
+    printf("P3\n32 32\n255\n");
+    for (int i = 0; i < 32 * 32; i++)
+        printf("%u %u %u\n", img[i] & 255, img[i] >> 8 & 255, img[i] >> 16 & 255);
+    return 0;
+}
+--- hint
+`floor_div(a, b)` for `b > 0`: take `q = a / b`; if `a` is negative and not an exact multiple, subtract 1.
+--- hint
+`& 1` tests odd/even and, unlike `% 2`, gives 1 for odd negative numbers too (`-3 % 2` is `-1`).
+--- harness
+int main(void) {
+    Tex s = {TEX_SOLID, 7, 9, 1};
+    CHECK_UINT(tex_sample(&s, -5, 100), 7);
+    Tex c = {TEX_CHECKER, 1, 2, 4};
+    CHECK_UINT(tex_sample(&c, 0, 0), 1);
+    CHECK_UINT(tex_sample(&c, 3, 3), 1);
+    CHECK_UINT(tex_sample(&c, 4, 0), 2);
+    CHECK_UINT(tex_sample(&c, 4, 4), 1);
+    CHECK_UINT(tex_sample(&c, -1, 0), 2);
+    CHECK_UINT(tex_sample(&c, -4, 0), 2);
+    CHECK_UINT(tex_sample(&c, -5, 0), 1);
+    CHECK_UINT(tex_sample(&c, -1, -1), 1);
+    Tex st = {TEX_STRIPES, 10, 20, 3};
+    CHECK_UINT(tex_sample(&st, 99, 2), 10);
+    CHECK_UINT(tex_sample(&st, 99, 3), 20);
+    CHECK_UINT(tex_sample(&st, 99, -1), 20);
+    CHECK_UINT(tex_sample(&st, 99, -3), 20);
+    CHECK_UINT(tex_sample(&st, 99, -4), 10);
+    int W = 37, H = 23, bad = 0;
+    uint32_t img[37 * 23];
+    Tex all[3] = {s, c, st};
+    for (int k = 0; k < 3; k++)
+        for (int o = -40; o <= 40; o += 20) {
+            tex_fill(&all[k], img, W, H, o, -o / 2);
+            for (int y = 0; y < H; y++)
+                for (int x = 0; x < W; x++)
+                    if (img[y * W + x] != tex_sample(&all[k], o + x, -o / 2 + y)) bad++;
+        }
+    CHECK_INT(bad, 0);
+    // seamless across the origin: every 4x4 cell is one color
+    tex_fill(&c, img, 16, 16, -8, -8);
+    int seams = 0;
+    for (int y = 0; y < 16; y++)
+        for (int x = 0; x < 16; x++)
+            if (img[y * 16 + x] != img[(y / 4 * 4) * 16 + x / 4 * 4]) seams++;
+    CHECK_INT(seams, 0);
+    CHECK(img[0] != img[4]);
     return TEST_END();
 }
 

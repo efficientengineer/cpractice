@@ -7,18 +7,23 @@ window.CHAPTER_FILES = [
   '# Procedural graphics', 'p1-images', 'p2-vecmath', 'p3-noise', 'p4-textures', 'p5-terrain',
   'p6-lsystems', 'p7-raymarch', 'p8-performance'
 ];
+// The world course is one continuous project; chapters with "lib: yes" ship a reference engine
+// module in content/world/lib/FILE.js that later chapters load automatically.
+window.WORLD_FILES = [
+  '# Part 1: First light', '00-start', '01-noise', '02-compute', '03-terrain', '04-controller', '05-shading',
+  '# Part 2: Terrain at scale', '06-shaping', '07-erosion', '08-chunks', '09-texturing', '10-materials',
+  '# Part 3: Populating the world', '11-scatter', '12-rocks', '13-grass', '14-trees', '15-lod',
+  '# Part 4: Rendering and optimization', '16-gpu-driven', '17-occlusion', '18-shadows', '19-deferred', '20-postfx',
+  '21-sky-water', '22-profiling', '23-world'
+];
 window.COURSES = [
-  { id: 'c', title: 'C', lang: 'c', dir: 'content', files: window.CHAPTER_FILES,
-    blurb: 'Pointers, memory, undefined behavior, then procedural graphics in C: images, noise, textures, terrain, L-systems, ray marching.' },
+  { id: 'world', title: 'Procedural World', lang: 'webgpu', dir: 'content/world', files: window.WORLD_FILES, canvas: [960, 540], pointerLock: true,
+    blurb: 'One continuous project: a procedural, high-detail open world in WebGPU. Terrain, cliffs, rocks, foliage, trees and procedural materials, with LOD, frustum and occlusion culling, GPU-driven rendering, shadows and full-screen effects.' },
   { id: 'js', title: 'JavaScript', lang: 'js', dir: 'content/js',
     files: ['00-start', '01-functions', '02-objects', '03-arrays', '04-classes', '05-collections', '06-async',
       '07-types', '08-strings', '09-functional', '10-binary', '11-metaprogramming', '12-projects',
       '# Procedural generation', 'p1-pixels', 'p2-noise', 'p3-textures', 'p4-lsystems', 'p5-meshes', 'p6-terrain'],
     blurb: 'Modern JavaScript in depth, then CPU-side procedural generation: pixels, noise, textures, L-systems, meshes, terrain.' },
-  { id: 'webgpu', title: 'WebGPU', lang: 'webgpu', dir: 'content/webgpu',
-    files: ['00-start', '01-wgsl', '02-buffers', '03-compute', '04-triangle', '05-vertices', '06-uniforms',
-      '07-textures', '08-3d', '09-particles', '10-projects',
-      '# 3D procedural graphics', 'p1-controller', 'p2-noise', 'p3-materials', 'p4-baking', 'p5-terrain', 'p6-foliage',
-      'p7-trees', 'p8-sdf', 'p9-sky', 'p10-lighting', 'p11-world'],
-    blurb: 'GPU fundamentals, then 3D procedural graphics: character controller, shader noise, procedural materials, terrain, foliage, trees, SDFs, sky.' }
+  { id: 'c', title: 'C', lang: 'c', dir: 'content', files: window.CHAPTER_FILES,
+    blurb: 'Pointers, memory, undefined behavior, then procedural graphics in C: images, noise, textures, terrain, L-systems, ray marching.' }
 ];

@@ -16,15 +16,15 @@ Each chapter is `content/NN-name.txt`, listed in `js/manifest.js`. `content/00-s
 
 `node tools/verify.mjs [file-prefix]` compiles every solution with gcc `-std=c17 -Wall -Wextra -fsanitize=address,undefined` (leaks detected), runs the tests, requires zero warnings, requires starters to compile but not pass, and checks `run: yes` quizzes. It must report 0 failures.
 
-## JavaScript and WebGPU courses
+## JavaScript and Procedural World courses
 
-Chapters live in `content/js/` and `content/webgpu/` (file lists in `js/manifest.js`). Same format, with these differences:
+Chapters live in `content/js/` and `content/world/` (file lists in `js/manifest.js`). Same format, with these differences:
 
 - Code runs as the body of an `async` function in a Web Worker (`js/jsrunner.js`): top-level `await` works; no `import`/`export` statements (use dynamic `import()` only in prose); no DOM. `console.log` output is formatted like Node's (`[ 1, 'a' ]`, `{ a: 1 }`, `Map(1) { 'k' => 1 }`). Use ```js fences for runnable code (every js block gets a playground button), ```wgsl for shader listings.
 - Function exercises: `--- harness` is plain JS appended after the user's code in the same scope (then `return __testEnd()` is added). Helpers: `eq(got, want, msg?)` (deep equality), `check(cond, msg?)`, `near(got, want, eps?, msg?)`, `throws(fn, msg?)`, `await rejects(promiseOrFn, msg?)`. Never redeclare a name the user's code declares; wrap harness locals in a block `{ ... }` if needed. At least one check must run.
 - Program exercises: `--- test` (leave empty) + `--- out` is the expected console output. 5 second timeout (WebGPU: 15 s).
 - WebGPU globals: `canvas` (an OffscreenCanvas; don't assume its size, use `canvas.width`), `await getDevice()` (shared GPUDevice), `await readBuffer(device, buffer, size?, offset?)` → ArrayBuffer (buffer needs COPY_SRC), `await readPixels(device, texture)` → Uint8Array of RGBA rows (texture needs COPY_SRC, format `rgba8unorm`). Render exercises should take `device` (and a format) as parameters and the harness renders into its own `rgba8unorm` texture and checks pixels; the canvas is for showing results when the learner clicks Run.
-- Verify with `node tools/verify-browser.mjs js [prefix]` or `node tools/verify-browser.mjs webgpu [prefix]` (headless Chromium, WebGPU on SwiftShader). Must report 0 failures.
+- Verify with `node tools/verify-browser.mjs js [prefix]` or `node tools/verify-browser.mjs world [prefix]` (headless Chromium, WebGPU on SwiftShader). Must report 0 failures.
 
 ## Focus: 3D graphics and procedural generation, with performance
 
@@ -46,3 +46,7 @@ The learner wants graphics programming with a heavy focus on procedural generati
 - Code that mentions `canvas` gets a 512×512 canvas (`canvas.getContext('2d')` or `'webgpu'`). The worker stays alive after the code finishes, so `requestAnimationFrame` loops keep running until the next Run; later console output streams in.
 - Input globals: `keys` (a Set of `KeyboardEvent.code` values currently held, e.g. `'ArrowLeft'`, `'KeyW'`, `'Space'`), `mouse` (`{ x, y, down }` in canvas pixels), `input.onKeyDown(fn(code))`, `input.onKeyUp(fn)`, `input.onMouseDown(fn(x, y))`.
 - Keep logic testable: generators and math are pure functions over typed arrays; interactive parts use `update(state, dt, keys, mouse)` and a separate render. Harness tests call the pure functions and drive `update` with fake input (`new Set(['KeyW'])`) and fixed `dt`; the canvas is for looking at results when the learner clicks Run. Any run (including test runs) gets a canvas when the code mentions `canvas`, so a solution may start its loop at top level; the test still finishes when the main body returns.
+
+## The Procedural World course
+
+See [ENGINE.md](ENGINE.md). Chapters with `lib: yes` ship `content/world/lib/FILE.js`; later chapters get it preloaded. The world canvas is 960×540 with pointer lock on click (`mouse.dx`/`mouse.dy` accumulate movement; read and zero them each frame; `mouse.locked`).

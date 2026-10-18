@@ -71,8 +71,10 @@
     let canvas;
     if (canvasHost) canvasHost.hidden = true;
     if (canvasHost && /\bcanvas\b/.test(code)) {
-      canvasHost.innerHTML = '<div class="muted small">Click the canvas to give it keyboard focus.</div>';
-      const c = document.createElement('canvas'); c.width = 512; c.height = 512; c.tabIndex = 0; canvasHost.appendChild(c);
+      canvasHost.innerHTML = `<div class="muted small">${CUR.pointerLock ? 'Click the canvas to capture the mouse (Esc releases it). WASD moves.' : 'Click the canvas to give it keyboard focus.'}</div>`;
+      const c = document.createElement('canvas'); c.tabIndex = 0; canvasHost.appendChild(c);
+      [c.width, c.height] = CUR.canvas || [512, 512];
+      c.style.aspectRatio = c.width + ' / ' + c.height;
       canvasHost.hidden = false;
       const key = down => e => {
         if (/^(Arrow|Space)/.test(e.code)) e.preventDefault();
@@ -84,7 +86,15 @@
         const r = c.getBoundingClientRect();
         JSRunner.send({ t: 'mouse', m: { x: (e.clientX - r.left) * c.width / r.width, y: (e.clientY - r.top) * c.height / r.height, ...(down === null ? {} : { down }) } });
       };
-      c.addEventListener('mousemove', m(null)); c.addEventListener('mousedown', e => { c.focus(); m(true)(e); }); window.addEventListener('mouseup', m(false), { once: false });
+      c.addEventListener('mousemove', e => {
+        m(null)(e);
+        if (document.pointerLockElement === c) JSRunner.send({ t: 'mouse', m: { mx: e.movementX, my: e.movementY } });
+      });
+      c.addEventListener('mousedown', e => { c.focus(); m(true)(e); if (CUR.pointerLock && document.pointerLockElement !== c) c.requestPointerLock?.(); });
+      document.addEventListener('pointerlockchange', () => JSRunner.send({ t: 'mouse', m: { locked: document.pointerLockElement === c } }));
+      window.addEventListener('mouseup', m(false));
+      canvasHost.insertAdjacentHTML('beforeend', '<button class="btn small fsbtn">Fullscreen</button>');
+      canvasHost.querySelector('.fsbtn').onclick = () => c.requestFullscreen?.();
       canvas = c.transferControlToOffscreen();
     }
     const onLate = (kind, line) => {
@@ -95,7 +105,13 @@
       pre.textContent = (pre.textContent ? pre.textContent + '\n' : '') + line;
       const lines = pre.textContent.split('\n'); if (lines.length > 200) pre.textContent = lines.slice(-200).join('\n');
     };
-    return JSRunner.run(code, { canvas, keepAlive: true, timeout: CUR.lang === 'webgpu' ? 15000 : 5000, onLate });
+    return JSRunner.run(code, { canvas, libs: libsFor(curChapter), keepAlive: true, timeout: CUR.lang === 'webgpu' ? 15000 : 5000, onLate });
+  }
+  // Engine libraries (header "lib: yes") of chapters before ch, or of all chapters in the playground.
+  let curChapter = null;
+  function libsFor(ch) {
+    const list = CUR.chapters, end = ch ? list.indexOf(ch) : list.length;
+    return list.slice(0, end).filter(c => c.lib === 'yes').map(c => `${CUR.dir}/lib/${c.file}.js`);
   }
   const assemble = (code, ex) => isC() ? Assemble.harness(code, ex) : JSRunner.harness(code, ex);
   const busy = (out, msg) => { out.innerHTML = `<div class="muted spin">${msg}</div>`; };
@@ -126,8 +142,8 @@
     CUR = null; renderSide(); nav();
     main.innerHTML = `
       <section class="hero">
-        <h1>Learn by writing code</h1>
-        <p>Three courses for working programmers. Each chapter has runnable examples, quizzes, and exercises checked against tests right here in the browser. Progress is saved in this browser.</p>
+        <h1>Build a procedural world</h1>
+        <p>The main course builds a procedural open world in WebGPU from the first chapter on. The JavaScript and C courses cover the languages, with procedural generation tracks of their own. Each chapter has runnable examples, quizzes, and exercises checked against tests right here in the browser. Progress is saved in this browser.</p>
       </section>
       <div class="cards">${COURSES.map(c => {
         const all = c.chapters.flatMap(ch => ch.exercises.map(e => [ch, e])), done = all.filter(([ch, e]) => P.done[exKey(ch, e)]).length;
@@ -140,6 +156,7 @@
   const INTRO = {
     c: 'A course for people who already program in C#, JavaScript or similar, and want real C: pointers, memory, strings, undefined behavior and all. Exercises are compiled with gcc on a remote service and checked against tests, with AddressSanitizer catching your memory bugs.',
     js: 'Modern JavaScript properly: scope and closures, this and prototypes, the event loop, iterators and generators, typed arrays, metaprogramming. Everything runs in a Web Worker in your browser, so console.log output appears below your code.',
+    world: 'Build a procedural, high-detail open world from scratch with WebGPU, one chapter at a time. Every chapter adds a system to the same engine: noise and compute, terrain and erosion, chunk streaming and LOD, procedural materials, scattered rocks, grass and trees, then the rendering techniques that make it fast and beautiful: GPU-driven rendering, frustum and Hi-Z occlusion culling, cascaded shadows, deferred lighting, post-processing, sky and water. Earlier chapters\' reference engine code is loaded automatically, so each exercise focuses on the new system. Needs a WebGPU browser (recent Chrome/Edge; Safari 26+; Firefox 141+ on Windows).',
     webgpu: 'GPU programming with WebGPU and WGSL: buffers, compute shaders, render pipelines, textures, 3D and particles. Code runs in your browser, so you need a WebGPU-capable one (recent Chrome or Edge; Safari 26+; Firefox 141+ on Windows). Rendering appears on the canvas under the editor.'
   };
   function home() {
@@ -151,7 +168,7 @@
       <section class="hero">
         <h1>${esc(CUR.title)}</h1>
         <p>${INTRO[CUR.id]}</p>
-        ${CUR.id === 'webgpu' && !navigator.gpu ? '<blockquote>This browser does not expose <code>navigator.gpu</code>. You can read the chapters, but the code will not run here.</blockquote>' : ''}
+        ${CUR.lang === 'webgpu' && !navigator.gpu ? '<blockquote>This browser does not expose <code>navigator.gpu</code>. You can read the chapters, but the code will not run here.</blockquote>' : ''}
         <div class="progressbar"><div style="width:${all.length ? 100 * done / all.length : 0}%"></div></div>
         <p class="muted">${done} of ${all.length} exercises solved. Progress is saved in this browser.</p>
         ${next ? `<a class="btn primary" href="${R('ex/' + next[0].id + '/' + next[1].id)}">Continue: ${esc(next[1].title)}</a>` : ''}
@@ -193,6 +210,7 @@
   }
 
   function chapter(ch) {
+    curChapter = ch;
     renderSide(ch);
     const idx = COURSE.indexOf(ch), prev = COURSE[idx - 1], next = COURSE[idx + 1];
     const body = MD.render(ch.body || '');
@@ -221,6 +239,7 @@
   }
 
   function exercise(ch, ex) {
+    curChapter = ch;
     renderSide(ch, ex);
     const key = exKey(ch, ex), list = ch.exercises, i = list.indexOf(ex);
     const nextEx = list[i + 1] ? R(`ex/${ch.id}/${list[i + 1].id}`) : (COURSE[COURSE.indexOf(ch) + 1] ? R('ch/' + COURSE[COURSE.indexOf(ch) + 1].id) : R(''));
@@ -347,14 +366,37 @@ device.queue.submit([enc.finish()]);
 console.log('drew a triangle');
 `
   };
+  PLAY_DEFAULT.world = `// Libraries from all chapters are loaded here (the W namespace).
+const device = await getDevice();
+const ctx = canvas.getContext('webgpu');
+const format = navigator.gpu.getPreferredCanvasFormat();
+ctx.configure({ device, format });
+const module = device.createShaderModule({ code: \`
+  @vertex fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4f {
+    let p = array(vec2f(-1, -1), vec2f(3, -1), vec2f(-1, 3));
+    return vec4f(p[i], 0, 1);
+  }
+  @fragment fn fs(@builtin(position) p: vec4f) -> @location(0) vec4f {
+    let y = p.y / ${'${canvas.height}'}.0;
+    return vec4f(mix(vec3f(0.35, 0.55, 0.9), vec3f(0.85, 0.9, 1.0), y), 1);
+  }
+\` });
+const pipeline = device.createRenderPipeline({ layout: 'auto', vertex: { module }, fragment: { module, targets: [{ format }] } });
+const enc = device.createCommandEncoder();
+const pass = enc.beginRenderPass({ colorAttachments: [{ view: ctx.getCurrentTexture().createView(), loadOp: 'clear', storeOp: 'store' }] });
+pass.setPipeline(pipeline); pass.draw(3); pass.end();
+device.queue.submit([enc.finish()]);
+console.log('a sky');
+`;
   function play(q) {
+    curChapter = null;
     renderSide();
     const fromLink = q.get('c'), pk = 'cpractice.playcode.' + CUR.id;
     let code = fromLink ? decodeURIComponent(escape(atob(fromLink))) : sessionStorage.getItem('cpractice.play.' + CUR.id) || localStorage.getItem(pk) || PLAY_DEFAULT[CUR.id];
     sessionStorage.removeItem('cpractice.play.' + CUR.id);
     main.innerHTML = `<h1>${esc(CUR.title)} playground</h1>
       ${isC() ? `<p class="muted">Flags: <code>${esc(Runner.flags(Runner.Settings.get()).join(' '))}</code> (<a href="#/settings">change</a>)</p>`
-        : `<p class="muted">Runs in a Web Worker in your browser. Top-level <code>await</code> works.${CUR.lang === 'webgpu' ? ' <code>canvas</code> is an OffscreenCanvas; <code>getDevice()</code> returns a shared GPUDevice.' : ''}</p>`}
+        : `<p class="muted">Runs in a Web Worker in your browser. Top-level <code>await</code> works.${CUR.lang === 'webgpu' ? ' <code>canvas</code> is an OffscreenCanvas; <code>getDevice()</code> returns a shared GPUDevice.' : ''}${CUR.id === 'world' ? ' All engine libraries (<code>W</code>) are loaded.' : ''}</p>`}
       <div class="editorhost"></div>
       ${isC() ? '<details class="stdinbox"><summary>stdin</summary><textarea class="stdin" spellcheck="false"></textarea></details>' : ''}
       <div class="toolbar"><button class="btn primary" id="run" title="Ctrl+Enter">▶ Run</button> <button class="btn" id="share">Copy share link</button>
@@ -469,12 +511,13 @@ console.log('drew a triangle');
   Promise.all(COURSES.map(c => Promise.all(c.files.map(f => f[0] === '#' ? f : fetch(`${c.dir}/${f}.txt`).then(r => r.ok ? r.text() : null).catch(() => null)))
     .then(texts => {
       let section = null;
-      c.chapters = texts.filter(Boolean).flatMap(t => {
+      const files = c.files;
+      c.chapters = texts.map((t, i) => [t, i]).filter(([t]) => t).flatMap(([t, i]) => {
         if (t[0] === '#') { section = t.slice(1).trim(); return []; }
         let ch;
         try { ch = Format.parseChapter(t); } catch (e) { console.error(e); return []; }
         if (section) { ch.section = section; section = null; }
-        ch.course = c.id;
+        ch.course = c.id; ch.file = files[i];
         ch.quiz.forEach(q => q.id = c.id + '/' + q.id);
         return [ch];
       });

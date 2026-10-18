@@ -80,7 +80,8 @@ self.onunhandledrejection = e => { send('err', ['Unhandled promise rejection: ' 
 // Keyboard and mouse forwarded from the page (games). keys holds KeyboardEvent.code values.
 const keyDown_ = [], keyUp_ = [], mouseDown_ = [];
 self.keys = new Set();
-self.mouse = { x: 0, y: 0, down: false };
+// mouse.dx/dy accumulate movement (pointer-locked mouse look); consumers read and zero them.
+self.mouse = { x: 0, y: 0, dx: 0, dy: 0, down: false, locked: false };
 self.input = { keys, mouse, onKeyDown: f => keyDown_.push(f), onKeyUp: f => keyUp_.push(f), onMouseDown: f => mouseDown_.push(f) };
 onmessage = async e => {
   if (e.data.t === 'key') {
@@ -91,14 +92,18 @@ onmessage = async e => {
     return;
   }
   if (e.data.t === 'mouse') {
-    const was = mouse.down; Object.assign(mouse, e.data.m);
+    const was = mouse.down, m = e.data.m;
+    if (m.mx !== undefined) { mouse.dx += m.mx; mouse.dy += m.my; delete m.mx; delete m.my; }
+    Object.assign(mouse, m);
     if (mouse.down && !was) mouseDown_.forEach(f => f(mouse.x, mouse.y));
     return;
   }
-  const { code, canvas } = e.data;
+  const { code, canvas, libs } = e.data;
   self.canvas = canvas;
   let exit = 0;
   try {
+    // Engine libraries from earlier chapters: classic scripts defining globals (the W namespace).
+    if (libs && libs.length) importScripts(...libs);
     const AsyncFunction = (async () => {}).constructor;
     const r = await new AsyncFunction(code + '\n//# sourceURL=main.js')();
     if (typeof r === 'number') exit = r;
@@ -133,7 +138,8 @@ onmessage = async e => {
         else if (m.t === 'done') finish(m.exit, false);
       };
       w.onerror = e => { e.preventDefault(); err.push(String(e.message || 'Worker error')); finish(1, false); };
-      w.postMessage({ code, canvas: opts.canvas }, opts.canvas ? [opts.canvas] : []);
+      const libs = (opts.libs || []).map(u => new URL(u, location.href).href);
+      w.postMessage({ code, canvas: opts.canvas, libs }, opts.canvas ? [opts.canvas] : []);
     });
   }
   function send(msg) { if (current) current.postMessage(msg); }

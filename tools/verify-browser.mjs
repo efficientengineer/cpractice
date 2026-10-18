@@ -1,5 +1,5 @@
 // Verifies JS and WebGPU courses in headless Chromium through the site's own worker runner.
-// Usage: node tools/verify-browser.mjs js|webgpu [file-prefix]
+// Usage: node tools/verify-browser.mjs js|world [file-prefix]
 import http from 'http'; import fs from 'fs'; import path from 'path'; import { createRequire } from 'module';
 const require = createRequire(import.meta.url);
 let pw; try { pw = require('playwright'); } catch { pw = require('/opt/node22/lib/node_modules/playwright'); }
@@ -21,16 +21,23 @@ const result = await page.evaluate(async ({ course, prefix }) => {
   let fails = 0, exs = 0, qs = 0, chs = 0;
   const bad = (w, m, extra = '') => { fails++; log.push(`FAIL ${w}: ${m}\n${String(extra).slice(0, 1500)}`); };
   // Like the app: a canvas when the code mentions it.
+  // Libraries of earlier chapters with "lib: yes", in course order (like the app).
+  let libs = [];
   const run = code => {
     let canvas;
     if (/\bcanvas\b/.test(code)) { const el = document.createElement('canvas'); el.width = el.height = 256; canvas = el.transferControlToOffscreen(); }
-    return JSRunner.run(code, { canvas, timeout: 20000 });
+    return JSRunner.run(code, { canvas, timeout: 30000, libs });
   };
   const ids = new Set();
+  const libsSoFar = [];
   for (const f of c.files) {
-    if (!f.startsWith(prefix)) continue;
+    if (f[0] === '#') continue;
     const r = await fetch(`${c.dir}/${f}.txt`); if (!r.ok) continue;
     let ch; try { ch = Format.parseChapter(await r.text()); } catch (e) { bad(f, 'parse error ' + e); continue; }
+    libs = libsSoFar.slice();
+    if (ch.lib === 'yes') libsSoFar.push(`${c.dir}/lib/${f}.js`);
+    if (!f.startsWith(prefix)) continue;
+    if (ch.lib === 'yes' && !(await fetch(`${c.dir}/lib/${f}.js`)).ok) bad(f, 'lib: yes but no lib file');
     chs++;
     for (const ex of ch.exercises) {
       exs++; const w = `${ch.id}/${ex.id}`;

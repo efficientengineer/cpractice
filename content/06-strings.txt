@@ -30,6 +30,8 @@ Consequences you have to absorb:
 - **A string cannot contain a zero byte.** For binary data use a pointer plus a length (and the `mem*` functions).
 - `char` holds one byte. UTF-8 text works (it is just bytes), but `strlen` counts bytes, not characters, and `s[i]` is a byte, not a code point.
 
+> **Performance:** the O(n) length is the root of most slow C string code. `for (i = 0; i < strlen(s); i++)` rescans the whole string on every iteration: a 1 MB string (a big L-system, a loaded shader, a level file) costs half a trillion byte reads. Call `strlen` once and keep the result, or loop `for (p = s; *p; p++)`. Better still, once you know a length, carry it with the pointer (`const char *s, size_t len`) instead of rediscovering it. And don't compare strings in hot loops at all: look a name up *once* (a material name, a uniform name, an asset path) and keep the resulting index or handle, then compare integers.
+
 ## Literals, arrays, and pointers
 
 ```c
@@ -107,6 +109,8 @@ int main(void) {
 
 Never compare strings with `==`. `a == b` compares the *pointers*: are they the same address? It can even appear to work, because identical literals often share storage. Use `strcmp(a, b) == 0`.
 
+> **Performance:** `strcat` is the classic accidental O(n²), known as *Schlemiel the painter's algorithm*: each call walks `d` from the start to find its end before appending. Appending n short pieces makes the total work grow with n². Building a 100,000-piece string (an L-system, a generated OBJ file, a long log) that way can take minutes. Keep a write position (or an end pointer) and copy each piece to it: `memcpy(buf + len, piece, n); len += n;`. The total cost is then the length of the result, once.
+
 ### Why strncpy is not the safe strcpy
 
 `strncpy` was designed for fixed-width record fields, not for safety. When the source is too long it copies exactly `n` bytes and **no terminator**:
@@ -180,11 +184,11 @@ Writing past a buffer on the stack can overwrite the saved return address, which
 
 int main(void) {
     char buf[16];
-    int n = snprintf(buf, sizeof buf, "%s scored %d", "Ada", 97);
-    printf("[%s] %d\n", buf, n);
+    int n = snprintf(buf, sizeof buf, "%s_%03d.ppm", "frame", 7);
+    printf("[%s] %d\n", buf, n);                // [frame_007.ppm] 13
 
     // gcc can see this truncation at compile time and warns about it
-    n = snprintf(buf, sizeof buf, "%s scored %d points", "Grace", 100);
+    n = snprintf(buf, sizeof buf, "%s_%dx%d.ppm", "terrain", 1024, 1024);
     if ((size_t)n >= sizeof buf)
         printf("truncated: [%s], needed %d\n", buf, n + 1);
 
@@ -196,6 +200,8 @@ int main(void) {
 ```
 
 To append, keep a position and pass `buf + pos, size - pos` each time. Treat it as C's `StringBuilder`; `sprintf` (no `n`) has no size and is as dangerous as `strcpy`.
+
+> **Performance:** `snprintf` is convenient and not fast: it interprets the format string every call. For text you rebuild every frame (an FPS counter, a debug overlay), format into a buffer you reuse, and only when the value actually changed. For bulk output (millions of numbers into a PPM image or an OBJ mesh), formatting dominates the run time; a hand-written integer-to-digits routine like the `itoa` exercise below is several times faster.
 
 ## Characters are small integers
 
@@ -788,6 +794,359 @@ int main(void) {
     CHECK_INT(one[0], 0);
 
     CHECK_UINT(format_list(NULL, 0, a, 3), 9);
+    return TEST_END();
+}
+
+=== exercise hexcolor
+title: Parse a hex color
+--- prompt
+Colors in config files, shaders tools and CSS are written as hex strings. Write `int parse_hex_color(const char *s, uint32_t *out)` that accepts exactly these forms (digits in either case):
+
+- `#RRGGBB`: alpha is 255,
+- `#RRGGBBAA`,
+- `#RGB`: each digit doubled, so `#f80` means `#ff8800`.
+
+On success store the color packed with red in the lowest byte (`r | g << 8 | b << 16 | a << 24`, the `rgba8` layout from the types chapter) and return 1. Anything else (no `#`, wrong length, a non-hex character, trailing spaces) returns 0 and leaves `*out` unchanged.
+
+Write a small helper that turns one character into its value 0-15, or -1. Don't use `strtol` here: it would accept `"#+12345"` and `"# 12345"`, and you want strict.
+--- starter
+#include <stdint.h>
+#include <string.h>
+
+int parse_hex_color(const char *s, uint32_t *out) {
+    return 0;
+}
+--- solution
+#include <stdint.h>
+#include <string.h>
+
+static int hexval(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+int parse_hex_color(const char *s, uint32_t *out) {
+    if (s[0] != '#') return 0;
+    s++;
+    size_t n = strlen(s);
+    if (n != 3 && n != 6 && n != 8) return 0;
+    int d[8];
+    for (size_t i = 0; i < n; i++)
+        if ((d[i] = hexval(s[i])) < 0) return 0;
+    uint32_t r, g, b, a = 255;
+    if (n == 3) {
+        r = (uint32_t)d[0] * 17;             // 0xA -> 0xAA is 10 * 17
+        g = (uint32_t)d[1] * 17;
+        b = (uint32_t)d[2] * 17;
+    } else {
+        r = (uint32_t)(d[0] << 4 | d[1]);
+        g = (uint32_t)(d[2] << 4 | d[3]);
+        b = (uint32_t)(d[4] << 4 | d[5]);
+        if (n == 8) a = (uint32_t)(d[6] << 4 | d[7]);
+    }
+    *out = r | g << 8 | b << 16 | a << 24;
+    return 1;
+}
+--- hint
+Check the `#`, then the length of the rest (3, 6 or 8), then convert every digit, failing on the first bad one. Only write `*out` at the very end.
+--- hint
+Doubling a hex digit `d` gives `d * 16 + d`, which is `d * 17`.
+--- harness
+#include <stdint.h>
+int main(void) {
+    uint32_t c = 0;
+    CHECK_INT(parse_hex_color("#ff8800", &c), 1); CHECK_UINT(c, 0xFF0088FFu);
+    CHECK_INT(parse_hex_color("#FF8800", &c), 1); CHECK_UINT(c, 0xFF0088FFu);
+    CHECK_INT(parse_hex_color("#f80", &c), 1);    CHECK_UINT(c, 0xFF0088FFu);
+    CHECK_INT(parse_hex_color("#11223344", &c), 1); CHECK_UINT(c, 0x44332211u);
+    CHECK_INT(parse_hex_color("#000", &c), 1);    CHECK_UINT(c, 0xFF000000u);
+    CHECK_INT(parse_hex_color("#aBcDeF", &c), 1); CHECK_UINT(c, 0xFFEFCDABu);
+    c = 1234;
+    CHECK_INT(parse_hex_color("ff8800", &c), 0);
+    CHECK_INT(parse_hex_color("#ff880", &c), 0);
+    CHECK_INT(parse_hex_color("#ff8800 ", &c), 0);
+    CHECK_INT(parse_hex_color("#gg0000", &c), 0);
+    CHECK_INT(parse_hex_color("#", &c), 0);
+    CHECK_INT(parse_hex_color("", &c), 0);
+    CHECK_INT(parse_hex_color("#+12345", &c), 0);
+    CHECK_INT(parse_hex_color("#1234567890", &c), 0);
+    CHECK_UINT(c, 1234u);
+    return TEST_END();
+}
+
+=== exercise lsystem
+title: One L-system step
+--- prompt
+An **L-system** grows plants, fractals and road networks from a string. Each step replaces every character that has a *rule* with the rule's text, all at once; characters without a rule are copied. With the rule `F -> F+F-F-F+F`, `F` becomes `F+F-F-F+F`, which becomes `F+F-F-F+F+F+F-F-F+F-...`, and drawn with a turtle (next exercises) that is a Koch curve.
+
+Rules are given as a table indexed by character: `rules['F']` is the replacement for `F`, or `NULL` for "copy". Write
+
+```c
+size_t lsys_expand(const char *in, const char *const rules[128], char *out, size_t cap);
+```
+
+It writes the expanded string into `out`, never more than `cap - 1` characters plus the terminator (`cap` is at least 1), and returns the length the *full* result has, like `snprintf`. So the caller can detect truncation with `result >= cap`. Characters are plain ASCII.
+
+Keep a write position and copy each piece there. Do not build the output with `strcat`: it rescans the whole output to find its end on every call. The next exercise grows strings to millions of characters, where that makes the difference between instant and never finishing.
+--- starter
+#include <stddef.h>
+#include <string.h>
+
+size_t lsys_expand(const char *in, const char *const rules[128], char *out, size_t cap) {
+    out[0] = '\0';
+    return 0;
+}
+--- solution
+#include <stddef.h>
+#include <string.h>
+
+size_t lsys_expand(const char *in, const char *const rules[128], char *out, size_t cap) {
+    size_t len = 0;                                  // full length so far
+    for (; *in; in++) {
+        unsigned char c = (unsigned char)*in;
+        const char *rep = c < 128 ? rules[c] : NULL;
+        if (rep) {
+            for (; *rep; rep++, len++)
+                if (len + 1 < cap) out[len] = *rep;
+        } else {
+            if (len + 1 < cap) out[len] = (char)c;
+            len++;
+        }
+    }
+    out[len < cap ? len : cap - 1] = '\0';
+    return len;
+}
+--- hint
+Count `len` for every character you *would* write, but only store it when `len + 1 < cap`. At the end, terminate at `len` or at `cap - 1`, whichever is smaller.
+--- harness
+int main(void) {
+    const char *rules[128] = {0};
+    rules['F'] = "F+F-F-F+F";
+    char out[64];
+    CHECK_INT(lsys_expand("F", rules, out, sizeof out), 9);
+    CHECK_STR(out, "F+F-F-F+F");
+    CHECK_INT(lsys_expand("F+F", rules, out, sizeof out), 19);
+    CHECK_STR(out, "F+F-F-F+F+F+F-F-F+F");
+    CHECK_INT(lsys_expand("", rules, out, sizeof out), 0);
+    CHECK_STR(out, "");
+    CHECK_INT(lsys_expand("+-[]", rules, out, sizeof out), 4);
+    CHECK_STR(out, "+-[]");
+    const char *algae[128] = {0};
+    algae['A'] = "AB";
+    algae['B'] = "A";
+    CHECK_INT(lsys_expand("ABAAB", algae, out, sizeof out), 8);
+    CHECK_STR(out, "ABAABABA");
+    char small[5];
+    CHECK_INT(lsys_expand("F", rules, small, sizeof small), 9);
+    CHECK_STR(small, "F+F-");
+    char one[1];
+    CHECK_INT(lsys_expand("FF", rules, one, 1), 18);
+    CHECK_STR(one, "");
+    const char *erase[128] = {0};
+    erase['x'] = "";
+    CHECK_INT(lsys_expand("axbxc", erase, out, sizeof out), 3);
+    CHECK_STR(out, "abc");
+    return TEST_END();
+}
+
+=== exercise lsysgrow
+title: Growing an L-system
+continues: lsystem
+--- prompt
+Add the driver:
+
+```c
+const char *lsys_generate(const char *axiom, const char *const rules[128], int iterations,
+                          char *a, char *b, size_t cap);
+```
+
+Start from `axiom`, apply `iterations` steps, and return a pointer to whichever of the two caller-provided buffers `a` and `b` (each `cap` bytes) holds the result. If the axiom or any step does not fit (length `>= cap`), return `NULL`.
+
+This is the **ping-pong** (double buffer) pattern: expand `a` into `b`, then `b` into `a`, and so on, swapping two pointers instead of allocating or copying. The tests grow a Koch curve for 9 steps, almost 4 million characters, in buffers allocated once. Any per-character `strcat` or `strlen(out)` turns that into trillions of steps.
+--- stubs
+const char *lsys_generate(const char *axiom, const char *const rules[128], int iterations,
+                          char *a, char *b, size_t cap) {
+    return NULL;
+}
+--- solution
+#include <stddef.h>
+#include <string.h>
+
+size_t lsys_expand(const char *in, const char *const rules[128], char *out, size_t cap) {
+    size_t len = 0;
+    for (; *in; in++) {
+        unsigned char c = (unsigned char)*in;
+        const char *rep = c < 128 ? rules[c] : NULL;
+        if (rep) {
+            for (; *rep; rep++, len++)
+                if (len + 1 < cap) out[len] = *rep;
+        } else {
+            if (len + 1 < cap) out[len] = (char)c;
+            len++;
+        }
+    }
+    out[len < cap ? len : cap - 1] = '\0';
+    return len;
+}
+
+const char *lsys_generate(const char *axiom, const char *const rules[128], int iterations,
+                          char *a, char *b, size_t cap) {
+    size_t n = strlen(axiom);
+    if (n >= cap) return NULL;
+    memcpy(a, axiom, n + 1);
+    char *cur = a, *next = b;
+    for (int i = 0; i < iterations; i++) {
+        if (lsys_expand(cur, rules, next, cap) >= cap) return NULL;
+        char *t = cur; cur = next; next = t;      // swap roles, no copying
+    }
+    return cur;
+}
+--- hint
+Copy the axiom into `a` (check it fits first). Keep two pointers `cur` and `next`; after each step swap them.
+--- harness
+int main(void) {
+    const char *rules[128] = {0};
+    rules['F'] = "F+F-F-F+F";
+    char a[64], b[64];
+    const char *r = lsys_generate("F", rules, 0, a, b, sizeof a);
+    CHECK(r != NULL);
+    if (r) CHECK_STR(r, "F");
+    r = lsys_generate("F", rules, 1, a, b, sizeof a);
+    CHECK(r == b);
+    if (r) CHECK_STR(r, "F+F-F-F+F");
+    r = lsys_generate("F", rules, 2, a, b, sizeof a);
+    CHECK(r == a);
+    if (r) CHECK_INT(strlen(r), 49);
+    CHECK(lsys_generate("F", rules, 3, a, b, sizeof a) == NULL);   // 249 chars: too big
+    CHECK(lsys_generate("FFFFFFFFFF", rules, 0, a, b, 8) == NULL);
+    const char *algae[128] = {0};
+    algae['A'] = "AB";
+    algae['B'] = "A";
+    r = lsys_generate("A", algae, 5, a, b, sizeof a);
+    CHECK(r != NULL);
+    if (r) CHECK_STR(r, "ABAABABAABAAB");
+    // 9 Koch steps: 3,906,249 characters
+    size_t cap = 4000000;
+    char *ba = malloc(cap), *bb = malloc(cap);
+    r = lsys_generate("F", rules, 9, ba, bb, cap);
+    CHECK(r != NULL);
+    if (r) {
+        CHECK_INT(strlen(r), 3906249);
+        size_t fs = 0;
+        for (const char *p = r; *p; p++) fs += *p == 'F';
+        CHECK_INT(fs, 1953125);
+    }
+    free(ba); free(bb);
+    return TEST_END();
+}
+
+=== exercise turtle
+title: Turtle bounds
+continues: lsysgrow
+--- prompt
+An L-system string is a program for a **turtle**: `F` moves one unit forward (drawing a line), `+` turns 90 degrees left, `-` turns 90 degrees right; anything else is ignored. The turtle starts at `(0, 0)` facing `+x`.
+
+Before drawing, a renderer needs the bounding box to scale the picture to fit. Add
+
+```c
+int turtle_bounds(const char *cmds, int *minx, int *miny, int *maxx, int *maxy);
+```
+
+that walks the string once, writes the smallest and largest `x` and `y` visited (including the start), and returns the number of `F` moves.
+
+Keep the heading as a direction vector `(dx, dy)` rather than an angle: turning left is `(dx, dy) -> (-dy, dx)` and right is `(dy, -dx)`. No `sin`, no `cos`, no rounding errors, exact integer positions. The tests walk the 9-step Koch curve.
+--- stubs
+int turtle_bounds(const char *cmds, int *minx, int *miny, int *maxx, int *maxy) {
+    return -1;
+}
+--- solution
+#include <stddef.h>
+#include <string.h>
+
+size_t lsys_expand(const char *in, const char *const rules[128], char *out, size_t cap) {
+    size_t len = 0;
+    for (; *in; in++) {
+        unsigned char c = (unsigned char)*in;
+        const char *rep = c < 128 ? rules[c] : NULL;
+        if (rep) {
+            for (; *rep; rep++, len++)
+                if (len + 1 < cap) out[len] = *rep;
+        } else {
+            if (len + 1 < cap) out[len] = (char)c;
+            len++;
+        }
+    }
+    out[len < cap ? len : cap - 1] = '\0';
+    return len;
+}
+
+const char *lsys_generate(const char *axiom, const char *const rules[128], int iterations,
+                          char *a, char *b, size_t cap) {
+    size_t n = strlen(axiom);
+    if (n >= cap) return NULL;
+    memcpy(a, axiom, n + 1);
+    char *cur = a, *next = b;
+    for (int i = 0; i < iterations; i++) {
+        if (lsys_expand(cur, rules, next, cap) >= cap) return NULL;
+        char *t = cur; cur = next; next = t;
+    }
+    return cur;
+}
+
+int turtle_bounds(const char *cmds, int *minx, int *miny, int *maxx, int *maxy) {
+    int x = 0, y = 0, dx = 1, dy = 0, moves = 0;
+    int x0 = 0, y0 = 0, x1 = 0, y1 = 0;
+    for (; *cmds; cmds++) {
+        int t;
+        switch (*cmds) {
+        case 'F':
+            x += dx; y += dy; moves++;
+            if (x < x0) x0 = x;
+            if (x > x1) x1 = x;
+            if (y < y0) y0 = y;
+            if (y > y1) y1 = y;
+            break;
+        case '+': t = dx; dx = -dy; dy = t; break;
+        case '-': t = dx; dx = dy; dy = -t; break;
+        default: break;
+        }
+    }
+    *minx = x0; *miny = y0; *maxx = x1; *maxy = y1;
+    return moves;
+}
+--- hint
+Keep the running min/max in locals and write through the pointers once at the end, rather than writing `*minx` on every step (that is the aliasing lesson from the pointers chapter).
+--- harness
+int main(void) {
+    int x0, y0, x1, y1;
+    CHECK_INT(turtle_bounds("", &x0, &y0, &x1, &y1), 0);
+    CHECK(x0 == 0 && y0 == 0 && x1 == 0 && y1 == 0);
+    CHECK_INT(turtle_bounds("FF+F", &x0, &y0, &x1, &y1), 3);
+    CHECK(x0 == 0 && y0 == 0 && x1 == 2 && y1 == 1);
+    CHECK_INT(turtle_bounds("--FFF-F[x]", &x0, &y0, &x1, &y1), 4);
+    CHECK(x0 == -3 && y0 == 0 && x1 == 0 && y1 == 1);
+    CHECK_INT(turtle_bounds("F+F+F+F+", &x0, &y0, &x1, &y1), 4);
+    CHECK(x0 == 0 && y0 == 0 && x1 == 1 && y1 == 1);
+    const char *rules[128] = {0};
+    rules['F'] = "F+F-F-F+F";
+    char a[64], b[64];
+    const char *r = lsys_generate("F", rules, 2, a, b, sizeof a);
+    CHECK(r != NULL);
+    if (r) {
+        CHECK_INT(turtle_bounds(r, &x0, &y0, &x1, &y1), 25);
+        CHECK(x0 == 0 && y0 == 0 && x1 == 9 && y1 == 4);
+    }
+    size_t cap = 4000000;
+    char *ba = malloc(cap), *bb = malloc(cap);
+    r = lsys_generate("F", rules, 9, ba, bb, cap);
+    CHECK(r != NULL);
+    if (r) {
+        CHECK_INT(turtle_bounds(r, &x0, &y0, &x1, &y1), 1953125);
+        CHECK(x0 == 0 && y0 == 0 && x1 == 19683 && y1 == 9841);
+    }
+    free(ba); free(bb);
     return TEST_END();
 }
 
