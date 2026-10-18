@@ -1,0 +1,3084 @@
+=== chapter projects
+title: Projects
+blurb: Capstone projects for a game engine's core: a frame-reusable string builder, an asset-name interning table, a timed event queue, a particle pool, level-data compression, a debug-console calculator, a scripting VM and a settings parser.
+--- body
+## Putting it together
+
+The exercises in this chapter are the unglamorous core of a game engine: the pieces that sit underneath rendering and gameplay and that every frame leans on. They are larger than earlier exercises. Expect to spend an hour or more on some, to write helper functions, and to run your code many times. Several are **multi-step**: a later step starts from your solution to the earlier one and extends it, the way real code grows.
+
+The tests are thorough. Some feed hostile input, and several are **performance tests**: they push hundreds of thousands of items through your code, and an O(n²) solution will time out even though it gives the right answers. That is deliberate. In a game, a correct answer that takes 40 ms is a bug, because the whole frame budget is 16.6 ms at 60 fps.
+
+(The separate game development track covers tile maps, physics, entities, procedural generation, pathfinding and whole games. This chapter builds the infrastructure those things sit on.)
+
+General advice:
+
+- **Design the data first.** Decide what structs you need, which arrays are contiguous, and who owns each allocation, before writing logic.
+- **Write small `static` helpers.** A 200-line function is as hard to debug in C as anywhere else.
+- **Test incrementally**: the playground's stdin box for programs, or your own `main` for function exercises (it is renamed out of the way when the tests run).
+- **Keep the sanitizers on.** Every one of these has a natural off-by-one or leak waiting to happen.
+
+> **Performance:** the recurring theme is *no allocation in the hot path*. Each structure here allocates rarely (geometric growth, or once up front) and then reuses its memory. Allocation in a frame loop costs time, fragments the heap, and makes frame times jittery; keep it out.
+
+## The projects
+
+### String builder (2 steps)
+
+C# has `StringBuilder`; JavaScript has `array.join`. In C you build one: a heap buffer with a length and a capacity that grows geometrically, so `n` appends cost O(n) in total rather than O(n²). A game uses one for the HUD, the debug overlay and the console log, *cleared and reused every frame*: once it has grown to the size of a typical frame's text, it never allocates again. Step 2 adds formatted appends (measure with `vsnprintf(NULL, 0, ...)` first), insertion, and aliasing: appending a builder's contents to itself must work even though growing may move the buffer.
+
+### Asset-name interning
+
+Games refer to assets by name (`"tex/rock_03.png"`), but comparing and hashing strings every frame is waste. An **interning table** maps each distinct string to a small integer id, once, at load time; after that the engine passes `uint32_t`s around and compares them with `==`. You will build it on an open-addressing hash table, with all the name bytes stored back to back in one buffer instead of one `malloc` per name.
+
+### Timed event queue (2 steps)
+
+"Respawn this enemy in 300 ticks", "this grenade explodes in 90 ticks": games schedule work for the future. A **binary min-heap** in a plain array gives O(log n) insert and pop-earliest, with no per-event allocation. Events at the same tick must fire in the order they were scheduled, or replays and networked games desynchronize. Step 2 adds cancellation (the enemy died before its respawn timer fired) using *lazy deletion*.
+
+### Particle pool
+
+Particles, bullets and sound voices are created and destroyed constantly. A **pool** hands out fixed-size blocks from one preallocated buffer in O(1), with an *intrusive free list*: a free block's own first bytes store the pointer to the next free block, so the allocator needs no memory of its own.
+
+### Level-data compression
+
+Rows of tiles are full of runs: `"..........####......"`. **Run-length encoding** turns that into `"10.4#6."`. Encoding is easy; decoding robustly is the real work, because a decoder must reject malformed input without overrunning, leaking, or allocating gigabytes because a corrupt file said `999999999999x`.
+
+### Debug-console calculator
+
+Every engine has a console where you type `spawn_count * 2 + 1`. Its core is a **recursive-descent parser**: one function per grammar rule, each calling the rules it contains. The grammar encodes precedence. Evaluate while parsing; no tree is needed.
+
+```text
+expr    := term (('+' | '-') term)*
+term    := unary (('*' | '/' | '%') unary)*
+unary   := ('-' | '+') unary | power
+power   := primary ('^' unary)?
+primary := NUMBER | '(' expr ')'
+```
+
+### Scripting VM (2 steps)
+
+Lua, the scripting language in countless games, runs on a bytecode VM: an array of instructions, a program counter, a value stack, and a `switch` in a loop. You will write a two-pass assembler (labels can be used before they are defined) and the interpreter, with errors that name the source line. Step 2 gives scripts variables.
+
+> **Performance:** an interpreter's inner loop runs millions of times per second, so do all the expensive work (parsing text, looking up labels) *once*, at load time, and leave the loop with nothing but array indexing and a `switch`.
+
+### Settings file parser
+
+`settings.ini` holds resolution, volume and key bindings. Line-oriented parsing, trimming, case-folding, override semantics and sorted output, with precise error reporting.
+
+=== exercise strbuf
+title: String builder, step 1: growth and reuse
+--- prompt
+Implement the core of a growable string builder for HUD and console text:
+
+```c
+typedef struct { char *data; size_t len; size_t cap; } StrBuf;
+```
+
+`data` is either `NULL` (nothing allocated yet, `len == cap == 0`) or a heap buffer of `cap` bytes holding `len` characters followed by `'\0'`.
+
+- `void sb_init(StrBuf *sb)`: empty, no allocation.
+- `bool sb_append_n(StrBuf *sb, const char *s, size_t n)`: append `n` bytes from `s`; `false` (builder unchanged) if allocation fails.
+- `bool sb_append(StrBuf *sb, const char *s)`, `bool sb_append_char(StrBuf *sb, char c)`.
+- `void sb_clear(StrBuf *sb)`: make it empty **but keep the buffer**, so next frame's text reuses it.
+- `const char *sb_cstr(const StrBuf *sb)`: the contents, `""` when nothing is allocated.
+- `void sb_free(StrBuf *sb)`: free and reset to empty.
+
+**Growth:** when more room is needed, the new capacity is at least double the old one (minimum 16). The tests append two million characters one at a time and allow at most 25 reallocations; growing by a fixed amount copies the buffer over and over and times out. They also simulate frames: after the first frame, clearing and rebuilding text of the same size must not reallocate at all.
+--- starter
+#include <stdarg.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+typedef struct {
+    char *data;
+    size_t len;
+    size_t cap;
+} StrBuf;
+
+void sb_init(StrBuf *sb) {
+    sb->data = NULL;
+    sb->len = sb->cap = 0;
+}
+
+bool sb_append_n(StrBuf *sb, const char *s, size_t n) {
+    (void)sb; (void)s; (void)n;
+    return false;
+}
+
+bool sb_append(StrBuf *sb, const char *s) {
+    return sb_append_n(sb, s, strlen(s));
+}
+
+bool sb_append_char(StrBuf *sb, char c) {
+    return sb_append_n(sb, &c, 1);
+}
+
+void sb_clear(StrBuf *sb) {
+    (void)sb;
+}
+
+const char *sb_cstr(const StrBuf *sb) {
+    return sb->data ? sb->data : "";
+}
+
+void sb_free(StrBuf *sb) {
+    (void)sb;
+}
+--- solution
+#include <stdarg.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+typedef struct {
+    char *data;
+    size_t len;
+    size_t cap;
+} StrBuf;
+
+void sb_init(StrBuf *sb) {
+    sb->data = NULL;
+    sb->len = sb->cap = 0;
+}
+
+/* Make room for `extra` more characters plus the terminator. */
+static bool sb_reserve(StrBuf *sb, size_t extra) {
+    if (extra > SIZE_MAX - sb->len - 1) return false;
+    size_t need = sb->len + extra + 1;
+    if (need <= sb->cap) return true;
+    size_t ncap = sb->cap ? sb->cap : 16;
+    while (ncap < need) {
+        if (ncap > SIZE_MAX / 2) { ncap = need; break; }
+        ncap *= 2;
+    }
+    char *p = realloc(sb->data, ncap);
+    if (!p) return false;
+    if (!sb->data) p[0] = '\0';
+    sb->data = p;
+    sb->cap = ncap;
+    return true;
+}
+
+bool sb_append_n(StrBuf *sb, const char *s, size_t n) {
+    if (!sb_reserve(sb, n)) return false;
+    memcpy(sb->data + sb->len, s, n);
+    sb->len += n;
+    sb->data[sb->len] = '\0';
+    return true;
+}
+
+bool sb_append(StrBuf *sb, const char *s) {
+    return sb_append_n(sb, s, strlen(s));
+}
+
+bool sb_append_char(StrBuf *sb, char c) {
+    return sb_append_n(sb, &c, 1);
+}
+
+void sb_clear(StrBuf *sb) {
+    sb->len = 0;
+    if (sb->data) sb->data[0] = '\0';
+}
+
+const char *sb_cstr(const StrBuf *sb) {
+    return sb->data ? sb->data : "";
+}
+
+void sb_free(StrBuf *sb) {
+    free(sb->data);
+    sb_init(sb);
+}
+--- hint
+Write one private `sb_reserve(sb, extra)` that ensures `len + extra + 1 <= cap`, doubling `cap` until it fits. Every append goes through it.
+--- hint
+`sb_clear` only sets `len = 0` and writes the terminator. Freeing there would defeat the purpose: next frame would allocate again.
+--- harness
+int main(void) {
+    StrBuf sb;
+    sb_init(&sb);
+    CHECK_STR(sb_cstr(&sb), "");
+    sb_clear(&sb);
+    CHECK(sb.data == NULL);
+    CHECK(sb_append(&sb, "HP: "));
+    CHECK(sb_append_char(&sb, '9'));
+    CHECK(sb_append(&sb, "7/100"));
+    CHECK_STR(sb_cstr(&sb), "HP: 97/100");
+    CHECK_INT(sb.len, 10);
+    CHECK(sb.cap >= 11);
+    CHECK(sb_append_n(&sb, " | AMMO 12 junk", 10));
+    CHECK_STR(sb_cstr(&sb), "HP: 97/100 | AMMO 12");
+    CHECK(sb_append(&sb, ""));
+    CHECK_INT(sb.len, 20);
+    sb_free(&sb);
+    CHECK(sb.data == NULL);
+    CHECK_INT(sb.len, 0);
+    CHECK_INT(sb.cap, 0);
+    sb_free(&sb);
+
+    /* two million single-character appends: geometric growth only */
+    sb_init(&sb);
+    size_t last_cap = sb.cap;
+    int reallocs = 0, ok = 1;
+    for (int i = 0; i < 2000000; i++) {
+        ok &= sb_append_char(&sb, (char)('a' + i % 26));
+        if (sb.cap != last_cap) { reallocs++; last_cap = sb.cap; }
+    }
+    CHECK(ok);
+    CHECK_INT(sb.len, 2000000);
+    CHECK(reallocs <= 25);
+    CHECK(sb.cap > sb.len);
+    CHECK_INT(sb.data[1999999], 'a' + 1999999 % 26);
+    CHECK_INT(sb.data[2000000], 0);
+    sb_free(&sb);
+
+    /* frames: build, clear, rebuild. After frame 0 there must be no reallocation. */
+    sb_init(&sb);
+    char *first_buffer = NULL;
+    int stable = 1;
+    for (int frame = 0; frame < 100; frame++) {
+        sb_clear(&sb);
+        CHECK_INT(sb.len, 0);
+        for (int line = 0; line < 20; line++) {
+            sb_append(&sb, "entity ");
+            sb_append_char(&sb, (char)('A' + line));
+            sb_append(&sb, " pos=(12,34) vel=(0,-1)\n");
+        }
+        if (frame == 0) first_buffer = sb.data;
+        else stable &= sb.data == first_buffer;
+    }
+    CHECK(stable);
+    CHECK_INT(sb.len, 20 * 32);
+    CHECK(strncmp(sb_cstr(&sb), "entity A pos", 12) == 0);
+    sb_clear(&sb);
+    CHECK_STR(sb_cstr(&sb), "");
+    sb_free(&sb);
+    return TEST_END();
+}
+
+=== exercise strbuf_fmt
+title: String builder, step 2: formatting, insertion, aliasing
+continues: strbuf
+--- prompt
+Extend your string builder from step 1.
+
+- `bool sb_appendf(StrBuf *sb, const char *fmt, ...)`: append `printf`-style formatted text.
+- `bool sb_insert(StrBuf *sb, size_t pos, const char *s)`: insert at position `pos` (`0..len`); `false` if `pos > len`.
+- `char *sb_detach(StrBuf *sb)`: hand the caller the heap string (never `NULL` unless allocation fails; `""` for an empty builder) and reset the builder to empty, without copying. The caller frees it.
+
+And make `sb_append_n` (so also `sb_append`) and `sb_insert` safe when `s` points **into the builder's own buffer**: `sb_append(&sb, sb.data)` must double the string, and `sb_insert(&sb, 0, sb.data + 3)` must work. Your step 1 `sb_append_n` probably reads freed memory in that case when the buffer moves; ASan will tell you.
+
+> **Performance:** `sb_appendf` should format straight into the builder's buffer. Formatting into a temporary `malloc`ed string and then appending it doubles the work and allocates on every call.
+--- stubs
+bool sb_appendf(StrBuf *sb, const char *fmt, ...) {
+    (void)sb; (void)fmt;
+    return false;
+}
+
+bool sb_insert(StrBuf *sb, size_t pos, const char *s) {
+    (void)sb; (void)pos; (void)s;
+    return false;
+}
+
+char *sb_detach(StrBuf *sb) {
+    (void)sb;
+    return NULL;
+}
+--- solution
+#include <stdarg.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+typedef struct {
+    char *data;
+    size_t len;
+    size_t cap;
+} StrBuf;
+
+void sb_init(StrBuf *sb) {
+    sb->data = NULL;
+    sb->len = sb->cap = 0;
+}
+
+/* Make room for `extra` more characters plus the terminator. */
+static bool sb_reserve(StrBuf *sb, size_t extra) {
+    if (extra > SIZE_MAX - sb->len - 1) return false;
+    size_t need = sb->len + extra + 1;
+    if (need <= sb->cap) return true;
+    size_t ncap = sb->cap ? sb->cap : 16;
+    while (ncap < need) {
+        if (ncap > SIZE_MAX / 2) { ncap = need; break; }
+        ncap *= 2;
+    }
+    char *p = realloc(sb->data, ncap);
+    if (!p) return false;
+    if (!sb->data) p[0] = '\0';
+    sb->data = p;
+    sb->cap = ncap;
+    return true;
+}
+
+/* Does s point into the builder's buffer? Compare as integers: relational
+   comparison of pointers into different objects is undefined. */
+static bool aliases(const StrBuf *sb, const char *s) {
+    uintptr_t b = (uintptr_t)sb->data, p = (uintptr_t)s;
+    return sb->data && p >= b && p < b + sb->cap;
+}
+
+bool sb_append_n(StrBuf *sb, const char *s, size_t n) {
+    size_t offset = aliases(sb, s) ? (size_t)(s - sb->data) : SIZE_MAX;
+    if (!sb_reserve(sb, n)) return false;
+    if (offset != SIZE_MAX) s = sb->data + offset;   /* the buffer may have moved */
+    memmove(sb->data + sb->len, s, n);
+    sb->len += n;
+    sb->data[sb->len] = '\0';
+    return true;
+}
+
+bool sb_append(StrBuf *sb, const char *s) {
+    return sb_append_n(sb, s, strlen(s));
+}
+
+bool sb_append_char(StrBuf *sb, char c) {
+    return sb_append_n(sb, &c, 1);
+}
+
+void sb_clear(StrBuf *sb) {
+    sb->len = 0;
+    if (sb->data) sb->data[0] = '\0';
+}
+
+const char *sb_cstr(const StrBuf *sb) {
+    return sb->data ? sb->data : "";
+}
+
+void sb_free(StrBuf *sb) {
+    free(sb->data);
+    sb_init(sb);
+}
+
+bool sb_appendf(StrBuf *sb, const char *fmt, ...) {
+    va_list ap, ap2;
+    va_start(ap, fmt);
+    va_copy(ap2, ap);
+    int n = vsnprintf(NULL, 0, fmt, ap);
+    va_end(ap);
+    bool ok = n >= 0 && sb_reserve(sb, (size_t)n);
+    if (ok) {
+        vsnprintf(sb->data + sb->len, (size_t)n + 1, fmt, ap2);
+        sb->len += (size_t)n;
+    }
+    va_end(ap2);
+    return ok;
+}
+
+bool sb_insert(StrBuf *sb, size_t pos, const char *s) {
+    if (pos > sb->len) return false;
+    size_t n = strlen(s);
+    char *copy = NULL;
+    if (aliases(sb, s)) {          /* the shift below would overwrite the source */
+        copy = malloc(n + 1);
+        if (!copy) return false;
+        memcpy(copy, s, n + 1);
+        s = copy;
+    }
+    bool ok = sb_reserve(sb, n);
+    if (ok) {
+        memmove(sb->data + pos + n, sb->data + pos, sb->len - pos + 1);
+        memcpy(sb->data + pos, s, n);
+        sb->len += n;
+    }
+    free(copy);
+    return ok;
+}
+
+char *sb_detach(StrBuf *sb) {
+    char *out = sb->data;
+    if (!out) {
+        out = malloc(1);
+        if (!out) return NULL;
+        out[0] = '\0';
+    }
+    sb_init(sb);
+    return out;
+}
+--- hint
+`vsnprintf(NULL, 0, fmt, ap)` returns the length the text needs. A `va_list` can only be walked once, so `va_copy` it before measuring, reserve, then format directly into `data + len`.
+--- hint
+For aliasing in append: if `s` points into `data`, remember the *offset* `s - data` before growing and recompute `s = data + offset` after. Use `memmove`, since source and destination may overlap. For insert, the simplest correct approach is to copy the source first.
+--- harness
+int main(void) {
+    StrBuf sb;
+    sb_init(&sb);
+    CHECK(sb_append(&sb, "Score"));
+    CHECK(sb_appendf(&sb, ": %d (x%d) %s %.2f", 1500, 3, "combo", 0.5));
+    CHECK_STR(sb_cstr(&sb), "Score: 1500 (x3) combo 0.50");
+    CHECK(sb_insert(&sb, 0, ">> "));
+    CHECK(sb_insert(&sb, 8, "_"));
+    CHECK(sb_insert(&sb, sb.len, " <<"));
+    CHECK_STR(sb_cstr(&sb), ">> Score_: 1500 (x3) combo 0.50 <<");
+    CHECK(!sb_insert(&sb, sb.len + 1, "x"));
+    CHECK_INT(sb.len, strlen(">> Score_: 1500 (x3) combo 0.50 <<"));
+    sb_free(&sb);
+
+    sb_init(&sb);
+    CHECK(sb_appendf(&sb, "%s", ""));
+    CHECK_STR(sb_cstr(&sb), "");
+    for (int i = 0; i < 1000; i++) sb_appendf(&sb, "[%04d]", i);
+    CHECK_INT(sb.len, 6000);
+    CHECK(strncmp(sb.data + 5994, "[0999]", 6) == 0);
+    sb_free(&sb);
+
+    sb_init(&sb);
+    sb_append(&sb, "abc");
+    for (int i = 0; i < 6; i++) CHECK(sb_append(&sb, sb.data));
+    CHECK_INT(sb.len, 3 * 64);
+    CHECK(strncmp(sb.data + 189, "abc", 3) == 0);
+    sb_free(&sb);
+
+    sb_init(&sb);
+    sb_append(&sb, "0123456789");
+    CHECK(sb_insert(&sb, 0, sb.data + 7));
+    CHECK_STR(sb_cstr(&sb), "7890123456789");
+    CHECK(sb_insert(&sb, 5, sb.data));
+    CHECK_STR(sb_cstr(&sb), "78901789012345678923456789");
+    sb_free(&sb);
+
+    sb_init(&sb);
+    char *empty = sb_detach(&sb);
+    CHECK_STR(empty, "");
+    free(empty);
+    sb_appendf(&sb, "%s-%03d", "id", 7);
+    char *before = sb.data;
+    char *s = sb_detach(&sb);
+    CHECK_STR(s, "id-007");
+    CHECK(s == before);
+    CHECK(sb.data == NULL);
+    CHECK_STR(sb_cstr(&sb), "");
+    free(s);
+    sb_append(&sb, "reuse");
+    CHECK_STR(sb_cstr(&sb), "reuse");
+    sb_free(&sb);
+    return TEST_END();
+}
+
+=== exercise intern
+title: Interning asset names
+--- prompt
+Build a string-interning table that gives every distinct asset name a dense integer id: the first new name gets `0`, the next `1`, and so on. Interning a name that is already present returns its existing id.
+
+```c
+void intern_init(Interner *in);
+uint32_t intern(Interner *in, const char *name);       /* id; UINT32_MAX if allocation fails */
+uint32_t intern_find(const Interner *in, const char *name);  /* id, or UINT32_MAX if absent */
+const char *intern_name(const Interner *in, uint32_t id);    /* NULL for an unknown id */
+uint32_t intern_count(const Interner *in);
+void intern_free(Interner *in);                        /* frees everything, leaves it empty */
+```
+
+You design `Interner`. The table copies the names (the caller's buffer may change afterwards). A pointer from `intern_name` may be invalidated by a later `intern` call, like a pointer into a growing array.
+
+The tests intern 150000 distinct names and look them up again. A linear search through all names takes minutes; you need a hash table.
+
+> **Performance:** don't `malloc` each name separately. Store all the characters back to back in one growable `char` buffer and keep each name's *offset* (an offset survives `realloc`; a pointer doesn't). Use open addressing (one flat `uint32_t` slot array, linear probing, kept under 3/4 full) rather than chained nodes: probing walks adjacent memory, which the cache loves, while a chain is a pointer chase per step.
+--- starter
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
+
+typedef struct {
+    int todo;
+} Interner;
+
+void intern_init(Interner *in) {
+    in->todo = 0;
+}
+
+uint32_t intern(Interner *in, const char *name) {
+    (void)in; (void)name;
+    return UINT32_MAX;
+}
+
+uint32_t intern_find(const Interner *in, const char *name) {
+    (void)in; (void)name;
+    return UINT32_MAX;
+}
+
+const char *intern_name(const Interner *in, uint32_t id) {
+    (void)in; (void)id;
+    return NULL;
+}
+
+uint32_t intern_count(const Interner *in) {
+    (void)in;
+    return 0;
+}
+
+void intern_free(Interner *in) {
+    (void)in;
+}
+--- solution
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
+
+typedef struct {
+    char *chars;          /* every name, each followed by '\0', back to back */
+    size_t chars_len, chars_cap;
+    uint32_t *offsets;    /* id -> offset of its name in chars */
+    uint32_t count, offsets_cap;
+    uint32_t *slots;      /* open addressing: 0 = empty, otherwise id + 1 */
+    uint32_t nslots;      /* power of two */
+} Interner;
+
+void intern_init(Interner *in) {
+    memset(in, 0, sizeof *in);
+}
+
+static uint32_t hash_str(const char *s) {   /* FNV-1a, 32-bit */
+    uint32_t h = 2166136261u;
+    for (; *s; s++) {
+        h ^= (unsigned char)*s;
+        h *= 16777619u;
+    }
+    return h;
+}
+
+/* Index of the slot holding `name`, or of the empty slot where it would go. */
+static uint32_t find_slot(const Interner *in, const char *name, uint32_t h) {
+    uint32_t mask = in->nslots - 1;
+    for (uint32_t i = h & mask;; i = (i + 1) & mask) {
+        uint32_t v = in->slots[i];
+        if (v == 0 || strcmp(in->chars + in->offsets[v - 1], name) == 0) return i;
+    }
+}
+
+static bool rehash(Interner *in) {
+    uint32_t n = in->nslots ? in->nslots * 2 : 64;
+    uint32_t *slots = calloc(n, sizeof *slots);
+    if (!slots) return false;
+    free(in->slots);
+    in->slots = slots;
+    in->nslots = n;
+    for (uint32_t id = 0; id < in->count; id++) {
+        uint32_t i = hash_str(in->chars + in->offsets[id]) & (n - 1);
+        while (slots[i]) i = (i + 1) & (n - 1);
+        slots[i] = id + 1;
+    }
+    return true;
+}
+
+uint32_t intern_find(const Interner *in, const char *name) {
+    if (in->count == 0) return UINT32_MAX;
+    uint32_t v = in->slots[find_slot(in, name, hash_str(name))];
+    return v ? v - 1 : UINT32_MAX;
+}
+
+uint32_t intern(Interner *in, const char *name) {
+    if ((in->count + 1) * 4 > in->nslots * 3 && !rehash(in)) return UINT32_MAX;  /* load <= 3/4 */
+    uint32_t h = hash_str(name);
+    uint32_t slot = find_slot(in, name, h);
+    if (in->slots[slot]) return in->slots[slot] - 1;
+    size_t n = strlen(name) + 1;
+    if (in->chars_len + n > in->chars_cap) {
+        size_t cap = in->chars_cap ? in->chars_cap : 1024;
+        while (cap < in->chars_len + n) cap *= 2;
+        char *p = realloc(in->chars, cap);
+        if (!p) return UINT32_MAX;
+        in->chars = p;
+        in->chars_cap = cap;
+    }
+    if (in->count == in->offsets_cap) {
+        uint32_t cap = in->offsets_cap ? in->offsets_cap * 2 : 64;
+        uint32_t *p = realloc(in->offsets, cap * sizeof *p);
+        if (!p) return UINT32_MAX;
+        in->offsets = p;
+        in->offsets_cap = cap;
+    }
+    memcpy(in->chars + in->chars_len, name, n);
+    in->offsets[in->count] = (uint32_t)in->chars_len;
+    in->chars_len += n;
+    in->slots[slot] = in->count + 1;
+    return in->count++;
+}
+
+const char *intern_name(const Interner *in, uint32_t id) {
+    return id < in->count ? in->chars + in->offsets[id] : NULL;
+}
+
+uint32_t intern_count(const Interner *in) {
+    return in->count;
+}
+
+void intern_free(Interner *in) {
+    free(in->chars);
+    free(in->offsets);
+    free(in->slots);
+    intern_init(in);
+}
+--- hint
+A layout that works: `char *chars` (all names, each with its `'\0'`), `uint32_t *offsets` (id to offset into `chars`), and `uint32_t *slots`, a power-of-two-sized hash table where `0` means empty and any other value is `id + 1`.
+--- hint
+Lookup: hash the name (FNV-1a: `h ^= byte; h *= 16777619u;` starting from `2166136261u`), start at `h & (nslots - 1)` and step forward until you hit an empty slot (absent) or a slot whose name matches.
+--- hint
+Before inserting, grow when `count + 1` would exceed 3/4 of the slots: allocate a slot array twice the size and re-insert every id by rehashing its name. The `chars` and `offsets` arrays don't change when you rehash.
+--- harness
+int main(void) {
+    Interner in;
+    intern_init(&in);
+    CHECK_INT(intern_count(&in), 0);
+    CHECK_UINT(intern_find(&in, "player.png"), UINT32_MAX);
+    CHECK(intern_name(&in, 0) == NULL);
+    uint32_t a = intern(&in, "player.png");
+    uint32_t b = intern(&in, "enemy.png");
+    uint32_t c = intern(&in, "player.png");
+    CHECK_UINT(a, 0);
+    CHECK_UINT(b, 1);
+    CHECK_UINT(c, 0);
+    CHECK_INT(intern_count(&in), 2);
+    CHECK_STR(intern_name(&in, 1), "enemy.png");
+    CHECK_UINT(intern_find(&in, "enemy.png"), 1);
+    CHECK_UINT(intern_find(&in, "Enemy.png"), UINT32_MAX);
+    CHECK_UINT(intern(&in, ""), 2);
+    CHECK_STR(intern_name(&in, 2), "");
+    CHECK(intern_name(&in, 3) == NULL);
+    char buf[64];
+    strcpy(buf, "sfx/jump.wav");
+    uint32_t j = intern(&in, buf);
+    strcpy(buf, "overwritten");
+    CHECK_STR(intern_name(&in, j), "sfx/jump.wav");
+    intern_free(&in);
+
+    /* 150000 distinct asset names, each interned twice and looked up: needs a hash table */
+    intern_init(&in);
+    enum { N = 150000 };
+    int ok = 1;
+    for (int i = 0; i < N; i++) {
+        snprintf(buf, sizeof buf, "tex/tile_%d_%d.png", i % 977, i);
+        ok &= intern(&in, buf) == (uint32_t)i;
+    }
+    for (int i = N - 1; i >= 0; i -= 3) {
+        snprintf(buf, sizeof buf, "tex/tile_%d_%d.png", i % 977, i);
+        ok &= intern(&in, buf) == (uint32_t)i;
+        ok &= intern_find(&in, buf) == (uint32_t)i;
+        ok &= strcmp(intern_name(&in, (uint32_t)i), buf) == 0;
+    }
+    CHECK(ok);
+    CHECK_INT(intern_count(&in), N);
+    CHECK_UINT(intern_find(&in, "tex/tile_0_150000.png"), UINT32_MAX);
+    intern_free(&in);
+    CHECK_INT(intern_count(&in), 0);
+    intern_free(&in);
+    return TEST_END();
+}
+
+=== exercise events
+title: Event queue, step 1: a binary heap
+--- prompt
+Implement a queue of timed game events, ordered by the tick they fire at.
+
+```c
+typedef struct { uint32_t time; int type; int entity; uint32_t id; } Event;
+
+void eq_init(EventQueue *q);
+uint32_t eq_push(EventQueue *q, uint32_t time, int type, int entity);
+bool eq_pop_due(EventQueue *q, uint32_t now, Event *out);
+size_t eq_size(const EventQueue *q);
+void eq_free(EventQueue *q);
+```
+
+- `eq_push` schedules an event and returns its id: ids are `0, 1, 2, ...` in push order (`UINT32_MAX` if allocation fails).
+- `eq_pop_due` removes the earliest event whose `time <= now` into `*out` and returns `true`, or returns `false` if no event is due. Events with the same `time` come out **in push order**.
+- `eq_size` is the number of pending events.
+
+You design `EventQueue`. The tests schedule 300000 events at random ticks and drain them tick by tick; a sorted array (O(n) insert) or a linear scan for the minimum (O(n) pop) times out.
+
+> **Performance:** a binary heap lives in one flat array: the children of index `i` are `2i + 1` and `2i + 2`, with no pointers at all. Pushing and popping are O(log n) swaps within that array, and nothing is allocated per event (only when the array doubles). Use integer ticks rather than floating-point seconds for game time: they compare exactly and never drift.
+--- starter
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+#include <stdlib.h>
+
+typedef struct {
+    uint32_t time;     /* game tick when it fires */
+    int type;
+    int entity;
+    uint32_t id;       /* push order: 0, 1, 2, ... */
+} Event;
+
+typedef struct {
+    int todo;
+} EventQueue;
+
+void eq_init(EventQueue *q) {
+    q->todo = 0;
+}
+
+uint32_t eq_push(EventQueue *q, uint32_t time, int type, int entity) {
+    (void)q; (void)time; (void)type; (void)entity;
+    return UINT32_MAX;
+}
+
+bool eq_pop_due(EventQueue *q, uint32_t now, Event *out) {
+    (void)q; (void)now; (void)out;
+    return false;
+}
+
+size_t eq_size(const EventQueue *q) {
+    (void)q;
+    return 0;
+}
+
+void eq_free(EventQueue *q) {
+    (void)q;
+}
+--- solution
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+#include <stdlib.h>
+
+typedef struct {
+    uint32_t time;     /* game tick when it fires */
+    int type;
+    int entity;
+    uint32_t id;       /* push order: 0, 1, 2, ... */
+} Event;
+
+typedef struct {
+    Event *heap;       /* binary min-heap on (time, id) */
+    size_t len, cap;
+    uint32_t next_id;
+} EventQueue;
+
+void eq_init(EventQueue *q) {
+    q->heap = NULL;
+    q->len = q->cap = 0;
+    q->next_id = 0;
+}
+
+static bool before(const Event *a, const Event *b) {
+    return a->time != b->time ? a->time < b->time : a->id < b->id;
+}
+
+static void sift_up(Event *h, size_t i) {
+    Event e = h[i];
+    while (i > 0) {
+        size_t parent = (i - 1) / 2;
+        if (!before(&e, &h[parent])) break;
+        h[i] = h[parent];
+        i = parent;
+    }
+    h[i] = e;
+}
+
+static void sift_down(Event *h, size_t len, size_t i) {
+    Event e = h[i];
+    for (;;) {
+        size_t child = 2 * i + 1;
+        if (child >= len) break;
+        if (child + 1 < len && before(&h[child + 1], &h[child])) child++;
+        if (!before(&h[child], &e)) break;
+        h[i] = h[child];
+        i = child;
+    }
+    h[i] = e;
+}
+
+uint32_t eq_push(EventQueue *q, uint32_t time, int type, int entity) {
+    if (q->len == q->cap) {
+        size_t cap = q->cap ? q->cap * 2 : 64;
+        Event *p = realloc(q->heap, cap * sizeof *p);
+        if (!p) return UINT32_MAX;
+        q->heap = p;
+        q->cap = cap;
+    }
+    Event e = {time, type, entity, q->next_id++};
+    q->heap[q->len] = e;
+    sift_up(q->heap, q->len++);
+    return e.id;
+}
+
+bool eq_pop_due(EventQueue *q, uint32_t now, Event *out) {
+    if (q->len == 0 || q->heap[0].time > now) return false;
+    *out = q->heap[0];
+    q->heap[0] = q->heap[--q->len];
+    if (q->len > 0) sift_down(q->heap, q->len, 0);
+    return true;
+}
+
+size_t eq_size(const EventQueue *q) {
+    return q->len;
+}
+
+void eq_free(EventQueue *q) {
+    free(q->heap);
+    eq_init(q);
+}
+--- hint
+Order events by `(time, id)`: compare times, and if they are equal compare ids. Since ids increase with every push, that makes equal-time events come out in push order. A heap alone is not stable; the id tie-break is what makes it so.
+--- hint
+Push: append at the end, then *sift up*, swapping with the parent `(i - 1) / 2` while it is larger. Pop: take `heap[0]`, move the last element to the root, then *sift down*, swapping with the smaller child while that child is smaller.
+--- hint
+`eq_pop_due` only has to look at `heap[0]`: if the earliest event is not due, nothing is.
+--- harness
+enum { EV_SPAWN, EV_EXPLODE, EV_RESPAWN };
+
+static uint32_t rng_state = 12345;
+static uint32_t rng(void) {   /* xorshift32: deterministic "random" ticks */
+    rng_state ^= rng_state << 13;
+    rng_state ^= rng_state >> 17;
+    rng_state ^= rng_state << 5;
+    return rng_state;
+}
+
+int main(void) {
+    EventQueue q;
+    eq_init(&q);
+    Event e = {0, 0, 0, 0};
+    CHECK(!eq_pop_due(&q, 1000, &e));
+    CHECK_UINT(eq_push(&q, 30, EV_EXPLODE, 7), 0);
+    CHECK_UINT(eq_push(&q, 10, EV_SPAWN, 1), 1);
+    CHECK_UINT(eq_push(&q, 20, EV_SPAWN, 2), 2);
+    CHECK_UINT(eq_push(&q, 10, EV_RESPAWN, 3), 3);
+    CHECK_INT(eq_size(&q), 4);
+    CHECK(!eq_pop_due(&q, 9, &e));
+    CHECK(eq_pop_due(&q, 10, &e));
+    CHECK_INT(e.entity, 1);
+    CHECK_INT(e.time, 10);
+    CHECK(eq_pop_due(&q, 10, &e));
+    CHECK_INT(e.entity, 3);
+    CHECK_INT(e.type, EV_RESPAWN);
+    CHECK_UINT(e.id, 3);
+    CHECK(!eq_pop_due(&q, 19, &e));
+    CHECK(eq_pop_due(&q, 100, &e));
+    CHECK_INT(e.entity, 2);
+    CHECK_UINT(eq_push(&q, 5, EV_SPAWN, 9), 4);
+    CHECK(eq_pop_due(&q, 100, &e));
+    CHECK_INT(e.entity, 9);
+    CHECK(eq_pop_due(&q, 100, &e));
+    CHECK_INT(e.entity, 7);
+    CHECK_INT(eq_size(&q), 0);
+    CHECK(!eq_pop_due(&q, UINT32_MAX, &e));
+    for (int i = 0; i < 100; i++) eq_push(&q, 50, EV_SPAWN, i);
+    int fifo = 1;
+    for (int i = 0; i < 100; i++) fifo &= eq_pop_due(&q, 50, &e) && e.entity == i;
+    CHECK(fifo);
+    eq_free(&q);
+
+    /* 300000 events at pseudo-random ticks: a sorted array or a linear scan is far too slow */
+    eq_init(&q);
+    enum { N = 300000 };
+    for (int i = 0; i < N; i++) eq_push(&q, rng() % 100000, EV_SPAWN, i);
+    CHECK_INT(eq_size(&q), N);
+    uint32_t last_time = 0, last_id = 0, popped = 0;
+    int ordered = 1;
+    for (uint32_t tick = 0; tick < 100000; tick += 1000)
+        while (eq_pop_due(&q, tick + 999, &e)) {
+            ordered &= e.time <= tick + 999 && (e.time > last_time || (e.time == last_time && (popped == 0 || e.id > last_id)));
+            ordered &= (int)e.id == e.entity;
+            last_time = e.time;
+            last_id = e.id;
+            popped++;
+        }
+    CHECK(ordered);
+    CHECK_INT(popped, N);
+    eq_free(&q);
+    return TEST_END();
+}
+
+=== exercise events_cancel
+title: Event queue, step 2: cancellation
+continues: events
+--- prompt
+Add cancellation to your event queue:
+
+```c
+bool eq_cancel(EventQueue *q, uint32_t id);
+```
+
+It returns `true` if event `id` was pending and is now cancelled; `false` if no such event was ever pushed, or it was already popped or cancelled. A cancelled event is never returned by `eq_pop_due`, and `eq_size` counts only events that are still pending.
+
+The tests schedule 300000 timers and cancel a third of them. Searching the heap for the event to remove is O(n) per cancel and times out.
+
+> **Performance:** use **lazy deletion**. Don't remove a cancelled event from the heap; just mark its id as dead (ids are dense, so a byte array indexed by id is a perfect O(1) lookup). When a dead event reaches the top of the heap, `eq_pop_due` discards it and looks again. Each event is still pushed and popped exactly once, so everything stays O(log n).
+--- stubs
+bool eq_cancel(EventQueue *q, uint32_t id) {
+    (void)q; (void)id;
+    return false;
+}
+--- solution
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+#include <stdlib.h>
+
+typedef struct {
+    uint32_t time;     /* game tick when it fires */
+    int type;
+    int entity;
+    uint32_t id;       /* push order: 0, 1, 2, ... */
+} Event;
+
+typedef struct {
+    Event *heap;       /* binary min-heap on (time, id) */
+    size_t len, cap;
+    uint32_t next_id;
+    unsigned char *state;   /* per id: PENDING, DONE (popped or cancelled) */
+    size_t state_cap;
+    size_t live;            /* pending events not cancelled */
+} EventQueue;
+
+enum { PENDING = 0, DONE = 1 };
+
+void eq_init(EventQueue *q) {
+    q->heap = NULL;
+    q->len = q->cap = 0;
+    q->next_id = 0;
+    q->state = NULL;
+    q->state_cap = 0;
+    q->live = 0;
+}
+
+static bool before(const Event *a, const Event *b) {
+    return a->time != b->time ? a->time < b->time : a->id < b->id;
+}
+
+static void sift_up(Event *h, size_t i) {
+    Event e = h[i];
+    while (i > 0) {
+        size_t parent = (i - 1) / 2;
+        if (!before(&e, &h[parent])) break;
+        h[i] = h[parent];
+        i = parent;
+    }
+    h[i] = e;
+}
+
+static void sift_down(Event *h, size_t len, size_t i) {
+    Event e = h[i];
+    for (;;) {
+        size_t child = 2 * i + 1;
+        if (child >= len) break;
+        if (child + 1 < len && before(&h[child + 1], &h[child])) child++;
+        if (!before(&h[child], &e)) break;
+        h[i] = h[child];
+        i = child;
+    }
+    h[i] = e;
+}
+
+uint32_t eq_push(EventQueue *q, uint32_t time, int type, int entity) {
+    if (q->len == q->cap) {
+        size_t cap = q->cap ? q->cap * 2 : 64;
+        Event *p = realloc(q->heap, cap * sizeof *p);
+        if (!p) return UINT32_MAX;
+        q->heap = p;
+        q->cap = cap;
+    }
+    if (q->next_id == q->state_cap) {
+        size_t cap = q->state_cap ? q->state_cap * 2 : 64;
+        unsigned char *p = realloc(q->state, cap);
+        if (!p) return UINT32_MAX;
+        q->state = p;
+        q->state_cap = cap;
+    }
+    Event e = {time, type, entity, q->next_id++};
+    q->state[e.id] = PENDING;
+    q->heap[q->len] = e;
+    sift_up(q->heap, q->len++);
+    q->live++;
+    return e.id;
+}
+
+static void remove_top(EventQueue *q) {
+    q->heap[0] = q->heap[--q->len];
+    if (q->len > 0) sift_down(q->heap, q->len, 0);
+}
+
+bool eq_pop_due(EventQueue *q, uint32_t now, Event *out) {
+    /* lazy deletion: cancelled events stay in the heap until they reach the top */
+    while (q->len > 0 && q->state[q->heap[0].id] == DONE) remove_top(q);
+    if (q->len == 0 || q->heap[0].time > now) return false;
+    *out = q->heap[0];
+    q->state[out->id] = DONE;
+    q->live--;
+    remove_top(q);
+    return true;
+}
+
+bool eq_cancel(EventQueue *q, uint32_t id) {
+    if (id >= q->next_id || q->state[id] == DONE) return false;
+    q->state[id] = DONE;
+    q->live--;
+    return true;
+}
+
+size_t eq_size(const EventQueue *q) {
+    return q->live;
+}
+
+void eq_free(EventQueue *q) {
+    free(q->heap);
+    free(q->state);
+    eq_init(q);
+}
+--- hint
+Keep a growable `unsigned char *state` array indexed by id (grown in `eq_push` alongside `next_id`), with values like `PENDING` and `DONE`. Popping and cancelling both set `DONE`, so cancelling something already popped correctly returns `false`.
+--- hint
+Track the number of live events in a separate counter: the heap's length now includes dead entries.
+--- harness
+static uint32_t rng_state = 777;
+static uint32_t rng(void) {
+    rng_state ^= rng_state << 13;
+    rng_state ^= rng_state >> 17;
+    rng_state ^= rng_state << 5;
+    return rng_state;
+}
+
+int main(void) {
+    EventQueue q;
+    eq_init(&q);
+    Event e = {0, 0, 0, 0};
+    uint32_t a = eq_push(&q, 10, 0, 1);
+    uint32_t b = eq_push(&q, 20, 0, 2);
+    uint32_t c = eq_push(&q, 30, 0, 3);
+    CHECK_INT(eq_size(&q), 3);
+    CHECK(eq_cancel(&q, b));
+    CHECK(!eq_cancel(&q, b));
+    CHECK(!eq_cancel(&q, 999));
+    CHECK_INT(eq_size(&q), 2);
+    CHECK(eq_pop_due(&q, 100, &e));
+    CHECK_UINT(e.id, a);
+    CHECK(!eq_cancel(&q, a));
+    CHECK(eq_pop_due(&q, 100, &e));
+    CHECK_UINT(e.id, c);
+    CHECK(!eq_pop_due(&q, 100, &e));
+    CHECK_INT(eq_size(&q), 0);
+    uint32_t d = eq_push(&q, 5, 0, 4);
+    CHECK(eq_cancel(&q, d));
+    CHECK(!eq_pop_due(&q, UINT32_MAX, &e));
+    CHECK_INT(eq_size(&q), 0);
+    uint32_t f = eq_push(&q, 50, 0, 5);
+    CHECK(eq_pop_due(&q, 50, &e));
+    CHECK_UINT(e.id, f);
+    eq_free(&q);
+
+    /* 300000 timers, every third cancelled (an entity died before its timer fired) */
+    eq_init(&q);
+    enum { N = 300000 };
+    for (int i = 0; i < N; i++) eq_push(&q, rng() % 50000, 1, i);
+    int ok = 1;
+    for (uint32_t id = 0; id < N; id += 3) ok &= eq_cancel(&q, id);
+    CHECK(ok);
+    CHECK_INT(eq_size(&q), N - N / 3);
+    uint32_t last = 0, count = 0;
+    while (eq_pop_due(&q, UINT32_MAX, &e)) {
+        ok &= e.id % 3 != 0 && e.time >= last;
+        last = e.time;
+        count++;
+    }
+    CHECK(ok);
+    CHECK_INT(count, N - N / 3);
+    CHECK_INT(eq_size(&q), 0);
+    eq_free(&q);
+    return TEST_END();
+}
+
+=== exercise pool
+title: Particle pool allocator
+--- prompt
+Particles, bullets and sound voices are created and destroyed by the thousand every second. Implement a pool allocator that carves fixed-size blocks out of a buffer the caller provides, with O(1) allocate and free and no memory of its own beyond the `Pool` struct.
+
+```c
+typedef struct {
+    unsigned char *start;   /* first block */
+    size_t block_size;      /* after rounding */
+    size_t nblocks;
+    void *free_list;        /* first free block, or NULL */
+    size_t available;
+} Pool;
+```
+
+- `size_t pool_init(Pool *p, void *mem, size_t mem_size, size_t block_size)`: round `block_size` up to a multiple of `alignof(max_align_t)` (16 here); a `block_size` smaller than that becomes 16. The first block starts at the first suitably aligned address at or after `mem`. Make as many whole blocks as fit in the buffer and return that number (possibly 0).
+- `void *pool_alloc(Pool *p)`: a free block, or `NULL` if none. Initially blocks come out in increasing address order.
+- `bool pool_free(Pool *p, void *block)`: return `block` to the pool. Return `false` and do nothing for `NULL` or for a pointer that is not the start of one of this pool's blocks. The most recently freed block is the next one allocated (LIFO).
+- `size_t pool_available(const Pool *p)`.
+
+Keep the free list *inside* the free blocks: each free block's first bytes hold a pointer to the next free block.
+
+The tests churn a pool of 100000 particles hundreds of thousands of times. An allocator that *scans* for a free block (a "used" flag per block, or a bitmap searched from the start) is O(n) per allocation and times out.
+
+> **Performance:** a pool beats `malloc` for this job three ways: allocation is two pointer moves with no locking or size-class lookup; all particles sit in one contiguous buffer, so iterating them is cache friendly; and there is no fragmentation, because every block is the same size. Allocate the pool's buffer once at level load and never call `malloc` in the frame loop.
+--- starter
+#include <stdalign.h>
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+#include <string.h>
+
+typedef struct {
+    unsigned char *start;
+    size_t block_size;
+    size_t nblocks;
+    void *free_list;
+    size_t available;
+} Pool;
+
+size_t pool_init(Pool *p, void *mem, size_t mem_size, size_t block_size) {
+    (void)mem; (void)mem_size; (void)block_size;
+    p->start = NULL;
+    p->block_size = p->nblocks = p->available = 0;
+    p->free_list = NULL;
+    return 0;
+}
+
+void *pool_alloc(Pool *p) {
+    (void)p;
+    return NULL;
+}
+
+bool pool_free(Pool *p, void *block) {
+    (void)p; (void)block;
+    return false;
+}
+
+size_t pool_available(const Pool *p) {
+    return p->available;
+}
+--- solution
+#include <stdalign.h>
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+#include <string.h>
+
+typedef struct {
+    unsigned char *start;
+    size_t block_size;
+    size_t nblocks;
+    void *free_list;
+    size_t available;
+} Pool;
+
+/* The free list lives inside the blocks. memcpy avoids any alignment or aliasing doubts. */
+static void *next_of(void *block) {
+    void *next;
+    memcpy(&next, block, sizeof next);
+    return next;
+}
+
+static void set_next(void *block, void *next) {
+    memcpy(block, &next, sizeof next);
+}
+
+size_t pool_init(Pool *p, void *mem, size_t mem_size, size_t block_size) {
+    const size_t a = alignof(max_align_t);
+    if (block_size < a) block_size = a;
+    block_size = (block_size + a - 1) & ~(a - 1);
+    uintptr_t m = (uintptr_t)mem;
+    size_t skip = (size_t)(((m + a - 1) & ~(uintptr_t)(a - 1)) - m);
+    size_t n = mem_size > skip ? (mem_size - skip) / block_size : 0;
+    p->start = (unsigned char *)mem + skip;
+    p->block_size = block_size;
+    p->nblocks = n;
+    p->available = n;
+    p->free_list = n ? p->start : NULL;
+    for (size_t i = 0; i < n; i++)
+        set_next(p->start + i * block_size, i + 1 < n ? p->start + (i + 1) * block_size : NULL);
+    return n;
+}
+
+void *pool_alloc(Pool *p) {
+    void *b = p->free_list;
+    if (!b) return NULL;
+    p->free_list = next_of(b);
+    p->available--;
+    return b;
+}
+
+bool pool_free(Pool *p, void *block) {
+    if (!block || p->nblocks == 0) return false;
+    uintptr_t s = (uintptr_t)p->start, b = (uintptr_t)block;
+    if (b < s || b >= s + p->nblocks * p->block_size || (b - s) % p->block_size != 0) return false;
+    set_next(block, p->free_list);
+    p->free_list = block;
+    p->available++;
+    return true;
+}
+
+size_t pool_available(const Pool *p) {
+    return p->available;
+}
+--- hint
+In `pool_init`, link block `i` to block `i + 1` (the last to `NULL`) and point `free_list` at block 0. Alloc pops the head; free pushes onto the head. That gives LIFO reuse.
+--- hint
+Align the start address like the arena did: `((uintptr_t)mem + a - 1) & ~(uintptr_t)(a - 1)`. Remember to subtract the skipped bytes from the usable size.
+--- hint
+To check ownership, convert to `uintptr_t` (comparing unrelated pointers with `<` is undefined), then check the range and that the offset is a multiple of `block_size`.
+--- harness
+#include <stdalign.h>
+#include <stdint.h>
+
+static alignas(16) unsigned char mem[1024];
+
+int main(void) {
+    Pool p;
+    CHECK_INT(pool_init(&p, mem, 1000, 24), 31);
+    CHECK_INT(p.block_size, 32);
+    CHECK_INT(pool_available(&p), 31);
+    void *blocks[31];
+    int ok = 1;
+    for (int i = 0; i < 31; i++) {
+        blocks[i] = pool_alloc(&p);
+        ok &= blocks[i] != NULL && (uintptr_t)blocks[i] % 16 == 0;
+        if (i > 0) ok &= (unsigned char *)blocks[i] == (unsigned char *)blocks[i - 1] + 32;
+    }
+    CHECK(ok);
+    CHECK((void *)blocks[0] == (void *)mem);
+    CHECK(pool_alloc(&p) == NULL);
+    CHECK_INT(pool_available(&p), 0);
+    for (int i = 0; i < 31; i++) memset(blocks[i], i, 32);
+    for (int i = 0; i < 31; i++) ok &= ((unsigned char *)blocks[i])[31] == i && ((unsigned char *)blocks[i])[0] == i;
+    CHECK(ok);
+    CHECK(pool_free(&p, blocks[5]));
+    CHECK(pool_free(&p, blocks[20]));
+    CHECK_INT(pool_available(&p), 2);
+    CHECK(pool_alloc(&p) == blocks[20]);
+    CHECK(pool_alloc(&p) == blocks[5]);
+    CHECK(pool_alloc(&p) == NULL);
+    CHECK(!pool_free(&p, NULL));
+    CHECK(!pool_free(&p, (unsigned char *)blocks[3] + 8));
+    CHECK(!pool_free(&p, mem + 1000));
+    int local;
+    CHECK(!pool_free(&p, &local));
+    CHECK_INT(pool_available(&p), 0);
+    for (int i = 30; i >= 0; i--) pool_free(&p, blocks[i]);
+    CHECK_INT(pool_available(&p), 31);
+    CHECK(pool_alloc(&p) == blocks[0]);
+
+    CHECK_INT(pool_init(&p, mem + 1, 1000, 24), 30);
+    void *b = pool_alloc(&p);
+    CHECK((void *)b == (void *)(mem + 16));
+    CHECK(pool_free(&p, b));
+
+    CHECK_INT(pool_init(&p, mem, 64, 1), 4);
+    CHECK_INT(p.block_size, 16);
+    CHECK_INT(pool_init(&p, mem, 100, 33), 2);
+    CHECK_INT(p.block_size, 48);
+    CHECK_INT(pool_init(&p, mem + 3, 20, 16), 0);
+    CHECK(pool_alloc(&p) == NULL);
+    CHECK(!pool_free(&p, mem));
+    CHECK_INT(pool_init(&p, mem, 0, 16), 0);
+
+    /* churn: 100000 live particles, then 300000 die/spawn cycles near the end of the pool */
+    enum { N = 100000 };
+    static alignas(16) unsigned char big[N * 32];
+    static void *live[N];
+    CHECK_INT(pool_init(&p, big, sizeof big, 32), N);
+    for (int i = 0; i < N; i++) live[i] = pool_alloc(&p);
+    CHECK(pool_alloc(&p) == NULL);
+    ok = 1;
+    for (int i = 0; i < 300000; i++) {
+        int k = N - 1 - i % 16;
+        ok &= pool_free(&p, live[k]);
+        void *again = pool_alloc(&p);
+        ok &= again == live[k];
+    }
+    CHECK(ok);
+    for (int i = 0; i < N; i += 2) pool_free(&p, live[i]);
+    CHECK_INT(pool_available(&p), N / 2);
+    return TEST_END();
+}
+
+
+=== exercise rle
+title: Compressing level rows
+--- prompt
+Level rows are long runs of the same tile: `"..........####......"`. Implement run-length encoding of text, in which each run of identical characters becomes its length in decimal followed by the character: `"aaabcc"` becomes `"3a1b2c"`, and twelve `x`s become `"12x"`, so that row is `"10.4#6."`.
+
+- `char *rle_encode(const char *s)`: return the encoding as a new heap string (`""` for `""`). Since counts are digits, input containing a digit `0-9` cannot be encoded: return `NULL`.
+- `char *rle_decode(const char *s)`: return the decoded heap string, or `NULL` if the input is malformed. Valid input is a sequence of zero or more pairs: a count of one or more digits with no leading zero, between 1 and 1000000 inclusive, then one non-digit character. Anything else is malformed: `"a"`, `"0a"`, `"03a"`, `"3"`, `"3a2"`, `"1000001a"`.
+
+The caller frees the results. Neither function may leak on any path, and the decoder must validate the whole input before allocating, so `"999999999999x"` must not trigger a huge allocation.
+
+The tests include a two-million-character level. Building the output with `strcat` (which rescans the whole string every call) or growing it with a `realloc` per run is O(n²) and times out.
+
+> **Performance:** compute the output size first and allocate exactly once, then write through a moving pointer. That pattern (measure, allocate, fill) is how you keep serialization code out of the profiler.
+--- starter
+#include <stdlib.h>
+#include <string.h>
+
+char *rle_encode(const char *s) {
+    (void)s;
+    return NULL;
+}
+
+char *rle_decode(const char *s) {
+    (void)s;
+    return NULL;
+}
+--- solution
+#include <stdlib.h>
+#include <string.h>
+#include <stdbool.h>
+
+static bool is_digit(char c) { return c >= '0' && c <= '9'; }
+
+char *rle_encode(const char *s) {
+    size_t n = strlen(s);
+    for (size_t i = 0; i < n; i++)
+        if (is_digit(s[i])) return NULL;
+    char *out = malloc(2 * n + 1);   /* worst case: every run has length 1 */
+    if (!out) return NULL;
+    char *w = out;
+    for (size_t i = 0; i < n;) {
+        size_t run = 1;
+        while (i + run < n && s[i + run] == s[i]) run++;
+        char digits[24];
+        int k = 0;
+        for (size_t r = run; r; r /= 10) digits[k++] = (char)('0' + r % 10);
+        while (k) *w++ = digits[--k];
+        *w++ = s[i];
+        i += run;
+    }
+    *w = '\0';
+    return out;
+}
+
+/* Parses one count at *p. Returns 0 if malformed. */
+static long parse_count(const char **p) {
+    const char *s = *p;
+    if (!is_digit(*s) || *s == '0') return 0;
+    long v = 0;
+    while (is_digit(*s)) {
+        v = v * 10 + (*s++ - '0');
+        if (v > 1000000) return 0;
+    }
+    *p = s;
+    return v;
+}
+
+char *rle_decode(const char *s) {
+    size_t total = 0;
+    for (const char *p = s; *p;) {      /* pass 1: validate and measure */
+        long count = parse_count(&p);
+        if (count == 0 || *p == '\0') return NULL;
+        p++;                            /* the character (cannot be a digit here) */
+        total += (size_t)count;
+    }
+    char *out = malloc(total + 1);
+    if (!out) return NULL;
+    char *w = out;
+    for (const char *p = s; *p;) {      /* pass 2: fill */
+        long count = parse_count(&p);
+        memset(w, *p++, (size_t)count);
+        w += count;
+    }
+    *w = '\0';
+    return out;
+}
+--- hint
+Encoding: the output is never longer than `2 * strlen(s)` (a run of length 1 costs 2 characters, longer runs cost less per character), so one allocation is enough. Write the count's digits into a small buffer backwards, then copy them forwards.
+--- hint
+Decoding in two passes: the first only parses and adds up the lengths, returning `NULL` at the first problem (nothing allocated yet, so nothing to leak). The second allocates once and fills with `memset`.
+--- hint
+Reject the count as soon as it exceeds 1000000, while reading digits, so a 50-digit count cannot overflow your accumulator.
+--- harness
+static char *repeat(char c, size_t n) {
+    char *s = malloc(n + 1);
+    memset(s, c, n);
+    s[n] = '\0';
+    return s;
+}
+
+int main(void) {
+    char *e = rle_encode("aaabcc");
+    CHECK_STR(e, "3a1b2c");
+    free(e);
+    e = rle_encode("");
+    CHECK_STR(e, "");
+    free(e);
+    e = rle_encode("abc");
+    CHECK_STR(e, "1a1b1c");
+    free(e);
+    e = rle_encode("xxxxxxxxxxxx  !");
+    CHECK_STR(e, "12x2 1!");
+    free(e);
+    CHECK(rle_encode("abc1") == NULL);
+    CHECK(rle_encode("0") == NULL);
+    char *big = repeat('z', 1234567);
+    e = rle_encode(big);
+    CHECK_STR(e, "1234567z");
+    free(e);
+    free(big);
+
+    char *d = rle_decode("3a1b2c");
+    CHECK_STR(d, "aaabcc");
+    free(d);
+    d = rle_decode("");
+    CHECK_STR(d, "");
+    free(d);
+    d = rle_decode("12x2 1!");
+    CHECK_STR(d, "xxxxxxxxxxxx  !");
+    free(d);
+    d = rle_decode("1000000q");
+    CHECK(d != NULL);
+    if (d) CHECK_INT(strlen(d), 1000000);
+    free(d);
+    const char *bad[] = {"a", "0a", "03a", "3", "3a2", "1000001a", "999999999999x",
+                         "99999999999999999999999999999999999999999a", "2a0b", "-1a", "3ab", "12"};
+    for (size_t i = 0; i < sizeof bad / sizeof bad[0]; i++) {
+        d = rle_decode(bad[i]);
+        if (d) printf("  should reject \"%s\"\n", bad[i]);
+        CHECK(d == NULL);
+        free(d);
+    }
+
+    const char *samples[] = {"hello world", "aaaaaaaaaabbbbbbbbbbbccc", "a", "  ..  ..  ", "mississippi"};
+    for (size_t i = 0; i < sizeof samples / sizeof samples[0]; i++) {
+        char *enc = rle_encode(samples[i]);
+        char *dec = enc ? rle_decode(enc) : NULL;
+        CHECK_STR(dec, samples[i]);
+        free(enc);
+        free(dec);
+    }
+    char mixed[3001];
+    for (int i = 0; i < 3000; i++) mixed[i] = (char)('a' + (i / (1 + i % 7)) % 3);
+    mixed[3000] = '\0';
+    char *enc = rle_encode(mixed);
+    char *dec = enc ? rle_decode(enc) : NULL;
+    CHECK_STR(dec, mixed);
+    free(enc);
+    free(dec);
+
+    /* a 2,000,000-tile level with runs of 1 to 4 tiles */
+    size_t n = 2000000;
+    char *level = malloc(n + 1);
+    for (size_t i = 0, run = 0; i < n; run++) {
+        size_t len = 1 + run % 4;
+        for (size_t k = 0; k < len && i < n; k++) level[i++] = ".#~^"[run % 4];
+    }
+    level[n] = '\0';
+    enc = rle_encode(level);
+    dec = enc ? rle_decode(enc) : NULL;
+    CHECK(dec != NULL && strcmp(dec, level) == 0);
+    CHECK(enc != NULL && strncmp(enc, "1.2#3~4^1.", 10) == 0);
+    free(enc);
+    free(dec);
+    free(level);
+    return TEST_END();
+}
+
+
+=== exercise calc
+title: Debug-console calculator
+--- prompt
+Write the evaluator behind a game's debug console: it reads expressions from stdin, one per line, and prints each result on its own line. Blank lines (empty or only spaces/tabs) produce no output. Lines are at most 1000 characters.
+
+**Syntax.** Integer literals are non-negative decimal numbers. Operators are `+ - * / % ^`, plus unary `-` and `+`, and parentheses. Spaces and tabs may appear between tokens. From loosest to tightest:
+
+| Level | Operators | Associativity |
+|---|---|---|
+| additive | `+` `-` | left |
+| multiplicative | `*` `/` `%` | left |
+| unary | `-x` `+x` | prefix |
+| power | `^` | right, and its right operand may be unary: `2^-1` |
+
+So `-2^2` is `-4`, `2^3^2` is `512`, and `10 - 4 - 3` is `3`. All arithmetic is on `long long`; `/` and `%` truncate as in C. `0^0` is 1.
+
+**Errors.** If the line is not a valid expression, print `error: syntax`. Otherwise, if evaluation goes wrong, print the *first* problem in left-to-right evaluation order:
+
+- `error: division by zero` for `/` or `%` by zero;
+- `error: overflow` if any literal or intermediate result does not fit in a `long long` (so `-9223372036854775808` is an overflow, because the literal is; write `-9223372036854775807 - 1`);
+- `error: negative exponent`.
+
+`x % -1` is `0` for every `x`, even `LLONG_MIN`.
+
+```text
+1 + 2 * 3
+(1 + 2) * 3
+-7 / 2
+2 ^ 10
+1 +
+10 / (5 - 5)
+```
+
+prints
+
+```text
+7
+9
+-3
+1024
+error: syntax
+error: division by zero
+```
+--- starter
+#include <stdio.h>
+#include <string.h>
+
+int main(void) {
+    char line[1024];
+    while (fgets(line, sizeof line, stdin)) {
+        line[strcspn(line, "\r\n")] = '\0';
+        // parse and evaluate the line
+    }
+    return 0;
+}
+--- solution
+#include <stdio.h>
+#include <string.h>
+#include <stdbool.h>
+
+typedef struct {
+    const char *p;      /* current position in the line */
+    bool syntax_error;
+    const char *error;  /* first evaluation error, or NULL */
+} Parser;
+
+static void skip_spaces(Parser *ps) {
+    while (*ps->p == ' ' || *ps->p == '\t') ps->p++;
+}
+
+static void fail(Parser *ps, const char *msg) {
+    if (!ps->error) ps->error = msg;
+}
+
+static long long expr(Parser *ps);
+static long long unary(Parser *ps);
+
+static long long primary(Parser *ps) {
+    skip_spaces(ps);
+    if (*ps->p == '(') {
+        ps->p++;
+        long long v = expr(ps);
+        skip_spaces(ps);
+        if (*ps->p != ')') { ps->syntax_error = true; return 0; }
+        ps->p++;
+        return v;
+    }
+    if (*ps->p < '0' || *ps->p > '9') { ps->syntax_error = true; return 0; }
+    long long v = 0;
+    bool over = false;
+    while (*ps->p >= '0' && *ps->p <= '9') {
+        int d = *ps->p++ - '0';
+        if (!over && (__builtin_mul_overflow(v, 10, &v) || __builtin_add_overflow(v, d, &v))) over = true;
+    }
+    if (over) { fail(ps, "overflow"); return 0; }
+    return v;
+}
+
+static long long ipow(Parser *ps, long long base, long long e) {
+    if (e < 0) { fail(ps, "negative exponent"); return 0; }
+    if (base == 0) return e == 0 ? 1 : 0;
+    if (base == 1) return 1;
+    if (base == -1) return e % 2 == 0 ? 1 : -1;
+    long long r = 1;   /* |base| >= 2, so this overflows within 64 steps */
+    while (e-- > 0)
+        if (__builtin_mul_overflow(r, base, &r)) { fail(ps, "overflow"); return 0; }
+    return r;
+}
+
+/* power := primary ('^' unary)?   right associative, binds tighter than unary minus */
+static long long power(Parser *ps) {
+    long long base = primary(ps);
+    skip_spaces(ps);
+    if (*ps->p != '^') return base;
+    ps->p++;
+    long long e = unary(ps);
+    return ipow(ps, base, e);
+}
+
+/* unary := ('-' | '+') unary | power */
+static long long unary(Parser *ps) {
+    skip_spaces(ps);
+    if (*ps->p == '-') {
+        ps->p++;
+        long long v = unary(ps), r;
+        if (__builtin_sub_overflow(0LL, v, &r)) { fail(ps, "overflow"); return 0; }
+        return r;
+    }
+    if (*ps->p == '+') {
+        ps->p++;
+        return unary(ps);
+    }
+    return power(ps);
+}
+
+/* term := unary (('*' | '/' | '%') unary)* */
+static long long term(Parser *ps) {
+    long long v = unary(ps);
+    for (;;) {
+        skip_spaces(ps);
+        char op = *ps->p;
+        if (op != '*' && op != '/' && op != '%') return v;
+        ps->p++;
+        long long rhs = unary(ps);
+        if (op == '*') {
+            if (__builtin_mul_overflow(v, rhs, &v)) { fail(ps, "overflow"); v = 0; }
+        } else if (rhs == 0) {
+            fail(ps, "division by zero");
+            v = 0;
+        } else if (rhs == -1) {
+            /* LLONG_MIN / -1 overflows; x % -1 is always 0 */
+            if (op == '%') v = 0;
+            else if (__builtin_sub_overflow(0LL, v, &v)) { fail(ps, "overflow"); v = 0; }
+        } else {
+            v = op == '/' ? v / rhs : v % rhs;
+        }
+    }
+}
+
+/* expr := term (('+' | '-') term)* */
+static long long expr(Parser *ps) {
+    long long v = term(ps);
+    for (;;) {
+        skip_spaces(ps);
+        char op = *ps->p;
+        if (op != '+' && op != '-') return v;
+        ps->p++;
+        long long rhs = term(ps);
+        bool over = op == '+' ? __builtin_add_overflow(v, rhs, &v) : __builtin_sub_overflow(v, rhs, &v);
+        if (over) { fail(ps, "overflow"); v = 0; }
+    }
+}
+
+int main(void) {
+    char line[1024];
+    while (fgets(line, sizeof line, stdin)) {
+        line[strcspn(line, "\r\n")] = '\0';
+        Parser ps = {line, false, NULL};
+        skip_spaces(&ps);
+        if (*ps.p == '\0') continue;
+        long long v = expr(&ps);
+        skip_spaces(&ps);
+        if (*ps.p != '\0') ps.syntax_error = true;
+        if (ps.syntax_error) puts("error: syntax");
+        else if (ps.error) printf("error: %s\n", ps.error);
+        else printf("%lld\n", v);
+    }
+    return 0;
+}
+--- hint
+Keep the parser state in a struct: the current position, a syntax-error flag, and the first evaluation error message. Write `expr`, `term`, `unary`, `power` and `primary` as functions that each return a `long long` and advance the position.
+--- hint
+Don't stop at the first evaluation error: record it and keep parsing, because a syntax error anywhere on the line takes priority. After `expr` returns, the rest of the line must be only spaces.
+--- hint
+`__builtin_add_overflow`, `__builtin_sub_overflow` and `__builtin_mul_overflow` handle `+ - *` and the literal accumulation. Division overflows only for `LLONG_MIN / -1`. For `^`, handle bases 0, 1 and -1 specially; any other base overflows within 64 multiplications, so a simple loop is fine.
+--- test
+1 + 2 * 3
+(1 + 2) * 3
+-7 / 2
+2 ^ 10
+1 +
+10 / (5 - 5)
+--- out
+7
+9
+-3
+1024
+error: syntax
+error: division by zero
+--- test
+10 - 4 - 3
+100 % 7 % 3
+-7 % 3
+2*(3+4)*5-6/2
+
+	  42
++5
+--5
+3 * -(-4)
+((((7))))
+--- out
+3
+2
+-1
+67
+42
+5
+5
+12
+7
+--- test
+2^3^2
+2 ^ 2 ^ 3
+-2^2
+(-2)^3
+(-1)^1001
+0^0
+0^5
+3^39
+2^-1
+2^62 + 2^62
+2^63
+1^999999999999
+--- out
+512
+256
+-4
+-8
+-1
+1
+0
+4052555153018976267
+error: negative exponent
+error: overflow
+error: overflow
+1
+--- test
+9223372036854775807
+9223372036854775807 + 1
+-9223372036854775807 - 1
+-9223372036854775808
+(-9223372036854775807 - 1) / -1
+(-9223372036854775807 - 1) % -1
+-(-9223372036854775807 - 1)
+99999999999999999999 * 0
+3037000500 * 3037000500
+3037000499 * 3037000499
+--- out
+9223372036854775807
+error: overflow
+-9223372036854775808
+error: overflow
+error: overflow
+0
+error: overflow
+error: overflow
+error: overflow
+9223372030926249001
+--- test
+1 2
+(1 + 2
+1 + 2)
+()
+abc
+1 + * 2
+2 ^
+7 %% 2
+1/0 +
+1/0 + 2^-1
+2^-1 + 1/0
+-
+3 4 +
+--- out
+error: syntax
+error: syntax
+error: syntax
+error: syntax
+error: syntax
+error: syntax
+error: syntax
+error: syntax
+error: syntax
+error: division by zero
+error: negative exponent
+error: syntax
+error: syntax
+
+
+=== exercise vm
+title: Scripting VM, step 1: assembler and interpreter
+--- prompt
+Write an assembler and interpreter for a small stack machine, the kind of VM that runs game scripts (enemy behaviors, cutscenes, quest logic). The script text comes from stdin, one instruction per line. A `;` starts a comment that runs to the end of the line; blank lines are ignored. A line `name:` defines a label (letters, digits and `_`, not starting with a digit, at most 31 characters) for the next instruction. Lines are at most 255 characters; programs have at most 1000 instructions.
+
+The machine has a stack of up to 256 `long long` values and a separate call stack of up to 256 return addresses. Instructions (in the descriptions, `b` is the top of the stack and `a` the one below it):
+
+| Instruction | Effect |
+|---|---|
+| `push N` | push the decimal integer N (must fit in a `long long`) |
+| `pop`, `dup` | discard the top; push a copy of the top |
+| `swap`, `over` | `a b` to `b a`; `a b` to `a b a` |
+| `rot` | `x a b` to `a b x` (the third item moves to the top) |
+| `add`, `sub`, `mul` | pop `a` and `b`, push `a + b`, `a - b`, `a * b`, wrapping around on overflow (two's complement) |
+| `div`, `mod` | push `a / b`, `a % b` as in C; `LLONG_MIN / -1` wraps to `LLONG_MIN`, and `x % -1` is `0` |
+| `neg` | negate the top (wrapping) |
+| `eq`, `lt`, `gt` | pop `a` and `b`, push `1` if `a == b` / `a < b` / `a > b`, else `0` |
+| `print` | pop and print the value on its own line |
+| `jmp L` | jump to label L |
+| `jz L`, `jnz L` | pop; jump if the value is zero / non-zero |
+| `call L`, `ret` | push the address of the next instruction on the call stack and jump; pop it and jump there |
+| `halt` | stop. Running past the last instruction also stops. |
+
+**Assembly** happens before anything runs. Report the first problem in source order and exit with code 1, executing nothing:
+
+- `error: line N: unknown instruction 'X'`
+- `error: line N: wrong number of operands`
+- `error: line N: bad number 'X'`
+- `error: line N: bad label` (a malformed label name, in a definition or an operand)
+- `error: line N: duplicate label 'X'`
+- `error: line N: unknown label 'X'` (checked after the whole program is read, reported for the first instruction that uses it)
+
+**Runtime errors** stop execution with exit code 1, after any output already printed: `error: line N: stack underflow` (not enough values for the instruction), `stack overflow` (more than 256 values), `division by zero`, `return without call` and `call stack overflow`, each prefixed with `error: line N: ` where `N` is the source line of the failing instruction.
+
+Line numbers count every input line, including blank and comment lines, starting at 1.
+
+> **Performance:** resolve labels to instruction indices once, in the assembler. A VM that looks labels up by name (`strcmp` over a table) on every jump spends its time searching instead of running the script.
+--- starter
+#include <stdio.h>
+#include <string.h>
+
+int main(void) {
+    char line[256];
+    int lineno = 0;
+    while (fgets(line, sizeof line, stdin)) {
+        lineno++;
+        // assemble the line
+    }
+    // resolve labels, then run
+    return 0;
+}
+--- solution
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <ctype.h>
+#include <errno.h>
+
+enum op {
+    OP_PUSH, OP_POP, OP_DUP, OP_SWAP, OP_OVER, OP_ROT,
+    OP_ADD, OP_SUB, OP_MUL, OP_DIV, OP_MOD, OP_NEG,
+    OP_EQ, OP_LT, OP_GT, OP_PRINT,
+    OP_JMP, OP_JZ, OP_JNZ, OP_CALL, OP_RET, OP_HALT, OP_COUNT
+};
+
+static const char *const op_names[] = {
+    "push", "pop", "dup", "swap", "over", "rot",
+    "add", "sub", "mul", "div", "mod", "neg",
+    "eq", "lt", "gt", "print",
+    "jmp", "jz", "jnz", "call", "ret", "halt"
+};
+#define NOPS ((int)(sizeof op_names / sizeof op_names[0]))
+
+typedef struct {
+    enum op op;
+    long long arg;          /* push value, or jump target after linking */
+    char label[32];         /* jump label before linking */
+    int line;               /* source line, for error messages */
+} Instr;
+
+typedef struct { char name[32]; int addr; } Label;
+
+#define MAX_CODE 1000
+#define STACK_MAX 256
+
+static Instr code[MAX_CODE];
+static int ncode;
+static Label labels[MAX_CODE];
+static int nlabels;
+
+static int find_label(const char *name) {
+    for (int i = 0; i < nlabels; i++)
+        if (strcmp(labels[i].name, name) == 0) return labels[i].addr;
+    return -1;
+}
+
+static int is_ident(const char *s) {
+    if (!*s || !(isalpha((unsigned char)*s) || *s == '_')) return 0;
+    for (; *s; s++)
+        if (!(isalnum((unsigned char)*s) || *s == '_')) return 0;
+    return 1;
+}
+
+/* Assemble one source line. Returns 0 on success, prints an error and returns -1 otherwise. */
+static int assemble_line(char *s, int lineno) {
+    char *semi = strchr(s, ';');
+    if (semi) *semi = '\0';
+    char a[64] = "", b[64] = "", extra[2] = "";
+    int n = sscanf(s, "%63s %63s %1s", a, b, extra);
+    if (n <= 0) return 0;                       /* blank or comment */
+    size_t alen = strlen(a);
+    if (a[alen - 1] == ':') {                   /* label */
+        a[alen - 1] = '\0';
+        if (n != 1 || !is_ident(a) || alen > 31) {
+            printf("error: line %d: bad label\n", lineno);
+            return -1;
+        }
+        if (find_label(a) >= 0) {
+            printf("error: line %d: duplicate label '%s'\n", lineno, a);
+            return -1;
+        }
+        strcpy(labels[nlabels].name, a);
+        labels[nlabels++].addr = ncode;
+        return 0;
+    }
+    int op = -1;
+    for (int i = 0; i < NOPS; i++)
+        if (strcmp(a, op_names[i]) == 0) op = i;
+    if (op < 0) {
+        printf("error: line %d: unknown instruction '%s'\n", lineno, a);
+        return -1;
+    }
+    int wants_arg = op == OP_PUSH || op == OP_JMP || op == OP_JZ || op == OP_JNZ || op == OP_CALL;
+    if (n != (wants_arg ? 2 : 1)) {
+        printf("error: line %d: wrong number of operands\n", lineno);
+        return -1;
+    }
+    if (ncode == MAX_CODE) {
+        printf("error: line %d: program too long\n", lineno);
+        return -1;
+    }
+    Instr *in = &code[ncode];
+    in->op = (enum op)op;
+    in->line = lineno;
+    in->arg = 0;
+    in->label[0] = '\0';
+    if (op == OP_PUSH) {
+        char *end;
+        errno = 0;
+        in->arg = strtoll(b, &end, 10);
+        if (*end != '\0' || errno == ERANGE) {
+            printf("error: line %d: bad number '%s'\n", lineno, b);
+            return -1;
+        }
+    } else if (wants_arg) {
+        if (!is_ident(b) || strlen(b) > 31) {
+            printf("error: line %d: bad label\n", lineno);
+            return -1;
+        }
+        strcpy(in->label, b);
+    }
+    ncode++;
+    return 0;
+}
+
+static int link_labels(void) {
+    for (int i = 0; i < ncode; i++) {
+        if (!code[i].label[0]) continue;
+        int addr = find_label(code[i].label);
+        if (addr < 0) {
+            printf("error: line %d: unknown label '%s'\n", code[i].line, code[i].label);
+            return -1;
+        }
+        code[i].arg = addr;
+    }
+    return 0;
+}
+
+static int run(void) {
+    long long stack[STACK_MAX];
+    int calls[STACK_MAX];
+    int sp = 0, csp = 0, pc = 0;
+    while (pc < ncode) {
+        Instr *in = &code[pc++];
+        static const signed char pops[OP_COUNT] = {
+            [OP_POP] = 1, [OP_DUP] = 1, [OP_SWAP] = 2, [OP_OVER] = 2, [OP_ROT] = 3,
+            [OP_ADD] = 2, [OP_SUB] = 2, [OP_MUL] = 2, [OP_DIV] = 2, [OP_MOD] = 2, [OP_NEG] = 1,
+            [OP_EQ] = 2, [OP_LT] = 2, [OP_GT] = 2, [OP_PRINT] = 1, [OP_JZ] = 1, [OP_JNZ] = 1,
+        };
+        static const signed char pushes[OP_COUNT] = {
+            [OP_PUSH] = 1, [OP_DUP] = 2, [OP_SWAP] = 2, [OP_OVER] = 3, [OP_ROT] = 3,
+            [OP_ADD] = 1, [OP_SUB] = 1, [OP_MUL] = 1, [OP_DIV] = 1, [OP_MOD] = 1, [OP_NEG] = 1,
+            [OP_EQ] = 1, [OP_LT] = 1, [OP_GT] = 1,
+        };
+        if (sp < pops[in->op]) {
+            printf("error: line %d: stack underflow\n", in->line);
+            return -1;
+        }
+        if (sp - pops[in->op] + pushes[in->op] > STACK_MAX) {
+            printf("error: line %d: stack overflow\n", in->line);
+            return -1;
+        }
+        long long a = sp >= 2 ? stack[sp - 2] : 0, b = sp >= 1 ? stack[sp - 1] : 0;
+        unsigned long long ua = (unsigned long long)a, ub = (unsigned long long)b;
+        switch (in->op) {
+        case OP_PUSH: stack[sp++] = in->arg; break;
+        case OP_POP: sp--; break;
+        case OP_DUP: stack[sp++] = b; break;
+        case OP_SWAP: stack[sp - 2] = b; stack[sp - 1] = a; break;
+        case OP_OVER: stack[sp++] = a; break;
+        case OP_ROT: {   /* x a b -> a b x */
+            long long x = stack[sp - 3];
+            stack[sp - 3] = a; stack[sp - 2] = b; stack[sp - 1] = x;
+            break;
+        }
+        case OP_ADD: stack[--sp - 1] = (long long)(ua + ub); break;
+        case OP_SUB: stack[--sp - 1] = (long long)(ua - ub); break;
+        case OP_MUL: stack[--sp - 1] = (long long)(ua * ub); break;
+        case OP_DIV:
+        case OP_MOD:
+            if (b == 0) {
+                printf("error: line %d: division by zero\n", in->line);
+                return -1;
+            }
+            if (b == -1) stack[--sp - 1] = in->op == OP_DIV ? (long long)(0 - ua) : 0;
+            else stack[--sp - 1] = in->op == OP_DIV ? a / b : a % b;
+            break;
+        case OP_NEG: stack[sp - 1] = (long long)(0 - ub); break;
+        case OP_EQ: stack[--sp - 1] = a == b; break;
+        case OP_LT: stack[--sp - 1] = a < b; break;
+        case OP_GT: stack[--sp - 1] = a > b; break;
+        case OP_PRINT: printf("%lld\n", stack[--sp]); break;
+        case OP_JMP: pc = (int)in->arg; break;
+        case OP_JZ: if (stack[--sp] == 0) pc = (int)in->arg; break;
+        case OP_JNZ: if (stack[--sp] != 0) pc = (int)in->arg; break;
+        case OP_CALL:
+            if (csp == STACK_MAX) {
+                printf("error: line %d: call stack overflow\n", in->line);
+                return -1;
+            }
+            calls[csp++] = pc;
+            pc = (int)in->arg;
+            break;
+        case OP_RET:
+            if (csp == 0) {
+                printf("error: line %d: return without call\n", in->line);
+                return -1;
+            }
+            pc = calls[--csp];
+            break;
+        case OP_HALT: return 0;
+        case OP_COUNT: break;
+        }
+    }
+    return 0;
+}
+
+int main(void) {
+    char line[256];
+    int lineno = 0;
+    while (fgets(line, sizeof line, stdin)) {
+        lineno++;
+        if (assemble_line(line, lineno) != 0) return 1;
+    }
+    if (link_labels() != 0) return 1;
+    return run() == 0 ? 0 : 1;
+}
+--- hint
+Assemble into an array of structs `{ op, arg, label, line }`. Labels map to the index of the next instruction. After reading everything, a second pass replaces each jump's label with its index; that is how forward references work.
+--- hint
+`sscanf(line, "%63s %63s %1s", a, b, extra)` after cutting the line at `;` gives you the mnemonic, the operand, and tells you whether there was anything extra (it returns how many it read).
+--- hint
+Check stack depth before executing each instruction: a table of how many values each opcode pops and pushes keeps the underflow and overflow checks in one place. Do arithmetic in `unsigned long long` and convert back to get defined wrap-around.
+--- test
+push 2
+push 3
+add
+push 4
+mul
+print
+--- out
+20
+--- test
+; countdown
+push 3
+loop:
+  dup
+  print
+  push 1
+  sub
+  dup
+  jnz loop   ; keep going while non-zero
+pop
+--- out
+3
+2
+1
+--- test
+; first 10 Fibonacci numbers
+push 10   ; n
+push 0    ; a
+push 1    ; b
+loop:
+  over
+  print
+  swap
+  over
+  add
+  rot
+  push 1
+  sub
+  dup
+  jz done
+  rot
+  rot
+  jmp loop
+done:
+--- out
+0
+1
+1
+2
+3
+5
+8
+13
+21
+34
+--- test
+; recursive factorial
+push 10
+call fact
+print
+push 20
+call fact
+print
+halt
+push 999
+print
+
+fact:       ; n -> n!
+  dup
+  push 2
+  lt
+  jnz base
+  dup
+  push 1
+  sub
+  call fact
+  mul
+  ret
+base:
+  pop
+  push 1
+  ret
+--- out
+3628800
+2432902008176640000
+--- test
+push 1
+push 2
+over
+print
+print
+print
+push 1
+push 2
+push 3
+rot
+print
+print
+print
+push 7
+push 7
+eq
+print
+push 3
+push 5
+gt
+print
+push -3
+push 5
+lt
+print
+--- out
+1
+2
+1
+1
+3
+2
+1
+0
+1
+--- test
+push 9223372036854775807
+push 1
+add
+print
+push -9223372036854775807
+push 1
+sub
+push -1
+div
+print
+push -7
+push 2
+mod
+print
+push -7
+push 2
+div
+print
+push 5
+neg
+print
+push 4611686018427387904
+push 2
+mul
+print
+--- out
+-9223372036854775808
+-9223372036854775808
+-1
+-3
+-5
+-9223372036854775808
+--- test
+push 1
+print
+push 2
+add
+print
+--- out
+1
+error: line 4: stack underflow
+--- exit
+1
+--- test
+push 10
+push 0
+
+div
+--- out
+error: line 4: division by zero
+--- exit
+1
+--- test
+push 1
+print
+; typo below
+pushh 2
+--- out
+error: line 4: unknown instruction 'pushh'
+--- exit
+1
+--- test
+push 1
+jz nowhere
+print
+--- out
+error: line 2: unknown label 'nowhere'
+--- exit
+1
+--- test
+push 1 2
+--- out
+error: line 1: wrong number of operands
+--- exit
+1
+--- test
+add 3
+--- out
+error: line 1: wrong number of operands
+--- exit
+1
+--- test
+push 12x
+--- out
+error: line 1: bad number '12x'
+--- exit
+1
+--- test
+push 99999999999999999999
+--- out
+error: line 1: bad number '99999999999999999999'
+--- exit
+1
+--- test
+start:
+push 1
+start:
+--- out
+error: line 3: duplicate label 'start'
+--- exit
+1
+--- test
+jmp 9lives
+--- out
+error: line 1: bad label
+--- exit
+1
+--- test
+push 5
+ret
+--- out
+error: line 2: return without call
+--- exit
+1
+--- test
+loop:
+  push 1
+  jmp loop
+--- out
+error: line 2: stack overflow
+--- exit
+1
+--- test
+f:
+  call f
+--- out
+error: line 2: call stack overflow
+--- exit
+1
+--- test
+--- out
+
+
+=== exercise vm_vars
+title: Scripting VM, step 2: variables
+continues: vm
+--- prompt
+Scripts need state: a door's open flag, a boss's phase, a counter. Extend your VM from step 1 with 16 variable slots, numbered `0` to `15`, all starting at `0`:
+
+| Instruction | Effect |
+|---|---|
+| `load N` | push the value of slot N |
+| `store N` | pop a value into slot N |
+
+The operand must be a decimal number from `0` to `15`; anything else is an assembly error `error: line N: bad slot 'X'`. A missing or extra operand is `wrong number of operands`, as before, and `store` with an empty stack is a `stack underflow`.
+
+One test runs a loop of a million iterations (about ten million instructions); it should take well under a second.
+
+> **Performance:** variables are an array indexed by a number fixed at assembly time, never a lookup by name at run time. Real VMs (Lua's included) compile local variable names to slot numbers for exactly this reason.
+--- stubs
+/* Step 2: add OP_LOAD and OP_STORE to the opcode enum and name table, assemble their slot
+   operand (0..15, else "bad slot"), and execute them against a `long long slots[16]` array. */
+--- solution
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <ctype.h>
+#include <errno.h>
+
+enum op {
+    OP_PUSH, OP_POP, OP_DUP, OP_SWAP, OP_OVER, OP_ROT,
+    OP_ADD, OP_SUB, OP_MUL, OP_DIV, OP_MOD, OP_NEG,
+    OP_EQ, OP_LT, OP_GT, OP_PRINT,
+    OP_JMP, OP_JZ, OP_JNZ, OP_CALL, OP_RET, OP_HALT,
+    OP_LOAD, OP_STORE, OP_COUNT
+};
+
+static const char *const op_names[] = {
+    "push", "pop", "dup", "swap", "over", "rot",
+    "add", "sub", "mul", "div", "mod", "neg",
+    "eq", "lt", "gt", "print",
+    "jmp", "jz", "jnz", "call", "ret", "halt",
+    "load", "store"
+};
+#define NOPS ((int)(sizeof op_names / sizeof op_names[0]))
+
+typedef struct {
+    enum op op;
+    long long arg;          /* push value, or jump target after linking */
+    char label[32];         /* jump label before linking */
+    int line;               /* source line, for error messages */
+} Instr;
+
+typedef struct { char name[32]; int addr; } Label;
+
+#define MAX_CODE 1000
+#define STACK_MAX 256
+#define NSLOTS 16
+
+static Instr code[MAX_CODE];
+static int ncode;
+static Label labels[MAX_CODE];
+static int nlabels;
+
+static int find_label(const char *name) {
+    for (int i = 0; i < nlabels; i++)
+        if (strcmp(labels[i].name, name) == 0) return labels[i].addr;
+    return -1;
+}
+
+static int is_ident(const char *s) {
+    if (!*s || !(isalpha((unsigned char)*s) || *s == '_')) return 0;
+    for (; *s; s++)
+        if (!(isalnum((unsigned char)*s) || *s == '_')) return 0;
+    return 1;
+}
+
+/* Assemble one source line. Returns 0 on success, prints an error and returns -1 otherwise. */
+static int assemble_line(char *s, int lineno) {
+    char *semi = strchr(s, ';');
+    if (semi) *semi = '\0';
+    char a[64] = "", b[64] = "", extra[2] = "";
+    int n = sscanf(s, "%63s %63s %1s", a, b, extra);
+    if (n <= 0) return 0;                       /* blank or comment */
+    size_t alen = strlen(a);
+    if (a[alen - 1] == ':') {                   /* label */
+        a[alen - 1] = '\0';
+        if (n != 1 || !is_ident(a) || alen > 31) {
+            printf("error: line %d: bad label\n", lineno);
+            return -1;
+        }
+        if (find_label(a) >= 0) {
+            printf("error: line %d: duplicate label '%s'\n", lineno, a);
+            return -1;
+        }
+        strcpy(labels[nlabels].name, a);
+        labels[nlabels++].addr = ncode;
+        return 0;
+    }
+    int op = -1;
+    for (int i = 0; i < NOPS; i++)
+        if (strcmp(a, op_names[i]) == 0) op = i;
+    if (op < 0) {
+        printf("error: line %d: unknown instruction '%s'\n", lineno, a);
+        return -1;
+    }
+    int wants_arg = op == OP_PUSH || op == OP_LOAD || op == OP_STORE || op == OP_JMP || op == OP_JZ || op == OP_JNZ || op == OP_CALL;
+    if (n != (wants_arg ? 2 : 1)) {
+        printf("error: line %d: wrong number of operands\n", lineno);
+        return -1;
+    }
+    if (ncode == MAX_CODE) {
+        printf("error: line %d: program too long\n", lineno);
+        return -1;
+    }
+    Instr *in = &code[ncode];
+    in->op = (enum op)op;
+    in->line = lineno;
+    in->arg = 0;
+    in->label[0] = '\0';
+    if (op == OP_PUSH) {
+        char *end;
+        errno = 0;
+        in->arg = strtoll(b, &end, 10);
+        if (*end != '\0' || errno == ERANGE) {
+            printf("error: line %d: bad number '%s'\n", lineno, b);
+            return -1;
+        }
+    } else if (op == OP_LOAD || op == OP_STORE) {
+        char *end;
+        long slot = strtol(b, &end, 10);
+        if (*end != '\0' || !isdigit((unsigned char)b[0]) || slot >= NSLOTS) {
+            printf("error: line %d: bad slot '%s'\n", lineno, b);
+            return -1;
+        }
+        in->arg = slot;
+    } else if (wants_arg) {
+        if (!is_ident(b) || strlen(b) > 31) {
+            printf("error: line %d: bad label\n", lineno);
+            return -1;
+        }
+        strcpy(in->label, b);
+    }
+    ncode++;
+    return 0;
+}
+
+static int link_labels(void) {
+    for (int i = 0; i < ncode; i++) {
+        if (!code[i].label[0]) continue;
+        int addr = find_label(code[i].label);
+        if (addr < 0) {
+            printf("error: line %d: unknown label '%s'\n", code[i].line, code[i].label);
+            return -1;
+        }
+        code[i].arg = addr;
+    }
+    return 0;
+}
+
+static int run(void) {
+    long long stack[STACK_MAX];
+    int calls[STACK_MAX];
+    long long slots[NSLOTS] = {0};
+    int sp = 0, csp = 0, pc = 0;
+    while (pc < ncode) {
+        Instr *in = &code[pc++];
+        static const signed char pops[OP_COUNT] = {
+            [OP_POP] = 1, [OP_DUP] = 1, [OP_SWAP] = 2, [OP_OVER] = 2, [OP_ROT] = 3,
+            [OP_ADD] = 2, [OP_SUB] = 2, [OP_MUL] = 2, [OP_DIV] = 2, [OP_MOD] = 2, [OP_NEG] = 1,
+            [OP_EQ] = 2, [OP_LT] = 2, [OP_GT] = 2, [OP_PRINT] = 1, [OP_JZ] = 1, [OP_JNZ] = 1, [OP_STORE] = 1,
+        };
+        static const signed char pushes[OP_COUNT] = {
+            [OP_PUSH] = 1, [OP_DUP] = 2, [OP_SWAP] = 2, [OP_OVER] = 3, [OP_ROT] = 3,
+            [OP_ADD] = 1, [OP_SUB] = 1, [OP_MUL] = 1, [OP_DIV] = 1, [OP_MOD] = 1, [OP_NEG] = 1,
+            [OP_EQ] = 1, [OP_LT] = 1, [OP_GT] = 1, [OP_LOAD] = 1,
+        };
+        if (sp < pops[in->op]) {
+            printf("error: line %d: stack underflow\n", in->line);
+            return -1;
+        }
+        if (sp - pops[in->op] + pushes[in->op] > STACK_MAX) {
+            printf("error: line %d: stack overflow\n", in->line);
+            return -1;
+        }
+        long long a = sp >= 2 ? stack[sp - 2] : 0, b = sp >= 1 ? stack[sp - 1] : 0;
+        unsigned long long ua = (unsigned long long)a, ub = (unsigned long long)b;
+        switch (in->op) {
+        case OP_PUSH: stack[sp++] = in->arg; break;
+        case OP_POP: sp--; break;
+        case OP_DUP: stack[sp++] = b; break;
+        case OP_SWAP: stack[sp - 2] = b; stack[sp - 1] = a; break;
+        case OP_OVER: stack[sp++] = a; break;
+        case OP_ROT: {   /* x a b -> a b x */
+            long long x = stack[sp - 3];
+            stack[sp - 3] = a; stack[sp - 2] = b; stack[sp - 1] = x;
+            break;
+        }
+        case OP_ADD: stack[--sp - 1] = (long long)(ua + ub); break;
+        case OP_SUB: stack[--sp - 1] = (long long)(ua - ub); break;
+        case OP_MUL: stack[--sp - 1] = (long long)(ua * ub); break;
+        case OP_DIV:
+        case OP_MOD:
+            if (b == 0) {
+                printf("error: line %d: division by zero\n", in->line);
+                return -1;
+            }
+            if (b == -1) stack[--sp - 1] = in->op == OP_DIV ? (long long)(0 - ua) : 0;
+            else stack[--sp - 1] = in->op == OP_DIV ? a / b : a % b;
+            break;
+        case OP_NEG: stack[sp - 1] = (long long)(0 - ub); break;
+        case OP_EQ: stack[--sp - 1] = a == b; break;
+        case OP_LT: stack[--sp - 1] = a < b; break;
+        case OP_GT: stack[--sp - 1] = a > b; break;
+        case OP_PRINT: printf("%lld\n", stack[--sp]); break;
+        case OP_JMP: pc = (int)in->arg; break;
+        case OP_JZ: if (stack[--sp] == 0) pc = (int)in->arg; break;
+        case OP_JNZ: if (stack[--sp] != 0) pc = (int)in->arg; break;
+        case OP_CALL:
+            if (csp == STACK_MAX) {
+                printf("error: line %d: call stack overflow\n", in->line);
+                return -1;
+            }
+            calls[csp++] = pc;
+            pc = (int)in->arg;
+            break;
+        case OP_RET:
+            if (csp == 0) {
+                printf("error: line %d: return without call\n", in->line);
+                return -1;
+            }
+            pc = calls[--csp];
+            break;
+        case OP_HALT: return 0;
+        case OP_LOAD: stack[sp++] = slots[in->arg]; break;
+        case OP_STORE: slots[in->arg] = stack[--sp]; break;
+        case OP_COUNT: break;
+        }
+    }
+    return 0;
+}
+
+int main(void) {
+    char line[256];
+    int lineno = 0;
+    while (fgets(line, sizeof line, stdin)) {
+        lineno++;
+        if (assemble_line(line, lineno) != 0) return 1;
+    }
+    if (link_labels() != 0) return 1;
+    return run() == 0 ? 0 : 1;
+}
+--- hint
+Assemble `load`/`store` like `push`, but validate the operand: it must be all digits and less than 16. Store the slot number in the instruction's `arg` field.
+--- hint
+`store` pops one value and pushes none; `load` pops none and pushes one. If you have a pops/pushes table, add them there and the stack checks come for free.
+--- test
+; a door that opens on the third switch press
+push 0
+store 0          ; presses
+press:
+  load 0
+  push 1
+  add
+  dup
+  store 0
+  push 3
+  lt
+  jnz press
+load 0
+print
+push 1
+store 7          ; door_open = 1
+load 7
+print
+load 15
+print
+--- out
+3
+1
+0
+--- test
+; sum 1..1000000
+push 0
+store 0          ; total
+push 1000000
+store 1          ; i
+loop:
+  load 0
+  load 1
+  add
+  store 0
+  load 1
+  push 1
+  sub
+  dup
+  store 1
+  jnz loop
+load 0
+print
+--- out
+500000500000
+--- test
+; boss phases: hp 100 takes 30 damage per hit, phase changes below 50
+push 100
+store 2          ; hp
+push 1
+store 3          ; phase
+hit:
+  load 2
+  push 30
+  sub
+  dup
+  store 2
+  dup
+  push 50
+  lt
+  jz still_one
+  push 2
+  store 3
+still_one:
+  push 0
+  gt
+  jnz hit
+load 2
+print
+load 3
+print
+--- out
+-20
+2
+--- test
+store 0
+--- out
+error: line 1: stack underflow
+--- exit
+1
+--- test
+push 1
+load 16
+--- out
+error: line 2: bad slot '16'
+--- exit
+1
+--- test
+store -1
+--- out
+error: line 1: bad slot '-1'
+--- exit
+1
+--- test
+load hp
+--- out
+error: line 1: bad slot 'hp'
+--- exit
+1
+--- test
+load
+--- out
+error: line 1: wrong number of operands
+--- exit
+1
+
+=== exercise ini
+title: Settings file parser
+--- prompt
+Read a game's `settings.ini` from stdin and print every setting as `section.key=value`, one per line, sorted by the full name (`section.key`) with `strcmp`.
+
+Lines (after trimming leading and trailing spaces and tabs) are one of:
+
+- blank, or a comment whose first character is `;` or `#`: ignored;
+- a section header `[name]`: spaces inside the brackets are trimmed; nothing may follow the `]`;
+- a setting `key = value`, split at the **first** `=`. The key and value are trimmed. The value may be empty and may contain `=`. If the trimmed value starts with `"`, it must also end with `"` and contain no other quotes; the quotes are removed and the spaces inside kept.
+
+Section names and keys must be non-empty and contain only letters, digits, `_` and `-`. They are case-insensitive: print them in lowercase. Values are printed as written. Settings before the first section header print as just `key=value`. If the same section and key appear again (including in a repeated section, in any case), the later value replaces the earlier one.
+
+If any line is malformed, print only `error: line N` (lines are numbered from 1, counting every line) and exit with code 1. Lines are at most 1000 characters.
+
+```text
+; global
+player_name = Ada Lovelace
+
+[Video]
+width = 1920
+vsync=on
+[video]
+WIDTH = 2560
+```
+
+prints
+
+```text
+player_name=Ada Lovelace
+video.vsync=on
+video.width=2560
+```
+--- starter
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+int main(void) {
+    char line[1024];
+    while (fgets(line, sizeof line, stdin)) {
+        // parse the line
+    }
+    return 0;
+}
+--- solution
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <ctype.h>
+
+typedef struct {
+    char *name;    /* "section.key" or "key", lowercased */
+    char *value;
+} Entry;
+
+static Entry *entries;
+static size_t count, cap;
+
+static char *dup_range(const char *s, size_t n) {
+    char *p = malloc(n + 1);
+    if (!p) exit(2);
+    memcpy(p, s, n);
+    p[n] = '\0';
+    return p;
+}
+
+/* Trim spaces and tabs in place; returns the start and sets *len. */
+static const char *trim(const char *s, size_t *len) {
+    const char *e = s + strlen(s);
+    while (*s == ' ' || *s == '\t') s++;
+    while (e > s && (e[-1] == ' ' || e[-1] == '\t')) e--;
+    *len = (size_t)(e - s);
+    return s;
+}
+
+static int valid_name(const char *s, size_t n) {
+    if (n == 0) return 0;
+    for (size_t i = 0; i < n; i++)
+        if (!(isalnum((unsigned char)s[i]) || s[i] == '_' || s[i] == '-')) return 0;
+    return 1;
+}
+
+static void set(char *name, char *value) {
+    for (size_t i = 0; i < count; i++)
+        if (strcmp(entries[i].name, name) == 0) {
+            free(entries[i].value);
+            free(name);
+            entries[i].value = value;
+            return;
+        }
+    if (count == cap) {
+        cap = cap ? cap * 2 : 16;
+        Entry *p = realloc(entries, cap * sizeof *p);
+        if (!p) exit(2);
+        entries = p;
+    }
+    entries[count].name = name;
+    entries[count].value = value;
+    count++;
+}
+
+static int by_name(const void *a, const void *b) {
+    return strcmp(((const Entry *)a)->name, ((const Entry *)b)->name);
+}
+
+static void free_all(void) {
+    for (size_t i = 0; i < count; i++) {
+        free(entries[i].name);
+        free(entries[i].value);
+    }
+    free(entries);
+}
+
+int main(void) {
+    char line[1024];
+    char section[256] = "";
+    int lineno = 0;
+    while (fgets(line, sizeof line, stdin)) {
+        lineno++;
+        line[strcspn(line, "\r\n")] = '\0';
+        size_t n;
+        const char *s = trim(line, &n);
+        if (n == 0 || *s == ';' || *s == '#') continue;
+        if (*s == '[') {
+            if (s[n - 1] != ']') goto bad;
+            char inner[256];
+            if (n - 2 >= sizeof inner) goto bad;
+            memcpy(inner, s + 1, n - 2);
+            inner[n - 2] = '\0';
+            size_t m;
+            const char *name = trim(inner, &m);
+            if (!valid_name(name, m)) goto bad;
+            for (size_t i = 0; i < m; i++) section[i] = (char)tolower((unsigned char)name[i]);
+            section[m] = '\0';
+            continue;
+        }
+        const char *eq = strchr(s, '=');
+        if (!eq) goto bad;
+        char keybuf[1024];
+        memcpy(keybuf, s, (size_t)(eq - s));
+        keybuf[eq - s] = '\0';
+        size_t klen;
+        const char *key = trim(keybuf, &klen);
+        if (!valid_name(key, klen)) goto bad;
+        size_t vlen;
+        const char *val = trim(eq + 1, &vlen);
+        if (vlen > 0 && *val == '"') {
+            if (vlen < 2 || val[vlen - 1] != '"') goto bad;
+            val++;
+            vlen -= 2;
+            if (memchr(val, '"', vlen)) goto bad;
+        }
+        size_t slen = strlen(section);
+        char *full = malloc(slen + 1 + klen + 1);
+        if (!full) return 2;
+        char *w = full;
+        if (slen) {
+            memcpy(w, section, slen);
+            w += slen;
+            *w++ = '.';
+        }
+        for (size_t i = 0; i < klen; i++) *w++ = (char)tolower((unsigned char)key[i]);
+        *w = '\0';
+        set(full, dup_range(val, vlen));
+    }
+    if (count > 0) qsort(entries, count, sizeof *entries, by_name);
+    for (size_t i = 0; i < count; i++) printf("%s=%s\n", entries[i].name, entries[i].value);
+    free_all();
+    return 0;
+bad:
+    printf("error: line %d\n", lineno);
+    free_all();
+    return 1;
+}
+--- hint
+Keep the settings in a growable array of `{ char *name; char *value; }` where `name` is the full lowercased `section.key`. Before adding, look for an existing entry with the same name and replace its value (freeing the old one).
+--- hint
+Write a `trim` helper that returns a pointer to the first non-space character and a length, rather than modifying the string; most of the parsing then becomes pointer arithmetic on ranges.
+--- hint
+Parse everything before printing anything: an error on the last line means nothing else is printed. Use `goto bad` to a single error exit that frees everything.
+--- test
+; global
+player_name = Ada Lovelace
+
+[Video]
+width = 1920
+vsync=on
+[video]
+WIDTH = 2560
+--- out
+player_name=Ada Lovelace
+video.vsync=on
+video.width=2560
+--- test
+# settings
+Version=3
+[ database ]
+user = admin
+password = "  pass word"
+url = postgres://h/db?x=1&y=2
+empty =
+quoted_empty = ""
+[a-b_c]
+Key_1 = value with = sign
+  ; indented comment
+	[ZZ]
+x=last
+[database]
+User = root
+--- out
+a-b_c.key_1=value with = sign
+database.empty=
+database.password=  pass word
+database.quoted_empty=
+database.url=postgres://h/db?x=1&y=2
+database.user=root
+version=3
+zz.x=last
+--- test
+[b]
+k=2
+[a]
+k=1
+[b]
+j=0
+--- out
+a.k=1
+b.j=0
+b.k=2
+--- test
+[ok]
+x = 1
+[broken
+y = 2
+--- out
+error: line 3
+--- exit
+1
+--- test
+a = 1
+
+this line has no equals sign
+--- out
+error: line 3
+--- exit
+1
+--- test
+[]
+--- out
+error: line 1
+--- exit
+1
+--- test
+[s] extra
+--- out
+error: line 1
+--- exit
+1
+--- test
+two words = 1
+--- out
+error: line 1
+--- exit
+1
+--- test
+ = 3
+--- out
+error: line 1
+--- exit
+1
+--- test
+k = "unterminated
+--- out
+error: line 1
+--- exit
+1
+--- test
+k = "a"b"
+--- out
+error: line 1
+--- exit
+1
+--- test
+[sec.tion]
+--- out
+error: line 1
+--- exit
+1
+--- test
+--- out
+
+
+=== quiz
+--- q
+A string builder grows its buffer by a fixed 64 bytes whenever it is full. What is the total cost of appending `n` characters one at a time?
+--- choice
+O(n), the same as doubling
+--- answer
+O(n²), because each regrowth may copy everything so far, and there are n/64 regrowths
+--- choice
+O(n log n)
+--- choice
+O(1) per append, because realloc never copies
+--- explain
+With a fixed increment there are about n/64 reallocations, each of which may copy the whole current buffer: 64 + 128 + ... + n, which is O(n²). Multiplying the capacity (by 2, or 1.5) makes the copies form a geometric series whose sum is O(n): amortized O(1) per append. `realloc` *can* sometimes extend in place, but you cannot rely on it.
+
+=== quiz
+--- q
+In the calculator grammar, why does `expr` call `term` and not the other way around?
+--- choice
+Because addition is evaluated before multiplication
+--- answer
+Because the rule for a lower-precedence operator is built from the rule for the higher one, so `*` groups first
+--- choice
+To avoid infinite recursion; the order is otherwise arbitrary
+--- choice
+Because `term` handles parentheses
+--- explain
+In `1 + 2 * 3`, `expr` asks `term` for its operands; `term` consumes `2 * 3` as a unit before `expr` ever sees the `+`. Each precedence level is one function, from loosest at the top to tightest at the bottom.
+
+=== quiz
+run: yes
+--- q
+A pool's block size is rounded up to 16 and its free list is stored inside the free blocks. What does this print?
+--- code
+#include <stdio.h>
+#include <stddef.h>
+
+static size_t round_block(size_t n) {
+    if (n < 16) n = 16;
+    return (n + 15) & ~(size_t)15;
+}
+
+int main(void) {
+    printf("%zu %zu %zu %zu\n", round_block(1), round_block(16), round_block(17), round_block(40));
+    return 0;
+}
+--- choice
+1 16 17 40
+--- choice
+16 16 16 32
+--- answer
+16 16 32 48
+--- choice
+16 32 32 48
+--- explain
+`(n + 15) & ~15` rounds up to the next multiple of 16 (leaving multiples alone). The minimum of 16 guarantees room for the free-list pointer and keeps every block aligned like `malloc`'s.
+
+=== quiz
+--- q
+In an array-based binary min-heap, where are the children of the element at index 5?
+--- choice
+6 and 7
+--- answer
+11 and 12
+--- choice
+10 and 11
+--- choice
+It depends on the order of insertion
+--- explain
+With the root at index 0, the children of `i` are `2i + 1` and `2i + 2`, and the parent is `(i - 1) / 2`. The whole tree is implicit in the indices, so the heap needs no pointers and sits in one contiguous block of memory.
+
+=== quiz
+--- q
+Your event queue uses lazy deletion: cancelled events stay in the heap and are discarded when they reach the top. What is the main cost?
+--- choice
+Popping becomes O(n)
+--- answer
+The heap can hold dead entries, so memory use is bounded by events pushed rather than events pending
+--- choice
+Events at the same tick come out in the wrong order
+--- choice
+Cancelling becomes O(log n)
+--- explain
+Every event is still pushed once and popped once, so the total work stays O(log n) per event and cancelling is O(1). The price is memory: if you cancel far more than you pop, dead entries pile up. Real engines rebuild the heap when the dead fraction gets large.
+
+=== quiz
+run: yes
+--- q
+What does this print?
+--- code
+#include <stdio.h>
+#include <string.h>
+
+int main(void) {
+    char row[] = "....####..";
+    char out[32], *w = out;
+    for (size_t i = 0; row[i];) {
+        size_t run = 1;
+        while (row[i + run] == row[i]) run++;
+        w += sprintf(w, "%zu%c", run, row[i]);
+        i += run;
+    }
+    puts(out);
+    return 0;
+}
+--- choice
+4.4#3.
+--- answer
+4.4#2.
+--- choice
+.4#4.2
+--- choice
+4.#4.2
+--- explain
+Each run is written as its length followed by the character. `sprintf` returns the number of characters written, so `w += sprintf(...)` advances the write pointer without rescanning the string, which is how to avoid `strcat`'s O(n²).

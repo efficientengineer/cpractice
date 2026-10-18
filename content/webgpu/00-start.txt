@@ -16,7 +16,9 @@ A CPU has a handful of big cores, each built to run one thread of branchy, unpre
 
 Rule of thumb: the GPU wins when you have a lot of data (tens of thousands of elements or more), the work per element is independent, and the data can stay on the GPU between steps. Adding two arrays of 100 numbers is faster on the CPU: the round trip costs more than the work.
 
-Graphics is the original case: every pixel runs the same fragment program, every vertex the same vertex program. *Compute shaders* use the same hardware for anything else: physics, image filters, matrix math, simulations, machine learning.
+Graphics is the original case: every pixel runs the same fragment program, every vertex the same vertex program. *Compute shaders* use the same hardware for anything else. In a game that means: moving 100,000 particles, stepping bullets, flocking, cellular automata on a tile map, culling, light grids, terrain generation.
+
+> **Performance:** the GPU is fast at *a lot of the same thing*. A game that sends it one sprite at a time, with a separate upload and draw call per sprite, is limited by CPU overhead and gets none of that speed. This course teaches the batched way first: one buffer upload per frame, one draw call for many objects (instancing), simulation that stays on the GPU.
 
 ## WebGPU and the native APIs
 
@@ -60,9 +62,11 @@ navigator.gpu                    entry point (GPU)
 - **Device**: owns every object you create. If the device is *lost* (driver crash, GPU reset, tab backgrounded on mobile), all of them become invalid and `device.lost` resolves.
 - **Queue**: `device.queue`. `submit()` hands command buffers to the GPU; `writeBuffer`/`writeTexture` upload data.
 - **Shader module**: WGSL source compiled once.
-- **Pipeline**: a shader entry point plus all the state that goes with it (for rendering: vertex formats, blending, target formats). Building it is expensive, so you do it once at startup, not per frame.
+- **Pipeline**: a shader entry point plus all the state that goes with it (for rendering: vertex formats, blending, target formats). Building one compiles shaders for the driver: milliseconds, sometimes far more.
 - **Bind group layout / bind group**: a shader declares `@group(0) @binding(1) var<storage> data: array<f32>;`. A *bind group* is the object that says "binding 1 of group 0 is *this* buffer". Its *layout* is the type: which bindings, what kinds of resources.
 - **Command encoder**: records commands (passes, copies) into a command buffer. Nothing runs until you submit it.
+
+> **Performance:** split your code into *init* and *frame*. Init creates shader modules, pipelines, buffers, textures and bind groups. The frame function only writes new data into existing buffers (`queue.writeBuffer`), encodes passes and submits. Creating a pipeline or buffer inside the frame loop is the most common WebGPU beginner mistake: it causes stutters (shader compiles), garbage, and steadily growing GPU memory. Encoders and command buffers are the exception: they are cheap, single-use, and made fresh every frame.
 
 ## GPU work is asynchronous
 
@@ -77,6 +81,8 @@ GPU:                └──── run the commands ────┘
 - To get results back you copy them to a buffer the CPU can map, then `await buffer.mapAsync(GPUMapMode.READ)`. That promise resolves once the GPU has finished everything that writes to it.
 - `await device.queue.onSubmittedWorkDone()` waits for all submitted work.
 - Commands run in submission order, so you can submit step 1, then step 2 that reads step 1's output, without waiting in between. Waiting (and reading back) is the slow part; do it as rarely as possible.
+
+> **Performance:** never `await mapAsync` (or `readBuffer`) inside a frame loop. It stalls the CPU until the GPU drains its queue, then the GPU sits idle while the CPU prepares the next frame: you lose the overlap that makes both fast. Keep game state on the GPU when the GPU computes it, or read results back a few frames late with a ring of staging buffers. This chapter's examples read back because that's how you *check* results while learning.
 
 ## Errors don't throw
 
@@ -140,7 +146,7 @@ const device = await adapter.requestDevice();
 console.log('max workgroup size x:', device.limits.maxComputeWorkgroupSizeX);
 ```
 
-Rendering exercises give you `device` and a texture *view* to draw into: the tests render into their own small texture and check pixel colors; **Run** shows the same drawing on the canvas.
+Rendering exercises give you `device` and a texture *view* to draw into: the tests render into their own small texture, check pixel colors, then draw your result on the canvas so you can see it.
 
 ## Something on the screen
 
@@ -164,6 +170,37 @@ pass.end();
 device.queue.submit([encoder.finish()]);
 console.log('cleared a', canvas.width, 'x', canvas.height, 'canvas');
 ```
+
+## A frame loop
+
+Games redraw every frame. `requestAnimationFrame` works in the worker; the worker keeps running after your code finishes, until the next Run. The globals `keys` (a `Set` of held `KeyboardEvent.code` values such as `'Space'` or `'ArrowLeft'`) and `mouse` (`{ x, y, down }` in canvas pixels) give you input; click the canvas first so it has keyboard focus.
+
+```js
+// INIT: everything that can be created once.
+const device = await getDevice();
+const context = canvas.getContext('webgpu');
+const format = navigator.gpu.getPreferredCanvasFormat();
+context.configure({ device, format });
+const flash = { r: 0.9, g: 0.2, b: 0.2, a: 1 }, calm = { r: 0.1, g: 0.1, b: 0.2, a: 1 };
+let hue = 0;
+
+// FRAME: only per-frame work. Hold Space or the mouse button to flash.
+function frame(t) {
+  hue = t / 1000;
+  const color = keys.has('Space') || mouse.down ? flash
+    : { r: 0.1, g: 0.15 + 0.1 * Math.sin(hue), b: 0.3, a: 1 };
+  const encoder = device.createCommandEncoder();
+  encoder.beginRenderPass({
+    colorAttachments: [{ view: context.getCurrentTexture().createView(), loadOp: 'clear', clearValue: color, storeOp: 'store' }],
+  }).end();
+  device.queue.submit([encoder.finish()]);
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+console.log('running: hold Space');
+```
+
+`getCurrentTexture()` returns a new texture each frame (the canvas swaps between buffers), so its view is made per frame. Everything else was made once.
 
 ## Your first compute shader, end to end
 
@@ -226,11 +263,15 @@ What happened, in order:
 4. The bind group connects the buffer to the shader's `@group(0) @binding(0)` declaration.
 5. The command encoder recorded the pass; nothing ran until `submit`.
 
-That is a lot of ceremony for squaring ten numbers, and on the CPU it would be faster. The ceremony is fixed cost: the same code squares ten million numbers, and then the GPU wins by a mile. The next chapters take each piece apart: WGSL, buffers, compute in depth, then rendering.
+That is a lot of ceremony for squaring ten numbers, and on the CPU it would be faster. The ceremony is fixed cost: the same code squares ten million numbers, and then the GPU wins by a mile.
+
+> **Performance:** in a real program steps 1 to 4 happen once at init; only 5 and 6 run per frame (or per batch). `@workgroup_size(64)` is a good default: GPUs execute invocations in hardware groups of 32 (NVIDIA, Apple, Intel) or 64 (AMD), and 64 fills either without waste. A size of 1 wastes 31 or 63 of every 32 or 64 lanes. The next chapters take each piece apart: WGSL, buffers, compute in depth, then rendering.
 
 === exercise addone
-title: Fill in the shader
+title: Health regeneration
 --- prompt
+Every unit in your strategy game regenerates 1 hit point per tick. The hit points live in a GPU buffer, one `u32` per unit.
+
 Everything except the shader's body is written for you. Make `addOne(device, data)` return a new `Uint32Array` where every element of `data` is one bigger.
 
 In WGSL, a `u32` literal is written with a `u` suffix: `1u`. Keep the bounds check.
@@ -315,7 +356,7 @@ console.log(await addOne(await getDevice(), new Uint32Array([1, 2, 3])));
 === exercise dispatch
 title: Fix the dispatch
 --- prompt
-`double(device, data)` doubles a `Float32Array` on the GPU. It works for 10 elements but is wrong for 1000. Find the two bugs:
+A power-up doubles the damage of every bullet on screen. `double(device, data)` doubles a `Float32Array` of damage values on the GPU. It works for 10 bullets but is wrong for 1000. Find the two bugs:
 
 1. It always launches **one** workgroup of 64 invocations.
 2. Once you launch enough workgroups, the last one will have invocations past the end of the array. The shader doesn't check.
@@ -462,7 +503,7 @@ title: Clear to a color
 --- prompt
 Write `function clear(device, view, color)` that records and submits a render pass that clears the texture behind `view` to `color` (an object `{ r, g, b, a }` with values 0 to 1). Nothing is drawn: a pass with `loadOp: 'clear'` and `storeOp: 'store'` that you `end()` immediately does the job.
 
-Run shows it on the canvas; the tests clear a small texture and read its pixels back.
+The tests clear a small texture and read its pixels back, then show your color on the canvas.
 --- starter
 function clear(device, view, color) {
   const encoder = device.createCommandEncoder();
@@ -470,11 +511,7 @@ function clear(device, view, color) {
   device.queue.submit([encoder.finish()]);
 }
 
-// Preview on the canvas (click Run).
-const device = await getDevice();
-const context = canvas.getContext('webgpu');
-context.configure({ device, format: navigator.gpu.getPreferredCanvasFormat() });
-clear(device, context.getCurrentTexture().createView(), { r: 1, g: 0.5, b: 0, a: 1 });
+// Click Check: the tests run, then your clear color appears on the canvas.
 --- solution
 function clear(device, view, color) {
   const encoder = device.createCommandEncoder();
@@ -485,11 +522,7 @@ function clear(device, view, color) {
   device.queue.submit([encoder.finish()]);
 }
 
-// Preview on the canvas (click Run).
-const device = await getDevice();
-const context = canvas.getContext('webgpu');
-context.configure({ device, format: navigator.gpu.getPreferredCanvasFormat() });
-clear(device, context.getCurrentTexture().createView(), { r: 1, g: 0.5, b: 0, a: 1 });
+// Click Check: the tests run, then your clear color appears on the canvas.
 --- hint
 `encoder.beginRenderPass({ colorAttachments: [{ view, loadOp: 'clear', clearValue: color, storeOp: 'store' }] })` returns a pass encoder. Call `.end()` on it.
 --- harness
@@ -503,12 +536,16 @@ clear(device, context.getCurrentTexture().createView(), { r: 1, g: 0.5, b: 0, a:
   const px2 = await readPixels(dev, tex);
   const last = (8 * 8 - 1) * 4;
   eq([...px2.slice(last, last + 4)], [0, 0, 255, 255], 'last pixel blue');
+  // Show your result on the canvas.
+  const context = canvas.getContext('webgpu');
+  context.configure({ device: dev, format: navigator.gpu.getPreferredCanvasFormat() });
+  clear(dev, context.getCurrentTexture().createView(), { r: 1, g: 0.5, b: 0, a: 1 });
 }
 
 === exercise ids
-title: Write the invocation ids
+title: Line up the enemies
 --- prompt
-Write `async function invocationIds(device, n)` that returns a `Uint32Array` of length `n` where element `i` is `i * 10`, computed on the GPU: each invocation writes its own `global_invocation_id.x` times 10 into its slot.
+A wave of `n` space invaders spawns in a row, 10 pixels apart. Write `async function invocationIds(device, n)` that returns a `Uint32Array` of length `n` where element `i` (enemy `i`'s x position) is `i * 10`, computed on the GPU: each invocation writes its own `global_invocation_id.x` times 10 into its slot.
 
 The starter creates the buffer (no upload needed: new buffers are zero-filled) and reads it back. You write the shader, the pipeline, the bind group and the pass. Use `@workgroup_size(64)`.
 --- starter

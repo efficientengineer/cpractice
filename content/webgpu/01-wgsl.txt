@@ -1,0 +1,987 @@
+=== chapter wgsl
+title: WGSL
+blurb: The WebGPU shading language: types, vectors and swizzles, matrices, structs, let/var/const/override, control flow, built-ins, address spaces and attributes.
+--- body
+## A small, strict language
+
+WGSL looks like a cut-down Rust. If you know C# or TypeScript you can read it immediately; the surprises are all about strictness:
+
+- **No implicit conversions.** `f32 + i32` is a compile error. You convert explicitly: `f32(i)`.
+- **No truthiness.** `if (count)` is an error; write `if (count != 0u)`.
+- **No recursion, no pointers to arbitrary memory, no heap, no strings.** Every function's memory use is known at compile time, which is what lets thousands of copies run at once.
+- **No ternary operator.** `select(falseValue, trueValue, condition)` instead (note the order).
+
+To try WGSL on this page, each example uses a small helper, `show`, that compiles a shader whose `main` writes some `f32` results into a buffer and prints them. It also prints compiler errors with line numbers, which you will want while learning:
+
+```js
+const device = await getDevice();
+async function show(decls, exprs) {
+  const code = `${decls}
+@group(0) @binding(0) var<storage, read_write> out: array<f32>;
+@compute @workgroup_size(1) fn main() {
+${exprs.map((e, i) => `  out[${i}] = f32(${e});`).join('\n')}
+}`;
+  const module = device.createShaderModule({ code });
+  for (const m of (await module.getCompilationInfo()).messages) console.log(`${m.type} line ${m.lineNum}: ${m.message}`);
+  const pipeline = device.createComputePipeline({ layout: 'auto', compute: { module } });
+  const buf = device.createBuffer({ size: exprs.length * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
+  const enc = device.createCommandEncoder(), pass = enc.beginComputePass();
+  pass.setPipeline(pipeline);
+  pass.setBindGroup(0, device.createBindGroup({ layout: pipeline.getBindGroupLayout(0), entries: [{ binding: 0, resource: { buffer: buf } }] }));
+  pass.dispatchWorkgroups(1); pass.end();
+  device.queue.submit([enc.finish()]);
+  const r = new Float32Array(await readBuffer(device, buf));
+  exprs.forEach((e, i) => console.log(e.padEnd(28), '=', r[i]));
+}
+
+await show(`fn hpPercent(hp: u32, maxHp: u32) -> f32 { return 100.0 * f32(hp) / f32(maxHp); }`,
+  ['hpPercent(37u, 50u)', '7 / 2', '-7 / 2', '7.0 / 2.0', 'i32(-3.7)', 'u32(-1.0)']);
+```
+
+(Writing a helper like this, once, and calling it many times is the pattern for real code too. This one creates a pipeline per call, which is fine for experiments but never in a frame loop.)
+
+## Scalar types and literals
+
+| Type | What | Literal |
+|---|---|---|
+| `bool` | `true` / `false` | `true` |
+| `i32` | 32-bit signed integer | `-5i`, or `-5` where an `i32` is expected |
+| `u32` | 32-bit unsigned integer | `5u`, `0xFFu` |
+| `f32` | 32-bit float | `1.5f`, `1.5`, `2e3` |
+| `f16` | 16-bit float (needs the `shader-f16` feature and `enable f16;`) | `1.5h` |
+
+A literal with no suffix is an *abstract* number: `2` is an abstract integer, `2.0` an abstract float. Abstract numbers convert to whatever concrete type the context needs, so `let x: f32 = 1;` and `v * 2` (with `v` a `vec3f`) are fine. Concrete values never convert:
+
+```wgsl
+let a = 1u;            // u32
+let b = 2;             // abstract, becomes i32 by default
+let c = a + 1;         // fine: the abstract 1 becomes u32
+let d = a + b;         // ERROR: u32 + i32
+let e = f32(a) * 0.5;  // fine: explicit conversion
+```
+
+Conversions: `f32(x)`, `i32(x)`, `u32(x)`. Float to integer truncates toward zero and *saturates* (clamps) instead of overflowing: `i32(-3.7)` is `-3`, `u32(-1.0)` is `0`. `bitcast<u32>(1.0)` reinterprets the bits (`0x3F800000`) instead of converting the value.
+
+Integer arithmetic at runtime **wraps** on overflow (like C# `unchecked`). Integer division truncates toward zero (`-7 / 2` is `-3`), and division by zero doesn't crash: `x / 0` gives `x`, `x % 0` gives `0`. Shift amounts are taken modulo 32.
+
+## Vectors and swizzles
+
+`vec2<f32>`, `vec3<i32>`, `vec4<u32>`, with short aliases: `vec2f`, `vec3i`, `vec4u`, `vec2h`. Constructors are flexible:
+
+```wgsl
+let p = vec2f(3.0, 4.0);
+let q = vec4f(p, 0.0, 1.0);      // (3, 4, 0, 1): vectors splice into constructors
+let ones = vec3f(1.0);           // (1, 1, 1): splat
+let zero = vec3f();              // (0, 0, 0)
+```
+
+Components are `x y z w` or `r g b a`. A **swizzle** reads any combination, in any order, with repeats, as long as you don't mix the two sets:
+
+```wgsl
+let c = vec4f(0.1, 0.2, 0.3, 1.0);
+c.x;        // 0.1
+c.zyx;      // vec3f(0.3, 0.2, 0.1)
+c.rgb;      // vec3f(0.1, 0.2, 0.3)
+c.xxyy;     // vec4f(0.1, 0.1, 0.2, 0.2)
+c.xg;       // ERROR: mixes xyzw with rgba
+```
+
+You can assign one component of a `var` vector (`v.x = 2.0;`) but not a multi-component swizzle (`v.xy = ...` is an error; write `v = vec3f(newXY, v.z);`).
+
+Arithmetic is **component-wise**, and scalars broadcast. `a * b` on two vectors multiplies component by component; it is *not* a dot product (that's `dot(a, b)`). Comparisons produce boolean vectors; reduce them with `all()` and `any()`:
+
+```js
+const device = await getDevice();
+const decls = `
+fn advance(pos: vec2f, vel: vec2f, dt: f32) -> vec2f { return pos + vel * dt; }
+fn onScreen(p: vec2f, size: vec2f) -> bool { return all(p >= vec2f(0.0)) && all(p < size); }`;
+const code = `${decls}
+@group(0) @binding(0) var<storage, read_write> out: array<f32>;
+@compute @workgroup_size(1) fn main() {
+  let p = advance(vec2f(10, 20), vec2f(100, -50), 0.5);
+  out[0] = p.x; out[1] = p.y;
+  out[2] = select(0.0, 1.0, onScreen(p, vec2f(640, 480)));
+  out[3] = select(0.0, 1.0, onScreen(vec2f(-1, 5), vec2f(640, 480)));
+  let a = vec3f(1, 2, 3);
+  out[4] = dot(a, a);            // 1 + 4 + 9
+  out[5] = (a * a).z;            // component-wise: 9
+  out[6] = length(vec2f(3, 4));  // 5
+}`;
+const module = device.createShaderModule({ code });
+const pipeline = device.createComputePipeline({ layout: 'auto', compute: { module } });
+const buf = device.createBuffer({ size: 7 * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
+const enc = device.createCommandEncoder(), pass = enc.beginComputePass();
+pass.setPipeline(pipeline);
+pass.setBindGroup(0, device.createBindGroup({ layout: pipeline.getBindGroupLayout(0), entries: [{ binding: 0, resource: { buffer: buf } }] }));
+pass.dispatchWorkgroups(1); pass.end();
+device.queue.submit([enc.finish()]);
+console.log(new Float32Array(await readBuffer(device, buf)));
+```
+
+## Matrices
+
+`matCxR<f32>` has **C columns and R rows**: `mat4x4f`, `mat3x3f`, `mat2x2f`, also non-square like `mat3x2f` (3 columns of `vec2f`). Matrices hold floats only.
+
+Storage is **column-major**: `m[i]` is column `i` (a vector), and the constructor takes values column by column. `m * v` treats `v` as a column vector (the usual math convention); `v * m` treats it as a row vector, which is the same as multiplying by the transpose.
+
+```wgsl
+// Rotation by angle a: columns are where the x axis and the y axis end up.
+fn rotation(a: f32) -> mat2x2f {
+  let c = cos(a);
+  let s = sin(a);
+  return mat2x2f(c, s,     // column 0: (cos, sin)
+                 -s, c);   // column 1: (-sin, cos)
+}
+// rotation(a) * v rotates v counterclockwise by a.
+```
+
+This is the classic transposition bug: write the matrix row by row, as you would on paper, and you get the inverse rotation. Rotating `(1, 0)` by 90° must give `(0, 1)`; test it.
+
+## Arrays and structs
+
+```wgsl
+const OFFSETS = array<vec2f, 4>(vec2f(0, 1), vec2f(1, 0), vec2f(0, -1), vec2f(-1, 0));
+
+struct Ship {
+  pos: vec2f,
+  vel: vec2f,
+  hp: u32,
+  team: u32,
+}
+
+@group(0) @binding(0) var<storage, read_write> ships: array<Ship>;   // runtime-sized
+```
+
+- `array<T, N>` has a fixed size known at compile time. Indexing out of bounds with a runtime index is *clamped* or returns zero, never a crash or a read of foreign memory.
+- `array<T>` (no size) is a **runtime-sized array**: only allowed as a storage buffer variable (or the last member of a struct in one). Its length comes from the bound buffer's size: `arrayLength(&ships)`.
+- Structs are plain values: `Ship(vec2f(0.0), vec2f(1.0, 0.0), 100u, 1u)` constructs one, `s.hp` reads a member. Assigning a struct copies it. There are no methods, no constructors, no inheritance: write free functions that take and return structs.
+
+> **Performance:** a storage buffer of structs (`array<Ship>`) is an *array of structs*. When a pass only reads one field of each element, separate arrays (`positions: array<vec2f>`, `hps: array<u32>`) read less memory. GPUs are usually limited by memory bandwidth, not arithmetic, so this matters more on the GPU than on the CPU.
+
+## let, var, const, override
+
+| Declaration | Mutable | Value known | Where |
+|---|---|---|---|
+| `const X = 4;` | no | at shader compile time | module or function scope; can size arrays |
+| `override X: u32 = 64;` | no | at pipeline creation (set from JS) | module scope only |
+| `let x = f(y);` | no | at runtime | function scope |
+| `var x = 0;` | yes | at runtime | function scope, or module scope with an address space |
+
+Prefer `let`; use `var` only for what changes. `override` lets you compile one shader module and specialize it per pipeline, like tuning constants:
+
+```wgsl
+override GRAVITY: f32 = -9.8;
+@id(0) override MAX_BULLETS: u32 = 1024;   // can also be set by numeric id
+```
+
+```text
+device.createComputePipeline({
+  layout: 'auto',
+  compute: { module, constants: { GRAVITY: -3.7, 0: 4096 } },
+});
+```
+
+Because the value is fixed before the driver compiles the pipeline, the compiler can fold it into the code, unlike a value read from a buffer.
+
+## Functions
+
+```wgsl
+fn damage(base: f32, armor: f32) -> f32 {
+  return max(base - armor, 1.0);
+}
+
+fn heal(hp: ptr<function, u32>, amount: u32, maxHp: u32) {
+  *hp = min(*hp + amount, maxHp);
+}
+
+fn example() {
+  var hp = 40u;
+  heal(&hp, 25u, 50u);    // hp is now 50
+}
+```
+
+Parameters are immutable values. To let a function change a caller's variable, pass a pointer: `ptr<function, T>` for a local `var`, `ptr<private, T>` for a module-scope `var<private>`. No recursion (the compiler reports a cycle), no overloading, no default arguments. Functions must be declared at module scope, but order doesn't matter.
+
+## Control flow
+
+```wgsl
+fn tileCost(kind: u32) -> u32 {
+  switch kind {
+    case 0u: { return 1u; }           // grass
+    case 1u, 2u: { return 3u; }       // sand, shallow water
+    default: { return 1000u; }        // walls: effectively impassable
+  }                                    // no fallthrough, no break needed
+}
+
+fn firstEmpty(slots: array<u32, 8>) -> i32 {
+  for (var i = 0; i < 8; i++) {
+    if (slots[i] == 0u) { return i; }
+  }
+  return -1;
+}
+
+fn countdown(n: u32) -> u32 {
+  var i = n;
+  var steps = 0u;
+  while (i > 0u) { i = i / 2u; steps++; }
+  loop {                               // loop runs until break
+    if (steps >= 3u) { break; }
+    steps += 1u;
+    continuing { }                     // like a for-loop's increment; may use `break if cond;`
+  }
+  return steps;
+}
+```
+
+Conditions must be `bool`. `++` and `+=` are statements, not expressions (`a = b++` doesn't exist). Use `select(f, t, cond)` for a branch-free choice; it works component-wise on vectors with a vector of `bool`.
+
+> **Performance:** invocations run in lockstep groups (32 or 64 lanes). When lanes in a group disagree on an `if`, the hardware runs *both* sides with lanes masked off. Short `if`s and `select` are cheap; long, divergent branches or loops whose trip count varies a lot between neighbors waste the lanes that are waiting. Keep inner loops simple and uniform where you can.
+
+## Built-in functions
+
+| Group | Functions |
+|---|---|
+| Arithmetic | `abs min max clamp sign floor ceil round trunc fract` |
+| Interpolation | `mix(a, b, t)` (lerp), `step(edge, x)`, `smoothstep(lo, hi, x)` |
+| Powers | `sqrt inverseSqrt pow exp exp2 log log2` |
+| Trigonometry | `sin cos tan asin acos atan atan2` (radians), `radians degrees` |
+| Geometry | `dot cross length distance normalize reflect faceForward` |
+| Matrices | `transpose determinant` |
+| Logic | `select all any` |
+| Integer bits | `countOneBits reverseBits firstLeadingBit firstTrailingBit extractBits insertBits` |
+| Packing | `pack4x8unorm unpack4x8unorm pack2x16float unpack2x16float` |
+| Arrays | `arrayLength(&storageArray)` |
+
+They work on scalars and component-wise on vectors: `clamp(pos, vec2f(0.0), size)` clamps both coordinates. Math built-ins are fast (many are single hardware instructions); `pow`, `exp`, trig are slower than `*` and `+` but far from expensive.
+
+## Address spaces
+
+Every variable lives in an *address space*, which says who can see it and how long it lives:
+
+| Space | Declared as | Visible to | Lifetime | Access |
+|---|---|---|---|---|
+| `function` | `var x` inside a function | one invocation | the call | read/write |
+| `private` | `var<private> x: T;` at module scope | one invocation | the whole invocation | read/write |
+| `workgroup` | `var<workgroup> tile: array<f32, 64>;` | all invocations of one workgroup | the workgroup | read/write, shared (compute only) |
+| `uniform` | `var<uniform> params: Params;` | everyone | bound buffer | read only, small, fast |
+| `storage` | `var<storage, read> a: array<f32>;` or `read_write` | everyone | bound buffer | read, or read/write |
+
+Uniform and storage variables (and textures and samplers, in the `handle` space) are resources, bound from JavaScript with bind groups. Uniforms are for small per-draw parameters (a camera matrix, the time, screen size); storage buffers for big arrays. Workgroup memory is the fast on-chip scratchpad that compute shaders use to cooperate; the compute chapter uses it.
+
+## Attributes
+
+| Attribute | Meaning |
+|---|---|
+| `@group(g) @binding(b)` | where a resource variable is bound: bind group `g`, slot `b` |
+| `@compute @workgroup_size(64)` | a compute entry point and its workgroup size (up to 3 dimensions) |
+| `@vertex`, `@fragment` | render entry points |
+| `@builtin(name)` | a value the GPU provides or consumes: `global_invocation_id`, `local_invocation_id`, `workgroup_id`, `vertex_index`, `instance_index`, `position`, `front_facing` and more |
+| `@location(n)` | a user-defined input/output: vertex attributes, values passed from vertex to fragment, fragment color outputs |
+| `@interpolate(flat)` | how a value passed to the fragment shader is interpolated |
+| `@id(n)` | numeric id for an `override` |
+| `@align(n)`, `@size(n)` | override a struct member's alignment or size (buffers chapter) |
+| `@must_use` | (on a function) warn when the result is ignored |
+
+Built-in inputs can be function parameters or struct members:
+
+```wgsl
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid: vec3u,
+        @builtin(local_invocation_id) lid: vec3u) { /* ... */ }
+```
+
+## Reading compiler errors
+
+The compiler is strict, but its messages are precise. A typical session:
+
+```js
+const device = await getDevice();
+const code = `
+fn speed(vel: vec2f) -> f32 {
+  return length(vel);
+}
+fn tilesMoved(vel: vec2f, tile: u32) -> u32 {
+  return speed(vel) / tile;
+}`;
+const info = await device.createShaderModule({ code }).getCompilationInfo();
+for (const m of info.messages) console.log(`line ${m.lineNum}: ${m.message.split('\n')[0]}`);
+```
+
+The fix is to say which conversion you mean: `u32(speed(vel) / f32(tile))`.
+
+=== exercise luminance
+title: Grayscale on death
+--- prompt
+When the player dies, the screen fades to gray. Write the WGSL function
+
+```wgsl
+fn luminance(c: vec3f) -> f32
+```
+
+that returns the perceived brightness of an RGB color: `0.2126 * r + 0.7152 * g + 0.0722 * b`. Use `dot` with a constant vector instead of writing out the three products.
+
+Your WGSL goes in the `WGSL` string. The tests compile it together with a `main` that calls your function on many colors (click **Tests** to see it); compile errors are printed with line numbers.
+--- starter
+const WGSL = `
+fn luminance(c: vec3f) -> f32 {
+  return 0.0;
+}
+`;
+--- solution
+const WGSL = `
+const LUMA = vec3f(0.2126, 0.7152, 0.0722);
+
+fn luminance(c: vec3f) -> f32 {
+  return dot(c, LUMA);
+}
+`;
+--- hint
+`dot(a, b)` is `a.x*b.x + a.y*b.y + a.z*b.z`.
+--- hint
+`return dot(c, vec3f(0.2126, 0.7152, 0.0722));`
+--- harness
+{
+  const device = await getDevice();
+  const code = WGSL + `
+@group(0) @binding(0) var<storage, read> inp: array<vec4f>;
+@group(0) @binding(1) var<storage, read_write> outp: array<f32>;
+@compute @workgroup_size(64) fn main(@builtin(global_invocation_id) id: vec3u) {
+  if (id.x >= arrayLength(&outp)) { return; }
+  outp[id.x] = luminance(inp[id.x].rgb);
+}`;
+  const module = device.createShaderModule({ code });
+  for (const m of (await module.getCompilationInfo()).messages)
+    if (m.type === 'error') console.log(`WGSL error, line ${m.lineNum}: ${m.message}`);
+  const colors = [[1, 0, 0], [0, 1, 0], [0, 0, 1], [1, 1, 1], [0.5, 0.25, 0.75], [0, 0, 0]];
+  const input = new Float32Array(colors.flatMap(c => [...c, 1]));
+  const pipeline = device.createComputePipeline({ layout: 'auto', compute: { module } });
+  const inBuf = device.createBuffer({ size: input.byteLength, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+  device.queue.writeBuffer(inBuf, 0, input);
+  const outBuf = device.createBuffer({ size: colors.length * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
+  const enc = device.createCommandEncoder(), pass = enc.beginComputePass();
+  pass.setPipeline(pipeline);
+  pass.setBindGroup(0, device.createBindGroup({ layout: pipeline.getBindGroupLayout(0), entries: [
+    { binding: 0, resource: { buffer: inBuf } }, { binding: 1, resource: { buffer: outBuf } }] }));
+  pass.dispatchWorkgroups(1); pass.end();
+  device.queue.submit([enc.finish()]);
+  const got = new Float32Array(await readBuffer(device, outBuf));
+  colors.forEach(([r, g, b], i) => near(got[i], 0.2126 * r + 0.7152 * g + 0.0722 * b, 1e-5, `luminance(${r}, ${g}, ${b})`));
+}
+
+=== exercise swizzle
+title: Sprite flips and channel order
+--- prompt
+Two one-liners with swizzles:
+
+- `fn flipX(uv: vec2f) -> vec2f`: mirror a sprite horizontally by mapping texture coordinate `(u, v)` to `(1 - u, v)`.
+- `fn bgra(c: vec4f) -> vec4f`: some image data comes in BGRA order. Return the color with red and blue swapped: `(b, g, r, a)`.
+
+Use a swizzle for `bgra` (one expression, no temporary variables).
+--- starter
+const WGSL = `
+fn flipX(uv: vec2f) -> vec2f {
+  return uv;
+}
+
+fn bgra(c: vec4f) -> vec4f {
+  return c;
+}
+`;
+--- solution
+const WGSL = `
+fn flipX(uv: vec2f) -> vec2f {
+  return vec2f(1.0 - uv.x, uv.y);
+}
+
+fn bgra(c: vec4f) -> vec4f {
+  return c.bgra;
+}
+`;
+--- hint
+`c.bgra` (or `c.zyxw`) reorders the components.
+--- hint
+`vec2f(1.0 - uv.x, uv.y)` builds the flipped coordinate.
+--- harness
+{
+  const device = await getDevice();
+  const code = WGSL + `
+@group(0) @binding(0) var<storage, read> inp: array<vec4f>;
+@group(0) @binding(1) var<storage, read_write> outp: array<vec4f>;
+@compute @workgroup_size(64) fn main(@builtin(global_invocation_id) id: vec3u) {
+  let n = arrayLength(&inp);
+  if (id.x >= n) { return; }
+  outp[id.x] = vec4f(flipX(inp[id.x].xy), 0.0, 0.0);
+  outp[n + id.x] = bgra(inp[id.x]);
+}`;
+  const module = device.createShaderModule({ code });
+  for (const m of (await module.getCompilationInfo()).messages)
+    if (m.type === 'error') console.log(`WGSL error, line ${m.lineNum}: ${m.message}`);
+  const vals = [[0.25, 0.5, 0.75, 1], [0, 1, 0.5, 0.2], [1, 0, 0, 0.5]];
+  const input = new Float32Array(vals.flat());
+  const pipeline = device.createComputePipeline({ layout: 'auto', compute: { module } });
+  const inBuf = device.createBuffer({ size: input.byteLength, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+  device.queue.writeBuffer(inBuf, 0, input);
+  const outBuf = device.createBuffer({ size: input.byteLength * 2, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
+  const enc = device.createCommandEncoder(), pass = enc.beginComputePass();
+  pass.setPipeline(pipeline);
+  pass.setBindGroup(0, device.createBindGroup({ layout: pipeline.getBindGroupLayout(0), entries: [
+    { binding: 0, resource: { buffer: inBuf } }, { binding: 1, resource: { buffer: outBuf } }] }));
+  pass.dispatchWorkgroups(1); pass.end();
+  device.queue.submit([enc.finish()]);
+  const got = [...new Float32Array(await readBuffer(device, outBuf))];
+  vals.forEach(([x, y, z, w], i) => {
+    eq(got.slice(i * 4, i * 4 + 2), [1 - x, y].map(Math.fround), `flipX(${x}, ${y})`);
+    eq(got.slice(12 + i * 4, 16 + i * 4), [z, y, x, w].map(Math.fround), `bgra(${[x, y, z, w]})`);
+  });
+}
+
+=== exercise tile
+title: Which tile am I on?
+--- prompt
+A tile map is stored row by row in a storage buffer: tile `(col, row)` is at index `row * mapWidth + col`. Write
+
+```wgsl
+fn tileIndex(pos: vec2f, tileSize: f32, mapWidth: u32) -> u32
+```
+
+that returns the index of the tile containing the world position `pos` (in pixels, never negative). For `tileSize = 16` and `mapWidth = 10`, `pos = (40, 20)` is in column 2, row 1, so the index is `12`.
+
+The starter doesn't compile: WGSL won't mix `f32` and `u32`. Convert explicitly.
+--- starter
+const WGSL = `
+fn tileIndex(pos: vec2f, tileSize: f32, mapWidth: u32) -> u32 {
+  let cell = pos / tileSize;
+  return cell.y * mapWidth + cell.x;
+}
+`;
+--- solution
+const WGSL = `
+fn tileIndex(pos: vec2f, tileSize: f32, mapWidth: u32) -> u32 {
+  let cell = vec2u(floor(pos / tileSize));
+  return cell.y * mapWidth + cell.x;
+}
+`;
+--- hint
+`vec2u(someVec2f)` converts both components (truncating toward zero). `floor` first makes the intent obvious.
+--- hint
+After converting, `cell.y * mapWidth + cell.x` is all `u32`.
+--- harness
+{
+  const device = await getDevice();
+  const code = WGSL + `
+struct Q { pos: vec2f, tileSize: f32, mapWidth: u32 }
+@group(0) @binding(0) var<storage, read> inp: array<Q>;
+@group(0) @binding(1) var<storage, read_write> outp: array<u32>;
+@compute @workgroup_size(64) fn main(@builtin(global_invocation_id) id: vec3u) {
+  if (id.x >= arrayLength(&outp)) { return; }
+  let q = inp[id.x];
+  outp[id.x] = tileIndex(q.pos, q.tileSize, q.mapWidth);
+}`;
+  const module = device.createShaderModule({ code });
+  for (const m of (await module.getCompilationInfo()).messages)
+    if (m.type === 'error') console.log(`WGSL error, line ${m.lineNum}: ${m.message}`);
+  const cases = [[40, 20, 16, 10], [0, 0, 16, 10], [15.9, 15.9, 16, 10], [16, 0, 16, 10], [100, 250, 32, 7], [1023, 5, 8, 128]];
+  const ab = new ArrayBuffer(cases.length * 16), f = new Float32Array(ab), u = new Uint32Array(ab);
+  cases.forEach(([x, y, t, w], i) => { f[i * 4] = x; f[i * 4 + 1] = y; f[i * 4 + 2] = t; u[i * 4 + 3] = w; });
+  const pipeline = device.createComputePipeline({ layout: 'auto', compute: { module } });
+  const inBuf = device.createBuffer({ size: ab.byteLength, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+  device.queue.writeBuffer(inBuf, 0, ab);
+  const outBuf = device.createBuffer({ size: cases.length * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
+  const enc = device.createCommandEncoder(), pass = enc.beginComputePass();
+  pass.setPipeline(pipeline);
+  pass.setBindGroup(0, device.createBindGroup({ layout: pipeline.getBindGroupLayout(0), entries: [
+    { binding: 0, resource: { buffer: inBuf } }, { binding: 1, resource: { buffer: outBuf } }] }));
+  pass.dispatchWorkgroups(1); pass.end();
+  device.queue.submit([enc.finish()]);
+  const got = new Uint32Array(await readBuffer(device, outBuf));
+  cases.forEach(([x, y, t, w], i) => eq(got[i], Math.floor(y / t) * w + Math.floor(x / t), `tileIndex((${x}, ${y}), ${t}, ${w})`));
+}
+
+=== exercise dice
+title: Dice on the GPU
+--- prompt
+GPUs have no `Math.random()`. Shaders use small hash functions on integers instead. Write
+
+```wgsl
+fn xorshift(x: u32) -> u32
+fn rollDice(seed: u32, n: u32) -> u32
+```
+
+- `xorshift` is the xorshift32 step: `x ^= x << 13`, then `x ^= x >> 17`, then `x ^= x << 5`; return `x`. `u32` arithmetic wraps, which is exactly what this needs.
+- `rollDice` rolls `n` six-sided dice and returns their total. Start with `state = seed`; for each die, `state = xorshift(state)` and the die shows `state % 6u + 1u`.
+
+Parameters are immutable, so you need a `var` copy inside `xorshift`.
+--- starter
+const WGSL = `
+fn xorshift(x: u32) -> u32 {
+  return x;
+}
+
+fn rollDice(seed: u32, n: u32) -> u32 {
+  return n;
+}
+`;
+--- solution
+const WGSL = `
+fn xorshift(x: u32) -> u32 {
+  var s = x;
+  s ^= s << 13u;
+  s ^= s >> 17u;
+  s ^= s << 5u;
+  return s;
+}
+
+fn rollDice(seed: u32, n: u32) -> u32 {
+  var state = seed;
+  var total = 0u;
+  for (var i = 0u; i < n; i++) {
+    state = xorshift(state);
+    total += state % 6u + 1u;
+  }
+  return total;
+}
+`;
+--- hint
+`var s = x;` then `s ^= s << 13u;` and so on.
+--- hint
+A `for (var i = 0u; i < n; i++)` loop with `var state` and `var total` outside it.
+--- harness
+{
+  const device = await getDevice();
+  const xs = x => { x ^= x << 13; x >>>= 0; x ^= x >>> 17; x ^= x << 5; return x >>> 0; };
+  const roll = (seed, n) => { let s = seed, t = 0; for (let i = 0; i < n; i++) { s = xs(s); t += s % 6 + 1; } return t; };
+  const code = WGSL + `
+@group(0) @binding(0) var<storage, read> inp: array<vec2u>;
+@group(0) @binding(1) var<storage, read_write> outp: array<u32>;
+@compute @workgroup_size(64) fn main(@builtin(global_invocation_id) id: vec3u) {
+  let n = arrayLength(&inp);
+  if (id.x >= n) { return; }
+  outp[id.x] = xorshift(inp[id.x].x);
+  outp[n + id.x] = rollDice(inp[id.x].x, inp[id.x].y);
+}`;
+  const module = device.createShaderModule({ code });
+  for (const m of (await module.getCompilationInfo()).messages)
+    if (m.type === 'error') console.log(`WGSL error, line ${m.lineNum}: ${m.message}`);
+  const cases = [[1, 1], [42, 3], [123456789, 10], [4294967295, 5], [7, 0], [2024, 100]];
+  const input = new Uint32Array(cases.flat());
+  const pipeline = device.createComputePipeline({ layout: 'auto', compute: { module } });
+  const inBuf = device.createBuffer({ size: input.byteLength, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+  device.queue.writeBuffer(inBuf, 0, input);
+  const outBuf = device.createBuffer({ size: cases.length * 8, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
+  const enc = device.createCommandEncoder(), pass = enc.beginComputePass();
+  pass.setPipeline(pipeline);
+  pass.setBindGroup(0, device.createBindGroup({ layout: pipeline.getBindGroupLayout(0), entries: [
+    { binding: 0, resource: { buffer: inBuf } }, { binding: 1, resource: { buffer: outBuf } }] }));
+  pass.dispatchWorkgroups(1); pass.end();
+  device.queue.submit([enc.finish()]);
+  const got = new Uint32Array(await readBuffer(device, outBuf));
+  cases.forEach(([s, n], i) => {
+    eq(got[i], xs(s), `xorshift(${s})`);
+    eq(got[cases.length + i], roll(s, n), `rollDice(${s}, ${n})`);
+  });
+}
+
+=== exercise rotate
+title: Rotate a sprite
+--- prompt
+Write `fn rotate(v: vec2f, angle: f32) -> vec2f` that rotates `v` counterclockwise by `angle` radians, by building a `mat2x2f` and multiplying.
+
+Remember: the constructor takes values **column by column**, and a rotation's columns are where the x axis `(1, 0)` and the y axis `(0, 1)` end up. Rotating `(1, 0)` by 90° gives `(0, 1)`.
+--- starter
+const WGSL = `
+fn rotate(v: vec2f, angle: f32) -> vec2f {
+  let c = cos(angle);
+  let s = sin(angle);
+  // Row by row, as on paper. Is that what the constructor wants?
+  let m = mat2x2f(c, -s,
+                  s,  c);
+  return m * v;
+}
+`;
+--- solution
+const WGSL = `
+fn rotate(v: vec2f, angle: f32) -> vec2f {
+  let c = cos(angle);
+  let s = sin(angle);
+  let m = mat2x2f(c, s,     // column 0: where (1, 0) goes
+                  -s, c);   // column 1: where (0, 1) goes
+  return m * v;
+}
+`;
+--- hint
+Column 0 is `(cos a, sin a)`, column 1 is `(-sin a, cos a)`. The starter wrote the transpose, which rotates the other way.
+--- harness
+{
+  const device = await getDevice();
+  const code = WGSL + `
+@group(0) @binding(0) var<storage, read> inp: array<vec4f>;
+@group(0) @binding(1) var<storage, read_write> outp: array<vec2f>;
+@compute @workgroup_size(64) fn main(@builtin(global_invocation_id) id: vec3u) {
+  if (id.x >= arrayLength(&outp)) { return; }
+  let q = inp[id.x];
+  outp[id.x] = rotate(q.xy, q.z);
+}`;
+  const module = device.createShaderModule({ code });
+  for (const m of (await module.getCompilationInfo()).messages)
+    if (m.type === 'error') console.log(`WGSL error, line ${m.lineNum}: ${m.message}`);
+  const cases = [[1, 0, Math.PI / 2], [0, 1, Math.PI / 2], [2, 3, 0], [1, 1, Math.PI], [3, -1, 0.7], [-2, 0.5, -1.2]];
+  const input = new Float32Array(cases.flatMap(c => [...c, 0]));
+  const pipeline = device.createComputePipeline({ layout: 'auto', compute: { module } });
+  const inBuf = device.createBuffer({ size: input.byteLength, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+  device.queue.writeBuffer(inBuf, 0, input);
+  const outBuf = device.createBuffer({ size: cases.length * 8, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
+  const enc = device.createCommandEncoder(), pass = enc.beginComputePass();
+  pass.setPipeline(pipeline);
+  pass.setBindGroup(0, device.createBindGroup({ layout: pipeline.getBindGroupLayout(0), entries: [
+    { binding: 0, resource: { buffer: inBuf } }, { binding: 1, resource: { buffer: outBuf } }] }));
+  pass.dispatchWorkgroups(1); pass.end();
+  device.queue.submit([enc.finish()]);
+  const got = new Float32Array(await readBuffer(device, outBuf));
+  cases.forEach(([x, y, a], i) => {
+    const c = Math.cos(a), s = Math.sin(a);
+    near(got[i * 2], c * x - s * y, 2e-3, `rotate((${x}, ${y}), ${a.toFixed(3)}).x`);
+    near(got[i * 2 + 1], s * x + c * y, 2e-3, `rotate((${x}, ${y}), ${a.toFixed(3)}).y`);
+  });
+}
+
+=== exercise particle
+title: Step a particle
+--- prompt
+Particles are structs:
+
+```wgsl
+struct Particle {
+  pos: vec2f,
+  vel: vec2f,
+  life: f32,
+}
+```
+
+Write `fn stepParticle(p: Particle, dt: f32, gravity: f32) -> Particle` that returns the particle one time step later (semi-implicit Euler, the usual game integrator):
+
+1. `vel.y` increases by `gravity * dt`,
+2. `pos` moves by the **new** `vel * dt`,
+3. `life` decreases by `dt`.
+
+The struct declaration is part of your WGSL (the tests' `main` uses it). `p` is immutable: copy it into a `var`, modify, return.
+--- starter
+const WGSL = `
+struct Particle {
+  pos: vec2f,
+  vel: vec2f,
+  life: f32,
+}
+
+fn stepParticle(p: Particle, dt: f32, gravity: f32) -> Particle {
+  return p;
+}
+`;
+--- solution
+const WGSL = `
+struct Particle {
+  pos: vec2f,
+  vel: vec2f,
+  life: f32,
+}
+
+fn stepParticle(p: Particle, dt: f32, gravity: f32) -> Particle {
+  var q = p;
+  q.vel.y += gravity * dt;
+  q.pos += q.vel * dt;
+  q.life -= dt;
+  return q;
+}
+`;
+--- hint
+`var q = p;` copies the struct. Then `q.vel.y += gravity * dt;` and so on.
+--- hint
+Order matters: update the velocity before using it to move.
+--- harness
+{
+  const device = await getDevice();
+  const code = WGSL + `
+struct Step { dt: f32, gravity: f32 }
+@group(0) @binding(0) var<storage, read_write> ps: array<Particle>;
+@group(0) @binding(1) var<storage, read> st: Step;
+@compute @workgroup_size(64) fn main(@builtin(global_invocation_id) id: vec3u) {
+  if (id.x >= arrayLength(&ps)) { return; }
+  ps[id.x] = stepParticle(ps[id.x], st.dt, st.gravity);
+}`;
+  const module = device.createShaderModule({ code });
+  for (const m of (await module.getCompilationInfo()).messages)
+    if (m.type === 'error') console.log(`WGSL error, line ${m.lineNum}: ${m.message}`);
+  // Particle: pos at 0, vel at 8, life at 16; struct size 24 (alignment 8).
+  const parts = [[0, 0, 10, 20, 1], [5, -5, 0, 0, 0.5], [100, 50, -3, 4, 2]];
+  const data = new Float32Array(parts.length * 6);
+  parts.forEach((p, i) => data.set(p, i * 6));
+  const pipeline = device.createComputePipeline({ layout: 'auto', compute: { module } });
+  const pBuf = device.createBuffer({ size: data.byteLength, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC });
+  device.queue.writeBuffer(pBuf, 0, data);
+  const sBuf = device.createBuffer({ size: 8, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+  device.queue.writeBuffer(sBuf, 0, new Float32Array([0.5, -10]));
+  const enc = device.createCommandEncoder(), pass = enc.beginComputePass();
+  pass.setPipeline(pipeline);
+  pass.setBindGroup(0, device.createBindGroup({ layout: pipeline.getBindGroupLayout(0), entries: [
+    { binding: 0, resource: { buffer: pBuf } }, { binding: 1, resource: { buffer: sBuf } }] }));
+  pass.dispatchWorkgroups(1); pass.end();
+  device.queue.submit([enc.finish()]);
+  const got = new Float32Array(await readBuffer(device, pBuf));
+  parts.forEach(([x, y, vx, vy, life], i) => {
+    const nvy = vy + -10 * 0.5;
+    const want = [x + vx * 0.5, y + nvy * 0.5, vx, nvy, life - 0.5];
+    want.forEach((w, k) => near(got[i * 6 + k], w, 1e-4, `particle ${i} field ${['pos.x', 'pos.y', 'vel.x', 'vel.y', 'life'][k]}`));
+  });
+}
+
+=== exercise aggro
+title: Aggro radius
+--- prompt
+An enemy notices the player when they are within its aggro radius. Write
+
+```wgsl
+fn inAggro(enemy: vec2f, player: vec2f, radius: f32) -> bool
+```
+
+returning `true` when the distance is **at most** `radius`. Compare squared distances, which avoids the square root: `dot(d, d) <= radius * radius` where `d = player - enemy`.
+
+Then write `fn aggroFlag(enemy: vec2f, player: vec2f, radius: f32) -> u32` that returns `1u` or `0u`. Storage buffers can't hold `bool`, so this is how shaders store booleans. Use `select`, not `if`.
+--- starter
+const WGSL = `
+fn inAggro(enemy: vec2f, player: vec2f, radius: f32) -> bool {
+  return false;
+}
+
+fn aggroFlag(enemy: vec2f, player: vec2f, radius: f32) -> u32 {
+  return 0u;
+}
+`;
+--- solution
+const WGSL = `
+fn inAggro(enemy: vec2f, player: vec2f, radius: f32) -> bool {
+  let d = player - enemy;
+  return dot(d, d) <= radius * radius;
+}
+
+fn aggroFlag(enemy: vec2f, player: vec2f, radius: f32) -> u32 {
+  return select(0u, 1u, inAggro(enemy, player, radius));
+}
+`;
+--- hint
+`select(falseValue, trueValue, condition)`: the value for `false` comes first.
+--- harness
+{
+  const device = await getDevice();
+  const code = WGSL + `
+@group(0) @binding(0) var<storage, read> inp: array<vec4f>;
+@group(0) @binding(1) var<storage, read_write> outp: array<u32>;
+@compute @workgroup_size(64) fn main(@builtin(global_invocation_id) id: vec3u) {
+  if (id.x >= arrayLength(&outp)) { return; }
+  outp[id.x] = aggroFlag(inp[id.x].xy, inp[id.x].zw, 5.0);
+}`;
+  const module = device.createShaderModule({ code });
+  for (const m of (await module.getCompilationInfo()).messages)
+    if (m.type === 'error') console.log(`WGSL error, line ${m.lineNum}: ${m.message}`);
+  const cases = [[0, 0, 3, 4], [0, 0, 3, 4.1], [10, 10, 10, 10], [10, 10, 16, 10], [-2, -2, 1, 1], [1, 1, 4.5, 4.5]];
+  const input = new Float32Array(cases.flat());
+  const pipeline = device.createComputePipeline({ layout: 'auto', compute: { module } });
+  const inBuf = device.createBuffer({ size: input.byteLength, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+  device.queue.writeBuffer(inBuf, 0, input);
+  const outBuf = device.createBuffer({ size: cases.length * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
+  const enc = device.createCommandEncoder(), pass = enc.beginComputePass();
+  pass.setPipeline(pipeline);
+  pass.setBindGroup(0, device.createBindGroup({ layout: pipeline.getBindGroupLayout(0), entries: [
+    { binding: 0, resource: { buffer: inBuf } }, { binding: 1, resource: { buffer: outBuf } }] }));
+  pass.dispatchWorkgroups(1); pass.end();
+  device.queue.submit([enc.finish()]);
+  const got = [...new Uint32Array(await readBuffer(device, outBuf))];
+  eq(got, [1, 0, 1, 0, 1, 1], 'aggro flags for 6 enemy/player pairs (radius 5)');
+}
+
+=== exercise override
+title: Tuning constants with override
+--- prompt
+This shader caps every unit's speed at `MAX_SPEED`, an `override` constant:
+
+```wgsl
+override MAX_SPEED: f32 = 100.0;
+@group(0) @binding(0) var<storage, read_write> speeds: array<f32>;
+@compute @workgroup_size(64) fn main(@builtin(global_invocation_id) id: vec3u) {
+  if (id.x < arrayLength(&speeds)) { speeds[id.x] = min(speeds[id.x], MAX_SPEED); }
+}
+```
+
+Write `function makePipeline(device, module, maxSpeed)` that creates the compute pipeline for that module with `MAX_SPEED` set to `maxSpeed`. The tests compile the module once and build pipelines for different caps (say, normal units and a speed power-up) from it.
+--- starter
+function makePipeline(device, module, maxSpeed) {
+  return device.createComputePipeline({
+    layout: 'auto',
+    compute: { module },
+  });
+}
+--- solution
+function makePipeline(device, module, maxSpeed) {
+  return device.createComputePipeline({
+    layout: 'auto',
+    compute: { module, constants: { MAX_SPEED: maxSpeed } },
+  });
+}
+--- hint
+The `compute` stage descriptor takes `constants: { NAME: value }`.
+--- harness
+{
+  const device = await getDevice();
+  const module = device.createShaderModule({ code: `
+override MAX_SPEED: f32 = 100.0;
+@group(0) @binding(0) var<storage, read_write> speeds: array<f32>;
+@compute @workgroup_size(64) fn main(@builtin(global_invocation_id) id: vec3u) {
+  if (id.x < arrayLength(&speeds)) { speeds[id.x] = min(speeds[id.x], MAX_SPEED); }
+}` });
+  const runWith = async cap => {
+    const pipeline = makePipeline(device, module, cap);
+    const buf = device.createBuffer({ size: 16, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC });
+    device.queue.writeBuffer(buf, 0, new Float32Array([10, 50, 150, 400]));
+    const enc = device.createCommandEncoder(), pass = enc.beginComputePass();
+    pass.setPipeline(pipeline);
+    pass.setBindGroup(0, device.createBindGroup({ layout: pipeline.getBindGroupLayout(0), entries: [{ binding: 0, resource: { buffer: buf } }] }));
+    pass.dispatchWorkgroups(1); pass.end();
+    device.queue.submit([enc.finish()]);
+    return [...new Float32Array(await readBuffer(device, buf))];
+  };
+  eq(await runWith(30), [10, 30, 30, 30], 'MAX_SPEED = 30');
+  eq(await runWith(200), [10, 50, 150, 200], 'MAX_SPEED = 200');
+}
+
+=== quiz
+run: yes
+--- q
+Which of these four function bodies compile? The code prints `true` for each one that has no errors.
+--- code
+const device = await getDevice();
+const bodies = [
+  'let x: f32 = 1;',
+  'let i: i32 = 1; let x: f32 = i;',
+  'let a = 1u; let b = a + 1;',
+  'let a = 1i; let b = 1u; let c = a + b;',
+];
+const ok = [];
+for (const b of bodies) {
+  const info = await device.createShaderModule({ code: `fn f() { ${b} }` }).getCompilationInfo();
+  ok.push(!info.messages.some(m => m.type === 'error'));
+}
+console.log(ok.join(' '));
+--- choice
+false false true false
+--- answer
+true false true false
+--- choice
+true true true false
+--- choice
+true false true true
+--- explain
+Unsuffixed literals are *abstract* and convert to whatever type is needed, so `let x: f32 = 1;` and `a + 1` with `a: u32` are fine. Concrete values never convert implicitly: assigning an `i32` to an `f32`, or adding `i32` to `u32`, is an error.
+
+=== quiz
+--- q
+`let c = vec4f(0.1, 0.2, 0.3, 1.0);` Which expression is a compile error?
+--- choice
+`c.zyx`
+--- choice
+`c.rgba`
+--- answer
+`c.xg`
+--- choice
+`c.wwww`
+--- explain
+Swizzles may reorder and repeat components, but must use letters from one set: `xyzw` or `rgba`, not both.
+
+=== quiz
+--- q
+`mat3x2f` is:
+--- choice
+3 rows and 2 columns
+--- answer
+3 columns, each a `vec2f`
+--- choice
+a 3x3 matrix with 2-byte floats
+--- choice
+a 2x3 matrix stored row-major
+--- explain
+WGSL names matrices `matCxR`: columns first. Storage is column-major, and `m[i]` is column `i`.
+
+=== quiz
+--- q
+What does `select(a, b, cond)` return?
+--- choice
+`a` when `cond` is true, otherwise `b`
+--- answer
+`b` when `cond` is true, otherwise `a`
+--- choice
+the larger of `a` and `b`
+--- choice
+it selects a bind group
+--- explain
+The false value comes first: `select(falseValue, trueValue, cond)`. It is the WGSL replacement for `cond ? b : a`, and works component-wise on vectors.
+
+=== quiz
+--- q
+A compute shader needs a scratch array that all 64 invocations of a workgroup read and write together. Which address space?
+--- choice
+`private`
+--- choice
+`function`
+--- answer
+`workgroup`
+--- choice
+`uniform`
+--- explain
+`var<workgroup>` is shared by the invocations of one workgroup (and not visible to other workgroups). `private` and `function` variables are per invocation; `uniform` is read-only.
+
+=== quiz
+--- q
+When is the value of an `override` constant fixed?
+--- choice
+When the shader module is created
+--- answer
+When a pipeline is created from the module, through `constants` in the pipeline descriptor
+--- choice
+Every time you call `dispatchWorkgroups`
+--- choice
+It can change at any time through `queue.writeBuffer`
+--- explain
+`override` values are supplied per pipeline. One module can produce several specialized pipelines, and the driver compiles each with the value folded in.
+
+=== quiz
+run: yes
+--- q
+`inp` holds `[2147483647, 7, 0]` as `i32`. What does this print?
+--- code
+const device = await getDevice();
+const module = device.createShaderModule({ code: `
+@group(0) @binding(0) var<storage, read> inp: array<i32>;
+@group(0) @binding(1) var<storage, read_write> o: array<i32>;
+@compute @workgroup_size(1) fn main() {
+  o[0] = inp[0] + 1;
+  o[1] = -inp[1] / 2;
+  o[2] = inp[1] / inp[2];
+}` });
+const pipeline = device.createComputePipeline({ layout: 'auto', compute: { module } });
+const inp = device.createBuffer({ size: 12, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
+device.queue.writeBuffer(inp, 0, new Int32Array([2147483647, 7, 0]));
+const out = device.createBuffer({ size: 12, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
+const enc = device.createCommandEncoder(), pass = enc.beginComputePass();
+pass.setPipeline(pipeline);
+pass.setBindGroup(0, device.createBindGroup({ layout: pipeline.getBindGroupLayout(0), entries: [
+  { binding: 0, resource: { buffer: inp } }, { binding: 1, resource: { buffer: out } }] }));
+pass.dispatchWorkgroups(1); pass.end();
+device.queue.submit([enc.finish()]);
+console.log([...new Int32Array(await readBuffer(device, out))].join(' '));
+--- answer
+-2147483648 -3 7
+--- choice
+2147483648 -4 0
+--- choice
+-2147483648 -4 7
+--- choice
+2147483647 -3 0
+--- explain
+Runtime integer overflow wraps. Integer division truncates toward zero. Dividing by zero doesn't crash a shader: WGSL defines `x / 0` as `x`.

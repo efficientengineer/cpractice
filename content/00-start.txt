@@ -87,6 +87,8 @@ int main(void) {
 
 `puts("text")` prints a string plus a newline. `putchar('x')` prints one character.
 
+> **Performance:** `printf` parses its format string at runtime on every call, and output to a terminal is line buffered, so every `\n` can mean a system call. A `printf` per entity per frame will eat your frame budget on its own. Keep printing out of per-frame code (log on events, or once a second), and when you must format every frame (a HUD), format into a reused buffer and only when the value changed.
+
 ## Reading input
 
 `scanf` is the mirror of `printf`, but it needs *addresses* of the variables to fill in, hence the `&`. It returns how many items it successfully read, which is how you detect bad input or end of file.
@@ -142,6 +144,19 @@ There are two kinds of exercise:
 - **Function** exercises: write one or more functions. Hidden test code (you can view it) calls them and checks the results. You may keep a `main` of your own for experimenting; it is renamed out of the way when the tests run.
 
 Shortcuts: **Ctrl+Enter** runs, **Ctrl+Shift+Enter** checks against the tests.
+
+> **Performance:** `-O0` with sanitizers is the right setting for *finding bugs*, and the wrong one for *measuring speed*: code here runs several times slower than an optimized build. When you care how fast something is, build with `gcc -O2` (and no sanitizers) on your own machine and measure before and after; never guess. Some exercises here have large-input tests with a 10 second limit. Those are not checking micro-optimizations; they fail a solution that does the wrong *amount* of work (an O(n²) loop where O(n) was possible), which no optimizer can save.
+
+## Thinking like a game programmer
+
+The examples and exercises lean toward game code: health and damage, tile maps, entities, particles, inventories. A game is a loop that must finish all its work in a fixed **frame budget**: 16.7 ms at 60 frames per second, 6.9 ms at 144. That budget shapes the habits this course teaches from the start:
+
+- **Do the expensive work once, outside the loop**: allocate memory at load time, convert units when data is loaded, look up names once and keep the result.
+- **Keep data contiguous**: arrays of plain values, walked in order, are what CPUs are fastest at.
+- **Count the work**: an O(n²) loop over 10,000 entities is 100 million steps, every frame.
+- **Measure** before optimizing, with an optimized build.
+
+Notes marked **Performance** throughout the chapters point out the cheap way to do things and the habits to avoid.
 
 === exercise hello
 title: Hello, C
@@ -343,6 +358,258 @@ int main(void) {
 }
 --- hint
 `(double)a` converts before the addition, so the addition and division happen in floating point. That also avoids `int` overflow in the last test.
+
+=== exercise hud
+title: A HUD line
+--- prompt
+Games print a lot of fixed-width text: HUDs, debug overlays, log lines. Fixed widths keep the numbers from jittering left and right as they change.
+
+Read `hp max_hp gold x y` from stdin (three `int`s, then two `double`s) and print one line:
+
+- `HP`, a space, `hp` right aligned in 3 columns, `/`, `max_hp` left aligned in 3 columns,
+- ` | Gold `, then `gold` zero padded to 5 digits,
+- ` | Pos (`, `x` and `y` each 7 wide with 2 decimals, separated by `, `, then `)`.
+
+For input `45 100 120 3.5 -2.25`:
+
+```text
+HP  45/100 | Gold 00120 | Pos (   3.50,   -2.25)
+```
+
+If the input does not contain all five values, print `bad input` and exit with code 1.
+--- starter
+#include <stdio.h>
+
+int main(void) {
+    int hp, max_hp, gold;
+    double x, y;
+    // read, check, print
+    return 0;
+}
+--- solution
+#include <stdio.h>
+
+int main(void) {
+    int hp, max_hp, gold;
+    double x, y;
+    if (scanf("%d %d %d %lf %lf", &hp, &max_hp, &gold, &x, &y) != 5) {
+        puts("bad input");
+        return 1;
+    }
+    printf("HP %3d/%-3d | Gold %05d | Pos (%7.2f, %7.2f)\n", hp, max_hp, gold, x, y);
+    return 0;
+}
+--- hint
+`scanf` needs `%lf` for a `double *` (but `printf` uses `%f` for a `double`). It returns how many values it read.
+--- hint
+One `printf` does it: `"HP %3d/%-3d | Gold %05d | Pos (%7.2f, %7.2f)\n"`.
+--- test
+45 100 120 3.5 -2.25
+--- out
+HP  45/100 | Gold 00120 | Pos (   3.50,   -2.25)
+--- test
+7 50 99999 -120.125 0
+--- out
+HP   7/50  | Gold 99999 | Pos (-120.12,    0.00)
+--- test
+100 100 0 1000.5 -0.004
+--- out
+HP 100/100 | Gold 00000 | Pos (1000.50,   -0.00)
+--- test
+10 20 x
+--- out
+bad input
+--- exit
+1
+
+=== exercise ticks
+title: Seconds to ticks
+--- prompt
+Most games run their simulation at a **fixed tick rate** (say 60 updates per second) no matter how fast frames are drawn. Game logic then counts in integer *ticks*, not floating-point seconds: integers never drift, two runs with the same input give the same result (replays, networking), and comparing `int`s is exact. Designers still think in seconds, so you convert once, when the data is loaded.
+
+Write:
+
+- `int seconds_to_ticks(double seconds, int tick_rate)`: the number of ticks closest to `seconds` (round halves up). `seconds` and `tick_rate` are never negative. `seconds_to_ticks(0.5, 60)` is 30, `seconds_to_ticks(0.1, 60)` is 6, `seconds_to_ticks(1.0 / 120, 60)` is 1 (0.5 rounds up).
+- `double tick_ms(int tick_rate)`: how many milliseconds one tick lasts, so `tick_ms(60)` is about 16.667. This is your **frame budget**: everything the game does per tick has to fit in it.
+
+The next exercise builds on these.
+--- starter
+int seconds_to_ticks(double seconds, int tick_rate) {
+    return 0;
+}
+
+double tick_ms(int tick_rate) {
+    return 0;
+}
+--- solution
+int seconds_to_ticks(double seconds, int tick_rate) {
+    return (int)(seconds * tick_rate + 0.5);
+}
+
+double tick_ms(int tick_rate) {
+    return 1000.0 / tick_rate;
+}
+--- hint
+Converting a `double` to `int` truncates toward zero. For non-negative values, adding `0.5` first turns truncation into rounding.
+--- hint
+`1000 / tick_rate` is integer division: 16, not 16.667.
+--- harness
+int main(void) {
+    CHECK_INT(seconds_to_ticks(0.5, 60), 30);
+    CHECK_INT(seconds_to_ticks(0.1, 60), 6);
+    CHECK_INT(seconds_to_ticks(1.0 / 120, 60), 1);
+    CHECK_INT(seconds_to_ticks(0.0, 60), 0);
+    CHECK_INT(seconds_to_ticks(2.0, 30), 60);
+    CHECK_INT(seconds_to_ticks(0.004, 60), 0);
+    CHECK_INT(seconds_to_ticks(90.0, 144), 12960);
+    CHECK_DBL(tick_ms(60), 1000.0 / 60);
+    CHECK_DBL(tick_ms(144), 1000.0 / 144);
+    CHECK_DBL(tick_ms(1000), 1.0);
+    return TEST_END();
+}
+
+=== exercise cooldown
+title: Ability cooldowns
+continues: ticks
+--- prompt
+Keep your two functions and add cooldowns, measured in ticks. An ability used at tick `last_used` with a cooldown of `cooldown` ticks is ready again at tick `last_used + cooldown`.
+
+- `int cooldown_left(int now, int last_used, int cooldown)`: how many ticks until the ability is ready, or 0 if it is ready now.
+- `int cooldown_ticks(double seconds, int tick_rate)`: the designer gives cooldowns in seconds; convert with your `seconds_to_ticks`, but never return less than 1 tick (a cooldown of 0 would let the ability fire every tick, which designers never mean).
+
+Notice the shape: store the *tick it was used*, not a countdown you decrement every frame. Nothing needs updating per frame, and checking costs one subtraction.
+--- stubs
+int cooldown_left(int now, int last_used, int cooldown) {
+    return -1;
+}
+
+int cooldown_ticks(double seconds, int tick_rate) {
+    return -1;
+}
+--- solution
+int seconds_to_ticks(double seconds, int tick_rate) {
+    return (int)(seconds * tick_rate + 0.5);
+}
+
+double tick_ms(int tick_rate) {
+    return 1000.0 / tick_rate;
+}
+
+int cooldown_left(int now, int last_used, int cooldown) {
+    int left = last_used + cooldown - now;
+    return left > 0 ? left : 0;
+}
+
+int cooldown_ticks(double seconds, int tick_rate) {
+    int t = seconds_to_ticks(seconds, tick_rate);
+    return t < 1 ? 1 : t;
+}
+--- hint
+`last_used + cooldown - now` can be negative once the cooldown is over: clamp it to 0.
+--- harness
+int main(void) {
+    CHECK_INT(cooldown_left(100, 100, 30), 30);
+    CHECK_INT(cooldown_left(110, 100, 30), 20);
+    CHECK_INT(cooldown_left(129, 100, 30), 1);
+    CHECK_INT(cooldown_left(130, 100, 30), 0);
+    CHECK_INT(cooldown_left(5000, 100, 30), 0);
+    CHECK_INT(cooldown_ticks(0.5, 60), 30);
+    CHECK_INT(cooldown_ticks(0.0, 60), 1);
+    CHECK_INT(cooldown_ticks(0.001, 60), 1);
+    CHECK_INT(cooldown_ticks(2.5, 20), 50);
+    CHECK_INT(seconds_to_ticks(0.5, 60), 30);
+    return TEST_END();
+}
+
+=== exercise budget
+title: Frame budget report
+--- prompt
+A profiler says how long each system took this frame. Read the target frame rate `fps` and a count `n`, then `n` lines of `name milliseconds`. Print the budget, one line per system with its share of the budget, and a total line:
+
+```text
+60 3
+physics 4.2
+ai 6.1
+render 7.5
+```
+
+gives
+
+```text
+budget 16.67 ms
+physics    4.20 ms  25.2%
+ai         6.10 ms  36.6%
+render     7.50 ms  45.0%
+total     17.80 ms  OVER by 1.13 ms
+```
+
+- Names are left aligned in 8 columns, times are `%7.2f`, the share is `%5.1f` followed by `%`. The share is `100 * ms / budget`.
+- The last line is `total` in 8 columns, the summed time as `%7.2f ms`, then two spaces and either `OVER by X ms` (if the total is above the budget, `X` with 2 decimals) or `ok, X ms spare`.
+
+Names are at most 15 characters. Read each with `scanf("%15s %lf", name, &ms)`: the `15` stops `scanf` from writing past the 16-byte array.
+--- starter
+#include <stdio.h>
+
+int main(void) {
+    int fps, n;
+    if (scanf("%d %d", &fps, &n) != 2) return 1;
+    char name[16];
+    double ms;
+    // print the report
+    return 0;
+}
+--- solution
+#include <stdio.h>
+
+int main(void) {
+    int fps, n;
+    if (scanf("%d %d", &fps, &n) != 2) return 1;
+    double budget = 1000.0 / fps, total = 0;
+    printf("budget %.2f ms\n", budget);
+    char name[16];
+    double ms;
+    for (int i = 0; i < n; i++) {
+        if (scanf("%15s %lf", name, &ms) != 2) return 1;
+        total += ms;
+        printf("%-8s%7.2f ms %5.1f%%\n", name, ms, 100 * ms / budget);
+    }
+    if (total > budget)
+        printf("%-8s%7.2f ms  OVER by %.2f ms\n", "total", total, total - budget);
+    else
+        printf("%-8s%7.2f ms  ok, %.2f ms spare\n", "total", total, budget - total);
+    return 0;
+}
+--- hint
+`1000.0 / fps` is the budget in ms. A literal `%` in a format string is `%%`.
+--- hint
+Keep a running `total` while you print the rows; you don't need to store them.
+--- test
+60 3
+physics 4.2
+ai 6.1
+render 7.5
+--- out
+budget 16.67 ms
+physics    4.20 ms  25.2%
+ai         6.10 ms  36.6%
+render     7.50 ms  45.0%
+total     17.80 ms  OVER by 1.13 ms
+--- test
+30 2
+update 10
+draw 12.5
+--- out
+budget 33.33 ms
+update    10.00 ms  30.0%
+draw      12.50 ms  37.5%
+total     22.50 ms  ok, 10.83 ms spare
+--- test
+144 1
+everything 9.5
+--- out
+budget 6.94 ms
+everything   9.50 ms 136.8%
+total      9.50 ms  OVER by 2.56 ms
 
 === quiz
 run: yes

@@ -100,20 +100,23 @@ int main(void) {
 
 `&&` and `||` evaluate left to right and stop as soon as the answer is known, exactly as in C# and JS. That makes guards like `if (p != NULL && p->count > 0)` and `if (d != 0 && n / d > 2)` safe. The bitwise `&` and `|` always evaluate both sides.
 
+> **Performance:** short-circuiting is also a cheap filter. In a collision check, test the cheap condition that usually fails first: `if (e->alive && e->layer == layer && dist_sq(a, e) < r * r)`. Most entities are rejected by the first comparison, and the distance math only runs for the few that pass.
+
 `cond ? a : b` evaluates only one of `a` and `b`. Both branches are converted to a common type, the usual arithmetic conversions again: `n > 0 ? 1 : 0.5` has type `double`. It nests right to left, so a chain reads like `else if`:
 
 ```c
 #include <stdio.h>
 
-const char *size_name(int n) {
-    return n < 10   ? "small"
-         : n < 100  ? "medium"
-         : n < 1000 ? "large"
-         :            "huge";
+const char *health_label(int hp, int max_hp) {
+    return hp <= 0              ? "dead"
+         : hp * 4 <= max_hp     ? "critical"
+         : hp * 4 <= max_hp * 3 ? "hurt"
+         :                        "healthy";
 }
 
 int main(void) {
-    printf("%s %s %s %s\n", size_name(3), size_name(42), size_name(999), size_name(5000));
+    printf("%s %s %s %s\n", health_label(0, 100), health_label(20, 100),
+           health_label(60, 100), health_label(90, 100));   // dead critical hurt healthy
     return 0;
 }
 ```
@@ -197,6 +200,8 @@ int main(void) {
 
 Two more rules: before C23 a label must be followed by a statement, so `case 1: int x = 5;` is an error; wrap the case body in braces `case 1: { int x = 5; ... break; }`. And `default` can go anywhere, but put it last.
 
+> **Performance:** a `switch` over dense case values (0, 1, 2, ... like an enum) usually compiles to a *jump table*: one indexed jump, however many cases. Sparse values (1, 1000, 50000) become a chain or tree of comparisons. Either is cheap once. What costs is a `switch` on a value that changes unpredictably *per element in a hot loop*, such as switching on each entity's type while updating 10,000 mixed entities: the CPU cannot predict the jump and pays for a misprediction (around 15-20 cycles) again and again. Game engines often keep each kind of entity in its own array, so every loop body is one straight path. You will see that design in the structs chapter.
+
 ## Loops
 
 `while`, `do ... while` and `for` behave as in C#. There is no `foreach`: you loop over indices or pointers. Since C99 you can declare the loop variable in the `for` header, scoped to the loop. `for (;;)` is the idiomatic infinite loop.
@@ -225,6 +230,32 @@ int main(void) {
 
 `break` inside a `switch` inside a loop leaves the `switch`, not the loop. There is no labeled `break` like Java's; to leave nested loops, use a flag, move the loops into a function and `return`, or use `goto`.
 
+### Loops that run every frame
+
+Two habits matter more than any micro-optimization in a loop that runs over every entity, every frame:
+
+**Hoist work out of the loop.** Anything that does not change between iterations should be computed once before the loop. The compiler can do it for plain arithmetic, but not across a function call it cannot see into, and not at `-O0`:
+
+```c
+#include <stdio.h>
+
+int main(void) {
+    float x[4] = {0, 10, 20, 30};
+    float speed = 120.0f, dt = 1.0f / 60, drag = 0.5f;
+
+    // Slow habit: the same product computed on every iteration
+    // for (int i = 0; i < n; i++) x[i] += speed * dt * (1.0f - drag * dt);
+
+    float step = speed * dt * (1.0f - drag * dt);   // once, before the loop
+    for (int i = 0; i < 4; i++)
+        x[i] += step;
+    printf("%.4f %.4f\n", x[0], x[3]);
+    return 0;
+}
+```
+
+**Keep branches predictable.** A modern CPU guesses which way each `if` goes and runs ahead speculatively. A branch that almost always goes the same way (`if (hp <= 0)` on mostly living enemies) is nearly free. A branch that is effectively random (50/50 on unsorted data) is mispredicted about half the time, and each miss throws away 15-20 cycles of work. For small decisions, a ternary that picks between two values (`v = v < lo ? lo : v;`) often compiles to a conditional move with no branch at all. Sorting or grouping data so that equal cases come together also makes branches predictable.
+
 ## goto
 
 `goto label;` jumps to `label:` anywhere in the same function. Dijkstra was right that spaghetti `goto` is bad, but two uses are standard, idiomatic C, used all over the Linux kernel, SQLite and CPython:
@@ -233,15 +264,19 @@ int main(void) {
 #include <stdio.h>
 
 int main(void) {
-    int grid[3][3] = {{1, 2, 3}, {4, 5, 6}, {7, 8, 9}};
-    int target = 5;
-    for (int r = 0; r < 3; r++)
-        for (int c = 0; c < 3; c++)
-            if (grid[r][c] == target) {
-                printf("found at %d,%d\n", r, c);
+    enum { FLOOR, WALL, DOOR };
+    int map[3][4] = {
+        {WALL, WALL, WALL, WALL},
+        {WALL, FLOOR, FLOOR, DOOR},
+        {WALL, WALL, WALL, WALL},
+    };
+    for (int y = 0; y < 3; y++)
+        for (int x = 0; x < 4; x++)
+            if (map[y][x] == DOOR) {
+                printf("door at %d,%d\n", x, y);
                 goto done;            // leave both loops at once
             }
-    puts("not found");
+    puts("no door");
 done:
     return 0;
 }
@@ -785,6 +820,238 @@ empty
 1 2 3 4
 --- out
 1 1
+
+=== exercise gridwalk
+title: Walking on a grid
+--- prompt
+A character stands on a `W` by `H` grid of tiles, at column `x`, row `y` (row 0 is the top, so "up" decreases `y`). Read `W H x y` from stdin, then read the rest of the input one character at a time with `getchar` until `EOF`. Each character is a move:
+
+- `U` or `u`: up, `D` or `d`: down, `L` or `l`: left, `R` or `r`: right.
+- Anything else (spaces, newlines, other letters) is ignored.
+
+A move that would leave the grid does not happen; count it as a **bump**. At the end print `x y bumps`.
+
+For input `5 3 0 0` and moves `RRUDDDLL`: right twice to (2,0), up bumps, down twice to (2,2), down bumps, left twice to (0,2). Output `0 2 2`.
+
+Use a `switch` with stacked `case` labels for the key mapping. This is the shape of real input handling: map raw keys to a direction once, then apply the direction with one bounds check.
+--- starter
+#include <stdio.h>
+
+int main(void) {
+    int w, h, x, y;
+    if (scanf("%d %d %d %d", &w, &h, &x, &y) != 4) return 1;
+    int bumps = 0;
+    // read moves with getchar until EOF
+    printf("%d %d %d\n", x, y, bumps);
+    return 0;
+}
+--- solution
+#include <stdio.h>
+
+int main(void) {
+    int w, h, x, y;
+    if (scanf("%d %d %d %d", &w, &h, &x, &y) != 4) return 1;
+    int bumps = 0, c;
+    while ((c = getchar()) != EOF) {
+        int dx = 0, dy = 0;
+        switch (c) {
+        case 'U': case 'u': dy = -1; break;
+        case 'D': case 'd': dy = 1; break;
+        case 'L': case 'l': dx = -1; break;
+        case 'R': case 'r': dx = 1; break;
+        default: continue;              // not a move: next character
+        }
+        int nx = x + dx, ny = y + dy;
+        if (nx < 0 || nx >= w || ny < 0 || ny >= h) bumps++;
+        else { x = nx; y = ny; }
+    }
+    printf("%d %d %d\n", x, y, bumps);
+    return 0;
+}
+--- hint
+`c` must be an `int` to hold `EOF`. Turn the key into `dx`, `dy` in the `switch`, then do one bounds check after it.
+--- hint
+`continue` inside a `switch` inside a loop goes to the next loop iteration (only `break` is captured by the `switch`).
+--- test
+5 3 0 0
+RRUDDDLL
+--- out
+0 2 2
+--- test
+1 1 0 0
+UDLRudlr
+--- out
+0 0 8
+--- test
+10 10 5 5
+r R r R r R r
+u U x y z
+d
+--- out
+9 4 3
+--- test
+4 4 3 3
+--- out
+3 3 0
+
+=== exercise hitroll
+title: Roll to hit
+--- prompt
+A tabletop-style attack: roll a 20-sided die (`roll` is 1 to 20), add the attacker's `attack` bonus, and compare with the target's `defense`. Write `int hit_result(int roll, int attack, int defense)` returning one of the constants in the starter:
+
+- a natural 20 (`roll == 20`) is always `HIT_CRIT`,
+- a natural 1 is always `HIT_MISS`,
+- otherwise `HIT_NORMAL` if `roll + attack >= defense`, else `HIT_MISS`.
+
+Order your tests so the special cases come first. The next exercise uses this in a combat loop.
+--- starter
+enum { HIT_MISS, HIT_NORMAL, HIT_CRIT };
+
+int hit_result(int roll, int attack, int defense) {
+    return HIT_MISS;
+}
+--- solution
+enum { HIT_MISS, HIT_NORMAL, HIT_CRIT };
+
+int hit_result(int roll, int attack, int defense) {
+    if (roll == 20) return HIT_CRIT;
+    if (roll == 1) return HIT_MISS;
+    return roll + attack >= defense ? HIT_NORMAL : HIT_MISS;
+}
+--- harness
+int main(void) {
+    CHECK_INT(hit_result(20, 0, 100), HIT_CRIT);
+    CHECK_INT(hit_result(1, 100, 0), HIT_MISS);
+    CHECK_INT(hit_result(10, 5, 15), HIT_NORMAL);
+    CHECK_INT(hit_result(10, 4, 15), HIT_MISS);
+    CHECK_INT(hit_result(19, 0, 19), HIT_NORMAL);
+    CHECK_INT(hit_result(2, -5, 0), HIT_MISS);
+    CHECK_INT(hit_result(2, 0, 2), HIT_NORMAL);
+    return TEST_END();
+}
+
+=== exercise duel
+title: Turns to kill
+continues: hitroll
+--- prompt
+Now a fight. Add `int turns_to_kill(int hp, int damage, int attack, int defense, unsigned seed)`: the attacker hits the target every turn until its `hp` reaches 0 or below, and you return how many turns that took. Each turn:
+
+1. Advance the random generator and take a roll: `seed = seed * 1103515245u + 12345u;` then `roll = (int)((seed >> 16) % 20) + 1;`
+2. Use your `hit_result`: a miss does nothing, a normal hit subtracts `damage`, a crit subtracts `2 * damage`.
+
+If the target is still alive after 1000 turns, give up and return -1 (a fight the attacker can't win must not hang the game). `hp` and `damage` are positive.
+
+Use a `switch` on the result. The random generator is a *linear congruential generator*: unsigned arithmetic wraps, which is well defined, so the same seed always gives the same fight. Games rely on that for replays and for testing exactly like this.
+--- stubs
+int turns_to_kill(int hp, int damage, int attack, int defense, unsigned seed) {
+    return 0;
+}
+--- solution
+enum { HIT_MISS, HIT_NORMAL, HIT_CRIT };
+
+int hit_result(int roll, int attack, int defense) {
+    if (roll == 20) return HIT_CRIT;
+    if (roll == 1) return HIT_MISS;
+    return roll + attack >= defense ? HIT_NORMAL : HIT_MISS;
+}
+
+int turns_to_kill(int hp, int damage, int attack, int defense, unsigned seed) {
+    for (int turn = 1; turn <= 1000; turn++) {
+        seed = seed * 1103515245u + 12345u;
+        int roll = (int)((seed >> 16) % 20) + 1;
+        switch (hit_result(roll, attack, defense)) {
+        case HIT_CRIT:   hp -= 2 * damage; break;
+        case HIT_NORMAL: hp -= damage; break;
+        default:         break;
+        }
+        if (hp <= 0) return turn;
+    }
+    return -1;
+}
+--- hint
+Count turns with a `for` loop from 1 to 1000 and `return` from inside it as soon as `hp <= 0`. After the loop, return -1.
+--- harness
+static int ref_turns(int hp, int damage, int attack, int defense, unsigned seed) {
+    for (int turn = 1; turn <= 1000; turn++) {
+        seed = seed * 1103515245u + 12345u;
+        int roll = (int)((seed >> 16) % 20) + 1;
+        if (roll == 20) hp -= 2 * damage;
+        else if (roll != 1 && roll + attack >= defense) hp -= damage;
+        if (hp <= 0) return turn;
+    }
+    return -1;
+}
+int main(void) {
+    CHECK_INT(turns_to_kill(10, 10, 100, 0, 1), ref_turns(10, 10, 100, 0, 1));
+    CHECK_INT(turns_to_kill(1, 1, 0, 0, 7), ref_turns(1, 1, 0, 0, 7));
+    CHECK_INT(turns_to_kill(100, 7, 3, 12, 42), ref_turns(100, 7, 3, 12, 42));
+    CHECK_INT(turns_to_kill(500, 3, 0, 15, 2024), ref_turns(500, 3, 0, 15, 2024));
+    CHECK_INT(turns_to_kill(50, 10, -100, 50, 99), ref_turns(50, 10, -100, 50, 99));
+    CHECK_INT(turns_to_kill(1000000, 1, 0, 0, 5), -1);
+    int bad = 0;
+    for (unsigned s = 0; s < 200; s++)
+        if (turns_to_kill(60, 5, 2, 14, s) != ref_turns(60, 5, 2, 14, s)) bad++;
+    CHECK_INT(bad, 0);
+    CHECK_INT(hit_result(20, 0, 100), HIT_CRIT);
+    return TEST_END();
+}
+
+=== exercise spawns
+title: Count spawns without simulating
+--- prompt
+An enemy spawner fires on tick `offset`, then every `period` ticks after that (`offset`, `offset + period`, `offset + 2 * period`, ...). Write `long long spawns_between(long long t0, long long t1, long long period, long long offset)`: how many spawn ticks `t` satisfy `t0 <= t < t1`?
+
+Inputs: `0 <= t0 <= t1 <= 10^18`, `period >= 1`, `offset >= 0`.
+
+The loop `for (t = t0; t < t1; t++) if (...) count++;` is correct, and on a range of 10^18 ticks it would run for decades. Some tests use ranges like that. Count with arithmetic instead: write a helper "how many spawns happen before tick `T`" (none if `T <= offset`, otherwise `(T - offset - 1) / period + 1`), and subtract.
+
+> **Performance:** a game that fast-forwards (an idle game catching up on the hours you were away, a server replaying a long fight, an AI predicting when a timer fires) must not step tick by tick when a closed form exists. Simulate only what actually interacts.
+--- starter
+long long spawns_between(long long t0, long long t1, long long period, long long offset) {
+    long long count = 0;
+    for (long long t = t0; t < t1; t++)
+        if (t >= offset && (t - offset) % period == 0) count++;
+    return count;
+}
+--- solution
+static long long spawns_before(long long T, long long period, long long offset) {
+    if (T <= offset) return 0;
+    return (T - offset - 1) / period + 1;
+}
+
+long long spawns_between(long long t0, long long t1, long long period, long long offset) {
+    return spawns_before(t1, period, offset) - spawns_before(t0, period, offset);
+}
+--- hint
+Spawns before tick `T`: the ticks `offset, offset + period, ...` that are `< T`. The last one is at most `T - 1`, so there are `(T - 1 - offset) / period + 1` of them when `T > offset`.
+--- hint
+Everything is non-negative, so `/` (truncation) is the same as floor here.
+--- harness
+static long long brute(long long t0, long long t1, long long p, long long o) {
+    long long c = 0;
+    for (long long t = t0; t < t1; t++) if (t >= o && (t - o) % p == 0) c++;
+    return c;
+}
+int main(void) {
+    CHECK_INT(spawns_between(0, 10, 3, 0), 4);
+    CHECK_INT(spawns_between(0, 10, 3, 1), 3);
+    CHECK_INT(spawns_between(1, 10, 3, 0), 3);
+    CHECK_INT(spawns_between(5, 5, 1, 0), 0);
+    CHECK_INT(spawns_between(0, 100, 7, 200), 0);
+    CHECK_INT(spawns_between(10, 11, 5, 10), 1);
+    CHECK_INT(spawns_between(11, 15, 5, 10), 0);
+    int bad = 0;
+    for (long long t0 = 0; t0 < 30; t0 += 3)
+        for (long long len = 0; len < 40; len += 7)
+            for (long long p = 1; p < 9; p++)
+                for (long long o = 0; o < 12; o += 5)
+                    if (spawns_between(t0, t0 + len, p, o) != brute(t0, t0 + len, p, o)) bad++;
+    CHECK_INT(bad, 0);
+    CHECK_INT(spawns_between(0, 1000000000000000000LL, 1, 0), 1000000000000000000LL);
+    CHECK_INT(spawns_between(0, 1000000000000000000LL, 60, 30), 16666666666666667LL);
+    CHECK_INT(spawns_between(123456789, 987654321987654321LL, 3600, 7), 274348422740055LL);
+    return TEST_END();
+}
 
 === quiz
 run: yes

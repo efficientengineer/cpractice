@@ -1,0 +1,791 @@
+=== chapter arrays
+title: Arrays
+blurb: The array methods (map/filter/reduce and friends), sorting traps, non-mutating copies, ranges, holes, destructuring, groupBy, data transformations, and arrays in hot loops.
+--- body
+## Arrays are lists (mostly)
+
+A JavaScript array is a growable, zero-indexed list of any values, closer to C#'s `List<object>` than to `T[]`. It's technically an object whose keys are integer strings plus a magic `length`, but engines store it as a real contiguous buffer as long as you treat it like one.
+
+```js
+const inv = ['sword', 'shield'];
+inv.push('potion');            // add at end (amortized O(1))
+const last = inv.pop();        // remove from end, O(1)
+inv.unshift('torch');          // add at front: O(n), shifts everything
+const first = inv.shift();     // remove from front: O(n)
+console.log(inv, last, first, inv.length, inv.at(-1), inv[99]);
+console.log(inv.indexOf('shield'), inv.includes('bow'), inv.join(' + '));
+
+const removed = inv.splice(0, 1, 'axe', 'bow');   // at index 0, remove 1, insert 2
+console.log(removed, inv, inv.slice(1), inv.concat(['rope']));
+```
+
+`push`/`pop` at the end are cheap; `shift`/`unshift`/`splice` in the middle move every later element. Reading out of bounds returns `undefined` rather than throwing.
+
+> **Performance:** a queue built on `push` + `shift` is O(n) per dequeue. Fine for 10 items, quadratic for an event queue that sees 10,000 events a frame. Use a read index (`queue[head++]`, reset when empty) or a ring buffer. Similarly `arr.includes(x)` is a linear scan: for "is this tile visited?" or "is this id in the set?" checks inside a loop, use a `Set` or a flat boolean/typed array indexed by id.
+
+## The iteration methods
+
+These are LINQ, eagerly evaluated. Each callback gets `(element, index, array)`.
+
+| Method | Returns | LINQ |
+|---|---|---|
+| `map(f)` | new array of `f(x)` | `Select` |
+| `filter(f)` | new array of elements where `f(x)` is truthy | `Where` |
+| `reduce(f, init)` | accumulated value | `Aggregate` |
+| `find(f)` / `findLast(f)` | first / last matching element or `undefined` | `FirstOrDefault` / `LastOrDefault` |
+| `findIndex(f)` / `findLastIndex(f)` | index or `-1` | |
+| `some(f)` / `every(f)` | boolean, short-circuits | `Any` / `All` |
+| `flatMap(f)` | map then flatten one level | `SelectMany` |
+| `flat(depth = 1)` | flattened copy | |
+| `includes(x)` | boolean (SameValueZero, finds `NaN`) | `Contains` |
+| `forEach(f)` | `undefined` (can't `break`) | |
+
+```js
+const enemies = [
+  { name: 'slime', hp: 3, xp: 1, tags: ['weak'] },
+  { name: 'orc', hp: 12, xp: 5, tags: ['melee', 'armored'] },
+  { name: 'imp', hp: 0, xp: 3, tags: ['flying'] },
+  { name: 'troll', hp: 30, xp: 20, tags: ['melee', 'regen'] },
+];
+const alive = enemies.filter(e => e.hp > 0);
+console.log(alive.map(e => e.name));
+console.log(enemies.reduce((sum, e) => sum + e.xp, 0));
+console.log(enemies.find(e => e.hp > 10)?.name, enemies.findIndex(e => e.hp === 0));
+console.log(enemies.some(e => e.tags.includes('flying')), enemies.every(e => e.xp > 0));
+console.log(enemies.flatMap(e => e.tags), [[1, [2]], [3]].flat(Infinity));
+```
+
+### reduce, properly
+
+Always pass the initial value. Without it, `reduce` uses the first element as the accumulator and **throws on an empty array**. With it, the accumulator can be any type: a number, an object, a `Map`.
+
+```js
+const loot = ['coin', 'gem', 'coin', 'coin', 'sword', 'gem'];
+const counts = loot.reduce((acc, item) => {
+  acc[item] = (acc[item] ?? 0) + 1;
+  return acc;
+}, {});
+console.log(counts);
+
+const foes = [{ name: 'slime', hp: 3 }, { name: 'troll', hp: 30 }, { name: 'orc', hp: 12 }];
+const strongest = foes.reduce((best, e) => (e.hp > best.hp ? e : best));
+console.log(strongest.name);
+try { [].reduce((a, b) => a + b); } catch (e) { console.log(e.name); }
+```
+
+Don't write `reduce((acc, x) => ({ ...acc, [x.id]: x }), {})`: spreading the accumulator copies it every step, making an O(n) job O(n²). Mutate the accumulator you own, or use `Object.fromEntries`/`new Map(...)`.
+
+### Chains versus loops
+
+```js
+const enemies = [{ hp: 0, xp: 1 }, { hp: 5, xp: 4 }, { hp: 0, xp: 3 }];
+// readable: three passes, two temporary arrays
+const xpFromKills = enemies.filter(e => e.hp === 0).map(e => e.xp).reduce((a, b) => a + b, 0);
+
+// one pass, no allocation
+let xp = 0;
+for (let i = 0; i < enemies.length; i++) if (enemies[i].hp === 0) xp += enemies[i].xp;
+console.log(xpFromKills, xp);
+```
+
+> **Performance:** each `map`/`filter`/`slice`/`concat`/spread allocates a new array. In code that runs once (loading a level, building a menu) the chain is the right choice: clearer, and the cost is invisible. In per-frame code over thousands of entities, those temporaries become garbage-collector pauses that show up as stutter. Use indexed `for` loops (or `for...of`) in hot paths, reuse arrays (`arr.length = 0` empties one in place), and keep the functional style for everything else. Measure with `performance.now()` before rewriting anything.
+
+## Sorting: the classic trap
+
+`sort()` **mutates** the array and, without a comparator, **sorts as strings**. So numbers sort lexicographically:
+
+```js
+const scores = [100, 25, 3, 1000, 42];
+console.log([...scores].sort());                  // strings!
+console.log([...scores].sort((a, b) => a - b));   // numeric ascending
+console.log([...scores].sort((a, b) => b - a));   // descending
+```
+
+The comparator returns negative (a first), positive (b first), or zero. Rules:
+
+- For numbers, `a - b`. Don't return a boolean (`a > b`): it's never negative, so the sort is wrong in engine-dependent ways.
+- For strings, `a.localeCompare(b)` (locale-aware) or `a < b ? -1 : a > b ? 1 : 0` (code-unit order, faster and deterministic).
+- Sort is **stable** (guaranteed since ES2019): equal elements keep their order, so you can sort by a secondary key with `||` chaining.
+
+```js
+const board = [
+  { name: 'cy', score: 50, time: 30 },
+  { name: 'ada', score: 80, time: 45 },
+  { name: 'bob', score: 50, time: 20 },
+  { name: 'dee', score: 80, time: 45 },
+];
+const ranked = board.toSorted((a, b) => b.score - a.score || a.time - b.time || a.name.localeCompare(b.name));
+console.log(ranked.map(p => p.name), board[0].name);
+```
+
+### Non-mutating versions (ES2023)
+
+`toSorted`, `toReversed`, `toSpliced` and `with(index, value)` return new arrays and leave the original alone. Use them whenever the array isn't yours to mutate (props, shared state); the old idiom was `[...arr].sort()`.
+
+```js
+const order = [3, 1, 2];
+console.log(order.toSorted(), order.toReversed(), order.with(0, 9), order.toSpliced(1, 1), order);
+```
+
+`reverse()`, `sort()`, `splice()`, `fill()`, `copyWithin()`, `push`/`pop`/`shift`/`unshift` mutate. `map`, `filter`, `slice`, `concat`, `flat`, `to*`, `with` don't.
+
+## Creating arrays and ranges
+
+There's no `Enumerable.Range`. `Array.from` takes an iterable or an array-like (`{ length: n }`) plus a mapping function:
+
+```js
+const range = (start, end, step = 1) => Array.from({ length: Math.max(0, Math.ceil((end - start) / step)) }, (_, i) => start + i * step);
+console.log(range(0, 5), range(10, 0, -3), range(0, 1, 0.25));
+
+const grid = Array.from({ length: 3 }, () => Array(4).fill('.'));   // 3 rows of 4
+grid[1][2] = '#';
+console.log(grid.map(row => row.join('')));
+
+const shared = Array(3).fill([]);   // trap: ONE array, three references
+shared[0].push('x');
+console.log(shared);
+console.log(Array.from('abc'), Array.from(new Set([1, 1, 2])), Array.of(7), Array(7).length);
+```
+
+`fill(obj)` puts the *same* object in every slot. For a grid, give `Array.from` a function so each row is new.
+
+> **Performance:** for tile maps, prefer one flat array of `width * height` cells indexed by `y * width + x` over an array of row arrays: one allocation, contiguous memory, one bounds check, and trivially copyable. With a typed array (`new Uint8Array(w * h)`) it's also compact: one byte per tile instead of an 8-byte reference.
+
+## Holes and sparse arrays
+
+`Array(5)`, `[1, , 3]`, `delete arr[i]` or writing `arr[100]` on a short array create **holes**: indexes that don't exist (different from holding `undefined`). Iteration methods (`forEach`, `map`, `filter`, `reduce`) *skip* holes; `for...of`, spread and `Array.from` treat them as `undefined`.
+
+```js
+const holey = [1, , 3];
+console.log(holey.length, 1 in holey, holey[1]);
+let visits = 0;
+holey.forEach(() => visits++);
+console.log(visits, [...holey], Array.from(holey, x => x ?? 0));
+console.log(Array(3).map(() => 'x').length, Array(3).map(() => 'x')[0], Array.from({ length: 3 }, () => 'x'));
+```
+
+> **Performance:** engines track an array's "elements kind": packed small integers, packed doubles, packed anything, and HOLEY variants of each. Transitions only go towards the slower, more general kinds, never back. Creating holes (`delete arr[i]`, `new Array(n)` then filling out of order, writing past the end) or mixing types (putting a string into a number array) slows every later access to that array. Preallocate by pushing in order or with `Array.from`/`fill`, keep arrays homogeneous, and never `delete` from an array; for numeric data use typed arrays.
+
+## Destructuring arrays
+
+```js
+const [first, second = 'none', ...others] = ['a'];
+console.log(first, second, others);
+
+const [, , third] = [1, 2, 3];               // skip with commas
+let px = 1, py = 2;
+[px, py] = [py, px];                          // swap
+console.log(third, px, py);
+
+const [[x0, y0], [x1, y1]] = [[0, 0], [3, 4]];
+console.log(Math.hypot(x1 - x0, y1 - y0));
+
+for (const [i, name] of ['ada', 'bob'].entries()) console.log(i, name);
+```
+
+The swap idiom is elegant but allocates a temporary array; in a hot inner loop (sorting, shuffling) use a `const t = a[i]; a[i] = a[j]; a[j] = t;` swap.
+
+## Grouping
+
+`Object.groupBy(items, keyFn)` (ES2024) groups into a null-prototype object of arrays; `Map.groupBy` does the same into a `Map` (use it when keys aren't strings).
+
+```js
+const drops = [
+  { item: 'potion', rarity: 'common', value: 5 },
+  { item: 'ruby', rarity: 'rare', value: 120 },
+  { item: 'bread', rarity: 'common', value: 2 },
+  { item: 'crown', rarity: 'epic', value: 900 },
+];
+const byRarity = Object.groupBy(drops, d => d.rarity);
+console.log(Object.keys(byRarity), byRarity.common.map(d => d.item));
+const byBand = Map.groupBy(drops, d => (d.value >= 100 ? 'valuable' : 'junk'));
+console.log([...byBand.keys()], byBand.get('junk').length);
+```
+
+## Common transformations
+
+```js
+const players = [
+  { id: 7, name: 'ada', team: 'red', kills: 12 },
+  { id: 3, name: 'bob', team: 'blue', kills: 4 },
+  { id: 9, name: 'cy', team: 'red', kills: 8 },
+];
+// index by id (build once, then O(1) lookups instead of find() in a loop)
+const byId = new Map(players.map(p => [p.id, p]));
+console.log(byId.get(9).name);
+
+// totals per team
+const teamKills = {};
+for (const p of players) teamKills[p.team] = (teamKills[p.team] ?? 0) + p.kills;
+console.log(teamKills);
+
+// unique values, preserving order
+console.log([...new Set(players.map(p => p.team))]);
+
+// zip two arrays
+const names = ['a', 'b', 'c'], hp = [10, 20, 30];
+console.log(names.map((n, i) => [n, hp[i]]));
+
+// chunk into rows of 2
+const chunk = (arr, n) => Array.from({ length: Math.ceil(arr.length / n) }, (_, i) => arr.slice(i * n, i * n + n));
+console.log(chunk([1, 2, 3, 4, 5], 2));
+
+// partition into [matching, rest] in one pass
+const [vets, rookies] = players.reduce((acc, p) => (acc[p.kills >= 8 ? 0 : 1].push(p), acc), [[], []]);
+console.log(vets.length, rookies.length);
+```
+
+The "index by id once" pattern matters: `ids.map(id => players.find(p => p.id === id))` is O(n·m) and is one of the most common accidental quadratic loops in JavaScript code.
+
+### Removing items in a game loop
+
+Removing dead entities from the middle of an array with `splice` while iterating is both buggy (indexes shift under you) and O(n) per removal. When order doesn't matter, which is usual for entity lists, use **swap-remove**: overwrite the dead slot with the last element and `pop`.
+
+```js
+const bullets = [{ id: 1, alive: true }, { id: 2, alive: false }, { id: 3, alive: true }, { id: 4, alive: false }];
+for (let i = bullets.length - 1; i >= 0; i--) {   // backwards: the swapped-in element was already visited
+  if (!bullets[i].alive) {
+    bullets[i] = bullets[bullets.length - 1];
+    bullets.pop();
+  }
+}
+console.log(bullets.map(b => b.id));
+```
+
+When order matters (draw order, a sorted list), compact in place with a write index: one pass, no allocation. One of the exercises is exactly that.
+
+=== exercise inventory
+title: Inventory report
+--- prompt
+Write `inventoryReport(items)` where each item is `{ name, type, qty, value }` (`value` is per unit). Return an array with one entry per `type`:
+
+```js
+{ type, count, totalQty, totalValue, best }
+```
+
+- `count`: number of distinct item entries of that type,
+- `totalQty`: sum of `qty`,
+- `totalValue`: sum of `qty * value`,
+- `best`: the `name` of the entry with the highest `qty * value` (on a tie, the one that appears first).
+
+Entries with `qty` of `0` or less are ignored entirely (a type with only such items doesn't appear). Sort the result by `totalValue` descending, and by `type` alphabetically (plain `<` comparison) when equal. Don't modify `items`.
+--- starter
+function inventoryReport(items) {
+  return items.map(i => ({ type: i.type }));
+}
+--- solution
+function inventoryReport(items) {
+  const groups = Object.groupBy(items.filter(i => i.qty > 0), i => i.type);
+  return Object.entries(groups)
+    .map(([type, list]) => {
+      let best = list[0];
+      for (const it of list) if (it.qty * it.value > best.qty * best.value) best = it;
+      return {
+        type,
+        count: list.length,
+        totalQty: list.reduce((s, i) => s + i.qty, 0),
+        totalValue: list.reduce((s, i) => s + i.qty * i.value, 0),
+        best: best.name,
+      };
+    })
+    .sort((a, b) => b.totalValue - a.totalValue || (a.type < b.type ? -1 : a.type > b.type ? 1 : 0));
+}
+--- hint
+`Object.groupBy(items.filter(...), i => i.type)` gives you `{ type: [items] }`; `Object.entries` turns it into pairs to `map` over.
+--- hint
+For `best`, a strict `>` comparison keeps the first of equal entries. Sort with `b.totalValue - a.totalValue || typeCompare`.
+--- harness
+{
+  const items = [
+    { name: 'potion', type: 'consumable', qty: 5, value: 10 },
+    { name: 'sword', type: 'weapon', qty: 1, value: 100 },
+    { name: 'bread', type: 'consumable', qty: 10, value: 2 },
+    { name: 'bow', type: 'weapon', qty: 1, value: 80 },
+    { name: 'arrow', type: 'ammo', qty: 50, value: 1 },
+    { name: 'elixir', type: 'consumable', qty: 0, value: 500 },
+    { name: 'ghost', type: 'quest', qty: 0, value: 1 },
+    { name: 'gem', type: 'treasure', qty: 2, value: 25 },
+  ];
+  const copy = structuredClone(items);
+  eq(inventoryReport(items), [
+    { type: 'weapon', count: 2, totalQty: 2, totalValue: 180, best: 'sword' },
+    { type: 'consumable', count: 2, totalQty: 15, totalValue: 70, best: 'potion' },
+    { type: 'ammo', count: 1, totalQty: 50, totalValue: 50, best: 'arrow' },
+    { type: 'treasure', count: 1, totalQty: 2, totalValue: 50, best: 'gem' },
+  ]);
+  eq(items, copy, 'input not modified');
+  eq(inventoryReport([]), []);
+  eq(inventoryReport([{ name: 'a', type: 't', qty: 1, value: 5 }, { name: 'b', type: 't', qty: 5, value: 1 }]),
+    [{ type: 't', count: 2, totalQty: 6, totalValue: 10, best: 'a' }], 'tie keeps first');
+  eq(inventoryReport([{ name: 'x', type: 'b', qty: -1, value: 5 }]), []);
+}
+
+=== exercise leaderboard
+title: Leaderboard ranks
+--- prompt
+Write `rankScores(entries)` where entries are `{ name, score, time }`. Return a **new** array (don't sort the input in place) of `{ rank, name, score }` sorted by score descending, then time ascending (faster is better), then name ascending (`<` comparison).
+
+Ranks use "competition ranking": entries with the same score **and** time share a rank, and the next rank skips accordingly (1, 2, 2, 4). Scores can be any numbers, including large ones and negatives, so make sure you sort numerically.
+--- starter
+function rankScores(entries) {
+  return entries.sort().map((e, i) => ({ rank: i + 1, name: e.name, score: e.score }));
+}
+--- solution
+function rankScores(entries) {
+  const sorted = entries.toSorted((a, b) =>
+    b.score - a.score || a.time - b.time || (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+  let rank = 0;
+  return sorted.map((e, i) => {
+    const prev = sorted[i - 1];
+    if (!prev || prev.score !== e.score || prev.time !== e.time) rank = i + 1;
+    return { rank, name: e.name, score: e.score };
+  });
+}
+--- hint
+`toSorted` with a comparator chained by `||`: `b.score - a.score || a.time - b.time || nameCompare`.
+--- hint
+Walk the sorted list; when an entry differs from the previous one in score or time, its rank is its index + 1, otherwise it inherits the previous rank.
+--- harness
+{
+  const input = [
+    { name: 'cy', score: 9, time: 40 },
+    { name: 'ada', score: 100, time: 50 },
+    { name: 'eve', score: 20, time: 10 },
+    { name: 'bob', score: 100, time: 50 },
+    { name: 'dan', score: 100, time: 30 },
+    { name: 'fay', score: -5, time: 1 },
+  ];
+  const before = structuredClone(input);
+  eq(rankScores(input), [
+    { rank: 1, name: 'dan', score: 100 },
+    { rank: 2, name: 'ada', score: 100 },
+    { rank: 2, name: 'bob', score: 100 },
+    { rank: 4, name: 'eve', score: 20 },
+    { rank: 5, name: 'cy', score: 9 },
+    { rank: 6, name: 'fay', score: -5 },
+  ]);
+  eq(input, before, 'input order untouched');
+  eq(rankScores([]), []);
+  eq(rankScores([{ name: 'z', score: 1000, time: 1 }, { name: 'y', score: 999, time: 1 }, { name: 'x', score: 10000, time: 1 }]).map(e => e.name), ['x', 'z', 'y'], 'numeric sort');
+  eq(rankScores([{ name: 'b', score: 1, time: 1 }, { name: 'a', score: 1, time: 1 }, { name: 'c', score: 1, time: 1 }]).map(e => e.rank + e.name), ['1a', '1b', '1c']);
+}
+
+=== exercise level
+title: Parse a level
+--- prompt
+Levels are drawn as text. Write `parseLevel(lines)` taking an array of equal-length strings and returning:
+
+```js
+{ width, height, tiles, spawns, coins }
+```
+
+- `tiles` is a **flat** array of length `width * height` (row-major, index `y * width + x`) containing `1` for a wall (`#`) and `0` for anything else.
+- `spawns` is an array of `{ x, y }` for each `P` (player spawn) in reading order.
+- `coins` is the number of `$`.
+
+Then write `tileAt(level, x, y)` returning the tile at that position, or `1` (wall) for any position outside the map, so movement code never needs separate bounds checks.
+
+```js
+const lvl = parseLevel(['#####', '#P.$#', '#####']);
+lvl.width       // 5
+lvl.tiles[6]    // 0   (x 1, y 1)
+tileAt(lvl, -1, 0)  // 1
+```
+--- starter
+function parseLevel(lines) {
+  return { width: 0, height: 0, tiles: [], spawns: [], coins: 0 };
+}
+
+function tileAt(level, x, y) {
+  return level.tiles[y][x];
+}
+--- solution
+function parseLevel(lines) {
+  const height = lines.length, width = height ? lines[0].length : 0;
+  const tiles = new Array(width * height).fill(0);
+  const spawns = [];
+  let coins = 0;
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      const c = lines[y][x];
+      if (c === '#') tiles[y * width + x] = 1;
+      else if (c === 'P') spawns.push({ x, y });
+      else if (c === '$') coins++;
+    }
+  }
+  return { width, height, tiles, spawns, coins };
+}
+
+function tileAt(level, x, y) {
+  if (x < 0 || y < 0 || x >= level.width || y >= level.height) return 1;
+  return level.tiles[y * level.width + x];
+}
+--- hint
+Allocate the flat array once (`new Array(w * h).fill(0)`), then two nested loops write `tiles[y * width + x]`.
+--- hint
+`tileAt` must check `x >= width` explicitly: with a flat array, `x = width` would silently read the first tile of the next row.
+--- harness
+{
+  const lvl = parseLevel([
+    '#######',
+    '#P..$.#',
+    '#.##..#',
+    '#$..P$#',
+    '#######',
+  ]);
+  eq([lvl.width, lvl.height], [7, 5]);
+  eq(lvl.tiles.length, 35);
+  check(Array.isArray(lvl.tiles) && !Array.isArray(lvl.tiles[0]), 'flat array');
+  eq(lvl.tiles.slice(7, 14), [1, 0, 0, 0, 0, 0, 1]);
+  eq(lvl.tiles.slice(14, 21), [1, 0, 1, 1, 0, 0, 1]);
+  eq(lvl.spawns, [{ x: 1, y: 1 }, { x: 4, y: 3 }]);
+  eq(lvl.coins, 3);
+  eq(tileAt(lvl, 1, 1), 0);
+  eq(tileAt(lvl, 2, 2), 1);
+  eq(tileAt(lvl, 0, 0), 1);
+  eq(tileAt(lvl, -1, 1), 1, 'left of map');
+  eq(tileAt(lvl, 7, 1), 1, 'right of map, must not wrap to next row');
+  eq(tileAt(lvl, 6, -1), 1);
+  eq(tileAt(lvl, 3, 5), 1);
+  const empty = parseLevel([]);
+  eq([empty.width, empty.height, empty.tiles.length, empty.coins], [0, 0, 0, 0]);
+  eq(tileAt(empty, 0, 0), 1);
+  const open = parseLevel(['...', '...']);
+  eq(open.tiles, [0, 0, 0, 0, 0, 0]);
+}
+
+=== exercise compact
+title: Remove the dead (fast)
+--- prompt
+Every frame, entities with `hp <= 0` must be removed from the entity list. Write two functions that **modify the array in place** (same array object, no new array) and return the number removed:
+
+- `removeDeadOrdered(list)`: keeps the survivors in their original order (they are in draw order).
+- `removeDeadUnordered(list)`: order of survivors doesn't matter. Use swap-remove.
+
+Both are tested with 300,000 entities, half of them dead, and must each finish in well under a second. Calling `splice` once per dead entity is O(n²) here and will fail the timing check. Don't allocate a new array either.
+--- starter
+function removeDeadOrdered(list) {
+  let removed = 0;
+  for (let i = 0; i < list.length; i++) {
+    if (list[i].hp <= 0) { list.splice(i, 1); i--; removed++; }
+  }
+  return removed;
+}
+
+function removeDeadUnordered(list) {
+  return removeDeadOrdered(list);
+}
+--- solution
+function removeDeadOrdered(list) {
+  let w = 0;
+  for (let r = 0; r < list.length; r++) {
+    const e = list[r];
+    if (e.hp > 0) list[w++] = e;
+  }
+  const removed = list.length - w;
+  list.length = w;
+  return removed;
+}
+
+function removeDeadUnordered(list) {
+  let removed = 0;
+  for (let i = list.length - 1; i >= 0; i--) {
+    if (list[i].hp <= 0) {
+      list[i] = list[list.length - 1];
+      list.pop();
+      removed++;
+    }
+  }
+  return removed;
+}
+--- hint
+Ordered: keep a write index `w`. For each survivor, `list[w++] = e`. At the end, truncate with `list.length = w`.
+--- hint
+Unordered: walk backwards; replace a dead element with the last one and `pop()`. Walking backwards means the element you swap in has already been checked.
+--- harness
+{
+  const mk = (n) => Array.from({ length: n }, (_, i) => ({ id: i, hp: i % 2 ? 0 : 5 - (i % 7) }));
+  const small = [{ id: 1, hp: 3 }, { id: 2, hp: 0 }, { id: 3, hp: -2 }, { id: 4, hp: 1 }, { id: 5, hp: 0 }];
+  const s1 = small.map(e => ({ ...e }));
+  eq(removeDeadOrdered(s1), 3);
+  eq(s1.map(e => e.id), [1, 4], 'ordered survivors');
+  const s2 = small.map(e => ({ ...e }));
+  eq(removeDeadUnordered(s2), 3);
+  eq(s2.map(e => e.id).sort((a, b) => a - b), [1, 4], 'unordered survivors');
+  const none = [];
+  eq([removeDeadOrdered(none), removeDeadUnordered(none)], [0, 0]);
+  const allDead = [{ hp: 0 }, { hp: 0 }];
+  eq(removeDeadUnordered(allDead), 2); eq(allDead.length, 0);
+  const allDead2 = [{ hp: 0 }, { hp: -1 }];
+  eq(removeDeadOrdered(allDead2), 2); eq(allDead2.length, 0);
+
+  const big = mk(300000), want = big.filter(e => e.hp > 0).map(e => e.id);
+  const ref = big;
+  let t = performance.now();
+  const n = removeDeadOrdered(big);
+  const ms1 = performance.now() - t;
+  check(ref === big, 'same array');
+  eq(n, 300000 - want.length);
+  eq(big.length, want.length);
+  check(big.every((e, i) => e.id === want[i]), 'big ordered survivors in order');
+  check(ms1 < 400, `removeDeadOrdered took ${ms1.toFixed(0)} ms (want < 400)`);
+
+  const big2 = mk(300000);
+  t = performance.now();
+  const n2 = removeDeadUnordered(big2);
+  const ms2 = performance.now() - t;
+  eq(n2, 300000 - want.length);
+  check(big2.every(e => e.hp > 0), 'only survivors left');
+  eq(big2.map(e => e.id).sort((a, b) => a - b).length, want.length);
+  check(ms2 < 400, `removeDeadUnordered took ${ms2.toFixed(0)} ms (want < 400)`);
+}
+
+=== exercise utils
+title: range, chunk, zip, windows
+--- prompt
+Write four small utilities. Each returns a new array.
+
+- `range(start, end, step = 1)`: numbers from `start` up to but excluding `end`. With a negative `step`, counts down to (excluding) `end`. If the range is empty, return `[]`. Throw a `RangeError` if `step` is `0`.
+- `chunk(arr, size)`: split into consecutive pieces of `size` (the last may be shorter). Throw a `RangeError` if `size < 1`.
+- `zip(...arrays)`: tuples of corresponding elements, as long as the **shortest** input. `zip()` is `[]`.
+- `windows(arr, size)`: every run of `size` consecutive elements (sliding window). Fewer than `size` elements gives `[]`.
+--- starter
+function range(start, end, step = 1) {
+  const out = [];
+  for (let i = start; i < end; i += step) out.push(i);
+  return out;
+}
+
+function chunk(arr, size) { return [arr]; }
+
+function zip(...arrays) { return arrays; }
+
+function windows(arr, size) { return [arr]; }
+--- solution
+function range(start, end, step = 1) {
+  if (step === 0) throw new RangeError('step must not be 0');
+  const n = Math.max(0, Math.ceil((end - start) / step));
+  return Array.from({ length: n }, (_, i) => start + i * step);
+}
+
+function chunk(arr, size) {
+  if (size < 1) throw new RangeError('size must be >= 1');
+  return Array.from({ length: Math.ceil(arr.length / size) }, (_, i) => arr.slice(i * size, (i + 1) * size));
+}
+
+function zip(...arrays) {
+  if (!arrays.length) return [];
+  const n = Math.min(...arrays.map(a => a.length));
+  return Array.from({ length: n }, (_, i) => arrays.map(a => a[i]));
+}
+
+function windows(arr, size) {
+  return Array.from({ length: Math.max(0, arr.length - size + 1) }, (_, i) => arr.slice(i, i + size));
+}
+--- hint
+All four are `Array.from({ length: n }, (_, i) => ...)` once you work out `n`. For `range` it's `ceil((end - start) / step)`, clamped at 0.
+--- hint
+`Math.min(...arrays.map(a => a.length))` for zip, but handle zero arrays first: `Math.min()` is `Infinity`.
+--- harness
+eq(range(0, 5), [0, 1, 2, 3, 4]);
+eq(range(2, 3), [2]);
+eq(range(5, 5), []);
+eq(range(5, 0), [], 'empty when going the wrong way');
+eq(range(10, 0, -3), [10, 7, 4, 1]);
+eq(range(0, 10, 3), [0, 3, 6, 9]);
+eq(range(0, 1, 0.25), [0, 0.25, 0.5, 0.75]);
+eq(range(-2, 2), [-2, -1, 0, 1]);
+throws(() => range(0, 5, 0), 'step 0 throws');
+eq(chunk([1, 2, 3, 4, 5], 2), [[1, 2], [3, 4], [5]]);
+eq(chunk([1, 2, 3, 4], 2), [[1, 2], [3, 4]]);
+eq(chunk([], 3), []);
+eq(chunk([1], 5), [[1]]);
+throws(() => chunk([1], 0), 'size 0 throws');
+eq(zip([1, 2, 3], ['a', 'b', 'c']), [[1, 'a'], [2, 'b'], [3, 'c']]);
+eq(zip([1, 2, 3], ['a']), [[1, 'a']]);
+eq(zip([1, 2], [3, 4], [5, 6]), [[1, 3, 5], [2, 4, 6]]);
+eq(zip([1, 2], []), []);
+eq(zip(), []);
+eq(windows([1, 2, 3, 4], 2), [[1, 2], [2, 3], [3, 4]]);
+eq(windows([1, 2, 3], 3), [[1, 2, 3]]);
+eq(windows([1, 2], 3), []);
+{
+  const src = [1, 2, 3];
+  const c = chunk(src, 3);
+  check(c[0] !== src, 'chunk copies');
+}
+
+=== exercise scoreboard
+title: Print a scoreboard
+--- prompt
+A program exercise. The starter has match results. Print a scoreboard: one line per player, sorted by total points descending (ties: name ascending), formatted as name padded to 6 characters, then the total padded on the left to 4, then the individual round scores joined with `,`. Finish with a line `MVP: name` for the top player.
+
+Expected output:
+
+```text
+cy     125 50,40,35
+ada    110 30,80
+bob    110 90,20,0
+dee     12 12
+MVP: cy
+```
+--- starter
+const rounds = [
+  ['ada', 30], ['bob', 90], ['cy', 50], ['ada', 80],
+  ['bob', 20], ['cy', 40], ['dee', 12], ['bob', 0], ['cy', 35],
+];
+// group by player, total, sort, print
+console.log(rounds.sort());
+--- solution
+const rounds = [
+  ['ada', 30], ['bob', 90], ['cy', 50], ['ada', 80],
+  ['bob', 20], ['cy', 40], ['dee', 12], ['bob', 0], ['cy', 35],
+];
+const byPlayer = Map.groupBy(rounds, ([name]) => name);
+const rows = [...byPlayer].map(([name, rs]) => {
+  const scores = rs.map(([, s]) => s);
+  return { name, scores, total: scores.reduce((a, b) => a + b, 0) };
+});
+rows.sort((a, b) => b.total - a.total || (a.name < b.name ? -1 : 1));
+for (const r of rows) console.log(`${r.name.padEnd(6)}${String(r.total).padStart(4)} ${r.scores.join(',')}`);
+console.log(`MVP: ${rows[0].name}`);
+--- hint
+`Map.groupBy(rounds, ([name]) => name)` keeps first-seen order and gives each player's rounds in order.
+--- hint
+`padEnd(6)` and `String(n).padStart(4)` do the alignment.
+--- test
+--- out
+cy     125 50,40,35
+ada    110 30,80
+bob    110 90,20,0
+dee     12 12
+MVP: cy
+
+=== quiz
+run: yes
+--- q
+What does this print?
+--- code
+console.log([10, 9, 1, 100, 25].sort());
+--- choice
+[ 1, 9, 10, 25, 100 ]
+--- answer
+[ 1, 10, 100, 25, 9 ]
+--- choice
+[ 100, 25, 10, 9, 1 ]
+--- choice
+[ 1, 9, 10, 100, 25 ]
+--- explain
+Without a comparator, `sort` converts elements to strings and compares them by UTF-16 code units: `'100' < '25'` because `'1' < '2'`. Always pass `(a, b) => a - b` for numbers.
+
+=== quiz
+run: yes
+--- q
+What does this print?
+--- code
+console.log(['1', '7', '11'].map(parseInt));
+--- choice
+[ 1, 7, 11 ]
+--- answer
+[ 1, NaN, 3 ]
+--- choice
+[ 1, NaN, NaN ]
+--- choice
+[ 1, 7, 3 ]
+--- explain
+`map` passes `(element, index, array)`, and `parseInt` takes `(string, radix)`. So the calls are `parseInt('1', 0)` (radix 0 means auto: 1), `parseInt('7', 1)` (radix 1 is invalid: NaN) and `parseInt('11', 2)` (binary: 3). Write `.map(s => parseInt(s, 10))` or `.map(Number)`.
+
+=== quiz
+run: yes
+--- q
+What does this print?
+--- code
+const a = [3, 1, 2];
+const b = a.sort();
+const c = a.toSorted((x, y) => y - x);
+console.log(a, b === a, c);
+--- choice
+[ 3, 1, 2 ] false [ 3, 2, 1 ]
+--- answer
+[ 1, 2, 3 ] true [ 3, 2, 1 ]
+--- choice
+[ 1, 2, 3 ] false [ 3, 2, 1 ]
+--- choice
+[ 3, 2, 1 ] true [ 3, 2, 1 ]
+--- explain
+`sort` sorts in place *and* returns the same array, so `b === a` and `a` is now sorted. `toSorted` returns a new array and leaves `a` alone.
+
+=== quiz
+run: yes
+--- q
+What does this print?
+--- code
+const grid = Array(2).fill(Array(2).fill(0));
+grid[0][0] = 5;
+const holes = Array(3).map((_, i) => i);
+console.log(grid, holes.length, holes[0], Array.from({ length: 3 }, (_, i) => i));
+--- choice
+[ [ 5, 0 ], [ 0, 0 ] ] 3 0 [ 0, 1, 2 ]
+--- answer
+[ [ 5, 0 ], [ 5, 0 ] ] 3 undefined [ 0, 1, 2 ]
+--- choice
+[ [ 5, 0 ], [ 5, 0 ] ] 0 undefined [ 0, 1, 2 ]
+--- choice
+[ [ 5, 0 ], [ 0, 0 ] ] 3 undefined [ undefined, undefined, undefined ]
+--- explain
+`fill` puts the same inner array in both rows, so one write shows twice. `Array(3)` has three holes, and `map` skips holes (keeping them), so `holes[0]` is still `undefined`. `Array.from` treats missing values as `undefined` and does call the function.
+
+=== quiz
+run: yes
+--- q
+What does this print?
+--- code
+const xs = [1, 2, 3, 4];
+let calls = 0;
+const found = xs.find(x => { calls++; return x > 1; });
+const any = xs.some(x => { calls++; return x > 10; });
+console.log(found, any, calls, [NaN].indexOf(NaN), [NaN].includes(NaN));
+--- choice
+2 false 8 -1 true
+--- answer
+2 false 6 -1 true
+--- choice
+[ 2, 3, 4 ] false 8 0 true
+--- choice
+2 false 6 0 true
+--- explain
+`find` stops at the first match (2 calls); `some` finds nothing, so it checks all 4. `indexOf` uses `===`, which never matches `NaN`; `includes` uses SameValueZero, which does.
+
+=== quiz
+run: yes
+--- q
+What does this print?
+--- code
+const [a, , b = 10, ...rest] = [1, 2, undefined, 4, 5];
+let x = 1, y = 2;
+[x, y] = [y, x];
+console.log(a, b, rest, x, y);
+--- choice
+1 2 [ 4, 5 ] 2 1
+--- answer
+1 10 [ 4, 5 ] 2 1
+--- choice
+1 undefined [ 4, 5 ] 1 2
+--- choice
+1 10 [ undefined, 4, 5 ] 2 1
+--- explain
+The empty slot skips `2`. `b` gets `undefined`, so its default `10` applies. `rest` takes the remainder. The destructuring assignment swaps `x` and `y`.
+
+=== quiz
+--- q
+A game removes dead bullets each frame with `bullets = bullets.filter(b => b.alive)`. With 5,000 bullets, what's the main cost compared to an in-place compaction?
+--- choice
+`filter` is O(n²).
+--- answer
+It allocates a new 5,000-slot array every frame, which becomes garbage the collector must reclaim.
+--- choice
+`filter` can't be used on arrays of objects.
+--- choice
+It changes the order of the surviving bullets.
+--- explain
+`filter` is O(n) and keeps order, so it's correct and often fine. But it creates a fresh array each frame; at 60 fps that's steady garbage, and GC pauses cause frame hitches. A write-index compaction reuses the same array.

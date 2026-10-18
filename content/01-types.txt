@@ -74,6 +74,8 @@ int main(void) {
 }
 ```
 
+> **Performance:** pick sizes by *where the value lives*. For locals, loop counters and arithmetic, use `int` (or `int32_t`): it is the size the CPU handles natively, and narrower types only add conversions. For data stored by the thousand (tile ids in a map, particle lifetimes, per-vertex colors) use the smallest type that holds the range: a 256x256 map of `uint8_t` tile ids is 64 KB and fits in the L2 cache, the same map as `int64_t` is 512 KB and doesn't. A cache line is 64 bytes, so it carries 64 `uint8_t`s or 8 `int64_t`s. The bad habit is `int64_t` (or `double`) everywhere "just in case": it halves or quarters how much useful data each memory access brings in.
+
 ## size_t and ptrdiff_t
 
 `size_t` (from `<stddef.h>`, also pulled in by `<stdio.h>`, `<string.h>`, `<stdlib.h>`) is the unsigned type that `sizeof` yields and that `strlen`, `malloc` and `memcpy` use for sizes. On LP64 it is 64 bits. Print it with `%zu`. `ptrdiff_t` is the signed type you get by subtracting two pointers; print it with `%td`.
@@ -132,7 +134,9 @@ int main(void) {
 }
 ```
 
-Use `double` unless you have a reason (memory, SIMD, GPU) to use `float`. `printf` takes `%f` for both (a `float` argument is promoted to `double`), but `scanf` needs `%f` for `float *` and `%lf` for `double *`.
+In general-purpose code, use `double` unless you have a reason to use `float`. Games usually *have* the reason: positions, velocities, colors and anything sent to the GPU are `float`. `printf` takes `%f` for both (a `float` argument is promoted to `double`), but `scanf` needs `%f` for `float *` and `%lf` for `double *`.
+
+> **Performance:** a `float` is half the size of a `double`, so an array of a million particle positions takes half the memory bandwidth, and a SIMD register holds twice as many (8 floats in a 256-bit AVX register, against 4 doubles). GPUs work in `float`. The precision cost is real: a `float` has about 7 significant digits, so at 100,000 units from the origin its steps are about 0.008 units, enough to make movement jitter. Big worlds keep coordinates relative to a nearby origin (or use `double` for world position only). One trap ruins `float` code silently: an unsuffixed literal is a `double`, so `x * 0.5` converts `x` to `double`, multiplies, and converts back. Write `x * 0.5f`, and `sqrtf`, `fabsf`, `floorf` for the `float` versions of the math functions.
 
 ## Literals and suffixes
 
@@ -223,11 +227,11 @@ C# wraps silently by default (and throws inside `checked`). In C you must preven
 #include <limits.h>
 
 int main(void) {
-    int a = INT_MAX, b = 1;
-    if (b > 0 && a > INT_MAX - b)
-        puts("would overflow");
+    int gold = INT_MAX, reward = 1;
+    if (reward > 0 && gold > INT_MAX - reward)
+        puts("would overflow");          // clamp, refuse, or use a wider type
     else
-        printf("%d\n", a + b);
+        printf("%d\n", gold + reward);
     printf("%d %d\n", INT_MIN, INT_MAX);
     printf("%u %ld\n", UINT_MAX, LONG_MAX);
     printf("%d %d %d\n", CHAR_BIT, SCHAR_MIN, UCHAR_MAX);
@@ -236,6 +240,8 @@ int main(void) {
 ```
 
 `<limits.h>` has `CHAR_BIT` (8), `SCHAR_MIN/MAX`, `UCHAR_MAX`, `CHAR_MIN/MAX`, `SHRT_MIN/MAX`, `INT_MIN/MAX`, `UINT_MAX`, `LONG_MIN/MAX`, `ULONG_MAX`, `LLONG_MIN/MAX`, `ULLONG_MAX`. `<float.h>` has `DBL_MAX`, `DBL_EPSILON` and friends. gcc also offers `__builtin_add_overflow(a, b, &result)`, which does the check for you.
+
+Games hit this more than you would think: a score or gold counter that a player farms for weeks, damage multiplied by a stack of buffs, an idle game's numbers. Decide for each counter what happens at the limit (clamp, use `int64_t`, or refuse the action) instead of finding out from a negative gold total.
 
 A few more things that are undefined: `INT_MIN / -1`, `INT_MIN % -1`, `-INT_MIN`, any integer division by zero, shifting by a negative amount or by the type's width or more, and converting a `double` to an integer type that cannot hold it.
 
@@ -270,6 +276,8 @@ int main(void) {
 
 There is no `Convert.ToInt32`, no `Math.Round` behind the scenes, no exception. If you want rounding, use `round`, `floor`, `ceil` or `lround` from `<math.h>`.
 
+> **Performance:** each int-to-float or float-to-int conversion is a separate CPU instruction with a few cycles of latency, and `floor` or `lround` may be library calls. One conversion is nothing; a conversion on every element of an inner loop is a cost you chose by mixing types. Keep a hot loop in one type (all `float` or all `int`), convert once at the edges (when loading data, when writing pixels), and prefer `(int)x` when you know `x >= 0`, since truncation is then the same as `floor`.
+
 ## const
 
 `const` makes an object read-only through that name. Writing to it is a compile error:
@@ -278,15 +286,15 @@ There is no `Convert.ToInt32`, no `Math.Round` behind the scenes, no exception. 
 #include <stdio.h>
 
 int main(void) {
-    const int max_users = 100;
-    // max_users = 200;     // error: assignment of read-only variable
-    const double rate = 0.2;
-    printf("%d %.1f\n", max_users, max_users * rate);
+    const int max_hp = 100;
+    // max_hp = 200;        // error: assignment of read-only variable
+    const double crit_multiplier = 1.5;
+    printf("%d %.1f\n", max_hp, max_hp * crit_multiplier);
     return 0;
 }
 ```
 
-Unlike C#'s `const`, a C `const` variable is **not** a compile-time constant. Prior to C23 it cannot be a `case` label, and `int arr[max_users];` makes a variable-length array rather than a normal one. For true named constants, C programmers use `#define MAX_USERS 100` or an `enum { MAX_USERS = 100 };`. `const` really earns its keep with pointers, in the pointers chapter.
+Unlike C#'s `const`, a C `const` variable is **not** a compile-time constant. Prior to C23 it cannot be a `case` label, and `int arr[max_hp];` makes a variable-length array rather than a normal one. For true named constants, C programmers use `#define MAX_HP 100` or an `enum { MAX_HP = 100 };`. `const` really earns its keep with pointers, in the pointers chapter.
 
 ## Summary of the traps
 
@@ -697,6 +705,251 @@ Unsigned: the sum wraps (legally) exactly when the result comes out smaller than
 Signed: overflow is only possible when both operands have the same sign. If `b > 0`, the sum is too big exactly when `a > INT32_MAX - b`, and that subtraction itself cannot overflow.
 --- hint
 The negative case mirrors it: if `b < 0`, check `a < INT32_MIN - b`.
+
+=== exercise damage
+title: Damage that never overflows
+--- prompt
+A first piece of combat code. Write `int apply_damage(int hp, int damage, int armor)` that returns the new hit points:
+
+- Armor is subtracted from the damage. If `damage` is positive, the hit always does **at least 1** point ("chip damage"), however high the armor.
+- If `damage` is 0 or negative, nothing happens: return `hp` unchanged.
+- Hit points never go below 0.
+
+`hp` is between 0 and `INT_MAX`. `damage` and `armor` can be any `int`: a debuff can make armor negative, and a "kill" effect deals `INT_MAX`. So `damage - armor` and `hp - effective` can both overflow an `int`, and signed overflow is undefined behavior (the sanitizer reports it). Here a wider type is the clean fix: do the arithmetic in `long long`, which holds any difference of two `int`s, then clamp and convert back.
+
+The next exercise adds healing to this.
+--- starter
+int apply_damage(int hp, int damage, int armor) {
+    return hp - (damage - armor);
+}
+--- solution
+int apply_damage(int hp, int damage, int armor) {
+    if (damage <= 0) return hp;
+    long long effective = (long long)damage - armor;
+    if (effective < 1) effective = 1;
+    long long left = hp - effective;
+    return left < 0 ? 0 : (int)left;
+}
+--- hint
+Cast *before* subtracting: `(long long)damage - armor`. `(long long)(damage - armor)` overflows first and converts afterwards.
+--- hint
+Clamp twice: the effective damage to at least 1, and the result to at least 0.
+--- harness
+#include <limits.h>
+int main(void) {
+    CHECK_INT(apply_damage(100, 30, 10), 80);
+    CHECK_INT(apply_damage(100, 5, 10), 99);
+    CHECK_INT(apply_damage(100, 10, 10), 99);
+    CHECK_INT(apply_damage(100, 0, 0), 100);
+    CHECK_INT(apply_damage(100, -50, 0), 100);
+    CHECK_INT(apply_damage(10, 50, 0), 0);
+    CHECK_INT(apply_damage(0, 50, 0), 0);
+    CHECK_INT(apply_damage(100, 10, -15), 75);
+    CHECK_INT(apply_damage(INT_MAX, INT_MAX, INT_MIN), 0);
+    CHECK_INT(apply_damage(INT_MAX, INT_MAX, -1), 0);
+    CHECK_INT(apply_damage(INT_MAX, 1, INT_MAX), INT_MAX - 1);
+    CHECK_INT(apply_damage(INT_MAX, INT_MAX, 0), 0);
+    CHECK_INT(apply_damage(5, 2, INT_MIN + 1), 0);
+    return TEST_END();
+}
+
+=== exercise heal
+title: Healing with a cap
+continues: damage
+--- prompt
+Keep `apply_damage` and add `int apply_heal(int hp, int amount, int max_hp)`:
+
+- A dead character (`hp == 0`) stays dead: return 0.
+- An `amount` of 0 or less does nothing.
+- Otherwise the result is `hp + amount`, capped at `max_hp`.
+- An "overheal" buff can leave `hp` *above* `max_hp`. Healing never lowers it: if `hp` is already at or above `max_hp`, return `hp` unchanged.
+
+Inputs are `0 <= hp <= INT_MAX`, `1 <= max_hp <= INT_MAX`, and any `amount`, including `INT_MAX`. This time do it **without** a wider type: compare against the room that is left (`max_hp - hp`), which cannot overflow once you know `hp < max_hp`. That is the habit for the day you are already using the widest type.
+--- stubs
+int apply_heal(int hp, int amount, int max_hp) {
+    return hp + amount > max_hp ? max_hp : hp + amount;
+}
+--- solution
+int apply_damage(int hp, int damage, int armor) {
+    if (damage <= 0) return hp;
+    long long effective = (long long)damage - armor;
+    if (effective < 1) effective = 1;
+    long long left = hp - effective;
+    return left < 0 ? 0 : (int)left;
+}
+
+int apply_heal(int hp, int amount, int max_hp) {
+    if (hp == 0 || amount <= 0 || hp >= max_hp) return hp;
+    int room = max_hp - hp;              // > 0, and cannot overflow
+    return amount >= room ? max_hp : hp + amount;
+}
+--- hint
+Handle the "nothing happens" cases first and return early. After that, `hp < max_hp`, so `max_hp - hp` is a positive `int`.
+--- harness
+#include <limits.h>
+int main(void) {
+    CHECK_INT(apply_heal(50, 20, 100), 70);
+    CHECK_INT(apply_heal(90, 20, 100), 100);
+    CHECK_INT(apply_heal(0, 20, 100), 0);
+    CHECK_INT(apply_heal(50, 0, 100), 50);
+    CHECK_INT(apply_heal(50, -10, 100), 50);
+    CHECK_INT(apply_heal(150, 20, 100), 150);
+    CHECK_INT(apply_heal(100, 20, 100), 100);
+    CHECK_INT(apply_heal(1, INT_MAX, 100), 100);
+    CHECK_INT(apply_heal(INT_MAX - 5, INT_MAX, INT_MAX), INT_MAX);
+    CHECK_INT(apply_heal(10, INT_MAX - 20, INT_MAX), INT_MAX - 10);
+    CHECK_INT(apply_heal(1, INT_MIN, 100), 1);
+    CHECK_INT(apply_damage(apply_heal(40, 30, 100), 25, 5), 50);
+    return TEST_END();
+}
+
+=== exercise xpcurve
+title: An XP curve
+--- prompt
+Reaching level `L` takes `50 * L * (L - 1)` total experience: level 1 needs 0, level 2 needs 100, level 3 needs 300, level 4 needs 600 (each level costs 100 more than the last). The level cap is `MAX_LEVEL`, 3,000,000.
+
+Write:
+
+- `int64_t xp_for_level(int level)`: the total XP for `level` (1 to `MAX_LEVEL`). At the cap that is about 4.5e14: far beyond `int`. `50 * level * (level - 1)` is computed in `int` and overflows long before the multiplication result reaches the `int64_t` you return it as. Convert first.
+- `int level_for_xp(int64_t xp)`: the highest level whose requirement is `<= xp`, never above `MAX_LEVEL`. `xp` is never negative.
+
+The obvious `level_for_xp` counts up from level 1 until the next level costs too much. The tests call it 200,000 times for players near the cap, which makes that loop about 3e11 steps: far over the time limit. The requirement grows with the level, so you can **binary search** the level range (about 22 steps), or start from the square root and correct by one.
+
+> **Performance:** this is a pattern you will meet constantly in games: a value that is cheap to compute in one direction (level to XP) and that you need in the other (XP to level). Search with a monotonic function, use a closed form, or precompute a table. Never scan.
+--- starter
+#include <stdint.h>
+
+#define MAX_LEVEL 3000000
+
+int64_t xp_for_level(int level) {
+    return 50 * level * (level - 1);
+}
+
+int level_for_xp(int64_t xp) {
+    int level = 1;
+    while (level < MAX_LEVEL && xp_for_level(level + 1) <= xp)
+        level++;
+    return level;
+}
+--- solution
+#include <stdint.h>
+
+#define MAX_LEVEL 3000000
+
+int64_t xp_for_level(int level) {
+    return (int64_t)50 * level * (level - 1);
+}
+
+int level_for_xp(int64_t xp) {
+    int lo = 1, hi = MAX_LEVEL;            // answer is in [lo, hi]
+    while (lo < hi) {
+        int mid = lo + (hi - lo + 1) / 2;  // round up so lo = mid always moves
+        if (xp_for_level(mid) <= xp) lo = mid;
+        else hi = mid - 1;
+    }
+    return lo;
+}
+--- hint
+`(int64_t)50 * level * (level - 1)`: multiplication is left to right, so once the first operand is 64-bit, every step is.
+--- hint
+Binary search for the last level that fits: keep `lo` as a level known to fit and `hi` as an upper bound, and pick `mid = lo + (hi - lo + 1) / 2` so the range always shrinks.
+--- harness
+#include <stdint.h>
+int main(void) {
+    CHECK_INT(xp_for_level(1), 0);
+    CHECK_INT(xp_for_level(2), 100);
+    CHECK_INT(xp_for_level(4), 600);
+    CHECK_INT(xp_for_level(10000), 4999500000LL);
+    CHECK_INT(xp_for_level(3000000), 449999850000000LL);
+    CHECK_INT(level_for_xp(0), 1);
+    CHECK_INT(level_for_xp(99), 1);
+    CHECK_INT(level_for_xp(100), 2);
+    CHECK_INT(level_for_xp(599), 3);
+    CHECK_INT(level_for_xp(600), 4);
+    CHECK_INT(level_for_xp(449999850000000LL), 3000000);
+    CHECK_INT(level_for_xp(449999849999999LL), 2999999);
+    CHECK_INT(level_for_xp(INT64_MAX), 3000000);
+    // 200,000 players near the cap
+    uint32_t s = 12345;
+    int bad = 0;
+    for (int i = 0; i < 200000; i++) {
+        s = s * 1664525u + 1013904223u;
+        int L = 2900000 + (int)(s % 100000);
+        int64_t need = (int64_t)50 * L * (L - 1);
+        if (level_for_xp(need) != L || level_for_xp(need - 1) != L - 1) bad++;
+    }
+    CHECK_INT(bad, 0);
+    return TEST_END();
+}
+
+=== exercise rgba
+title: Packing colors
+--- prompt
+Pixels and vertex colors are usually stored as four bytes packed into one 32-bit value: a quarter of the memory of four `float`s, which matters when there are millions of them. Write:
+
+- `uint8_t unit_to_byte(float v)`: convert a channel from `0.0..1.0` to `0..255`, rounding to nearest. Values below 0 (and NaN) give 0, values above 1 give 255. `unit_to_byte(0.5f)` is 128.
+- `uint32_t pack_rgba(uint8_t r, uint8_t g, uint8_t b, uint8_t a)`: `r` in the lowest byte, then `g`, `b`, and `a` in the highest byte. (On a little-endian CPU that puts the bytes in memory in R, G, B, A order, which is what a GPU's `rgba8` texture format expects.)
+- `uint8_t channel(uint32_t color, int i)`: byte `i` (0 = r, 3 = a).
+
+The trap is integer promotion: `a << 24` promotes `a` to a *signed* `int` first, and `255 << 24` does not fit in an `int`. Convert each byte to `uint32_t` before shifting.
+
+> **Performance:** float-to-int conversion is cheap per value but not free, and branches on data (`if (v < 0)`) in a loop over a whole image add up. Convert colors once (when loading, or when a value changes), store them packed, and keep per-pixel loops working on the packed form.
+--- starter
+#include <stdint.h>
+
+uint8_t unit_to_byte(float v) {
+    return (uint8_t)(v * 255);
+}
+
+uint32_t pack_rgba(uint8_t r, uint8_t g, uint8_t b, uint8_t a) {
+    return 0;
+}
+
+uint8_t channel(uint32_t color, int i) {
+    return 0;
+}
+--- solution
+#include <stdint.h>
+
+uint8_t unit_to_byte(float v) {
+    if (!(v > 0.0f)) return 0;           // also catches NaN: every comparison with NaN is false
+    if (v >= 1.0f) return 255;
+    return (uint8_t)(v * 255.0f + 0.5f);
+}
+
+uint32_t pack_rgba(uint8_t r, uint8_t g, uint8_t b, uint8_t a) {
+    return (uint32_t)r | (uint32_t)g << 8 | (uint32_t)b << 16 | (uint32_t)a << 24;
+}
+
+uint8_t channel(uint32_t color, int i) {
+    return (uint8_t)(color >> (8 * i));
+}
+--- hint
+`if (!(v > 0.0f))` is true for negatives, zero and NaN, because every comparison involving NaN is false.
+--- hint
+`(uint32_t)a << 24`: the cast binds tighter than the shift, so the shift happens in 32-bit unsigned arithmetic. To extract a byte, shift right and let the conversion to `uint8_t` keep the low 8 bits.
+--- harness
+#include <stdint.h>
+int main(void) {
+    CHECK_INT(unit_to_byte(0.0f), 0);
+    CHECK_INT(unit_to_byte(1.0f), 255);
+    CHECK_INT(unit_to_byte(0.5f), 128);
+    CHECK_INT(unit_to_byte(0.25f), 64);
+    CHECK_INT(unit_to_byte(-3.0f), 0);
+    CHECK_INT(unit_to_byte(7.5f), 255);
+    CHECK_INT(unit_to_byte(0.999f), 255);
+    CHECK_INT(unit_to_byte(0.001f), 0);
+    CHECK_INT(unit_to_byte(NAN), 0);
+    CHECK_UINT(pack_rgba(0x11, 0x22, 0x33, 0x44), 0x44332211u);
+    CHECK_UINT(pack_rgba(255, 0, 0, 255), 0xFF0000FFu);
+    CHECK_UINT(pack_rgba(255, 255, 255, 255), 0xFFFFFFFFu);
+    CHECK_UINT(pack_rgba(0, 0, 0, 0), 0u);
+    CHECK_INT(channel(0x44332211u, 0), 0x11);
+    CHECK_INT(channel(0x44332211u, 1), 0x22);
+    CHECK_INT(channel(0x44332211u, 3), 0x44);
+    CHECK_INT(channel(pack_rgba(unit_to_byte(1.0f), unit_to_byte(0.5f), 7, 200), 2), 7);
+    return TEST_END();
+}
 
 === quiz
 run: yes

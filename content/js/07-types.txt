@@ -97,6 +97,8 @@ console.log([1, 2] == '1,2', NaN == NaN, 1n == 1);
 
 The one idiomatic use: `x == null` is true exactly for `null` and `undefined`. Otherwise use `===`.
 
+> **Performance:** coercion is not just a correctness problem. JIT compilers specialize a function for the types it has seen. A `damage(hp, amount)` that is always called with numbers compiles to a few machine instructions; call it once with `'10'` from a parsed config and it is deoptimized and recompiled for mixed types, and in a hot loop you pay for that on every call. Convert data to the right types once, when you load it, and keep hot code *monomorphic* (one type per variable, one shape per object).
+
 ## Truthiness, || and ??
 
 The falsy values are `false`, `0`, `-0`, `0n`, `NaN`, `''`, `null` and `undefined`. Everything else is truthy, including `'0'`, `'false'`, `[]` and `{}`. `a || b` returns `a` if it is truthy, so `count || 10` replaces a legitimate `0`. `a ?? b` only replaces `null` and `undefined`, which is almost always what you mean for defaults. `??=`, `||=` and `&&=` assign with the same rules.
@@ -125,6 +127,10 @@ console.log(Object.is(-0, 0), -0 === 0, 1 / -0);
 - Integers are exact up to `Number.MAX_SAFE_INTEGER` (2^53 - 1). Beyond that, consecutive integers collide. IDs from a database `bigint` column must not pass through `JSON.parse` as numbers.
 - For money, store integer cents (or use bigint), and only format with a decimal point at the edges.
 
+> **Performance:** engines store small integers (31 or 32 bits, "Smis") unboxed and do integer arithmetic on them; other numbers are doubles, and a double stored in an object field or a generic array may be *boxed* (a heap allocation). Keep counters, indices, tile coordinates and scores as integers, and keep arrays of positions or velocities in a `Float32Array`/`Float64Array` (chapter 10), which stores raw values with no boxing. Never mix types in one array (`[1, 2.5, 'x']`): that forces the slowest representation for every element.
+
+For game physics, never compare positions with `===`. Accumulated float error means `x === 100` may never be true after `x += 0.1` a thousand times; test `x >= 100` or use a tolerance. For deterministic simulations (replays, lockstep multiplayer), use a **fixed timestep** and avoid order-dependent float sums.
+
 ## BigInt
 
 ```js
@@ -138,6 +144,8 @@ try { console.log(1n + 1); } catch (e) { console.log(e.name); }
 ```
 
 Bigints cannot mix with numbers in arithmetic, have no fractional part, are not supported by `Math`, cannot go through `JSON.stringify` (it throws), and are much slower than numbers. Use them for exact integer math (64-bit IDs, factorials, money in cents beyond 2^53) and convert at the boundary with `BigInt(n)` and `Number(b)`. `BigInt(1.5)` throws; `BigInt('0x10')` works.
+
+> **Performance:** every bigint result is a fresh heap allocation. Never use bigints in per-frame code (positions, timers, RNG state in a hot loop). For 32-bit integer tricks such as hashing and fast RNGs, use regular numbers with `| 0`, `>>> 0` and `Math.imul` (chapter 10) instead.
 
 ## Parsing numbers
 
@@ -181,6 +189,8 @@ try {
 ```
 
 There is only one `catch` per `try`: no `catch (IOException e)` filters. You test inside it and rethrow what you do not handle.
+
+> **Performance:** creating an `Error` captures a stack trace, which is expensive, and a `throw` unwinds through frames the optimizer would rather not see. Exceptions are for exceptional things: a corrupt save file, a missing asset. Don't use them for control flow in a game loop ("throw to break out of the collision search"); return a value instead.
 
 ### Error subclasses and cause
 
@@ -258,19 +268,19 @@ Coercion means a wrong-typed value rarely crashes where it entered. It travels, 
 function assert(cond, message, ErrorType = TypeError) {
   if (!cond) throw new ErrorType(message);
 }
-function createRect(w, h) {
-  assert(typeof w === 'number' && Number.isFinite(w), `width must be a finite number, got ${typeof w}`);
-  assert(Number.isFinite(h), `height must be a finite number`);
-  assert(w >= 0 && h >= 0, 'negative size', RangeError);
-  return { w, h, area: w * h };
+function createEnemy(hp, speed) {
+  assert(typeof hp === 'number' && Number.isInteger(hp), `hp must be an integer, got ${typeof hp}`);
+  assert(Number.isFinite(speed), `speed must be a finite number`);
+  assert(hp > 0 && speed >= 0, 'hp must be positive and speed non-negative', RangeError);
+  return { hp, speed, x: 0, y: 0 };
 }
-console.log(createRect(2, 3));
-for (const args of [['2', 3], [2, NaN], [-1, 1]]) {
-  try { createRect(...args); } catch (e) { console.log(`${e.name}: ${e.message}`); }
+console.log(createEnemy(30, 1.5));
+for (const args of [['30', 1], [30, NaN], [-1, 1]]) {
+  try { createEnemy(...args); } catch (e) { console.log(`${e.name}: ${e.message}`); }
 }
 ```
 
-Inside your own code, trust your types and do not re-check everything everywhere; that is noise. At the edges, check precisely: `Number.isFinite` rather than `typeof x === 'number'` (which accepts `NaN`), `Array.isArray`, `typeof s === 'string'`, and explicit format checks rather than "does it coerce".
+Inside your own code, trust your types and do not re-check everything everywhere; that is noise, and in a game it is also cost: validate a level file once when it loads, not every entity every frame. At the edges, check precisely: `Number.isFinite` rather than `typeof x === 'number'` (which accepts `NaN`), `Array.isArray`, `typeof s === 'string'`, and explicit format checks rather than "does it coerce".
 
 === exercise strictnum
 title: A strict number parser
@@ -503,55 +513,55 @@ throws(() => addDecimals([5]), 'non-string');
 }
 
 === exercise errors
-title: An error hierarchy
+title: Loading a save file
 --- prompt
-Build a small error hierarchy and a config loader that uses it.
+Build a small error hierarchy and a save-file loader that uses it. Players edit save files, disks corrupt them, and old versions linger, so this is a boundary where validation matters.
 
-1. `class ConfigError extends Error`: its `name` must be `'ConfigError'` (and subclasses must get their own class name automatically, without each one setting it), and it must pass the `options` argument through so `cause` works.
-2. `class MissingKeyError extends ConfigError` with constructor `(key)`: message `` `missing key: ${key}` ``, and a `key` property.
-3. `loadConfig(text)`:
-   - parses `text` with `JSON.parse`. If that throws, throw a `ConfigError` with message `'invalid JSON'` and the original error as `cause`.
-   - if the result is not a plain object (null, array, number...), throw `ConfigError('config must be an object')`.
-   - requires a `port` key (else `MissingKeyError('port')`) that must be an integer from 1 to 65535 (else a `RangeError` with any message), and an optional `host` that defaults to `'localhost'` and must be a non-empty string if present (else a `TypeError`).
-   - returns `{ host, port }`.
+1. `class SaveError extends Error`: its `name` must be `'SaveError'` (and subclasses must get their own class name automatically, without each one setting it), and it must pass the `options` argument through so `cause` works.
+2. `class MissingKeyError extends SaveError` with constructor `(key)`: message `` `missing key: ${key}` ``, and a `key` property.
+3. `loadSave(text)`:
+   - parses `text` with `JSON.parse`. If that throws, throw a `SaveError` with message `'invalid JSON'` and the original error as `cause`.
+   - if the result is not a plain object (null, array, number...), throw `SaveError('save must be an object')`.
+   - requires a `level` key (else `MissingKeyError('level')`) that must be an integer from 1 to 99 (else a `RangeError` with any message), and an optional `name` that defaults to `'Hero'` and must be a non-empty string if present (else a `TypeError`).
+   - returns `{ name, level }`.
 --- starter
-class ConfigError extends Error {}
+class SaveError extends Error {}
 
-class MissingKeyError extends ConfigError {}
+class MissingKeyError extends SaveError {}
 
-function loadConfig(text) {
+function loadSave(text) {
   return JSON.parse(text);
 }
 --- solution
-class ConfigError extends Error {
+class SaveError extends Error {
   constructor(message, options) {
     super(message, options);
     this.name = new.target.name;
   }
 }
 
-class MissingKeyError extends ConfigError {
+class MissingKeyError extends SaveError {
   constructor(key) {
     super(`missing key: ${key}`);
     this.key = key;
   }
 }
 
-function loadConfig(text) {
+function loadSave(text) {
   let data;
   try {
     data = JSON.parse(text);
   } catch (err) {
-    throw new ConfigError('invalid JSON', { cause: err });
+    throw new SaveError('invalid JSON', { cause: err });
   }
   if (data === null || typeof data !== 'object' || Array.isArray(data)) {
-    throw new ConfigError('config must be an object');
+    throw new SaveError('save must be an object');
   }
-  if (!('port' in data)) throw new MissingKeyError('port');
-  const { port, host = 'localhost' } = data;
-  if (!Number.isInteger(port) || port < 1 || port > 65535) throw new RangeError(`bad port: ${port}`);
-  if (typeof host !== 'string' || host === '') throw new TypeError('host must be a non-empty string');
-  return { host, port };
+  if (!('level' in data)) throw new MissingKeyError('level');
+  const { level, name = 'Hero' } = data;
+  if (!Number.isInteger(level) || level < 1 || level > 99) throw new RangeError(`bad level: ${level}`);
+  if (typeof name !== 'string' || name === '') throw new TypeError('name must be a non-empty string');
+  return { name, level };
 }
 --- hint
 `this.name = new.target.name` in the base constructor names every subclass correctly. `super(message, options)` is how `cause` gets stored.
@@ -560,42 +570,42 @@ Wrap only the `JSON.parse` call in try/catch. Validation errors thrown afterward
 --- harness
 {
   const catchErr = f => { try { f(); } catch (e) { return e; } return null; };
-  eq(loadConfig('{"port": 8080}'), { host: 'localhost', port: 8080 });
-  eq(loadConfig('{"port": 1, "host": "example.com"}'), { host: 'example.com', port: 1 });
-  eq(loadConfig('{"port": 65535, "extra": true}'), { host: 'localhost', port: 65535 });
+  eq(loadSave('{"level": 7}'), { name: 'Hero', level: 7 });
+  eq(loadSave('{"level": 1, "name": "Ada"}'), { name: 'Ada', level: 1 });
+  eq(loadSave('{"level": 99, "gold": 12}'), { name: 'Hero', level: 99 });
 
-  let e = catchErr(() => loadConfig('{port: 1}'));
-  check(e instanceof ConfigError, 'bad JSON gives ConfigError');
+  let e = catchErr(() => loadSave('{level: 1}'));
+  check(e instanceof SaveError, 'bad JSON gives SaveError');
   eq(e && e.message, 'invalid JSON');
-  eq(e && e.name, 'ConfigError');
+  eq(e && e.name, 'SaveError');
   check(e && e.cause instanceof SyntaxError, 'cause is the SyntaxError from JSON.parse');
   check(e && typeof e.stack === 'string', 'has a stack');
 
   for (const t of ['null', '[1]', '42', '"str"']) {
-    e = catchErr(() => loadConfig(t));
-    check(e instanceof ConfigError && !(e instanceof MissingKeyError), t + ' is not an object');
-    eq(e && e.message, 'config must be an object', t);
+    e = catchErr(() => loadSave(t));
+    check(e instanceof SaveError && !(e instanceof MissingKeyError), t + ' is not an object');
+    eq(e && e.message, 'save must be an object', t);
   }
 
-  e = catchErr(() => loadConfig('{"host": "x"}'));
-  check(e instanceof MissingKeyError, 'missing port');
-  check(e instanceof ConfigError && e instanceof Error, 'MissingKeyError is a ConfigError');
+  e = catchErr(() => loadSave('{"name": "x"}'));
+  check(e instanceof MissingKeyError, 'missing level');
+  check(e instanceof SaveError && e instanceof Error, 'MissingKeyError is a SaveError');
   eq(e && e.name, 'MissingKeyError', 'subclass name');
-  eq(e && e.message, 'missing key: port');
-  eq(e && e.key, 'port');
-  eq(e && String(e), 'MissingKeyError: missing key: port');
+  eq(e && e.message, 'missing key: level');
+  eq(e && e.key, 'level');
+  eq(e && String(e), 'MissingKeyError: missing key: level');
 
-  for (const p of ['0', '65536', '80.5', '"80"', 'null', '-1']) {
-    e = catchErr(() => loadConfig(`{"port": ${p}}`));
-    check(e instanceof RangeError, 'port ' + p + ' should give RangeError');
+  for (const p of ['0', '100', '8.5', '"8"', 'null', '-1']) {
+    e = catchErr(() => loadSave(`{"level": ${p}}`));
+    check(e instanceof RangeError, 'level ' + p + ' should give RangeError');
   }
   for (const h of ['""', '5', 'null', '["a"]']) {
-    e = catchErr(() => loadConfig(`{"port": 80, "host": ${h}}`));
-    check(e instanceof TypeError, 'host ' + h + ' should give TypeError');
+    e = catchErr(() => loadSave(`{"level": 8, "name": ${h}}`));
+    check(e instanceof TypeError, 'name ' + h + ' should give TypeError');
   }
-  const c = new ConfigError('x', { cause: 'why' });
+  const c = new SaveError('x', { cause: 'why' });
   eq(c.cause, 'why', 'options are passed to Error');
-  class Sub extends ConfigError {}
+  class Sub extends SaveError {}
   eq(new Sub('y').name, 'Sub', 'names come from new.target');
 }
 
@@ -705,27 +715,27 @@ For `withResource`, a plain `finally { r.close(); }` is wrong: if `use` threw an
 }
 
 === exercise receipt
-title: A receipt without float errors
+title: A shop receipt without float errors
 --- prompt
-The starter prints a receipt using float arithmetic, and some lines come out like `0.30000000000000004`. Rewrite it so that it prints exactly:
+An in-game shop prints a receipt for the player. The starter uses float arithmetic, and some lines come out like `0.30000000000000004`. Rewrite it so that it prints exactly:
 
 ```text
-coffee 3 x 1.10 = 3.30
-bagel 2 x 2.15 = 4.30
-juice 1 x 0.35 = 0.35
-tip 1 x 0.05 = 0.05
+potion 3 x 1.10 = 3.30
+arrows 2 x 2.15 = 4.30
+torch 1 x 0.35 = 0.35
+map 1 x 0.05 = 0.05
 subtotal 8.00
-tax 8.25% 0.66
+guild fee 8.25% 0.66
 total 8.66
 ```
 
-Rules: do all the money math in integer cents. Tax is `subtotal * 8.25%` rounded to the nearest cent (half up). Prices are always printed with two decimals. Keep the `items` array as given.
+Rules: do all the money math in integer cents. The guild fee is `subtotal * 8.25%` rounded to the nearest cent (half up). Prices are always printed with two decimals. Keep the `items` array as given.
 --- starter
 const items = [
-  ['coffee', 3, 1.10],
-  ['bagel', 2, 2.15],
-  ['juice', 1, 0.35],
-  ['tip', 1, 0.05],
+  ['potion', 3, 1.10],
+  ['arrows', 2, 2.15],
+  ['torch', 1, 0.35],
+  ['map', 1, 0.05],
 ];
 let subtotal = 0;
 for (const [name, qty, price] of items) {
@@ -734,15 +744,15 @@ for (const [name, qty, price] of items) {
   console.log(`${name} ${qty} x ${price} = ${line}`);
 }
 console.log(`subtotal ${subtotal}`);
-const tax = subtotal * 0.0825;
-console.log(`tax 8.25% ${tax}`);
-console.log(`total ${subtotal + tax}`);
+const fee = subtotal * 0.0825;
+console.log(`guild fee 8.25% ${fee}`);
+console.log(`total ${subtotal + fee}`);
 --- solution
 const items = [
-  ['coffee', 3, 1.10],
-  ['bagel', 2, 2.15],
-  ['juice', 1, 0.35],
-  ['tip', 1, 0.05],
+  ['potion', 3, 1.10],
+  ['arrows', 2, 2.15],
+  ['torch', 1, 0.35],
+  ['map', 1, 0.05],
 ];
 const fmt = cents => `${Math.trunc(cents / 100)}.${String(cents % 100).padStart(2, '0')}`;
 let subtotal = 0;
@@ -753,21 +763,21 @@ for (const [name, qty, price] of items) {
   console.log(`${name} ${qty} x ${fmt(unit)} = ${fmt(line)}`);
 }
 console.log(`subtotal ${fmt(subtotal)}`);
-const tax = Math.round(subtotal * 825 / 10000);
-console.log(`tax 8.25% ${fmt(tax)}`);
-console.log(`total ${fmt(subtotal + tax)}`);
+const fee = Math.round(subtotal * 825 / 10000);
+console.log(`guild fee 8.25% ${fmt(fee)}`);
+console.log(`total ${fmt(subtotal + fee)}`);
 --- hint
 Convert each price once with `Math.round(price * 100)`. Then everything is integer arithmetic until you print.
 --- hint
-Compute tax as `Math.round(subtotal * 825 / 10000)`: multiplying by the integer 825 first keeps it exact. Format cents with `Math.trunc(c / 100)` and `String(c % 100).padStart(2, '0')`.
+Compute the fee as `Math.round(subtotal * 825 / 10000)`: multiplying by the integer 825 first keeps it exact. Format cents with `Math.trunc(c / 100)` and `String(c % 100).padStart(2, '0')`.
 --- test
 --- out
-coffee 3 x 1.10 = 3.30
-bagel 2 x 2.15 = 4.30
-juice 1 x 0.35 = 0.35
-tip 1 x 0.05 = 0.05
+potion 3 x 1.10 = 3.30
+arrows 2 x 2.15 = 4.30
+torch 1 x 0.35 = 0.35
+map 1 x 0.05 = 0.05
 subtotal 8.00
-tax 8.25% 0.66
+guild fee 8.25% 0.66
 total 8.66
 
 === quiz

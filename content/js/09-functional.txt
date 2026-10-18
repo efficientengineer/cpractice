@@ -1,0 +1,1042 @@
+=== chapter functional
+title: Functional techniques
+blurb: Pure functions and immutability (and when not to use them), composition, currying, memoization, debounce and throttle, decorators, trampolines, reducers and state machines.
+--- body
+## Functions as the unit of reuse
+
+You know LINQ and delegates, and chapter 01 covered closures. This chapter is about the techniques that grow out of treating functions as values: building behavior by wrapping and combining functions instead of subclassing. In a game codebase these show up everywhere: reducers for game state, state machines for AI, decorators for cooldowns and profiling, memoized lookups, throttled input.
+
+It also covers where functional style costs too much. Functional code favours allocating new values; per-frame game code favours reusing memory. Knowing both, and where the boundary is, is the actual skill.
+
+## Pure functions and immutability
+
+A pure function's result depends only on its arguments, and it changes nothing outside itself. Pure functions are trivially testable, safe to memoize, and safe to replay, which is how deterministic replays and rollback netcode work: same inputs, same state.
+
+```js
+// Impure: reads and writes outside state.
+let gold = 100;
+function buyImpure(price) { gold -= price; return gold >= 0; }
+
+// Pure: returns a new state, leaves the old one alone.
+function buy(state, price) {
+  if (state.gold < price) return state;            // unchanged: return the same object
+  return { ...state, gold: state.gold - price, items: [...state.items, 'sword'] };
+}
+const s0 = { gold: 100, items: ['torch'], stats: { str: 5 } };
+const s1 = buy(s0, 30);
+console.log(s0, s1);
+console.log(s0.stats === s1.stats, buy(s1, 500) === s1);
+```
+
+Copying only along the path you change and sharing everything else is **structural sharing**. It makes "did anything change?" a cheap `===` check, which is what React, Redux and undo systems rely on.
+
+`Object.freeze` makes an object's own properties read-only. It is **shallow**, and writes to a frozen object fail *silently* in sloppy mode and throw in strict mode. Code on this site runs in sloppy mode unless it starts with `'use strict'` (classes and modules are always strict):
+
+```js
+'use strict';
+const cfg = Object.freeze({ speed: 3, keys: { jump: 'Space' } });
+try { cfg.speed = 99; } catch (e) { console.log(e.constructor.name, e.message); }
+cfg.keys.jump = 'KeyW';                  // nested objects are not frozen
+console.log(cfg);
+const deepFreeze = o => { Object.values(o).forEach(v => typeof v === 'object' && v && deepFreeze(v)); return Object.freeze(o); };
+console.log(Object.isFrozen(deepFreeze({ a: { b: 1 } }).a));
+```
+
+> **Performance:** immutable updates allocate. `entities = entities.map(e => ({ ...e, x: e.x + e.vx }))` every frame creates thousands of objects per second, and the garbage collector eventually pauses to clean them up, which shows up as a dropped frame. That is a bad habit in a simulation loop: mutate positions in place (ideally in typed arrays, chapter 10). Use immutability where changes are rare and history matters: menus, inventory, settings, turn-based game state, undo stacks, saved snapshots.
+
+## Composition and pipe
+
+`compose(f, g)(x)` is `f(g(x))` (right to left, the mathematical order). `pipe(f, g)(x)` is `g(f(x))` (left to right, reading order), which most people find clearer.
+
+```js
+const pipe = (...fns) => x => fns.reduce((acc, f) => f(acc), x);
+const compose = (...fns) => x => fns.reduceRight((acc, f) => f(acc), x);
+
+const clamp = (lo, hi) => v => Math.min(hi, Math.max(lo, v));
+const applyArmor = armor => dmg => dmg * (100 / (100 + armor));
+const crit = mult => dmg => dmg * mult;
+
+const damage = pipe(crit(2), applyArmor(50), Math.round, clamp(1, 999));
+console.log(damage(30), damage(0), damage(10000));
+console.log(compose(x => x + 1, x => x * 2)(3), pipe(x => x + 1, x => x * 2)(3));
+```
+
+A pipeline like `damage` is easy to read and test piece by piece. It is also a chain of closures and calls: fine for an event that happens a few times per second, worth inlining if it runs per particle per frame.
+
+## Currying and partial application
+
+**Partial application** fixes some arguments and returns a function of the rest (`bind` does it, and so does any closure). **Currying** turns an n-argument function into a chain of one-argument functions. A practical `curry` collects arguments until it has `fn.length` of them:
+
+```js
+function curry(fn) {
+  return function curried(...args) {
+    return args.length >= fn.length
+      ? fn.apply(this, args)
+      : (...more) => curried.apply(this, [...args, ...more]);
+  };
+}
+const dist2 = curry((x1, y1, x2, y2) => (x2 - x1) ** 2 + (y2 - y1) ** 2);
+const fromOrigin = dist2(0, 0);
+console.log(fromOrigin(3, 4), dist2(1)(1)(4, 5), dist2(1, 1, 4, 5));
+
+const log = (level, system, msg) => `[${level}] ${system}: ${msg}`;
+const warnAudio = log.bind(null, 'WARN', 'audio');
+console.log(warnAudio('buffer underrun'));
+console.log(((a, b = 2, ...c) => 0).length, (function (a, b) {}).length);
+```
+
+Note `fn.length` counts parameters before the first default or rest parameter, so `curry` does not work for those. Currying is less common in everyday JavaScript than in Haskell or F#; closures that fix a few arguments (`clamp(0, 100)` above) are the everyday form.
+
+## Memoization
+
+A memoized function caches results by argument. It only makes sense for **pure** functions, and the key choice is where the bugs hide:
+
+```js
+function memoize(fn) {
+  const cache = new Map();
+  return arg => {
+    if (cache.has(arg)) return cache.get(arg);
+    const v = fn(arg);
+    cache.set(arg, v);
+    return v;
+  };
+}
+let calls = 0;
+const fib = memoize(n => { calls++; return n < 2 ? n : fib(n - 1) + fib(n - 2); });
+console.log(fib(70), calls);
+```
+
+The memoized `fib` calls itself through the cache, so it is linear instead of exponential. For several arguments, the tempting key `args.join(',')` or `JSON.stringify(args)` conflates `1` with `'1'` (`join`), loses object identity (two different enemies with equal fields share an entry), costs a string allocation per call, and throws on cycles and bigints. The robust structure is a **trie of Maps**, one level per argument, keyed by the arguments themselves (Maps use SameValueZero, so `NaN` works and objects are compared by identity). Use a `WeakMap` level for object keys if the cache must not keep them alive.
+
+> **Performance:** memoization trades memory for time, and both sides have costs. A `Map` lookup is a hash plus a probe: cheaper than a pathfinding query or a font layout, *more expensive* than `a * b + c`. An unbounded cache is a memory leak with a nice name. Measure first, cap the size (an LRU cache, chapter 12) or scope the cache to a level or a frame, and never memoize on keys that change every call (like a timestamp or a fresh object).
+
+## Debounce and throttle
+
+Both limit how often a function runs:
+
+- **debounce**: run once, after calls *stop* for `ms` milliseconds (search-as-you-type, saving settings after the slider stops, resizing).
+- **throttle**: run at most once per `ms`, at a steady rate while calls continue (scroll handlers, network position updates).
+
+```js
+function debounce(fn, ms) {
+  let timer;
+  return function (...args) {
+    clearTimeout(timer);
+    timer = setTimeout(() => fn.apply(this, args), ms);
+  };
+}
+function throttle(fn, ms) {
+  let last = -Infinity;
+  return function (...args) {
+    const now = performance.now();
+    if (now - last >= ms) { last = now; return fn.apply(this, args); }
+  };
+}
+
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+const save = debounce(v => console.log('saved volume', v), 40);
+for (const v of [10, 20, 30]) { save(v); await sleep(5); }
+await sleep(80);
+
+const send = throttle(x => console.log('sent', x), 30);
+for (let i = 0; i < 10; i++) { send(i); await sleep(10); }
+```
+
+The throttle above is *leading-edge only*: the last call in a burst may be dropped. A full implementation also schedules a *trailing* call with the latest arguments; you will write one in the exercises.
+
+Inside a game, do not throttle gameplay with `setTimeout` or wall-clock time. Timers fire between frames at unpredictable moments, keep running while the game is paused, and break determinism. A weapon's fire rate is a **cooldown in game time**: subtract `dt` each update and fire when it reaches zero. Debounce and throttle are for the edges: UI, saving, networking, analytics.
+
+## once and function decorators
+
+A decorator takes a function and returns a wrapped function with extra behavior. The wrapper must pass through `this` and all arguments, so write it with `function` and `apply`, not an arrow:
+
+```js
+function once(fn) {
+  let done = false, result;
+  return function (...args) {
+    if (!done) { done = true; result = fn.apply(this, args); }
+    return result;
+  };
+}
+function timed(fn, label = fn.name) {
+  return function (...args) {
+    const t0 = performance.now();
+    try { return fn.apply(this, args); }
+    finally { const ms = performance.now() - t0; if (ms > 1000) console.log(`${label} took ${ms.toFixed(1)}ms`); }
+  };
+}
+const initAudio = once(() => { console.log('audio context created'); return { ready: true }; });
+console.log(initAudio(), initAudio() === initAudio());
+
+const player = { hp: 10, hit: timed(function (d) { return this.hp -= d; }) };
+console.log(player.hit(3), player.hp);
+```
+
+Decorators compose like any other function: `const fire = once(timed(loadLevel))`. The TC39 `@decorator` syntax for classes is standardized but not yet shipped in browsers, so you only see it with a build step (TypeScript, Babel); underneath it is exactly this pattern.
+
+## Recursion, stack depth and trampolines
+
+V8 does not implement proper tail calls, so every recursive call uses a stack frame, and the stack holds roughly ten thousand frames. A recursive flood fill on a 200 by 200 tile map, or a recursive walk over a long linked list, throws `RangeError: Maximum call stack size exceeded`.
+
+```js
+const depth = n => n === 0 ? 0 : 1 + depth(n - 1);
+try { depth(1e6); } catch (e) { console.log(e.name, e.message); }
+
+// Trampoline: return a thunk instead of recursing; a loop calls thunks until a value comes out.
+const trampoline = fn => (...args) => {
+  let r = fn(...args);
+  while (typeof r === 'function') r = r();
+  return r;
+};
+const sumTo = trampoline(function go(n, acc = 0) {
+  return n === 0 ? acc : () => go(n - 1, acc + n);
+});
+console.log(sumTo(1e6));
+```
+
+A trampoline keeps the recursive shape of the code. Usually the clearer fix is a loop with an explicit stack (an array you `push` and `pop`), which is also how you make depth-first searches over game maps safe and fast.
+
+> **Performance:** a trampoline allocates one closure per step, so it is a correctness fix, not a speed fix. An explicit stack of plain integers (`stack.push(x, y)`, or `y * width + x` packed into one number) allocates almost nothing.
+
+## Reducers
+
+A reducer is a pure function `(state, action) => newState`. All changes go through one place, actions are plain data (so they can be logged, sent over the network, or replayed), and the current state is just `actions.reduce(reducer, initial)`.
+
+```js
+function inventory(state, action) {
+  switch (action.type) {
+    case 'add': {
+      const n = (state[action.item] ?? 0) + action.qty;
+      return { ...state, [action.item]: n };
+    }
+    case 'use': {
+      const n = state[action.item] ?? 0;
+      if (n === 0) return state;
+      const { [action.item]: _, ...rest } = state;
+      return n === 1 ? rest : { ...state, [action.item]: n - 1 };
+    }
+    default:
+      return state;
+  }
+}
+const actions = [
+  { type: 'add', item: 'potion', qty: 2 },
+  { type: 'add', item: 'arrow', qty: 20 },
+  { type: 'use', item: 'potion' },
+  { type: 'use', item: 'potion' },
+  { type: 'use', item: 'bomb' },
+];
+console.log(actions.reduce(inventory, {}));
+```
+
+Returning the same `state` object for an action that changes nothing matters: it lets every consumer skip work with a single `===`.
+
+## State machines
+
+Game AI, menus, animation, network connections and input combos are all state machines: a finite set of states, and events that move between them. Writing the transitions as **data** instead of nested `if`s makes them inspectable, testable and easy to draw:
+
+```js
+const ENEMY = {
+  idle:   { seePlayer: 'chase', hurt: 'flee' },
+  chase:  { lostPlayer: 'idle', inRange: 'attack', hurt: 'flee' },
+  attack: { outOfRange: 'chase', hurt: 'flee' },
+  flee:   { healed: 'idle' },
+};
+function transition(state, event) {
+  return ENEMY[state][event] ?? state;      // unknown events are ignored
+}
+let s = 'idle';
+for (const ev of ['seePlayer', 'inRange', 'seePlayer', 'hurt', 'inRange', 'healed']) {
+  const next = transition(s, ev);
+  console.log(`${s} --${ev}--> ${next}`);
+  s = next;
+}
+```
+
+Each state can also carry per-state behavior (`enter`, `update(dt)`, `exit` functions), which turns the table into a full behavior system without a single subclass.
+
+=== exercise curry
+title: pipe and curry
+--- prompt
+Write three functions:
+
+- `pipe(...fns)` returns a function that passes its argument through each function left to right. `pipe()` with no functions is the identity. The first function may take several arguments: `pipe(Math.max, x => x * 2)(1, 5, 3)` is `10`.
+- `compose(...fns)` is the same but right to left; the *last* function may take several arguments.
+- `curry(fn, arity = fn.length)` returns a curried version that accepts arguments in any grouping (`f(1)(2)(3)`, `f(1, 2)(3)`, `f(1)(2, 3)`, `f(1, 2, 3)`). Calling with no arguments does not advance (`f()(1)()(2, 3)` still works). Extra arguments in the final call are passed through. The curried function must keep `this` (from the call that completes the arguments), and partial applications must be independent: `const a = f(1); a(2)(3); a(5)(6)` must not interfere.
+--- starter
+function pipe(...fns) {
+  return x => x;
+}
+
+function compose(...fns) {
+  return x => x;
+}
+
+function curry(fn, arity = fn.length) {
+  return fn;
+}
+--- solution
+function pipe(...fns) {
+  if (!fns.length) return x => x;
+  const [first, ...rest] = fns;
+  return function (...args) {
+    return rest.reduce((acc, f) => f.call(this, acc), first.apply(this, args));
+  };
+}
+
+function compose(...fns) {
+  return pipe(...fns.reverse());
+}
+
+function curry(fn, arity = fn.length) {
+  return function curried(...args) {
+    if (args.length >= arity) return fn.apply(this, args);
+    return function (...more) {
+      return curried.apply(this, [...args, ...more]);
+    };
+  };
+}
+--- hint
+For `pipe`, call the first function with all the arguments, then `reduce` over the rest with the single running value.
+--- hint
+`curry`'s inner function closes over the arguments collected so far and never mutates them; it creates a new array `[...args, ...more]` per call, which is what keeps partial applications independent.
+--- harness
+{
+  eq(pipe()(5), 5, 'empty pipe is identity');
+  eq(pipe(x => x + 1, x => x * 2)(3), 8);
+  eq(compose(x => x + 1, x => x * 2)(3), 7);
+  eq(pipe(Math.max, x => x * 2)(1, 5, 3), 10, 'first function takes several args');
+  eq(compose(x => x * 2, Math.max)(1, 5, 3), 10, 'last function takes several args');
+  eq(compose()('a'), 'a');
+  const strs = pipe(String, s => s.padStart(3, '0'), s => 'lvl' + s);
+  eq(strs(7), 'lvl007');
+  const fns = [x => x + 'a', x => x + 'b'];
+  compose(...fns);
+  eq(fns[0](''), 'a', 'compose must not reverse the caller\'s array');
+
+  const add3 = curry((a, b, c) => a + b + c);
+  eq(add3(1)(2)(3), 6);
+  eq(add3(1, 2)(3), 6);
+  eq(add3(1)(2, 3), 6);
+  eq(add3(1, 2, 3), 6);
+  eq(add3()(1)()(2, 3), 6, 'empty calls do not advance');
+  const a = add3(100);
+  eq(a(2)(3), 105);
+  eq(a(5)(6), 111, 'partial applications are independent');
+  const b = a(1);
+  eq(b(1), 102); eq(b(2), 103);
+  eq(curry((...xs) => xs.length, 3)(1)(2)(3), 3, 'explicit arity');
+  eq(curry((a, b) => [a, b])(1)(2, 3), [1, 2], 'only declared params used by fn');
+  eq(curry(function (a, b) { return arguments.length; })(1)(2, 3), 3, 'extra args passed through');
+  const obj = { base: 10, add: curry(function (a, b) { return this.base + a + b; }) };
+  eq(obj.add(1, 2), 13, 'this preserved');
+  eq(curry(() => 42)(), 42, 'zero arity calls immediately');
+}
+
+=== exercise memo
+title: A correct memoize
+--- prompt
+Write `memoize(fn)` that caches results for **any number of arguments** using a trie of `Map`s (one level per argument, then a terminal entry), so that:
+
+- arguments are compared like Map keys (SameValueZero): `1` and `'1'` are different, `NaN` matches `NaN`, objects match only by identity;
+- calls with different numbers of arguments do not collide (`f(1)` vs `f(1, undefined)` vs `f()`);
+- `this` is passed through to `fn` (it is not part of the key);
+- exceptions are not cached (the next call tries again);
+- the returned function has a `clear()` method that empties the cache and a `cacheSize()` method that returns the number of cached results.
+
+One subtlety: a trie node can need both "the result for exactly these arguments" and "deeper levels for longer argument lists". Store the result under a key that no argument can equal, such as a `Symbol()` created inside `memoize` (chapter 11), or keep separate maps for children and results.
+--- starter
+function memoize(fn) {
+  const cache = new Map();
+  const m = function (...args) {
+    const key = args.join(',');
+    if (!cache.has(key)) cache.set(key, fn.apply(this, args));
+    return cache.get(key);
+  };
+  m.clear = () => cache.clear();
+  m.cacheSize = () => cache.size;
+  return m;
+}
+--- solution
+function memoize(fn) {
+  const RESULT = Symbol('result');
+  let root = new Map(), count = 0;
+  const m = function (...args) {
+    let node = root;
+    for (const a of args) {
+      let next = node.get(a);
+      if (!next) { next = new Map(); node.set(a, next); }
+      node = next;
+    }
+    if (node.has(RESULT)) return node.get(RESULT);
+    const v = fn.apply(this, args);
+    node.set(RESULT, v);
+    count++;
+    return v;
+  };
+  m.clear = () => { root = new Map(); count = 0; };
+  m.cacheSize = () => count;
+  return m;
+}
+--- hint
+Walk one `Map` per argument, creating levels as needed. The node you end on represents exactly this argument list; store the result there under a `Symbol` key, which can never collide with an argument value.
+--- hint
+If `fn` throws, the `node.set(RESULT, ...)` line is never reached, so nothing is cached. Keep a counter for `cacheSize`.
+--- harness
+{
+  let calls = 0;
+  const f = memoize((...args) => { calls++; return args.length + ':' + args.map(String).join('|'); });
+  eq(f(1, 2), '2:1|2'); eq(f(1, 2), '2:1|2'); eq(calls, 1, 'cached');
+  eq(f('1', 2), '2:1|2'); eq(calls, 2, "'1' differs from 1");
+  eq(f('1,2'), '1:1,2'); eq(calls, 3, 'no join collisions');
+  f(); f(); eq(calls, 4, 'zero args cached');
+  f(1); f(1, undefined); f(1, undefined); eq(calls, 6, 'f(1) and f(1, undefined) differ');
+  f(NaN); f(NaN); eq(calls, 7, 'NaN matches NaN');
+  const e1 = { id: 1 }, e2 = { id: 1 };
+  f(e1); f(e1); f(e2); eq(calls, 9, 'objects by identity');
+  eq(f.cacheSize(), 9);
+  f.clear();
+  eq(f.cacheSize(), 0);
+  f(1, 2); eq(calls, 10, 'recomputed after clear');
+
+  const obj = { k: 5, get: memoize(function (x) { return this.k * x; }) };
+  eq(obj.get(2), 10, 'this passed through');
+
+  let n = 0;
+  const flaky = memoize(x => { if (n++ === 0) throw new Error('first time fails'); return x * 2; });
+  throws(() => flaky(4), 'first call throws');
+  eq(flaky(4), 8, 'exception not cached');
+  eq(flaky.cacheSize(), 1);
+
+  const undef = memoize(() => { n++; return undefined; });
+  const before = n; undef(); undef();
+  eq(n - before, 1, 'undefined results are cached too');
+
+  let pc = 0;
+  const pathCost = memoize((a, b) => { pc++; return Math.abs(a.x - b.x) + Math.abs(a.y - b.y); });
+  const tiles = Array.from({ length: 50 }, (_, i) => ({ x: i % 7, y: (i * 3) % 11 }));
+  let total = 0;
+  for (let rep = 0; rep < 3; rep++) for (const a of tiles) for (const b of tiles) total += pathCost(a, b);
+  eq(pc, 2500, 'each pair computed once');
+  eq(pathCost.cacheSize(), 2500);
+}
+
+=== exercise timing
+title: debounce and throttle
+--- prompt
+Write `debounce(fn, ms)` and `throttle(fn, ms)` with these exact behaviors. Both must pass `this` and the arguments through.
+
+**`debounce`** calls `fn` once, `ms` after the *last* call, with the arguments of that last call. The returned function also has:
+
+- `cancel()`: drop any pending call;
+- `flush()`: if a call is pending, run it immediately (and cancel the timer); otherwise do nothing.
+
+**`throttle`** calls `fn` **immediately** on the first call (leading edge), then ignores calls until `ms` has passed, except that if any calls arrived during that window, it calls `fn` **once more at the end of the window** with the latest arguments (trailing edge), which starts a new window. So 10 rapid calls in less than `ms` produce exactly 2 invocations: the first and the last.
+
+The tests use real timers with generous margins (windows of 60 to 100 ms).
+--- starter
+function debounce(fn, ms) {
+  const d = (...args) => fn(...args);
+  d.cancel = () => {};
+  d.flush = () => {};
+  return d;
+}
+
+function throttle(fn, ms) {
+  return (...args) => fn(...args);
+}
+--- solution
+function debounce(fn, ms) {
+  let timer = null, pending = null;
+  const run = () => {
+    const { self, args } = pending;
+    pending = null; timer = null;
+    fn.apply(self, args);
+  };
+  const d = function (...args) {
+    pending = { self: this, args };
+    clearTimeout(timer);
+    timer = setTimeout(run, ms);
+  };
+  d.cancel = () => { clearTimeout(timer); timer = null; pending = null; };
+  d.flush = () => { if (pending) { clearTimeout(timer); run(); } };
+  return d;
+}
+
+function throttle(fn, ms) {
+  let timer = null, pending = null;
+  const endWindow = () => {
+    timer = null;
+    if (pending) {
+      const { self, args } = pending;
+      pending = null;
+      fn.apply(self, args);
+      timer = setTimeout(endWindow, ms);
+    }
+  };
+  return function (...args) {
+    if (timer === null) {
+      fn.apply(this, args);
+      timer = setTimeout(endWindow, ms);
+    } else {
+      pending = { self: this, args };
+    }
+  };
+}
+--- hint
+For debounce, store the latest `this` and arguments together with the timer. `flush` and the timer callback can share one `run` function that clears the pending state before calling `fn`.
+--- hint
+For throttle, the timer *is* the window: `timer === null` means "not throttled". When the window ends, if there is a pending call, run it and start a new window.
+--- harness
+const sleep_ = ms => new Promise(r => setTimeout(r, ms));
+{
+  const got = [];
+  const d = debounce(function (x) { got.push([this && this.tag, x]); }, 60);
+  const o = { tag: 'o', d };
+  o.d(1); o.d(2); o.d(3);
+  eq(got, [], 'nothing yet');
+  await sleep_(20); o.d(4);
+  await sleep_(30);
+  eq(got, [], 'timer restarted by the last call');
+  await sleep_(90);
+  eq(got, [['o', 4]], 'called once with the last args and this');
+  await sleep_(80);
+  eq(got.length, 1, 'no extra calls');
+
+  d(5); d.cancel();
+  await sleep_(100);
+  eq(got.length, 1, 'cancel drops the call');
+
+  d(6); d.flush();
+  eq(got.length, 2, 'flush runs immediately');
+  eq(got[1][1], 6);
+  await sleep_(100);
+  eq(got.length, 2, 'flush cancels the timer');
+  d.flush();
+  eq(got.length, 2, 'flush with nothing pending does nothing');
+}
+{
+  const got = [];
+  const t = throttle(function (x) { got.push(x); return x; }, 100);
+  for (let i = 0; i < 10; i++) t(i);
+  eq(got, [0], 'leading call immediately');
+  await sleep_(160);
+  eq(got, [0, 9], 'trailing call with the latest args');
+  await sleep_(150);
+  eq(got, [0, 9], 'no more calls after a quiet window');
+  t(10);
+  eq(got, [0, 9, 10], 'after quiet, leading again');
+  await sleep_(150);
+  eq(got, [0, 9, 10], 'single call has no trailing duplicate');
+  const self = { n: 0, inc: throttle(function () { this.n++; }, 60) };
+  self.inc(); self.inc();
+  await sleep_(120);
+  eq(self.n, 2, 'this passed through on both edges');
+}
+
+=== exercise abilities
+title: Ability decorators in game time
+--- prompt
+Game abilities are functions wrapped with rules. Write three decorators. They work in **game time**: instead of reading a real clock, each takes a `clock` function that returns the current game time in seconds (the harness controls it, which keeps tests deterministic and makes pausing free).
+
+- `once(fn)`: calls `fn` the first time only, and returns that first result on every call.
+- `cooldown(fn, seconds, clock)`: calls `fn` if at least `seconds` have passed since the last *successful* call (the first call always succeeds); otherwise returns `undefined` without calling it. Attach a method `remaining()` returning the seconds left (0 when ready).
+- `charges(fn, max, rechargeSeconds, clock)`: starts with `max` charges. Each call that has a charge spends one and calls `fn`; with no charges, returns `undefined`. Charges regenerate one per `rechargeSeconds`, continuously, up to `max`. Recharge time is tracked exactly: if you are at 0 charges and 2.5 recharge periods pass, you have 2 charges and are halfway to the third. Attach `count()` returning the current whole number of charges.
+
+All three must pass `this` and arguments through and return `fn`'s result.
+--- starter
+function once(fn) {
+  return fn;
+}
+
+function cooldown(fn, seconds, clock) {
+  const f = function (...args) { return fn.apply(this, args); };
+  f.remaining = () => 0;
+  return f;
+}
+
+function charges(fn, max, rechargeSeconds, clock) {
+  const f = function (...args) { return fn.apply(this, args); };
+  f.count = () => max;
+  return f;
+}
+--- solution
+function once(fn) {
+  let done = false, result;
+  return function (...args) {
+    if (!done) { done = true; result = fn.apply(this, args); }
+    return result;
+  };
+}
+
+function cooldown(fn, seconds, clock) {
+  let last = -Infinity;
+  const f = function (...args) {
+    const now = clock();
+    if (now - last < seconds) return undefined;
+    last = now;
+    return fn.apply(this, args);
+  };
+  f.remaining = () => Math.max(0, seconds - (clock() - last));
+  return f;
+}
+
+function charges(fn, max, rechargeSeconds, clock) {
+  let stored = max, since = clock();          // stored may be fractional
+  const update = () => {
+    const now = clock();
+    stored = Math.min(max, stored + (now - since) / rechargeSeconds);
+    since = now;
+  };
+  const f = function (...args) {
+    update();
+    if (stored < 1) return undefined;
+    stored -= 1;
+    return fn.apply(this, args);
+  };
+  f.count = () => { update(); return Math.floor(stored + 1e-9); };
+  return f;
+}
+--- hint
+`cooldown` only needs the time of the last successful call, starting at `-Infinity`.
+--- hint
+For `charges`, store a fractional charge count and the time you last updated it. On every call, add `elapsed / rechargeSeconds` (capped at `max`), then spend 1 if at least 1 is available.
+--- harness
+{
+  let t = 0;
+  const clock = () => t;
+  let n = 0;
+  const init = once(function (x) { n++; return this.k + x; });
+  const o = { k: 1, init };
+  eq(o.init(1), 2); eq(o.init(5), 2, 'same first result'); eq(n, 1);
+  const und = once(() => { n++; });
+  und(); und(); eq(n, 2, 'once with undefined result still runs once');
+
+  const shots = [];
+  const fire = cooldown(function (dir) { shots.push(this.name + dir); return 'bang'; }, 0.5, clock);
+  const gun = { name: 'gun', fire };
+  eq(gun.fire('L'), 'bang', 'first shot');
+  eq(fire.remaining(), 0.5);
+  t = 0.3; eq(gun.fire('R'), undefined, 'on cooldown');
+  near(fire.remaining(), 0.2, 1e-9);
+  t = 0.5; eq(gun.fire('U'), 'bang', 'ready exactly at 0.5');
+  t = 0.9; gun.fire('X');
+  t = 1.2; gun.fire('D');
+  eq(shots, ['gunL', 'gunU', 'gunD'], 'failed attempts do not reset the cooldown');
+  t = 5; eq(fire.remaining(), 0);
+
+  t = 0;
+  let dashes = 0;
+  const dash = charges(() => ++dashes, 2, 3, clock);
+  eq(dash.count(), 2);
+  eq(dash(), 1); eq(dash(), 2); eq(dash(), undefined, 'out of charges');
+  eq(dash.count(), 0);
+  t = 2.9; eq(dash(), undefined, 'not recharged yet');
+  t = 3; eq(dash.count(), 1); eq(dash(), 3);
+  t = 3 + 7.5; eq(dash.count(), 2, 'capped at max');
+  dash(); dash();
+  eq(dash.count(), 0);
+  t += 7.5;
+  eq(dash.count(), 2, 'exactly 2.5 periods gives 2 (capped at 2)');
+  dash(); dash();
+  t += 2.5 * 1.5;
+  eq(dash.count(), 1, '1.25 periods gives 1');
+  t += 0.75 * 3;
+  eq(dash.count(), 2, 'leftover fraction carried over');
+  const thisCheck = { v: 7, go: charges(function () { return this.v; }, 1, 1, clock) };
+  eq(thisCheck.go(), 7, 'this passed through');
+}
+
+=== exercise floodfill
+title: Flood fill without recursion
+--- prompt
+Write `floodFill(grid, x, y, fill)` for a tile map. `grid` is an array of strings (rows), one character per tile. Replace the connected region (4-directional neighbours) of tiles that have the same character as `grid[y][x]` with the character `fill`, and **return a new grid**: the input must not be modified. Return the original grid object itself if nothing changes (out-of-bounds start, or the start tile already equals `fill`).
+
+The tests include a 1000 by 1000 map whose region is one long winding corridor, so a recursive fill overflows the stack. Use an explicit stack (or queue). It also has to be reasonably fast: about a million tiles within the time limit, so convert rows to arrays (or one flat array) once rather than rebuilding strings per tile.
+--- starter
+function floodFill(grid, x, y, fill) {
+  const g = grid.map(r => [...r]);
+  const target = g[y][x];
+  const go = (x, y) => {
+    if (y < 0 || y >= g.length || x < 0 || x >= g[y].length || g[y][x] !== target) return;
+    g[y][x] = fill;
+    go(x + 1, y); go(x - 1, y); go(x, y + 1); go(x, y - 1);
+  };
+  go(x, y);
+  return g.map(r => r.join(''));
+}
+--- solution
+function floodFill(grid, x, y, fill) {
+  const h = grid.length;
+  if (y < 0 || y >= h || x < 0 || x >= grid[y].length) return grid;
+  const target = grid[y][x];
+  if (target === fill) return grid;
+  const g = grid.map(r => r.split(''));
+  const stack = [x, y];
+  while (stack.length) {
+    const cy = stack.pop(), cx = stack.pop();
+    if (cy < 0 || cy >= h || cx < 0 || cx >= g[cy].length || g[cy][cx] !== target) continue;
+    g[cy][cx] = fill;
+    stack.push(cx + 1, cy, cx - 1, cy, cx, cy + 1, cx, cy - 1);
+  }
+  return g.map(r => r.join(''));
+}
+--- hint
+Push coordinates as pairs of numbers onto one array (`stack.push(x, y)`) and pop them in reverse order. Pushing plain numbers allocates far less than pushing `{x, y}` objects or `[x, y]` arrays.
+--- hint
+Check bounds and colour when you *pop* a tile, so pushing neighbours is unconditional. Mark a tile as filled before pushing its neighbours so no tile is processed twice.
+--- harness
+{
+  const map = ['#####', '#..##', '#.#.#', '#...#', '#####'];
+  const copy = map.slice();
+  eq(floodFill(map, 1, 1, '~'), ['#####', '#~~##', '#~#~#', '#~~~#', '#####']);
+  eq(map, copy, 'input not modified');
+  eq(floodFill(map, 0, 0, '@'), ['@@@@@', '@..@@', '@.#.@', '@...@', '@@@@@'], 'walls are a region too');
+  eq(floodFill(['ab', 'ba'], 0, 0, 'x'), ['xb', 'ba'], 'no diagonals');
+  check(floodFill(map, 1, 1, '.') === map, 'no change returns the same object');
+  check(floodFill(map, 9, 9, 'x') === map, 'out of bounds returns the same object');
+  check(floodFill(map, -1, 0, 'x') === map, 'negative x');
+  eq(floodFill(['.'], 0, 0, 'o'), ['o']);
+  eq(floodFill(['..#', '.##', '...'], 2, 0, '+'), ['..+', '.++', '...']);
+
+  const N = 1000;
+  const rows = [];
+  for (let r = 0; r < N; r++) {
+    if (r % 2 === 0) rows.push('.'.repeat(N));
+    else rows.push(r % 4 === 1 ? '#'.repeat(N - 1) + '.' : '.' + '#'.repeat(N - 1));
+  }
+  const t0 = performance.now();
+  const out = floodFill(rows, 0, 0, 'o');
+  const ms = performance.now() - t0;
+  eq(out.length, N);
+  eq(out[N - 2], 'o'.repeat(N), 'reached the far end of the serpentine corridor');
+  eq(out[N - 1], 'o' + '#'.repeat(N - 1));
+  eq(out[1], '#'.repeat(N - 1) + 'o');
+  eq(out[3][0], 'o');
+  check(ms < 3000, 'large fill took ' + Math.round(ms) + 'ms');
+}
+
+=== exercise inventory
+title: An immutable inventory reducer
+--- prompt
+Write a pure reducer `inventoryReducer(state, action)` for a game inventory. State has the shape:
+
+```js
+{ gold: 50, slots: [{ id: 'potion', qty: 3 }, { id: 'sword', qty: 1 }], equipped: { weapon: null } }
+```
+
+Actions:
+
+| action | effect |
+|---|---|
+| `{ type: 'add', id, qty }` | increase the slot's qty, or append a new slot `{ id, qty }` |
+| `{ type: 'remove', id, qty }` | decrease qty; a slot that reaches 0 is removed. If there are fewer than `qty`, nothing changes |
+| `{ type: 'buy', id, price }` | if `gold >= price`, subtract it and add 1 of `id`; else nothing changes |
+| `{ type: 'equip', id }` | if the item is in the inventory, set `equipped.weapon = id`; else nothing changes |
+| anything else | nothing changes |
+
+Rules: never mutate `state` or anything in it (the harness checks that every old state is unchanged afterwards). When nothing changes, return **the same `state` object**. When something changes, share everything you did not change: untouched slot objects and the `equipped` object must be the same references as before.
+--- starter
+function inventoryReducer(state, action) {
+  if (action.type === 'add') {
+    state.slots.push({ id: action.id, qty: action.qty });
+  }
+  return state;
+}
+--- solution
+function inventoryReducer(state, action) {
+  const find = id => state.slots.findIndex(s => s.id === id);
+  switch (action.type) {
+    case 'add': {
+      const i = find(action.id);
+      if (i < 0) return { ...state, slots: [...state.slots, { id: action.id, qty: action.qty }] };
+      return { ...state, slots: state.slots.map((s, j) => j === i ? { ...s, qty: s.qty + action.qty } : s) };
+    }
+    case 'remove': {
+      const i = find(action.id);
+      if (i < 0 || state.slots[i].qty < action.qty) return state;
+      const qty = state.slots[i].qty - action.qty;
+      const slots = qty === 0
+        ? state.slots.filter((_, j) => j !== i)
+        : state.slots.map((s, j) => j === i ? { ...s, qty } : s);
+      return { ...state, slots };
+    }
+    case 'buy': {
+      if (state.gold < action.price) return state;
+      const next = inventoryReducer(state, { type: 'add', id: action.id, qty: 1 });
+      return { ...next, gold: state.gold - action.price };
+    }
+    case 'equip':
+      if (find(action.id) < 0) return state;
+      return { ...state, equipped: { ...state.equipped, weapon: action.id } };
+    default:
+      return state;
+  }
+}
+--- hint
+`state.slots.map((s, j) => j === i ? { ...s, qty: newQty } : s)` copies the array but reuses every slot object except the one that changed.
+--- hint
+`buy` can reuse the `add` case by calling the reducer recursively, then replace `gold` on the result.
+--- harness
+{
+  const run = (st, a) => {
+    const before = structuredClone(st);
+    const out = inventoryReducer(st, a);
+    eq(st, before, 'state was mutated by ' + a.type);
+    return out;
+  };
+  const mk = () => ({ gold: 50, slots: [{ id: 'potion', qty: 3 }, { id: 'sword', qty: 1 }], equipped: { weapon: null } });
+  let s = mk(), r;
+  try {
+    r = run(s, { type: 'add', id: 'potion', qty: 2 });
+    eq(r.slots, [{ id: 'potion', qty: 5 }, { id: 'sword', qty: 1 }]);
+    check(r !== s && r.slots !== s.slots, 'new state and slots');
+    check(r.slots[1] === s.slots[1], 'untouched slot shared');
+    check(r.equipped === s.equipped, 'equipped shared');
+    eq(s.slots[0].qty, 3, 'old state intact');
+
+    r = run(s, { type: 'add', id: 'bow', qty: 1 });
+    eq(r.slots.map(x => x.id), ['potion', 'sword', 'bow']);
+    check(r.slots[0] === s.slots[0], 'shared on append');
+
+    r = run(s, { type: 'remove', id: 'potion', qty: 1 });
+    eq(r.slots[0], { id: 'potion', qty: 2 });
+    r = run(s, { type: 'remove', id: 'sword', qty: 1 });
+    eq(r.slots, [{ id: 'potion', qty: 3 }], 'slot removed at 0');
+    check(r.slots[0] === s.slots[0], 'shared on remove');
+    check(run(s, { type: 'remove', id: 'potion', qty: 4 }) === s, 'not enough: same state');
+    check(run(s, { type: 'remove', id: 'shield', qty: 1 }) === s, 'missing: same state');
+
+    r = run(s, { type: 'buy', id: 'potion', price: 20 });
+    eq(r.gold, 30); eq(r.slots[0].qty, 4);
+    r = run(r, { type: 'buy', id: 'bomb', price: 30 });
+    eq(r.gold, 0); eq(r.slots.map(x => x.id + x.qty), ['potion4', 'sword1', 'bomb1']);
+    check(run(r, { type: 'buy', id: 'x', price: 1 }) === r, 'too poor: same state');
+
+    r = run(s, { type: 'equip', id: 'sword' });
+    eq(r.equipped, { weapon: 'sword' });
+    check(r.slots === s.slots, 'slots shared on equip');
+    check(run(s, { type: 'equip', id: 'axe' }) === s, 'cannot equip missing item');
+    check(run(s, { type: 'dance' }) === s, 'unknown action');
+
+    const log = [{ type: 'add', id: 'arrow', qty: 10 }, { type: 'remove', id: 'arrow', qty: 4 }, { type: 'buy', id: 'arrow', price: 5 }, { type: 'equip', id: 'arrow' }];
+    const fin = log.reduce((st, a) => run(st, a), mk());
+    eq(fin, { gold: 45, slots: [{ id: 'potion', qty: 3 }, { id: 'sword', qty: 1 }, { id: 'arrow', qty: 7 }], equipped: { weapon: 'arrow' } }, 'replay');
+  } catch (e) {
+    check(false, 'threw ' + e);
+  }
+}
+
+=== exercise fsm
+title: An enemy AI state machine
+--- prompt
+Write a table-driven state machine for an enemy and print a trace. Use a transition table object like the chapter's `ENEMY` (do not write the logic as nested `if`s), with these states and events:
+
+| state | event → next state |
+|---|---|
+| `patrol` | `seePlayer` → `chase`, `hit` → `alert` |
+| `alert` | `seePlayer` → `chase`, `timeout` → `patrol` |
+| `chase` | `inRange` → `attack`, `lostPlayer` → `alert`, `lowHp` → `flee` |
+| `attack` | `outOfRange` → `chase`, `lowHp` → `flee` |
+| `flee` | `safe` → `patrol` |
+
+Unknown events leave the state unchanged. Run the `events` array from the starter starting in `patrol` and print one line per event: `state --event--> next`, adding ` (ignored)` when the state did not change. Then print how many times each state was **entered** (a transition into a different state counts; the initial state counts once) as `entered: patrol=2 alert=...` with the states in the table's order.
+
+```text
+patrol --hit--> alert
+alert --inRange--> alert (ignored)
+...
+```
+--- starter
+const events = ['hit', 'inRange', 'seePlayer', 'inRange', 'outOfRange', 'lostPlayer',
+  'timeout', 'seePlayer', 'inRange', 'lowHp', 'seePlayer', 'safe'];
+let state = 'patrol';
+for (const ev of events) {
+  console.log(`${state} --${ev}--> ${state}`);
+}
+--- solution
+const events = ['hit', 'inRange', 'seePlayer', 'inRange', 'outOfRange', 'lostPlayer',
+  'timeout', 'seePlayer', 'inRange', 'lowHp', 'seePlayer', 'safe'];
+const TABLE = {
+  patrol: { seePlayer: 'chase', hit: 'alert' },
+  alert: { seePlayer: 'chase', timeout: 'patrol' },
+  chase: { inRange: 'attack', lostPlayer: 'alert', lowHp: 'flee' },
+  attack: { outOfRange: 'chase', lowHp: 'flee' },
+  flee: { safe: 'patrol' },
+};
+const entered = Object.fromEntries(Object.keys(TABLE).map(s => [s, 0]));
+let state = 'patrol';
+entered[state]++;
+for (const ev of events) {
+  const next = TABLE[state][ev] ?? state;
+  console.log(`${state} --${ev}--> ${next}${next === state ? ' (ignored)' : ''}`);
+  if (next !== state) entered[next]++;
+  state = next;
+}
+console.log('entered: ' + Object.entries(entered).map(([k, v]) => `${k}=${v}`).join(' '));
+--- hint
+`TABLE[state][event] ?? state` is the whole transition function.
+--- hint
+Build the counters with `Object.fromEntries(Object.keys(TABLE).map(s => [s, 0]))` so they come out in table order.
+--- test
+--- out
+patrol --hit--> alert
+alert --inRange--> alert (ignored)
+alert --seePlayer--> chase
+chase --inRange--> attack
+attack --outOfRange--> chase
+chase --lostPlayer--> alert
+alert --timeout--> patrol
+patrol --seePlayer--> chase
+chase --inRange--> attack
+attack --lowHp--> flee
+flee --seePlayer--> flee (ignored)
+flee --safe--> patrol
+entered: patrol=3 alert=2 chase=3 attack=2 flee=1
+
+=== quiz
+run: yes
+--- q
+What does this print? (The code runs in sloppy mode.)
+--- code
+const o = Object.freeze({ hp: 10, pos: { x: 1 } });
+o.hp = 0;
+o.pos.x = 99;
+o.mana = 5;
+console.log(o, Object.isFrozen(o.pos));
+--- choice
+{ hp: 0, pos: { x: 99 }, mana: 5 } false
+--- choice
+{ hp: 10, pos: { x: 1 } } true
+--- answer
+{ hp: 10, pos: { x: 99 } } false
+--- explain
+`Object.freeze` is shallow: the nested `pos` object is still mutable. Writes to the frozen object itself (changing `hp`, adding `mana`) fail silently in sloppy mode; in strict mode they would throw a `TypeError`.
+
+=== quiz
+run: yes
+--- q
+What does this print?
+--- code
+const inc = x => x + 1, dbl = x => x * 2;
+const pipe = (...fs) => x => fs.reduce((a, f) => f(a), x);
+const compose = (...fs) => x => fs.reduceRight((a, f) => f(a), x);
+console.log(pipe(inc, dbl)(3), compose(inc, dbl)(3), pipe()(3));
+--- choice
+7 8 3
+--- answer
+8 7 3
+--- choice
+8 7 undefined
+--- explain
+`pipe` applies left to right: `dbl(inc(3))` is 8. `compose` applies right to left: `inc(dbl(3))` is 7. With no functions, `reduce` with an initial value just returns `x`.
+
+=== quiz
+run: yes
+--- q
+A memoize cache keyed with `String(args)`. What does this print?
+--- code
+const cache = new Map();
+let computed = 0;
+const m = (...args) => {
+  const k = String(args);
+  if (!cache.has(k)) { computed++; cache.set(k, args.length); }
+  return cache.get(k);
+};
+console.log(m(1, 2), m('1,2'), m([1, 2]), m(1, '2'), computed);
+--- choice
+2 1 1 2 3
+--- choice
+2 1 1 2 1
+--- answer
+2 2 2 2 1
+--- explain
+All four argument lists stringify to `'1,2'`, so they share one cache entry and all return the first result, `2`. This is why a memoize key must not be built by joining strings.
+
+=== quiz
+run: yes
+--- q
+What does this print?
+--- code
+const m = new Map();
+m.set({}, 'a'); m.set({}, 'b');
+m.set(NaN, 'c'); m.set(NaN, 'd');
+m.set(0, 'e'); m.set(-0, 'f');
+console.log(m.size, m.get(NaN), m.get(0), m.get({}));
+--- choice
+6 c e a
+--- choice
+3 d f b
+--- answer
+4 d f undefined
+--- explain
+Map keys use SameValueZero: two `{}` literals are distinct objects (two entries, and a third fresh `{}` finds nothing), `NaN` matches `NaN`, and `0` and `-0` are the same key. Setting an existing key overwrites the value.
+
+=== quiz
+run: yes
+--- q
+What does this print? (Sloppy mode.)
+--- code
+const arrowWrap = f => (...a) => f(...a);
+const fnWrap = f => function (...a) { return f.apply(this, a); };
+const hit = function (d) { return this.hp - d; };
+globalThis.hp = 100;
+const a = { hp: 10, hit: arrowWrap(hit) };
+const b = { hp: 10, hit: fnWrap(hit) };
+console.log(a.hit(3), b.hit(3));
+--- choice
+7 7
+--- choice
+NaN 7
+--- answer
+97 7
+--- explain
+The arrow wrapper calls `f(...a)` as a plain function, so inside `hit`, `this` is the global object in sloppy mode, whose `hp` is 100. The `function` wrapper forwards its own `this` (the object before the dot) with `apply`. Decorators must use the second form.
+
+=== quiz
+run: yes
+--- q
+What does this print?
+--- code
+const sum = (a, b) => a + b;
+let r1;
+try { r1 = [].reduce(sum); } catch (e) { r1 = e.name; }
+let called = 0;
+const r2 = [5].reduce((a, b) => { called++; return a + b; });
+console.log(r1, r2, called, [[1, 2], [3]].reduce((a, b) => a.concat(b)), [].reduce(sum, 0));
+--- choice
+undefined 5 1 [ 1, 2, 3 ] 0
+--- answer
+TypeError 5 0 [ 1, 2, 3 ] 0
+--- choice
+TypeError 5 1 [ [ 1, 2 ], [ 3 ] ] 0
+--- explain
+Without an initial value, `reduce` uses the first element as the accumulator: an empty array throws a `TypeError`, and a one-element array returns that element without ever calling the callback. Always pass an initial value in reducers.
+
+=== quiz
+run: yes
+--- q
+What does this print?
+--- code
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+function debounce(fn, ms) {
+  let t;
+  return (...a) => { clearTimeout(t); t = setTimeout(() => fn(...a), ms); };
+}
+const out = [];
+const d = debounce(x => out.push(x), 30);
+d(1); d(2);
+await sleep(60);
+d(3);
+await sleep(10);
+d(4);
+await sleep(60);
+console.log(out);
+--- choice
+[ 1, 2, 3, 4 ]
+--- choice
+[ 2, 3, 4 ]
+--- answer
+[ 2, 4 ]
+--- explain
+Each call restarts the timer. `1` is replaced by `2`, which fires after the 60 ms pause. `3` is replaced by `4` only 10 ms later, before its timer fires.
