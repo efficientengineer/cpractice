@@ -127,6 +127,34 @@ int main(void) {
 
 The insert pattern (clear the field with `& ~(mask << pos)`, then OR in the new value masked and shifted) is how you write hardware registers and packed formats.
 
+### Bitsets
+
+An array of `uint64_t` used as a big set of bits: bit `i` lives in word `i / 64` at position `i % 64` (compilers turn those into `i >> 6` and `i & 63`). Tile maps use them for "solid", "visited" and "visible" flags; ECS engines use them for "which entities have this component".
+
+```c
+#include <stdio.h>
+#include <stdint.h>
+
+#define W 256
+#define H 256
+static uint64_t solid[W * H / 64];            // 8 KB instead of 64 KB of bool
+
+static void set_solid(int x, int y) { unsigned i = (unsigned)(y * W + x); solid[i >> 6] |= (uint64_t)1 << (i & 63); }
+static int is_solid(int x, int y)   { unsigned i = (unsigned)(y * W + x); return (solid[i >> 6] >> (i & 63)) & 1; }
+
+int main(void) {
+    for (int x = 0; x < W; x++) { set_solid(x, 0); set_solid(x, H - 1); }   // floor and ceiling
+    set_solid(10, 5);
+    int count = 0;
+    for (size_t w = 0; w < sizeof solid / sizeof solid[0]; w++)
+        count += __builtin_popcountll(solid[w]);   // 64 tiles per instruction
+    printf("%d %d %d\n", is_solid(10, 5), is_solid(11, 5), count);   // 1 0 513
+    return 0;
+}
+```
+
+> **Performance:** Memory bandwidth and cache size are usually the bottleneck, not arithmetic. A `bool` per tile spends 8 bits on 1 bit of information; a bitset fits 8x more of the map in cache, and operations like "count solid tiles", "union of two visibility masks" or "any enemy in this row?" process 64 tiles per instruction with `&`, `|` and popcount. Same idea for small structs: shrinking an entity from 64 to 32 bytes by packing flags and using `int16_t` where the range allows doubles how many fit in each cache line during the update loop.
+
 ## Flags enums
 
 C#'s `[Flags] enum Perm { Read = 1, Write = 2, Exec = 4 }` is the same thing in C, without the type safety: enum constants are plain `int`s.
@@ -160,6 +188,14 @@ int main(void) {
 ```
 
 Note the difference between "has all of these flags" (`(p & m) == m`) and "has any" (`(p & m) != 0`). C#'s `HasFlag` is the first. Unix permissions, `open()` flags (`O_CREAT | O_TRUNC`) and window styles all work like this.
+
+Games are full of flag sets:
+
+- **Input state**: one bit per button, sampled each frame. `pressed = now & ~prev` (down this frame but not last), `released = prev & ~now`. Two ANDs replace a pile of per-button booleans and `if`s.
+- **Collision layers and masks** (as in Unity, Godot and Box2D): each object has a `layer` bit saying what it is and a `mask` of layers it collides with. Two objects interact if `(a.layer & b.mask) && (b.layer & a.mask)`.
+- **Component masks** in an ECS: an entity's mask says which components it has, and a system that needs Position and Velocity processes entities where `(mask & need) == need`.
+
+> **Performance:** Testing one AND per entity is branch-light and cache-friendly: the masks of 10,000 entities fit in 40 KB. Compare with a C#-style `if (e.HasComponent<Position>() && e.HasComponent<Velocity>())` doing two dictionary lookups per entity per frame.
 
 ## Counting and power-of-two tricks
 
@@ -204,6 +240,8 @@ int main(void) {
 }
 ```
 
+> **Performance:** When `n` is a power of two, `x % n` equals `x & (n - 1)` for unsigned `x`, and `x / n` equals `x >> log2(n)`. Compilers do this automatically when `n` is a compile-time constant, but not when it's a variable, so ring buffers, hash tables and tile maps often force power-of-two sizes and store the mask. Don't hand-write these tricks for constants; do pick power-of-two sizes for structures indexed in hot loops.
+
 Compilers offer builtins that map to single instructions: `__builtin_popcount`, `__builtin_ctz` (count trailing zeros), `__builtin_clz` (leading zeros; both undefined for 0). C23 standardizes them in `<stdbit.h>` (`stdc_count_ones`, ...). C#'s equivalent is `BitOperations.PopCount`, `TrailingZeroCount`, `Log2`.
 
 ## Packing values into an integer
@@ -232,6 +270,33 @@ int main(void) {
 ```
 
 `<<` binds tighter than `&` and `|` but looser than `+`, so `y << 9 | m << 5` works as written, though parentheses never hurt. Masking each input before shifting stops an out-of-range value from smearing into its neighbors.
+
+## Random numbers: xorshift
+
+`rand()` is a poor fit for games: its quality and range (`RAND_MAX` can be as small as 32767) vary by platform, it has one hidden global state, and `rand() % n` is biased. Games want a fast generator with explicit state they can seed, save and replay: same seed, same level, same replay. Xorshift generators are three shifts and three XORs:
+
+```c
+#include <stdio.h>
+#include <stdint.h>
+
+uint32_t xorshift32(uint32_t *state) {   // state must never be 0
+    uint32_t x = *state;
+    x ^= x << 13;
+    x ^= x >> 17;
+    x ^= x << 5;
+    return *state = x;
+}
+
+int main(void) {
+    uint32_t level_rng = 12345;          // seed: store it in the save file to regenerate the level
+    for (int i = 0; i < 3; i++) printf("%u\n", xorshift32(&level_rng));
+    // a float in [0, 1): use the top 24 bits, which fit exactly in a float's mantissa
+    printf("%.6f\n", (xorshift32(&level_rng) >> 8) * (1.0f / 16777216.0f));
+    return 0;
+}
+```
+
+Keep separate generator states for separate purposes (level generation, loot, cosmetic particles) so that adding a particle effect doesn't change which loot drops. Passing the state explicitly instead of hiding it in a global makes that natural.
 
 ## Endianness
 
@@ -564,6 +629,144 @@ int main(void) {
     return TEST_END();
 }
 
+=== exercise inputbits
+title: Input state and collision masks
+--- prompt
+Two everyday uses of bit flags in a game.
+
+**Input.** Each frame the platform layer gives you the set of held buttons as a bitmask (the `BTN_` constants in the starter). Write:
+
+- `void input_update(Input *in, uint32_t held_now)`: shift the current state into `prev` and store the new one.
+- `uint32_t input_pressed(const Input *in)`: buttons that went down this frame (held now, not held last frame).
+- `uint32_t input_released(const Input *in)`: buttons that went up this frame.
+- `int input_axis_x(const Input *in)`: `-1` if only LEFT is held, `1` if only RIGHT, `0` for neither or both.
+
+**Collision filtering.** Every physics object has a `layer` (the bit or bits saying what it is) and a `mask` (the layers it reacts to). Write `int should_collide(const Body *a, const Body *b)`: true only if each one's layer is in the other's mask.
+
+No loops over individual bits are needed: each function is one or two expressions.
+--- starter
+#include <stdint.h>
+
+enum {
+    BTN_LEFT  = 1u << 0,
+    BTN_RIGHT = 1u << 1,
+    BTN_UP    = 1u << 2,
+    BTN_DOWN  = 1u << 3,
+    BTN_JUMP  = 1u << 4,
+    BTN_FIRE  = 1u << 5,
+};
+
+typedef struct { uint32_t prev, now; } Input;
+typedef struct { uint32_t layer, mask; } Body;
+
+void input_update(Input *in, uint32_t held_now) {
+    in->now = held_now;
+}
+
+uint32_t input_pressed(const Input *in) {
+    return in->now;
+}
+
+uint32_t input_released(const Input *in) {
+    (void)in;
+    return 0;
+}
+
+int input_axis_x(const Input *in) {
+    (void)in;
+    return 0;
+}
+
+int should_collide(const Body *a, const Body *b) {
+    return (a->layer & b->mask) || (b->layer & a->mask);
+}
+--- solution
+#include <stdint.h>
+
+enum {
+    BTN_LEFT  = 1u << 0,
+    BTN_RIGHT = 1u << 1,
+    BTN_UP    = 1u << 2,
+    BTN_DOWN  = 1u << 3,
+    BTN_JUMP  = 1u << 4,
+    BTN_FIRE  = 1u << 5,
+};
+
+typedef struct { uint32_t prev, now; } Input;
+typedef struct { uint32_t layer, mask; } Body;
+
+void input_update(Input *in, uint32_t held_now) {
+    in->prev = in->now;
+    in->now = held_now;
+}
+
+uint32_t input_pressed(const Input *in) {
+    return in->now & ~in->prev;
+}
+
+uint32_t input_released(const Input *in) {
+    return in->prev & ~in->now;
+}
+
+int input_axis_x(const Input *in) {
+    return ((in->now & BTN_RIGHT) != 0) - ((in->now & BTN_LEFT) != 0);
+}
+
+int should_collide(const Body *a, const Body *b) {
+    return (a->layer & b->mask) != 0 && (b->layer & a->mask) != 0;
+}
+--- hint
+Pressed is "in `now` and not in `prev`": `now & ~prev`. Released is the mirror image.
+--- hint
+`(x & BTN_RIGHT) != 0` is 0 or 1; subtracting the LEFT version gives -1, 0 or 1 with no branches.
+--- hint
+Collision needs both directions to agree: AND, not OR.
+--- harness
+#include <stdint.h>
+int main(void) {
+    Input in = {0, 0};
+    input_update(&in, BTN_RIGHT | BTN_JUMP);
+    CHECK_UINT(input_pressed(&in), BTN_RIGHT | BTN_JUMP);
+    CHECK_UINT(input_released(&in), 0);
+    CHECK_INT(input_axis_x(&in), 1);
+    input_update(&in, BTN_RIGHT);                        /* still running, jump let go */
+    CHECK_UINT(input_pressed(&in), 0);
+    CHECK_UINT(input_released(&in), BTN_JUMP);
+    CHECK_UINT(in.prev, BTN_RIGHT | BTN_JUMP);
+    input_update(&in, BTN_RIGHT | BTN_LEFT | BTN_FIRE);
+    CHECK_UINT(input_pressed(&in), BTN_LEFT | BTN_FIRE);
+    CHECK_INT(input_axis_x(&in), 0);
+    input_update(&in, BTN_LEFT | BTN_FIRE);
+    CHECK_INT(input_axis_x(&in), -1);
+    CHECK_UINT(input_pressed(&in), 0);
+    CHECK_UINT(input_released(&in), BTN_RIGHT);
+    input_update(&in, 0);
+    CHECK_INT(input_axis_x(&in), 0);
+    CHECK_UINT(input_released(&in), BTN_LEFT | BTN_FIRE);
+    input_update(&in, 0x80000000u);
+    CHECK_UINT(input_pressed(&in), 0x80000000u);
+
+    enum { L_PLAYER = 1, L_ENEMY = 2, L_PBULLET = 4, L_WALL = 8, L_PICKUP = 16 };
+    Body player  = {L_PLAYER,  L_ENEMY | L_WALL | L_PICKUP};
+    Body enemy   = {L_ENEMY,   L_PLAYER | L_PBULLET | L_WALL};
+    Body bullet  = {L_PBULLET, L_ENEMY | L_WALL};
+    Body wall    = {L_WALL,    0xFFFFFFFFu};
+    Body pickup  = {L_PICKUP,  L_PLAYER};
+    Body ghost   = {L_ENEMY,   L_WALL};                  /* walks through the player */
+    CHECK(should_collide(&player, &enemy));
+    CHECK(should_collide(&enemy, &player));
+    CHECK(!should_collide(&player, &bullet));            /* no friendly fire */
+    CHECK(should_collide(&bullet, &enemy));
+    CHECK(should_collide(&bullet, &wall));
+    CHECK(should_collide(&player, &pickup));
+    CHECK(!should_collide(&enemy, &pickup));
+    CHECK(!should_collide(&ghost, &player));             /* player's mask has ENEMY, ghost's mask lacks PLAYER */
+    CHECK(!should_collide(&player, &ghost));
+    CHECK(should_collide(&ghost, &wall));
+    CHECK(!should_collide(&bullet, &bullet));
+    return TEST_END();
+}
+
 === exercise rgba
 title: Packed colors
 --- prompt
@@ -660,6 +863,131 @@ int main(void) {
     CHECK_UINT(rgba_gray(0x102030FFu), 0x202020FFu);
     CHECK_UINT(rgba_gray(0xFFFFFF00u), 0xFFFFFF00u);
     CHECK_UINT(rgba_gray(0x01010201u), 0x01010101u);
+    return TEST_END();
+}
+
+=== exercise xorshift
+title: A deterministic game RNG
+--- prompt
+Write a small random number toolkit that gives the same results on every machine, so that a seed stored in a save file regenerates the same level:
+
+- `uint32_t rng_next(uint32_t *state)`: xorshift32. With `x = *state`: `x ^= x << 13; x ^= x >> 17; x ^= x << 5;` then store `x` back into `*state` and return it.
+- `uint32_t rng_below(uint32_t *state, uint32_t n)`: a uniform value in `[0, n)` for `n >= 1`, **without modulo bias**, using exactly this rejection method so results are reproducible: let `t = (0u - n) % n` (that's 2³² mod n); draw `r = rng_next(state)` repeatedly until `r >= t`; return `r % n`.
+- `int rng_range(uint32_t *state, int lo, int hi)`: a uniform int in `[lo, hi]` inclusive, as `lo + rng_below(state, hi - lo + 1)`. Ranges up to the full `int` span must work (compute the width in `uint32_t`/`int64_t`; hi - lo + 1 overflows `int`, and the full span is 2³², which doesn't fit in a `uint32_t` either: in that case just return `(int)rng_next` reinterpreted, i.e. `lo + rng_next(state)` computed in 64 bits).
+- `float rng_float(uint32_t *state)`: `(rng_next(state) >> 8) * (1.0f / 16777216.0f)`, in `[0, 1)`.
+
+Why the rejection step: with `n = 3`, `2^32` isn't a multiple of 3, so plain `r % 3` returns 0 very slightly more often than 2. For a loot table rolled millions of times, that's a real skew.
+--- starter
+#include <stdint.h>
+
+uint32_t rng_next(uint32_t *state) {
+    *state = *state * 1103515245u + 12345u;
+    return *state;
+}
+
+uint32_t rng_below(uint32_t *state, uint32_t n) {
+    return rng_next(state) % n;
+}
+
+int rng_range(uint32_t *state, int lo, int hi) {
+    return lo + (int)(rng_next(state) % (uint32_t)(hi - lo + 1));
+}
+
+float rng_float(uint32_t *state) {
+    return (float)rng_next(state) / 4294967296.0f;
+}
+--- solution
+#include <stdint.h>
+
+uint32_t rng_next(uint32_t *state) {
+    uint32_t x = *state;
+    x ^= x << 13;
+    x ^= x >> 17;
+    x ^= x << 5;
+    return *state = x;
+}
+
+uint32_t rng_below(uint32_t *state, uint32_t n) {
+    uint32_t t = (0u - n) % n;
+    uint32_t r;
+    do r = rng_next(state); while (r < t);
+    return r % n;
+}
+
+int rng_range(uint32_t *state, int lo, int hi) {
+    int64_t width = (int64_t)hi - lo + 1;
+    if (width > UINT32_MAX) return (int)((int64_t)lo + rng_next(state));
+    return (int)(lo + (int64_t)rng_below(state, (uint32_t)width));
+}
+
+float rng_float(uint32_t *state) {
+    return (rng_next(state) >> 8) * (1.0f / 16777216.0f);
+}
+--- hint
+`0u - n` wraps to `2^32 - n` in unsigned arithmetic, and `(2^32 - n) % n == 2^32 % n`. Values below that threshold are the "extra" ones that would bias the result.
+--- hint
+Compute the width of `[lo, hi]` as `(int64_t)hi - lo + 1`. When it's exactly `2^32`, every `uint32_t` is a valid offset.
+--- harness
+#include <stdint.h>
+int main(void) {
+    uint32_t s = 1;
+    CHECK_UINT(rng_next(&s), 270369u);
+    CHECK_UINT(s, 270369u);
+    CHECK_UINT(rng_next(&s), 67634689u);
+    CHECK_UINT(rng_next(&s), 2647435461u);
+    s = 2463534242u;
+    uint32_t a = rng_next(&s);
+    CHECK_UINT(a, 723471715u);
+
+    s = 7;
+    uint32_t got[8];
+    for (int i = 0; i < 8; i++) got[i] = rng_below(&s, 10);
+    uint32_t s2 = 7, ok = 1;
+    for (int i = 0; i < 8; i++) { uint32_t r = rng_next(&s2); if (got[i] != r % 10) ok = 0; }
+    CHECK(ok);                                     /* threshold for 10 is 6: no rejections here */
+    CHECK_INT(s, s2);
+
+    /* a seed whose next value falls below the threshold must be rejected */
+    uint32_t n = 3000000000u, t = (0u - n) % n;    /* t = 1294967296 */
+    uint32_t probe = 1, steps = 0, seed = 0;
+    for (;;) { uint32_t before = probe; uint32_t r = rng_next(&probe); steps++; if (r < t) { seed = before; break; } }
+    s = seed;
+    uint32_t first = rng_next(&(uint32_t){seed});
+    uint32_t r2 = seed; rng_next(&r2);
+    uint32_t want;
+    do want = rng_next(&r2); while (want < t);
+    CHECK(first < t);
+    CHECK_UINT(rng_below(&s, n), want % n);
+    CHECK_UINT(rng_below(&s, 1), 0);
+    (void)steps;
+
+    s = 99;
+    int lo_seen = 0, hi_seen = 0, inrange = 1;
+    long hist[6] = {0};
+    for (int i = 0; i < 600000; i++) {
+        int d = rng_range(&s, 1, 6);
+        if (d < 1 || d > 6) { inrange = 0; break; }
+        hist[d - 1]++;
+        lo_seen |= d == 1; hi_seen |= d == 6;
+    }
+    CHECK(inrange && lo_seen && hi_seen);
+    int fair = 1;
+    for (int i = 0; i < 6; i++) if (hist[i] < 98000 || hist[i] > 102000) fair = 0;
+    CHECK(fair);
+    int neg = 1;
+    for (int i = 0; i < 1000; i++) { int v = rng_range(&s, -5, -3); if (v < -5 || v > -3) neg = 0; }
+    CHECK(neg);
+    s = 5;
+    uint32_t s3 = 5;
+    CHECK_INT(rng_range(&s, INT32_MIN, INT32_MAX), (int)((int64_t)INT32_MIN + rng_next(&s3)));
+    int wide = 1;
+    for (int i = 0; i < 1000; i++) { int v = rng_range(&s, -2000000000, 2000000000); if (v < -2000000000 || v > 2000000000) wide = 0; }
+    CHECK(wide);
+
+    s = 42;
+    float mn = 1, mx = 0;
+    for (int i = 0; i < 100000; i++) { float f = rng_float(&s); if (f < mn) mn = f; if (f > mx) mx = f; }
+    CHECK(mn >= 0.0f && mn < 0.001f && mx < 1.0f && mx > 0.999f);
     return TEST_END();
 }
 

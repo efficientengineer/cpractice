@@ -43,6 +43,8 @@ Consequences you will hit:
 
 `setvbuf(stdout, NULL, _IONBF, 0)` makes a stream unbuffered (call it before any output). `exit()` and returning from `main` flush everything; `_exit()` and crashes don't.
 
+> **Performance:** Buffering exists because system calls are expensive (around a microsecond each, versus nanoseconds for copying into a buffer). Bad habits that defeat it: calling `fflush` after every line of a log, making stdout unbuffered "to be safe", or `fputc`-ing a large file one byte at a time to an unbuffered stream. For big outputs (a screenshot, a level export) build the data in memory and write it with one `fwrite`. And keep file I/O out of the frame loop entirely: load and parse assets at startup or on a loading screen, write save files at checkpoints, and send per-frame logs to an in-memory ring buffer that's written out occasionally.
+
 ## printf's return value
 
 `printf` returns the number of characters written, or a negative value on error. Rarely checked, but useful for alignment:
@@ -248,6 +250,8 @@ int main(void) {
 
 Note the last line of a file may have no trailing newline; this handles it (the loop ends on `EOF` with `len > 0`, and that line is returned).
 
+> **Performance:** Grow buffers *geometrically* (double the capacity), never by a fixed step. Growing by 1 or by 100 bytes makes reading an n-byte line O(n²), since each `realloc` may copy everything so far. When you'll read many lines, reuse one buffer across calls (that's what POSIX `getline(&buf, &cap, f)` does) instead of a fresh `malloc` per line. To load a whole asset file, find its size with `fseek`/`ftell`, allocate once, and `fread` it in a single call; then parse from memory.
+
 ## Splitting lines
 
 Whitespace-separated input is easiest with `strtol` loops (numbers) or `sscanf` with `%n`. For delimited formats like CSV, avoid `strtok`: it treats a run of delimiters as one (so `a,,b` gives two fields, not three), modifies the string, and keeps hidden global state (not reentrant). `strchr`/`strcspn` give full control:
@@ -345,6 +349,10 @@ int main(void) {
 ```
 
 `fwrite` of a struct writes its in-memory bytes: padding, native endianness and all. That's fine for a cache file the same program reads back, and wrong for a format another machine or compiler must read (see the bits chapter: serialize field by field instead).
+
+For **save games**, start the file with a magic number and a version (`"SAV1"`, then a `uint32_t` version) so you can reject garbage and migrate old saves; store counts before arrays; and check every `fread` result so a truncated or corrupted save produces an error message rather than a crash. Write to a temporary file and rename it over the old save once it's complete, so a crash mid-save can't destroy the player's progress.
+
+> **Performance:** Text formats (JSON, CSV, your own) are great for hand-edited data like level layouts and tuning values; parse them once at load time. Binary formats written as a few big `fwrite` calls of arrays load orders of magnitude faster, which is why shipped games often "bake" text assets into binary during the build.
 
 === exercise parseint
 title: parse_int with full error checking
@@ -642,7 +650,7 @@ Write `char *read_line(FILE *f, size_t *len)`:
 - If `len` is not `NULL`, store the line's length in `*len`.
 - An empty line (just `'\n'`) returns `""`, not `NULL`.
 - Return `NULL` only when end of file is reached before any character is read (and on allocation failure).
-- Lines may be any length; the tests use 100,000 characters. Grow your buffer geometrically.
+- Lines may be any length; the tests use a 3,000,000-character line. Grow your buffer geometrically (double it): growing by a fixed amount makes this O(n²) and times out.
 
 The tests write text to a `tmpfile()`, rewind it, and call your function. Every returned line is freed by the tests.
 --- starter
@@ -690,7 +698,7 @@ int main(void) {
     FILE *f = tmpfile();
     if (!f) { printf("tmpfile failed\n"); return 1; }
     fputs("first line\n\nthird\t line  \n", f);
-    for (int i = 0; i < 100000; i++) fputc('a' + i % 26, f);
+    for (int i = 0; i < 3000000; i++) fputc('a' + i % 26, f);
     fputs("\nlast without newline", f);
     rewind(f);
 
@@ -708,10 +716,10 @@ int main(void) {
     free(s);
     s = read_line(f, &n);
     CHECK(s != NULL);
-    CHECK_INT(n, 100000);
+    CHECK_INT(n, 3000000);
     if (s) {
-        int ok = strlen(s) == 100000;
-        for (int i = 0; ok && i < 100000; i++) if (s[i] != 'a' + i % 26) ok = 0;
+        int ok = strlen(s) == 3000000;
+        for (int i = 0; ok && i < 3000000; i++) if (s[i] != 'a' + i % 26) ok = 0;
         CHECK(ok);
     }
     free(s);
@@ -959,10 +967,219 @@ error: bad header
 row 0: -2147483648
 cols: -2147483648
 
+=== exercise level
+title: Loading a tile map
+--- prompt
+Load a level from stdin, validate it, and report on it. The format:
+
+```text
+7 4
+#######
+#@.$..#
+###.#$#
+#$#####
+```
+
+The first line is the width `W` and height `H` (each 1 to 64). Then come `H` lines of exactly `W` tiles: `#` wall, `.` floor, `@` the player (exactly one), `$` a coin. Lines after the map are ignored.
+
+On success print three lines: the player's position as `player X,Y` (column, row, from 0), the number of coins, and how many coins the player can reach moving up, down, left and right through anything that isn't a wall:
+
+```text
+player 1,1
+coins 3
+reachable 2
+```
+
+On bad input print one error line and exit with status 1. Check each map line in order, length first:
+
+| Problem | Message |
+|---|---|
+| first line isn't two numbers in range | `error: bad header` |
+| a map line has the wrong length | `error: line N: expected W tiles, got M` |
+| a map line has another character | `error: line N: bad tile 'C'` (the first bad one) |
+| input ends before `H` map lines | `error: expected H rows, got K` |
+| not exactly one `@` | `error: need exactly one player, found K` |
+
+`N` is the line number in the input, where the header is line 1. Lines are under 100 characters; ignore a trailing `\r`.
+
+Store the map in one flat array indexed `y * W + x`, and do the reachability search (BFS or an explicit-stack flood fill) with fixed arrays sized for the largest map, not recursion and not a `malloc` per step.
+--- starter
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+
+#define MAXW 64
+#define MAXH 64
+
+int main(void) {
+    char line[128];
+    int w, h;
+    if (!fgets(line, sizeof line, stdin) || sscanf(line, "%d %d", &w, &h) != 2) {
+        printf("error: bad header\n");
+        return 1;
+    }
+    char map[MAXW * MAXH];
+    (void)map;
+    return 0;
+}
+--- solution
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+
+#define MAXW 64
+#define MAXH 64
+
+int main(void) {
+    char line[128];
+    int w, h;
+    if (!fgets(line, sizeof line, stdin) || sscanf(line, "%d %d", &w, &h) != 2 ||
+        w < 1 || w > MAXW || h < 1 || h > MAXH) {
+        printf("error: bad header\n");
+        return 1;
+    }
+    static char map[MAXW * MAXH];
+    int players = 0, px = 0, py = 0, coins = 0;
+    for (int y = 0; y < h; y++) {
+        if (!fgets(line, sizeof line, stdin)) {
+            printf("error: expected %d rows, got %d\n", h, y);
+            return 1;
+        }
+        line[strcspn(line, "\r\n")] = '\0';
+        int len = (int)strlen(line), lineno = y + 2;
+        if (len != w) {
+            printf("error: line %d: expected %d tiles, got %d\n", lineno, w, len);
+            return 1;
+        }
+        for (int x = 0; x < w; x++) {
+            char c = line[x];
+            if (!strchr("#.@$", c)) {
+                printf("error: line %d: bad tile '%c'\n", lineno, c);
+                return 1;
+            }
+            if (c == '@') { players++; px = x; py = y; }
+            if (c == '$') coins++;
+            map[y * w + x] = c;
+        }
+    }
+    if (players != 1) {
+        printf("error: need exactly one player, found %d\n", players);
+        return 1;
+    }
+    static int queue[MAXW * MAXH];
+    static unsigned char seen[MAXW * MAXH];
+    int head = 0, tail = 0, reachable = 0;
+    queue[tail++] = py * w + px;
+    seen[py * w + px] = 1;
+    while (head < tail) {
+        int i = queue[head++], x = i % w, y = i / w;
+        if (map[i] == '$') reachable++;
+        const int dx[4] = {1, -1, 0, 0}, dy[4] = {0, 0, 1, -1};
+        for (int d = 0; d < 4; d++) {
+            int nx = x + dx[d], ny = y + dy[d];
+            if (nx < 0 || ny < 0 || nx >= w || ny >= h) continue;
+            int j = ny * w + nx;
+            if (seen[j] || map[j] == '#') continue;
+            seen[j] = 1;
+            queue[tail++] = j;
+        }
+    }
+    printf("player %d,%d\ncoins %d\nreachable %d\n", px, py, coins, reachable);
+    return 0;
+}
+--- hint
+Read the header with `fgets` + `sscanf`, then exactly `H` more lines with `fgets`, stripping the newline with `strcspn` before measuring the length.
+--- hint
+BFS with a plain array as the queue: every tile enters at most once (mark it seen when you enqueue it), so an array of `W * H` ints is always big enough. Neighbors of index `i` are at `x ± 1` and `y ± 1` with `x = i % W`, `y = i / W`; check bounds and walls.
+--- test
+7 4
+#######
+#@.$..#
+###.#$#
+#$#####
+--- out
+player 1,1
+coins 3
+reachable 2
+--- test
+3 1
+$@$
+--- out
+player 1,0
+coins 2
+reachable 2
+--- test
+5 3
+#####
+#@#$#
+#####
+extra lines are ignored
+--- out
+player 1,1
+coins 1
+reachable 0
+--- test
+5 3
+#####
+#@..
+#####
+--- out
+error: line 3: expected 5 tiles, got 4
+--- exit
+1
+--- test
+4 2
+#@x#
+####
+--- out
+error: line 2: bad tile 'x'
+--- exit
+1
+--- test
+4 3
+####
+#@$#
+--- out
+error: expected 3 rows, got 2
+--- exit
+1
+--- test
+3 2
+@.@
+...
+--- out
+error: need exactly one player, found 2
+--- exit
+1
+--- test
+65 2
+--- out
+error: bad header
+--- exit
+1
+--- test
+level one
+--- out
+error: bad header
+--- exit
+1
+--- test
+12 6
+$..#....#..$
+.#.#.##.#.#.
+.#...#@...#.
+.####.#####.
+......#.$#.$
+######$#####
+--- out
+player 6,2
+coins 5
+reachable 3
+
 === exercise binfile
 title: Binary records with fread and fwrite
 --- prompt
-Save and load an array of records as a binary file: a `uint32_t` count followed by the raw structs.
+Save and load a player's inventory as a binary save file: a `uint32_t` count followed by the raw `Item` structs. (Writing raw structs is fine for a file only this build of the game reads; the chapter explains what a portable save format adds.)
 
 - `int save_items(FILE *f, const Item *items, size_t n)`: write at the current position. Return 0 on success, -1 if any write was short.
 - `Item *load_items(FILE *f, size_t *n)`: read a count and that many items from the current position into a new `malloc`'d array (the caller frees it); set `*n`. Return `NULL` (without leaking anything) if the count can't be read, if the count is over 1,000,000, or if fewer items than the count can be read. A count of 0 is valid: return a non-`NULL` pointer from `malloc(1)` and set `*n = 0`.

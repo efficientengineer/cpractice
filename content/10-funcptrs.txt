@@ -136,6 +136,10 @@ Three classic bugs:
 
 `qsort` is not guaranteed stable (equal elements may be reordered); `List<T>.Sort` isn't either, but LINQ's `OrderBy` is. If you need stability, tie-break on a secondary key or the original index.
 
+In a game, the classic `qsort` job is **draw order**: sort sprites by layer, then by y (things lower on screen drawn later, so they overlap correctly), then by id so the order is deterministic and sprites with equal keys don't flicker between frames.
+
+> **Performance:** `qsort` calls your comparator through a pointer O(n log n) times, and the compiler can't inline it, so it's maybe 2-3x slower than a hand-specialized sort. That's fine for thousands of sprites per frame. What's not fine: sorting with an O(n²) algorithm (bubble/insertion sort "because it's short"), or comparing expensive things (re-hashing strings, recomputing distances) inside the comparator. Precompute a sort key per element once, then sort on the key. If the data is nearly sorted from the last frame, insertion sort *is* fast, but measure first.
+
 ## bsearch
 
 ```c
@@ -293,6 +297,8 @@ int main(void) {
 }
 ```
 
+> **Performance:** A C# lambda that captures variables allocates a closure object (and often a delegate) on the heap; doing that inside `Update()` creates garbage every frame. The C pattern allocates nothing: the context is usually a pointer to a struct that already exists on the stack or in your game state.
+
 Every serious C callback API has this parameter: `pthread_create`'s `void *arg`, GLib's `gpointer user_data`, the `void *` in event libraries. `qsort` notably lacks it, which is why sorting by a runtime-chosen key forces a global variable (or the non-portable `qsort_r`). When you design an API that takes a callback, always add the `void *ctx`.
 
 Watch the lifetime: `ctx` usually points at a local. That's fine while the call is running, but if the callback is *stored* and called later (an event handler), the local may be gone. C# closures keep captured variables alive; C doesn't.
@@ -334,7 +340,11 @@ int main(void) {
 }
 ```
 
-When the keys are small integers (opcodes, enum values, states in a state machine) skip the search and index directly: `handlers[opcode](vm)`. That's the core loop of many interpreters and emulators.
+When the keys are small integers (opcodes, enum values, states in a state machine) skip the search and index directly: `handlers[opcode](vm)`. That's the core loop of many interpreters and emulators, and of game state machines: `states[game.state].update(&game, dt)` with one row per state (title, playing, paused, game over), each holding `enter`, `update`, `render` and `exit` pointers.
+
+> **Performance:** Look commands up by name *once* (when a key binding or script is loaded) and store the function pointer or index. `strcmp` through a table on every keypress is harmless; doing it per entity per frame is not.
+
+The same pattern with a list of handlers per event type gives you an **event bus**: systems subscribe a `(function, ctx)` pair to "enemy died" or "player damaged", and the code that detects the event calls every subscriber without knowing who they are. An exercise below builds one with fixed-size arrays so emitting never allocates.
 
 ## Interfaces and virtual methods: the vtable
 
@@ -403,6 +413,8 @@ Key points:
 - `self` is explicit. C#'s `this` is the same hidden first argument.
 - `destroy` in the vtable is the virtual destructor: callers free shapes without knowing their concrete type.
 - The Linux kernel (`struct file_operations`), SQLite (`sqlite3_vfs`) and COM all use this pattern.
+
+> **Performance:** Vtables are the right tool for things you have a few of and call occasionally: game states, asset loaders, audio backends, UI widgets. They're the wrong tool for the hot loop over 10,000 entities. An array of `Shape *`, each separately `malloc`'d and updated through a virtual call, costs a cache miss to reach each object, another to reach its vtable, and an unpredictable indirect branch, and it blocks inlining and vectorization. The data-oriented alternative: keep one plain array per type (`Circle circles[N]; Rect rects[M];`) and run one tight loop per array. Same behavior, no indirection, often several times faster. This is the core idea behind ECS engines.
 
 === exercise comparators
 title: Comparators that don't overflow
@@ -587,6 +599,249 @@ int main(void) {
     sort_people(ps, 0);
     sort_words(w, 1);
     CHECK_STR(w[0], "Banana");
+    return TEST_END();
+}
+
+=== exercise drawsort
+title: Sorting sprites into draw order
+--- prompt
+Each frame a 2D renderer sorts its sprites so they overlap correctly. Write `void sort_draw_order(Sprite *s, size_t n)` using `qsort`:
+
+```c
+typedef struct { int layer; float y; int id; } Sprite;
+```
+
+Order by `layer` ascending, then `y` ascending (lower on screen is drawn later), then `id` ascending so ties are deterministic and never flicker.
+
+Also write `size_t count_visible(const Sprite *s, size_t n, float top, float bottom)`: how many sprites have `top <= y <= bottom`, assuming nothing about order.
+
+The tests sort 300,000 sprites; a hand-written O(n²) sort times out.
+--- starter
+#include <stdlib.h>
+
+typedef struct { int layer; float y; int id; } Sprite;
+
+void sort_draw_order(Sprite *s, size_t n) {
+    /* insertion sort: correct, but O(n^2) */
+    for (size_t i = 1; i < n; i++) {
+        Sprite x = s[i];
+        size_t j = i;
+        while (j > 0 && (s[j - 1].layer > x.layer ||
+                         (s[j - 1].layer == x.layer && s[j - 1].y > x.y))) {
+            s[j] = s[j - 1];
+            j--;
+        }
+        s[j] = x;
+    }
+}
+
+size_t count_visible(const Sprite *s, size_t n, float top, float bottom) {
+    (void)s; (void)n; (void)top; (void)bottom;
+    return 0;
+}
+--- solution
+#include <stdlib.h>
+
+typedef struct { int layer; float y; int id; } Sprite;
+
+static int cmp_sprite(const void *pa, const void *pb) {
+    const Sprite *a = pa, *b = pb;
+    if (a->layer != b->layer) return (a->layer > b->layer) - (a->layer < b->layer);
+    if (a->y != b->y) return (a->y > b->y) - (a->y < b->y);
+    return (a->id > b->id) - (a->id < b->id);
+}
+
+void sort_draw_order(Sprite *s, size_t n) {
+    qsort(s, n, sizeof *s, cmp_sprite);
+}
+
+size_t count_visible(const Sprite *s, size_t n, float top, float bottom) {
+    size_t c = 0;
+    for (size_t i = 0; i < n; i++) c += s[i].y >= top && s[i].y <= bottom;
+    return c;
+}
+--- hint
+One comparator, three keys: compare `layer`; if equal compare `y`; if equal compare `id`. Use `(a > b) - (a < b)` at each level, which also works for `float`.
+--- hint
+`count_visible` can be branch-light: `c += (s[i].y >= top && s[i].y <= bottom);` adds 0 or 1.
+--- harness
+static int t_before(const Sprite *a, const Sprite *b) {
+    if (a->layer != b->layer) return a->layer < b->layer;
+    if (a->y != b->y) return a->y < b->y;
+    return a->id < b->id;
+}
+
+int main(void) {
+    Sprite s[] = {{1, 5.0f, 3}, {0, 9.5f, 1}, {1, 2.0f, 7}, {1, 5.0f, 2}, {0, -1.0f, 9}, {2, 0.0f, 4}};
+    sort_draw_order(s, 6);
+    int want[] = {9, 1, 7, 2, 3, 4};
+    for (int i = 0; i < 6; i++) CHECK_INT(s[i].id, want[i]);
+    CHECK_INT(count_visible(s, 6, 0.0f, 5.0f), 4);
+    CHECK_INT(count_visible(s, 6, 100.0f, 200.0f), 0);
+    sort_draw_order(s, 0);
+
+    size_t n = 300000;
+    Sprite *big = malloc(n * sizeof *big);
+    unsigned x = 99;
+    for (size_t i = 0; i < n; i++) {
+        x = x * 1664525u + 1013904223u;
+        big[i] = (Sprite){(int)(x >> 29), (float)((x >> 8) % 2000) * 0.5f, (int)i};
+    }
+    size_t vis = 0;
+    for (size_t i = 0; i < n; i++) vis += big[i].y >= 100.0f && big[i].y <= 300.0f;
+    CHECK_INT(count_visible(big, n, 100.0f, 300.0f), vis);
+    sort_draw_order(big, n);
+    int ok = 1;
+    for (size_t i = 1; i < n; i++) if (!t_before(&big[i - 1], &big[i])) { ok = 0; break; }
+    CHECK(ok);
+    free(big);
+    return TEST_END();
+}
+
+=== exercise eventbus
+title: An event bus without allocation
+--- prompt
+Write a publish/subscribe event bus for a game, the C version of C# `event`s. Systems subscribe a handler function plus a context pointer to an event type; emitting an event calls that type's handlers in subscription order. Everything lives in fixed-size arrays inside `Bus`, so subscribing and emitting never allocate.
+
+```c
+typedef struct { int type; int a, b; } Event;   // e.g. DAMAGE: a = target, b = amount
+typedef void (*Handler)(const Event *e, void *ctx);
+```
+
+- `void bus_init(Bus *b)`: no subscribers.
+- `int bus_subscribe(Bus *b, int type, Handler fn, void *ctx)`: 0 on success; -1 if `type` is outside `0..MAX_TYPES-1` or that type already has `MAX_HANDLERS` subscribers.
+- `int bus_unsubscribe(Bus *b, int type, Handler fn, void *ctx)`: remove the first subscription with exactly this `fn` **and** `ctx`, keeping the others in order; return 1 if one was removed, else 0.
+- `int bus_emit(const Bus *b, const Event *e)`: call each handler subscribed to `e->type` as `fn(e, ctx)`, in order; return how many were called (0 for an out-of-range type).
+--- starter
+#include <stddef.h>
+
+#define MAX_TYPES 16
+#define MAX_HANDLERS 8
+
+typedef struct { int type; int a, b; } Event;
+typedef void (*Handler)(const Event *e, void *ctx);
+
+typedef struct { Handler fn; void *ctx; } Sub;
+typedef struct {
+    Sub subs[MAX_TYPES][MAX_HANDLERS];
+    int count[MAX_TYPES];
+} Bus;
+
+void bus_init(Bus *b) {
+    (void)b;
+}
+
+int bus_subscribe(Bus *b, int type, Handler fn, void *ctx) {
+    (void)b; (void)type; (void)fn; (void)ctx;
+    return -1;
+}
+
+int bus_unsubscribe(Bus *b, int type, Handler fn, void *ctx) {
+    (void)b; (void)type; (void)fn; (void)ctx;
+    return 0;
+}
+
+int bus_emit(const Bus *b, const Event *e) {
+    (void)b; (void)e;
+    return 0;
+}
+--- solution
+#include <stddef.h>
+
+#define MAX_TYPES 16
+#define MAX_HANDLERS 8
+
+typedef struct { int type; int a, b; } Event;
+typedef void (*Handler)(const Event *e, void *ctx);
+
+typedef struct { Handler fn; void *ctx; } Sub;
+typedef struct {
+    Sub subs[MAX_TYPES][MAX_HANDLERS];
+    int count[MAX_TYPES];
+} Bus;
+
+void bus_init(Bus *b) {
+    for (int t = 0; t < MAX_TYPES; t++) b->count[t] = 0;
+}
+
+int bus_subscribe(Bus *b, int type, Handler fn, void *ctx) {
+    if (type < 0 || type >= MAX_TYPES || b->count[type] == MAX_HANDLERS) return -1;
+    b->subs[type][b->count[type]++] = (Sub){fn, ctx};
+    return 0;
+}
+
+int bus_unsubscribe(Bus *b, int type, Handler fn, void *ctx) {
+    if (type < 0 || type >= MAX_TYPES) return 0;
+    Sub *s = b->subs[type];
+    for (int i = 0; i < b->count[type]; i++) {
+        if (s[i].fn == fn && s[i].ctx == ctx) {
+            for (int j = i + 1; j < b->count[type]; j++) s[j - 1] = s[j];
+            b->count[type]--;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+int bus_emit(const Bus *b, const Event *e) {
+    if (e->type < 0 || e->type >= MAX_TYPES) return 0;
+    int n = b->count[e->type];
+    for (int i = 0; i < n; i++) b->subs[e->type][i].fn(e, b->subs[e->type][i].ctx);
+    return n;
+}
+--- hint
+Each event type has its own small array of `{fn, ctx}` pairs and a count. Subscribing appends; emitting loops.
+--- hint
+Function pointers can be compared with `==`. Unsubscribing shifts the later entries down by one to keep the order (the arrays are tiny, so that's fine here).
+--- harness
+enum { EV_DAMAGE, EV_KILL, EV_PICKUP };
+static int t_log[64], t_nlog = 0;
+static void t_apply_damage(const Event *e, void *ctx) { int *hp = ctx; hp[e->a] -= e->b; t_log[t_nlog++] = 1; }
+static void t_count(const Event *e, void *ctx) { (void)e; (*(int *)ctx)++; t_log[t_nlog++] = 2; }
+static void t_score(const Event *e, void *ctx) { *(long *)ctx += 100L * e->b; t_log[t_nlog++] = 3; }
+
+int main(void) {
+    Bus bus;
+    bus_init(&bus);
+    int hp[4] = {100, 100, 100, 100};
+    int damage_events = 0, kills = 0;
+    long score = 0;
+    CHECK_INT(bus_subscribe(&bus, EV_DAMAGE, t_apply_damage, hp), 0);
+    CHECK_INT(bus_subscribe(&bus, EV_DAMAGE, t_count, &damage_events), 0);
+    CHECK_INT(bus_subscribe(&bus, EV_KILL, t_count, &kills), 0);
+    CHECK_INT(bus_subscribe(&bus, EV_KILL, t_score, &score), 0);
+    CHECK_INT(bus_subscribe(&bus, -1, t_count, &kills), -1);
+    CHECK_INT(bus_subscribe(&bus, MAX_TYPES, t_count, &kills), -1);
+
+    CHECK_INT(bus_emit(&bus, &(Event){EV_DAMAGE, 2, 30}), 2);
+    CHECK_INT(bus_emit(&bus, &(Event){EV_DAMAGE, 0, 5}), 2);
+    CHECK_INT(bus_emit(&bus, &(Event){EV_KILL, 2, 3}), 2);
+    CHECK_INT(bus_emit(&bus, &(Event){EV_PICKUP, 0, 0}), 0);
+    CHECK_INT(bus_emit(&bus, &(Event){99, 0, 0}), 0);
+    CHECK(hp[0] == 95 && hp[1] == 100 && hp[2] == 70);
+    CHECK_INT(damage_events, 2);
+    CHECK_INT(kills, 1);
+    CHECK_INT(score, 300);
+    CHECK_INT(t_nlog, 6);
+    CHECK(t_log[0] == 1 && t_log[1] == 2 && t_log[4] == 2 && t_log[5] == 3);   /* subscription order */
+
+    CHECK_INT(bus_unsubscribe(&bus, EV_DAMAGE, t_count, &kills), 0);       /* wrong ctx */
+    CHECK_INT(bus_unsubscribe(&bus, EV_DAMAGE, t_apply_damage, hp), 1);
+    CHECK_INT(bus_unsubscribe(&bus, EV_DAMAGE, t_apply_damage, hp), 0);
+    CHECK_INT(bus_emit(&bus, &(Event){EV_DAMAGE, 0, 50}), 1);
+    CHECK_INT(hp[0], 95);
+    CHECK_INT(damage_events, 3);
+
+    int c[MAX_HANDLERS + 1] = {0};
+    for (int i = 0; i < MAX_HANDLERS; i++) CHECK_INT(bus_subscribe(&bus, EV_PICKUP, t_count, &c[i]), 0);
+    CHECK_INT(bus_subscribe(&bus, EV_PICKUP, t_count, &c[MAX_HANDLERS]), -1);
+    CHECK_INT(bus_unsubscribe(&bus, EV_PICKUP, t_count, &c[3]), 1);
+    t_nlog = 0;
+    CHECK_INT(bus_emit(&bus, &(Event){EV_PICKUP, 0, 0}), MAX_HANDLERS - 1);
+    int ok = 1;
+    for (int i = 0; i < MAX_HANDLERS; i++) if (c[i] != (i == 3 ? 0 : 1)) ok = 0;
+    CHECK(ok);
+    CHECK_INT(bus_subscribe(&bus, EV_PICKUP, t_count, &c[MAX_HANDLERS]), 0);
     return TEST_END();
 }
 
