@@ -1,0 +1,2959 @@
+=== chapter p1-images
+title: Images from scratch
+blurb: Project: a tiny image library. Flat pixel buffers, PNM output, sRGB, disks, lines, anti-aliasing, palettes, alpha, and an O(1) box blur, ending in a glowing neon scene.
+--- body
+## Why start here
+
+Every procedural texture, heightmap, noise field and render target in the rest of this course is the same thing: a rectangle of numbers in one block of memory. Before noise or 3D, you build the tool that holds and shows them. This chapter is one project, a small image library, grown in ten steps. Chapters on vector math, noise and textures start from its finished code.
+
+C has no canvas. Your programs here *print an image*: the site draws any output that starts with a PNM header as a picture. Keep run images at most 128×128; the tests never look at printed pictures, they call your functions and check pixel values.
+
+## One allocation, flat, row-major
+
+An image is width × height pixels. Store them in **one contiguous array**, row after row:
+
+```text
+index(x, y) = y * w + x          pixel (0,0) is top left, x grows right, y grows down
+```
+
+```c
+typedef struct { float r, g, b; } Color;              // linear light, 0..1
+typedef struct { int w, h; Color *px; } Image;         // px has w*h entries
+```
+
+`Color` is three floats, so `px` is also a flat `float` buffer `r g b r g b ...` of `3*w*h` values; you can hand `(float *)im.px` to anything that wants floats.
+
+What not to do, and why:
+
+| Layout | Problem |
+|---|---|
+| `Color **rows`, one `malloc` per row | h+1 allocations, rows scattered in memory, two dependent loads per pixel, can't `memcpy` or upload the image in one go |
+| `Color *pixel[w*h]`, one `malloc` per pixel | catastrophic: millions of allocations, 16+ bytes of overhead each, no locality |
+| `int` index `y*w+x` on huge images | `w*h*3` overflows `int` past ~27k×27k; compute offsets in `size_t` |
+
+> **Performance:** walk images in memory order, `y` in the outer loop and `x` in the inner one. A row of a 1024-wide float RGB image is 12 KB; going down a column touches a new cache line for every pixel. Swapping the loops on a large image costs several times the run time with identical results.
+
+Allocate once, at the size you need, and **reuse**: a blur needs a scratch image, a renderer needs a depth buffer. Create them once, pass them in, never `malloc` inside a per-pixel or per-frame loop.
+
+## Writing PNM
+
+PNM is the simplest image format there is: a text header and then numbers. `P2` is grayscale, `P3` is color:
+
+```text
+P3
+3 2
+255
+255 0 0  0 255 0  0 0 255
+255 255 0  255 255 255  0 0 0
+```
+
+`3 2` is width and height, `255` the maximum value. Here is a complete program that fills an image with a UV gradient (red follows x, green follows y) and prints it:
+
+```c
+#include <stdio.h>
+#include <stdlib.h>
+
+typedef struct { float r, g, b; } Color;
+typedef struct { int w, h; Color *px; } Image;
+
+int main(void) {
+    Image im = { 96, 64, calloc(96 * 64, sizeof(Color)) };
+    if (!im.px) return 1;
+    for (int y = 0; y < im.h; y++)
+        for (int x = 0; x < im.w; x++) {
+            Color *p = &im.px[(size_t)y * im.w + x];
+            p->r = (x + 0.5f) / im.w;          // sample at the pixel center
+            p->g = (y + 0.5f) / im.h;
+            p->b = 0.2f;
+        }
+    printf("P3\n%d %d\n255\n", im.w, im.h);
+    for (size_t i = 0; i < (size_t)im.w * im.h; i++)
+        printf("%d %d %d\n", (int)(im.px[i].r * 255 + 0.5f), (int)(im.px[i].g * 255 + 0.5f),
+               (int)(im.px[i].b * 255 + 0.5f));
+    free(im.px);
+    return 0;
+}
+```
+
+`(x + 0.5f) / w` samples the **pixel center**. Using `x / w` shifts everything half a pixel and makes the last column never reach 1. Pixel centers at half-integers is the convention every rasterizer and GPU uses; you'll meet it again with triangles.
+
+## Two ways to hold a color
+
+| | `Color` (3 floats, 0..1) | packed `uint32_t` `0xAARRGGBB` |
+|---|---|---|
+| Size | 12 bytes | 4 bytes |
+| Math (blend, blur, light) | direct, no precision loss, values above 1 allowed (HDR) | unpack, compute, repack, rounding at each step |
+| Use for | everything you compute | storage, files, GPU upload, framebuffers |
+
+Work in floats; convert to bytes **once**, at the very end. Converting a float to a byte needs a clamp (values outside 0..1 are normal after lighting or bloom) and rounding:
+
+```c
+uint8_t to_byte(float v) {
+    if (!(v > 0.0f)) return 0;          // also catches NaN, which fails every comparison
+    if (v >= 1.0f) return 255;
+    return (uint8_t)(v * 255.0f + 0.5f);
+}
+```
+
+Converting an out-of-range float straight to an integer type (`(uint8_t)(1.7f * 255)`) is undefined behavior, not a wrap-around. Clamp first.
+
+Packing is shifts and ors:
+
+```c
+uint32_t pack = 0xFF000000u | (uint32_t)r8 << 16 | (uint32_t)g8 << 8 | b8;
+uint8_t green = (pack >> 8) & 0xFF;
+```
+
+## Gamma: the bug in almost every first renderer
+
+Monitors don't show byte value 128 as half the light of 255; they show about 22%. Image bytes are stored in **sRGB**, a nonlinear encoding that spends more of the 256 codes on dark tones, where eyes are sensitive. Light, on the other hand, adds linearly: two lamps give twice the photons. So:
+
+- **Compute in linear light** (blending, blurring, lighting, averaging, anti-aliasing).
+- **Encode to sRGB once, when writing bytes**; decode sRGB inputs (textures, color pickers) when reading them.
+
+The exact sRGB transfer functions (IEC 61966-2-1) have a short linear toe:
+
+```text
+encode(l) = 12.92 l                      if l <= 0.0031308
+            1.055 l^(1/2.4) - 0.055      otherwise
+decode(s) = s / 12.92                    if s <= 0.04045
+            ((s + 0.055) / 1.055)^2.4    otherwise
+```
+
+Linear 0.5 encodes to 0.7354, byte 188. The test below makes it visible: the top band is a fine black/white checkerboard, which from a distance is exactly 50% of the light. The middle band is linear 0.5 encoded properly (188) and matches it; the bottom band is the naive byte 128 and is visibly too dark.
+
+```c
+#include <math.h>
+#include <stdio.h>
+
+static float srgb_encode(float l) {
+    return l <= 0.0031308f ? 12.92f * l : 1.055f * powf(l, 1.0f / 2.4f) - 0.055f;
+}
+
+int main(void) {
+    int w = 96, h = 72;
+    printf("P2\n%d %d\n255\n", w, h);
+    for (int y = 0; y < h; y++) {
+        for (int x = 0; x < w; x++) {
+            int v;
+            if (y < 24) v = ((x + y) & 1) ? 255 : 0;                    // 50% light, dithered
+            else if (y < 48) v = (int)(srgb_encode(0.5f) * 255 + 0.5f);  // 188
+            else v = 128;                                               // "half" the naive way
+            printf("%d ", v);
+        }
+        printf("\n");
+    }
+    return 0;
+}
+```
+
+(Zoom your browser to 100% for a fair comparison: a scaled checkerboard is resampled.) Gradients look different too: a linear ramp encoded to sRGB spends most of its width in light tones. For *designed* color ramps (palettes picked by an artist), interpolating in sRGB is sometimes what the artist wanted; for anything physical, use linear.
+
+> **Performance:** `powf` per channel per pixel is the most expensive thing in a simple image writer. A 4096-entry lookup table from linear value to sRGB byte (index `v * 4095`) gives the same bytes for all practical purposes and costs one load. Precomputed tables for expensive pure functions of one small input are one of the oldest graphics tricks; you'll use them again for permutation tables in noise.
+
+## Drawing shapes: only touch what can change
+
+A filled disk of radius `r` at `(cx, cy)` covers pixel `(x, y)` when the pixel's *center* is inside: `(x+0.5-cx)² + (y+0.5-cy)² <= r²`. The beginner's loop tests every pixel of the image for every disk. A 3-pixel spark on a 1024×1024 image then costs a million tests. Loop over the disk's **bounding box, clipped to the image**, instead: the work becomes proportional to the disk's area.
+
+```text
+x0 = max(0, floor(cx - r))      x1 = min(w - 1, floor(cx + r))
+y0 = max(0, floor(cy - r))      y1 = min(h - 1, floor(cy + r))
+```
+
+Clipping the box also makes out-of-range writes impossible, so the inner loop needs no bounds check. Compare squared distances; there is no need for `sqrtf` to decide inside or outside.
+
+### Lines: Bresenham
+
+Bresenham's algorithm (1962, for a pen plotter at IBM) draws a line with integer additions only. It steps one pixel along the major axis each iteration and keeps an *error term* that says when to step along the minor axis. Jack Bresenham's version handles one octant; this form (Alois Zingl's) handles all eight with one loop:
+
+```c
+int dx = abs(x1 - x0), sx = x0 < x1 ? 1 : -1;
+int dy = -abs(y1 - y0), sy = y0 < y1 ? 1 : -1;
+int err = dx + dy;
+for (;;) {
+    put_pixel(im, x0, y0, c);
+    if (x0 == x1 && y0 == y1) break;
+    int e2 = 2 * err;
+    if (e2 >= dy) { err += dy; x0 += sx; }   // step in x
+    if (e2 <= dx) { err += dx; y0 += sy; }   // step in y
+}
+```
+
+A line from `(0,0)` to `(20,7)` sets exactly 21 pixels, one per column, each the nearest to the ideal line. The float version (`y = y0 + t * slope`, rounded) gets the same picture with a float multiply and a rounding per pixel, and gaps when written carelessly (stepping along the minor axis).
+
+### Anti-aliasing by coverage
+
+A hard disk has jagged edges because each pixel is all in or all out. The fix is **coverage**: how much of the pixel's square the shape covers, used as an opacity. For a disk, the signed distance from the pixel center to the edge, `d - r`, approximates it well:
+
+```text
+coverage = clamp(r + 0.5 - d, 0, 1)        d = distance from the pixel center to the disk center
+```
+
+Pixels whose center is half a pixel inside get full coverage, half a pixel outside get none, and in between it ramps linearly. This "distance to edge → coverage" idea is how signed distance fields render text and shapes, and it carries straight into shaders. A ring is the same with `|d - radius|` against half the thickness.
+
+```c
+#include <math.h>
+#include <stdio.h>
+
+int main(void) {
+    int w = 64, h = 64;
+    float cx = 32, cy = 32, r = 20;
+    printf("P2\n%d %d\n255\n", w, h);
+    for (int y = 0; y < h; y++) {
+        for (int x = 0; x < w; x++) {
+            float dx = x + 0.5f - cx, dy = y + 0.5f - cy, d = sqrtf(dx * dx + dy * dy);
+            float hard = d <= r ? 1.0f : 0.0f;
+            float soft = fminf(fmaxf(r + 0.5f - d, 0.0f), 1.0f);
+            float v = x < 32 ? hard : soft;             // left half aliased, right half smooth
+            float s = v <= 0.0031308f ? 12.92f * v : 1.055f * powf(v, 1 / 2.4f) - 0.055f;
+            printf("%d ", (int)(s * 255 + 0.5f));
+        }
+        printf("\n");
+    }
+    return 0;
+}
+```
+
+Notice that the coverage is encoded to sRGB on output. Coverage is a fraction of light, so it is linear; writing it raw makes anti-aliased edges look thin and ropey.
+
+## Compositing
+
+Drawing with opacity `a` over what is there is a linear interpolation:
+
+```text
+out = dst + (src - dst) * a          ("over" with straight alpha)
+```
+
+Additive blending (`out = dst + src * k`) is for light: glows, sparks, fire. It never darkens and order doesn't matter.
+
+When the destination itself has alpha (layers, sprites, textures you will composite later), use **premultiplied alpha**: store `(r*a, g*a, b*a, a)`. Then "over" is
+
+```text
+out = src + dst * (1 - src.a)        for all four channels
+```
+
+which is associative (you can pre-merge layers), works for additive light (`a = 0` with nonzero color), and, importantly, filters correctly: blurring or downsampling a straight-alpha image bleeds the color of fully transparent pixels into the edges (the dark halo around badly resized sprites). Porter and Duff's 1984 paper "Compositing Digital Images" is the source of all of this.
+
+## Gradients and palettes
+
+Most procedural textures compute one number `t` per pixel (a noise value, a distance, a height) and then **map it to a color**. The tools:
+
+- `lerp(a, b, t) = a + (b - a) t`
+- `smoothstep(e0, e1, x)`: clamp `t = (x - e0)/(e1 - e0)` to 0..1, then `t*t*(3 - 2t)`. A soft threshold with zero slope at both ends.
+- **Multi-stop ramps**: sorted `(position, color)` stops, find the segment containing `t`, lerp inside it. Terrain colors (water, sand, grass, rock, snow) are a ramp over height.
+- **Cosine palettes** (Inigo Quilez, "palettes"): `color(t) = a + b * cos(2π (c t + d))` per channel, with four `Color` parameters. Four vectors give an endless family of smooth palettes and cost one `cosf` per channel.
+
+```c
+#include <math.h>
+#include <stdio.h>
+
+typedef struct { float r, g, b; } Color;
+
+static Color cosine_palette(float t, Color a, Color b, Color c, Color d) {
+    const float tau = 6.2831853f;
+    return (Color){ a.r + b.r * cosf(tau * (c.r * t + d.r)),
+                    a.g + b.g * cosf(tau * (c.g * t + d.g)),
+                    a.b + b.b * cosf(tau * (c.b * t + d.b)) };
+}
+static int byte(float v) { return v <= 0 ? 0 : v >= 1 ? 255 : (int)(v * 255 + 0.5f); }
+
+int main(void) {
+    Color a = {0.5f, 0.5f, 0.5f}, b = {0.5f, 0.5f, 0.5f};
+    Color cs[4] = {{1, 1, 1}, {1, 1, 1}, {1, 1, 0.5f}, {2, 1, 0}};
+    Color ds[4] = {{0, 0.33f, 0.67f}, {0, 0.1f, 0.2f}, {0.8f, 0.9f, 0.3f}, {0.5f, 0.2f, 0.25f}};
+    int w = 128, h = 64;
+    printf("P3\n%d %d\n255\n", w, h);
+    for (int y = 0; y < h; y++)
+        for (int x = 0; x < w; x++) {
+            Color c = cosine_palette((x + 0.5f) / w, a, b, cs[y / 16], ds[y / 16]);
+            printf("%d %d %d\n", byte(c.r), byte(c.g), byte(c.b));
+        }
+    return 0;
+}
+```
+
+> **Performance:** a ramp with many stops costs a search per pixel. Bake it once into a 256- or 1024-entry table and index it with `t`: the same trick as the sRGB table. For a handful of stops a linear scan is fine; measure before you bother.
+
+## Blur: from O(r²) to O(1) per pixel
+
+A box blur replaces each pixel with the mean of the `(2r+1)×(2r+1)` square around it. Done directly, that's `(2r+1)²` reads per pixel: radius 30 is 3721 reads, so a 1024² image needs almost 4 billion. Two observations fix it:
+
+1. **Separability.** A box filter is a horizontal box followed by a vertical box. Two 1D passes cost `2(2r+1)` per pixel instead of `(2r+1)²`. You need a scratch image between the passes.
+2. **Sliding window.** In one row, the window for `x+1` is the window for `x` with one pixel added on the right and one dropped on the left. Keep a running sum: each output costs two additions **no matter how big `r` is**.
+
+```text
+sum = px[-r] + ... + px[r]           (with the edge pixels repeated for indices outside the row)
+for x = 0 .. w-1:
+    out[x] = sum / (2r + 1)
+    sum += px[clamp(x + r + 1)] - px[clamp(x - r)]
+```
+
+At the borders, indices are **clamped** to the image (the edge pixel repeats), so every output is still a mean of exactly `2r+1` samples. Three box blurs in a row are very close to a Gaussian blur (the central limit theorem at work), which is how fast "Gaussian" blurs and bloom are built in practice.
+
+> **Performance:** this is the chapter's main lesson in *algorithmic* cost. No compiler flag turns `O(r²)` into `O(1)`; changing what you compute does. Blur, summed-area tables, prefix sums and running windows reappear in terrain smoothing, ambient occlusion and erosion.
+
+## The project
+
+The exercises build the library one function group at a time, each step keeping everything from the step before:
+
+1. image allocation and access
+2. byte conversion, packing and PPM output
+3. sRGB encode/decode and a lookup-table writer
+4. clipped filled disks
+5. Bresenham lines
+6. blending and premultiplied alpha
+7. anti-aliased disks and rings
+8. lerp, smoothstep, ramps and cosine palettes
+9. the separable sliding-window box blur
+10. bloom, and a neon scene that uses all of it
+
+Click **Run** at any step to see the current step's picture.
+
+=== exercise img_new
+title: Images, step 1: one flat buffer
+--- prompt
+This is the start of the image library that the next three chapters build on. The starter gives you the two types:
+
+```c
+typedef struct { float r, g, b; } Color;     // linear light, normally 0..1
+typedef struct { int w, h; Color *px; } Image; // w*h pixels, row-major
+```
+
+Write:
+
+- `Image image_new(int w, int h)`: one allocation of `w*h` pixels, **all zero** (black). Use `calloc`, which zeroes for you and checks the `count * size` multiplication for overflow. Compute the count in `size_t`.
+- `void image_free(Image *im)`: free the pixels and reset the struct to `{0, 0, NULL}` so a second `image_free` is harmless.
+- `Color *image_at(Image *im, int x, int y)`: pointer to pixel `(x, y)`, which is `px[y*w + x]`. No bounds check: callers loop over valid ranges, and a check in the hottest function of the library costs every caller.
+- `void image_fill(Image *im, Color c)`: set every pixel to `c` with a single loop over all `w*h` pixels (no need for nested `x`/`y` loops when the order doesn't matter).
+
+The bad habits this step rules out: one `malloc` per row or per pixel, and `int` arithmetic for buffer offsets.
+--- starter
+#include <math.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+typedef struct { float r, g, b; } Color;
+typedef struct { int w, h; Color *px; } Image;
+
+static inline Color rgb(float r, float g, float b) { return (Color){ r, g, b }; }
+
+Image image_new(int w, int h) {
+    Image im = { w, h, NULL };
+    return im;
+}
+
+void image_free(Image *im) {
+    (void)im;
+}
+
+Color *image_at(Image *im, int x, int y) {
+    (void)x; (void)y;
+    return im->px;
+}
+
+void image_fill(Image *im, Color c) {
+    (void)im; (void)c;
+}
+
+int main(void) {
+    Image im = image_new(96, 64);
+    if (!im.px) return 1;
+    for (int y = 0; y < im.h; y++)
+        for (int x = 0; x < im.w; x++)
+            *image_at(&im, x, y) = rgb((x + 0.5f) / im.w, (y + 0.5f) / im.h, 0.25f);
+    printf("P3\n%d %d\n255\n", im.w, im.h);
+    for (size_t i = 0; i < (size_t)im.w * im.h; i++)
+        printf("%d %d %d\n", (int)(im.px[i].r * 255 + 0.5f), (int)(im.px[i].g * 255 + 0.5f),
+               (int)(im.px[i].b * 255 + 0.5f));
+    image_free(&im);
+    return 0;
+}
+--- solution
+#include <math.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+typedef struct { float r, g, b; } Color;
+typedef struct { int w, h; Color *px; } Image;
+
+static inline Color rgb(float r, float g, float b) { return (Color){ r, g, b }; }
+
+Image image_new(int w, int h) {
+    Image im = { w, h, calloc((size_t)w * (size_t)h, sizeof(Color)) };
+    return im;
+}
+
+void image_free(Image *im) {
+    free(im->px);
+    im->px = NULL;
+    im->w = im->h = 0;
+}
+
+Color *image_at(Image *im, int x, int y) {
+    return &im->px[(size_t)y * im->w + x];
+}
+
+void image_fill(Image *im, Color c) {
+    size_t n = (size_t)im->w * im->h;
+    for (size_t i = 0; i < n; i++) im->px[i] = c;
+}
+
+int main(void) {
+    Image im = image_new(96, 64);
+    if (!im.px) return 1;
+    for (int y = 0; y < im.h; y++)
+        for (int x = 0; x < im.w; x++)
+            *image_at(&im, x, y) = rgb((x + 0.5f) / im.w, (y + 0.5f) / im.h, 0.25f);
+    printf("P3\n%d %d\n255\n", im.w, im.h);
+    for (size_t i = 0; i < (size_t)im.w * im.h; i++)
+        printf("%d %d %d\n", (int)(im.px[i].r * 255 + 0.5f), (int)(im.px[i].g * 255 + 0.5f),
+               (int)(im.px[i].b * 255 + 0.5f));
+    image_free(&im);
+    return 0;
+}
+--- hint
+`calloc((size_t)w * h, sizeof(Color))`: the cast makes the multiplication happen in `size_t`.
+--- hint
+`image_at` is one line: `return &im->px[(size_t)y * im->w + x];`
+--- harness
+int main(void) {
+    Image im = image_new(7, 5);
+    CHECK_INT(im.w, 7);
+    CHECK_INT(im.h, 5);
+    if (!im.px) { CHECK(!"image_new returned no pixels"); return TEST_END(); }
+    int zero = 1;
+    for (int i = 0; i < 35; i++) if (im.px[i].r != 0 || im.px[i].g != 0 || im.px[i].b != 0) zero = 0;
+    CHECK(zero);
+    CHECK(image_at(&im, 0, 0) == im.px);
+    CHECK(image_at(&im, 3, 2) == im.px + 17);
+    CHECK(image_at(&im, 6, 4) == im.px + 34);
+    CHECK(image_at(&im, 0, 1) == im.px + 7);
+    *image_at(&im, 2, 3) = rgb(0.25f, 0.5f, 0.75f);
+    CHECK_DBL(im.px[23].g, 0.5);
+    image_fill(&im, rgb(0.1f, 0.2f, 0.3f));
+    int all = 1;
+    for (int i = 0; i < 35; i++) if (im.px[i].r != 0.1f || im.px[i].g != 0.2f || im.px[i].b != 0.3f) all = 0;
+    CHECK(all);
+    image_free(&im);
+    CHECK(im.px == NULL);
+    CHECK_INT(im.w, 0);
+    image_free(&im);
+
+    Image big = image_new(1500, 1100);
+    if (big.px) {
+        CHECK(image_at(&big, 1499, 1099) == big.px + 1500 * 1100 - 1);
+        image_fill(&big, rgb(1, 1, 1));
+        CHECK_DBL(big.px[1500 * 1100 - 1].b, 1.0);
+        CHECK_DBL(big.px[0].r, 1.0);
+        image_free(&big);
+    } else CHECK(!"image_new(1500, 1100) failed");
+    return TEST_END();
+}
+
+=== exercise img_ppm
+title: Images, step 2: bytes, packing and PPM
+continues: img_new
+--- prompt
+Add output. All three functions convert *once*, at the edge of the program; everything inside stays float.
+
+- `uint8_t to_byte(float v)`: clamp `v` to `0..1`, then `v * 255` rounded to nearest. NaN gives 0. (Write the lower clamp as `if (!(v > 0.0f)) return 0;`: a NaN fails every comparison, so this form catches it.) Never cast an out-of-range float straight to an integer type: that is undefined behavior, and UBSan here will say so.
+- `uint32_t pack_rgb(Color c)`: `0xAARRGGBB` with alpha `0xFF`, each channel through `to_byte`.
+- `Color unpack_rgb(uint32_t p)`: the reverse, each channel byte divided by `255.0f` (alpha ignored).
+- `void image_write_ppm(const Image *im, FILE *f)`: a `P3` file: the header `P3\n<w> <h>\n255\n`, then **one line per image row**, each pixel as three numbers, all numbers on the row separated by single spaces, no trailing space. A 2×1 image of red and blue is
+
+```text
+P3
+2 1
+255
+255 0 0 0 0 255
+```
+
+The tests write into a `tmpfile()` and read it back. From now on, the `main` used by **Run** calls `image_write_ppm(&im, stdout)`.
+--- solution
+#include <math.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+typedef struct { float r, g, b; } Color;
+typedef struct { int w, h; Color *px; } Image;
+
+static inline Color rgb(float r, float g, float b) { return (Color){ r, g, b }; }
+
+Image image_new(int w, int h) {
+    Image im = { w, h, calloc((size_t)w * (size_t)h, sizeof(Color)) };
+    return im;
+}
+
+void image_free(Image *im) {
+    free(im->px);
+    im->px = NULL;
+    im->w = im->h = 0;
+}
+
+Color *image_at(Image *im, int x, int y) {
+    return &im->px[(size_t)y * im->w + x];
+}
+
+void image_fill(Image *im, Color c) {
+    size_t n = (size_t)im->w * im->h;
+    for (size_t i = 0; i < n; i++) im->px[i] = c;
+}
+
+uint8_t to_byte(float v) {
+    if (!(v > 0.0f)) return 0;
+    if (v >= 1.0f) return 255;
+    return (uint8_t)(v * 255.0f + 0.5f);
+}
+
+uint32_t pack_rgb(Color c) {
+    return 0xFF000000u | (uint32_t)to_byte(c.r) << 16 | (uint32_t)to_byte(c.g) << 8 | to_byte(c.b);
+}
+
+Color unpack_rgb(uint32_t p) {
+    return rgb(((p >> 16) & 0xFF) / 255.0f, ((p >> 8) & 0xFF) / 255.0f, (p & 0xFF) / 255.0f);
+}
+
+void image_write_ppm(const Image *im, FILE *f) {
+    fprintf(f, "P3\n%d %d\n255\n", im->w, im->h);
+    for (int y = 0; y < im->h; y++) {
+        const Color *row = im->px + (size_t)y * im->w;
+        for (int x = 0; x < im->w; x++)
+            fprintf(f, x ? " %d %d %d" : "%d %d %d", to_byte(row[x].r), to_byte(row[x].g), to_byte(row[x].b));
+        fputc('\n', f);
+    }
+}
+
+int main(void) {
+    Image im = image_new(96, 64);
+    if (!im.px) return 1;
+    for (int y = 0; y < im.h; y++)
+        for (int x = 0; x < im.w; x++)
+            *image_at(&im, x, y) = rgb((x + 0.5f) / im.w, (y + 0.5f) / im.h, 0.25f);
+    image_write_ppm(&im, stdout);
+    image_free(&im);
+    return 0;
+}
+--- stubs
+uint8_t to_byte(float v) {
+    (void)v;
+    return 0;
+}
+
+uint32_t pack_rgb(Color c) {
+    (void)c;
+    return 0;
+}
+
+Color unpack_rgb(uint32_t p) {
+    (void)p;
+    return rgb(0, 0, 0);
+}
+
+void image_write_ppm(const Image *im, FILE *f) {
+    (void)im; (void)f;
+}
+--- hint
+Rounding a non-negative float: `(uint8_t)(v * 255.0f + 0.5f)` once `v` is known to be in `0..1`.
+--- hint
+Packing: `0xFF000000u | (uint32_t)r << 16 | (uint32_t)g << 8 | b`. Unpacking green: `((p >> 8) & 0xFF) / 255.0f`.
+--- harness
+static void read_all(FILE *f, char *buf, size_t cap) {
+    rewind(f);
+    size_t n = fread(buf, 1, cap - 1, f);
+    buf[n] = 0;
+}
+
+int main(void) {
+    CHECK_INT(to_byte(0.0f), 0);
+    CHECK_INT(to_byte(1.0f), 255);
+    CHECK_INT(to_byte(0.5f), 128);
+    CHECK_INT(to_byte(0.2f), 51);
+    CHECK_INT(to_byte(0.998f), 254);
+    CHECK_INT(to_byte(-3.0f), 0);
+    CHECK_INT(to_byte(7.5f), 255);
+    CHECK_INT(to_byte(1e30f), 255);
+    CHECK_INT(to_byte(NAN), 0);
+    CHECK_INT(to_byte(INFINITY), 255);
+    CHECK_UINT(pack_rgb(rgb(1, 0, 0)), 0xFFFF0000u);
+    CHECK_UINT(pack_rgb(rgb(0, 0.5f, 1)), 0xFF0080FFu);
+    CHECK_UINT(pack_rgb(rgb(2, -1, 0.2f)), 0xFFFF0033u);
+    Color c = unpack_rgb(0xFF336699u);
+    CHECK_DBL(c.r, 0x33 / 255.0);
+    CHECK_DBL(c.g, 0x66 / 255.0);
+    CHECK_DBL(c.b, 0x99 / 255.0);
+    CHECK_UINT(pack_rgb(unpack_rgb(0x12ABCDEFu)), 0xFFABCDEFu);
+
+    char buf[512];
+    Image im = image_new(2, 1);
+    if (!im.px) { CHECK(!"image_new failed"); return TEST_END(); }
+    im.px[0] = rgb(1, 0, 0);
+    im.px[1] = rgb(0, 0, 1);
+    FILE *f = tmpfile();
+    if (!f) { CHECK(!"tmpfile failed"); image_free(&im); return TEST_END(); }
+    image_write_ppm(&im, f);
+    read_all(f, buf, sizeof buf);
+    CHECK_STR(buf, "P3\n2 1\n255\n255 0 0 0 0 255\n");
+    fclose(f);
+    image_free(&im);
+
+    im = image_new(3, 2);
+    if (!im.px) { CHECK(!"image_new failed"); return TEST_END(); }
+    for (int i = 0; i < 6; i++) im.px[i] = rgb(i * 0.2f, 1 - i * 0.2f, 1.5f);
+    f = tmpfile();
+    if (!f) { CHECK(!"tmpfile failed"); image_free(&im); return TEST_END(); }
+    image_write_ppm(&im, f);
+    read_all(f, buf, sizeof buf);
+    CHECK_STR(buf, "P3\n3 2\n255\n0 255 255 51 204 255 102 153 255\n153 102 255 204 51 255 255 0 255\n");
+    fclose(f);
+    image_free(&im);
+    return TEST_END();
+}
+
+=== exercise img_srgb
+title: Images, step 3: sRGB and a lookup table
+continues: img_ppm
+--- prompt
+Your pixels hold *linear* light. Bytes in image files are *sRGB*. Add the exact transfer functions (clamp the input to `0..1` first):
+
+```text
+srgb_encode(l) = 12.92 l                      if l <= 0.0031308
+                 1.055 l^(1/2.4) - 0.055      otherwise
+srgb_decode(s) = s / 12.92                    if s <= 0.04045
+                 ((s + 0.055) / 1.055)^2.4    otherwise
+```
+
+- `float srgb_encode(float linear)`, `float srgb_decode(float srgb)`: use `powf`, float constants.
+- `void srgb_lut_init(uint8_t lut[4096])`: `lut[i] = to_byte(srgb_encode(i / 4095.0f))`.
+- `void image_write_ppm_srgb(const Image *im, FILE *f, const uint8_t lut[4096])`: the same text format as `image_write_ppm`, but each channel `v` becomes `lut[i]` with `i = (int)(v * 4095 + 0.5f)` after clamping `v` to `0..1` (NaN counts as 0).
+
+The table is the point: `powf` for every channel of every pixel is the slowest part of writing an image. 4096 entries are fine enough that the byte almost never differs from the exact one, and cost 4 KB built once.
+
+From here on, Run output goes through the sRGB writer, so what you see is what the light values mean.
+--- solution
+#include <math.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+typedef struct { float r, g, b; } Color;
+typedef struct { int w, h; Color *px; } Image;
+
+static inline Color rgb(float r, float g, float b) { return (Color){ r, g, b }; }
+
+Image image_new(int w, int h) {
+    Image im = { w, h, calloc((size_t)w * (size_t)h, sizeof(Color)) };
+    return im;
+}
+
+void image_free(Image *im) {
+    free(im->px);
+    im->px = NULL;
+    im->w = im->h = 0;
+}
+
+Color *image_at(Image *im, int x, int y) {
+    return &im->px[(size_t)y * im->w + x];
+}
+
+void image_fill(Image *im, Color c) {
+    size_t n = (size_t)im->w * im->h;
+    for (size_t i = 0; i < n; i++) im->px[i] = c;
+}
+
+uint8_t to_byte(float v) {
+    if (!(v > 0.0f)) return 0;
+    if (v >= 1.0f) return 255;
+    return (uint8_t)(v * 255.0f + 0.5f);
+}
+
+uint32_t pack_rgb(Color c) {
+    return 0xFF000000u | (uint32_t)to_byte(c.r) << 16 | (uint32_t)to_byte(c.g) << 8 | to_byte(c.b);
+}
+
+Color unpack_rgb(uint32_t p) {
+    return rgb(((p >> 16) & 0xFF) / 255.0f, ((p >> 8) & 0xFF) / 255.0f, (p & 0xFF) / 255.0f);
+}
+
+void image_write_ppm(const Image *im, FILE *f) {
+    fprintf(f, "P3\n%d %d\n255\n", im->w, im->h);
+    for (int y = 0; y < im->h; y++) {
+        const Color *row = im->px + (size_t)y * im->w;
+        for (int x = 0; x < im->w; x++)
+            fprintf(f, x ? " %d %d %d" : "%d %d %d", to_byte(row[x].r), to_byte(row[x].g), to_byte(row[x].b));
+        fputc('\n', f);
+    }
+}
+
+float srgb_encode(float l) {
+    if (!(l > 0.0f)) return 0.0f;
+    if (l >= 1.0f) return 1.0f;
+    return l <= 0.0031308f ? 12.92f * l : 1.055f * powf(l, 1.0f / 2.4f) - 0.055f;
+}
+
+float srgb_decode(float s) {
+    if (!(s > 0.0f)) return 0.0f;
+    if (s >= 1.0f) return 1.0f;
+    return s <= 0.04045f ? s / 12.92f : powf((s + 0.055f) / 1.055f, 2.4f);
+}
+
+void srgb_lut_init(uint8_t lut[4096]) {
+    for (int i = 0; i < 4096; i++) lut[i] = to_byte(srgb_encode(i / 4095.0f));
+}
+
+static inline int lut_index(float v) {
+    if (!(v > 0.0f)) return 0;
+    if (v >= 1.0f) return 4095;
+    return (int)(v * 4095.0f + 0.5f);
+}
+
+void image_write_ppm_srgb(const Image *im, FILE *f, const uint8_t lut[4096]) {
+    fprintf(f, "P3\n%d %d\n255\n", im->w, im->h);
+    for (int y = 0; y < im->h; y++) {
+        const Color *row = im->px + (size_t)y * im->w;
+        for (int x = 0; x < im->w; x++)
+            fprintf(f, x ? " %d %d %d" : "%d %d %d", lut[lut_index(row[x].r)], lut[lut_index(row[x].g)],
+                    lut[lut_index(row[x].b)]);
+        fputc('\n', f);
+    }
+}
+
+int main(void) {
+    static uint8_t lut[4096];
+    srgb_lut_init(lut);
+    Image im = image_new(96, 72);
+    if (!im.px) return 1;
+    for (int y = 0; y < im.h; y++)
+        for (int x = 0; x < im.w; x++) {
+            float v;
+            if (y < 24) v = ((x + y) & 1) ? 1.0f : 0.0f;  // dithered 50% light
+            else if (y < 48) v = 0.5f;                    // linear 0.5, encoded: matches
+            else v = srgb_decode(0.5f);                   // what "byte 128" really is: too dark
+            *image_at(&im, x, y) = rgb(v, v, v);
+        }
+    image_write_ppm_srgb(&im, stdout, lut);
+    image_free(&im);
+    return 0;
+}
+--- stubs
+float srgb_encode(float linear) {
+    return linear;
+}
+
+float srgb_decode(float s) {
+    return s;
+}
+
+void srgb_lut_init(uint8_t lut[4096]) {
+    (void)lut;
+}
+
+void image_write_ppm_srgb(const Image *im, FILE *f, const uint8_t lut[4096]) {
+    (void)lut;
+    image_write_ppm(im, f);
+}
+--- hint
+Clamp first in both functions: `if (!(l > 0.0f)) return 0.0f; if (l >= 1.0f) return 1.0f;`
+--- hint
+In the writer, a small helper `int lut_index(float v)` that clamps and rounds keeps the loop readable.
+--- harness
+int main(void) {
+    CHECK(fabsf(srgb_encode(0.5f) - 0.735357f) < 1e-5f);
+    CHECK(fabsf(srgb_encode(0.001f) - 0.01292f) < 1e-6f);
+    CHECK(fabsf(srgb_encode(0.18f) - 0.461356f) < 1e-5f);
+    CHECK(fabsf(srgb_decode(0.5f) - 0.214041f) < 1e-5f);
+    CHECK(fabsf(srgb_decode(0.02f) - 0.02f / 12.92f) < 1e-7f);
+    CHECK_DBL(srgb_encode(0.0f), 0.0);
+    CHECK(fabsf(srgb_encode(1.0f) - 1.0f) < 1e-6f);
+    CHECK_DBL(srgb_encode(-1.0f), 0.0);
+    CHECK(fabsf(srgb_encode(4.0f) - 1.0f) < 1e-6f);
+    CHECK(fabsf(srgb_decode(2.0f) - 1.0f) < 1e-6f);
+    int round_trip = 1;
+    for (int i = 0; i <= 100; i++) {
+        float l = i / 100.0f;
+        if (fabsf(srgb_decode(srgb_encode(l)) - l) > 1e-5f) round_trip = 0;
+    }
+    CHECK(round_trip);
+    CHECK_INT(to_byte(srgb_encode(0.5f)), 188);
+
+    uint8_t lut[4096];
+    memset(lut, 7, sizeof lut);
+    srgb_lut_init(lut);
+    CHECK_INT(lut[0], 0);
+    CHECK_INT(lut[4095], 255);
+    CHECK_INT(lut[2048], 188);
+    CHECK_INT(lut[1], 1);
+    CHECK_INT(lut[100], 43);
+    CHECK_INT(lut[900], 129);
+    int mono = 1;
+    for (int i = 1; i < 4096; i++) if (lut[i] < lut[i - 1]) mono = 0;
+    CHECK(mono);
+
+    Image im = image_new(3, 1);
+    if (!im.px) { CHECK(!"image_new failed"); return TEST_END(); }
+    im.px[0] = rgb(0.5f, 0.0f, 1.0f);
+    im.px[1] = rgb(0.214041f, -2.0f, 9.0f);
+    im.px[2] = rgb(NAN, 0.01f, 0.18f);
+    FILE *f = tmpfile();
+    if (!f) { CHECK(!"tmpfile failed"); image_free(&im); return TEST_END(); }
+    image_write_ppm_srgb(&im, f, lut);
+    rewind(f);
+    char buf[256];
+    size_t n = fread(buf, 1, sizeof buf - 1, f);
+    buf[n] = 0;
+    CHECK_STR(buf, "P3\n3 1\n255\n188 0 255 127 0 255 0 25 118\n");
+    fclose(f);
+    image_free(&im);
+    return TEST_END();
+}
+
+=== exercise img_disk
+title: Images, step 4: clipped disks
+continues: img_srgb
+--- prompt
+Add two drawing functions.
+
+- `void put_pixel(Image *im, int x, int y, Color c)`: set one pixel, **ignoring** coordinates outside the image. Lines and sprites that hang off the edge rely on it.
+- `void draw_disk(Image *im, float cx, float cy, float r, Color c)`: fill every pixel whose **center** `(x + 0.5, y + 0.5)` is within distance `r` of `(cx, cy)` (`<=`, compared squared, no `sqrtf`).
+
+`draw_disk` must loop only over the disk's bounding box clipped to the image:
+
+```text
+x0 = max(0, (int)floorf(cx - r))      x1 = min(w - 1, (int)floorf(cx + r))
+```
+
+and the same for `y`. The clipped box guarantees every write is in bounds, so the inner loop needs no `put_pixel` check. A disk entirely off the image does no work at all. You may assume `cx`, `cy` and `r` are within ±1,000,000, so the `(int)` conversions are safe.
+
+The last test draws 100,000 small disks on a 1024×1024 image. Scanning the whole image per disk is 10¹¹ distance tests and times out; the bounding box makes it a few million.
+--- solution
+#include <math.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+typedef struct { float r, g, b; } Color;
+typedef struct { int w, h; Color *px; } Image;
+
+static inline Color rgb(float r, float g, float b) { return (Color){ r, g, b }; }
+
+Image image_new(int w, int h) {
+    Image im = { w, h, calloc((size_t)w * (size_t)h, sizeof(Color)) };
+    return im;
+}
+
+void image_free(Image *im) {
+    free(im->px);
+    im->px = NULL;
+    im->w = im->h = 0;
+}
+
+Color *image_at(Image *im, int x, int y) {
+    return &im->px[(size_t)y * im->w + x];
+}
+
+void image_fill(Image *im, Color c) {
+    size_t n = (size_t)im->w * im->h;
+    for (size_t i = 0; i < n; i++) im->px[i] = c;
+}
+
+uint8_t to_byte(float v) {
+    if (!(v > 0.0f)) return 0;
+    if (v >= 1.0f) return 255;
+    return (uint8_t)(v * 255.0f + 0.5f);
+}
+
+uint32_t pack_rgb(Color c) {
+    return 0xFF000000u | (uint32_t)to_byte(c.r) << 16 | (uint32_t)to_byte(c.g) << 8 | to_byte(c.b);
+}
+
+Color unpack_rgb(uint32_t p) {
+    return rgb(((p >> 16) & 0xFF) / 255.0f, ((p >> 8) & 0xFF) / 255.0f, (p & 0xFF) / 255.0f);
+}
+
+void image_write_ppm(const Image *im, FILE *f) {
+    fprintf(f, "P3\n%d %d\n255\n", im->w, im->h);
+    for (int y = 0; y < im->h; y++) {
+        const Color *row = im->px + (size_t)y * im->w;
+        for (int x = 0; x < im->w; x++)
+            fprintf(f, x ? " %d %d %d" : "%d %d %d", to_byte(row[x].r), to_byte(row[x].g), to_byte(row[x].b));
+        fputc('\n', f);
+    }
+}
+
+float srgb_encode(float l) {
+    if (!(l > 0.0f)) return 0.0f;
+    if (l >= 1.0f) return 1.0f;
+    return l <= 0.0031308f ? 12.92f * l : 1.055f * powf(l, 1.0f / 2.4f) - 0.055f;
+}
+
+float srgb_decode(float s) {
+    if (!(s > 0.0f)) return 0.0f;
+    if (s >= 1.0f) return 1.0f;
+    return s <= 0.04045f ? s / 12.92f : powf((s + 0.055f) / 1.055f, 2.4f);
+}
+
+void srgb_lut_init(uint8_t lut[4096]) {
+    for (int i = 0; i < 4096; i++) lut[i] = to_byte(srgb_encode(i / 4095.0f));
+}
+
+static inline int lut_index(float v) {
+    if (!(v > 0.0f)) return 0;
+    if (v >= 1.0f) return 4095;
+    return (int)(v * 4095.0f + 0.5f);
+}
+
+void image_write_ppm_srgb(const Image *im, FILE *f, const uint8_t lut[4096]) {
+    fprintf(f, "P3\n%d %d\n255\n", im->w, im->h);
+    for (int y = 0; y < im->h; y++) {
+        const Color *row = im->px + (size_t)y * im->w;
+        for (int x = 0; x < im->w; x++)
+            fprintf(f, x ? " %d %d %d" : "%d %d %d", lut[lut_index(row[x].r)], lut[lut_index(row[x].g)],
+                    lut[lut_index(row[x].b)]);
+        fputc('\n', f);
+    }
+}
+
+void put_pixel(Image *im, int x, int y, Color c) {
+    if (x < 0 || y < 0 || x >= im->w || y >= im->h) return;
+    im->px[(size_t)y * im->w + x] = c;
+}
+
+static inline int clampi(int v, int lo, int hi) { return v < lo ? lo : v > hi ? hi : v; }
+
+void draw_disk(Image *im, float cx, float cy, float r, Color c) {
+    int x0 = clampi((int)floorf(cx - r), 0, im->w), x1 = clampi((int)floorf(cx + r), -1, im->w - 1);
+    int y0 = clampi((int)floorf(cy - r), 0, im->h), y1 = clampi((int)floorf(cy + r), -1, im->h - 1);
+    float r2 = r * r;
+    for (int y = y0; y <= y1; y++) {
+        float dy = y + 0.5f - cy;
+        Color *row = im->px + (size_t)y * im->w;
+        for (int x = x0; x <= x1; x++) {
+            float dx = x + 0.5f - cx;
+            if (dx * dx + dy * dy <= r2) row[x] = c;
+        }
+    }
+}
+
+int main(void) {
+    static uint8_t lut[4096];
+    srgb_lut_init(lut);
+    Image im = image_new(128, 96);
+    if (!im.px) return 1;
+    image_fill(&im, rgb(0.02f, 0.02f, 0.04f));
+    uint32_t s = 12345;
+    for (int i = 0; i < 60; i++) {
+        s = s * 1664525u + 1013904223u; float x = (s >> 8) % 140 - 6.0f;
+        s = s * 1664525u + 1013904223u; float y = (s >> 8) % 108 - 6.0f;
+        s = s * 1664525u + 1013904223u; float r = 2 + (s >> 8) % 12;
+        draw_disk(&im, x, y, r, rgb(x / 128, y / 96, 1 - x / 128));
+    }
+    for (int x = 0; x < 128; x += 2) put_pixel(&im, x, 95, rgb(1, 1, 1));
+    image_write_ppm_srgb(&im, stdout, lut);
+    image_free(&im);
+    return 0;
+}
+--- stubs
+void put_pixel(Image *im, int x, int y, Color c) {
+    (void)im; (void)x; (void)y; (void)c;
+}
+
+void draw_disk(Image *im, float cx, float cy, float r, Color c) {
+    (void)im; (void)cx; (void)cy; (void)r; (void)c;
+}
+--- hint
+Clamp the box: `x0` to at least 0 and `x1` to at most `w - 1`. If the disk is off the image, `x0 > x1` and the loop simply doesn't run.
+--- hint
+Hoist `dy * dy` and the row pointer out of the inner loop: the inner loop is then one multiply-add and a compare.
+--- harness
+static int count_color(const Image *im, Color c) {
+    int n = 0;
+    for (int i = 0; i < im->w * im->h; i++)
+        if (im->px[i].r == c.r && im->px[i].g == c.g && im->px[i].b == c.b) n++;
+    return n;
+}
+
+int main(void) {
+    Image im = image_new(16, 16);
+    if (!im.px) { CHECK(!"image_new failed"); return TEST_END(); }
+    Color w = rgb(1, 1, 1);
+    put_pixel(&im, 3, 4, w);
+    CHECK_DBL(im.px[4 * 16 + 3].r, 1.0);
+    put_pixel(&im, -1, 0, w);
+    put_pixel(&im, 16, 0, w);
+    put_pixel(&im, 0, 16, w);
+    put_pixel(&im, 5, -9, w);
+    CHECK_INT(count_color(&im, w), 1);
+    image_fill(&im, rgb(0, 0, 0));
+
+    draw_disk(&im, 8, 8, 3, w);
+    CHECK_INT(count_color(&im, w), 32);
+    CHECK_DBL(image_at(&im, 7, 7)->r, 1.0);
+    CHECK_DBL(image_at(&im, 5, 7)->r, 1.0);
+    CHECK_DBL(image_at(&im, 4, 7)->r, 0.0);
+    CHECK_DBL(image_at(&im, 5, 5)->r, 0.0);
+    image_fill(&im, rgb(0, 0, 0));
+    draw_disk(&im, 8.5f, 8.5f, 3, w);
+    CHECK_INT(count_color(&im, w), 29);
+    CHECK_DBL(image_at(&im, 8, 5)->r, 1.0);
+    CHECK_DBL(image_at(&im, 11, 8)->r, 1.0);
+    CHECK_DBL(image_at(&im, 11, 9)->r, 0.0);
+    image_fill(&im, rgb(0, 0, 0));
+    draw_disk(&im, 0.5f, 0.5f, 0.4f, w);
+    CHECK_INT(count_color(&im, w), 1);
+    image_fill(&im, rgb(0, 0, 0));
+    draw_disk(&im, 0.3f, 0.3f, 0.1f, w);
+    CHECK_INT(count_color(&im, w), 0);
+    draw_disk(&im, -2, 5, 4, w);
+    CHECK_INT(count_color(&im, w), 10);
+    image_fill(&im, rgb(0, 0, 0));
+    draw_disk(&im, 15, 15, 30, w);
+    CHECK_INT(count_color(&im, w), 256);
+    image_fill(&im, rgb(0, 0, 0));
+    draw_disk(&im, 500, 500, 10, w);
+    draw_disk(&im, -100, 8, 50, w);
+    draw_disk(&im, 8, 50, 20, w);
+    CHECK_INT(count_color(&im, w), 0);
+    image_free(&im);
+
+    Image big = image_new(1024, 1024);
+    if (!big.px) { CHECK(!"image_new failed"); return TEST_END(); }
+    uint32_t s = 99;
+    for (int i = 0; i < 100000; i++) {
+        s = s * 1664525u + 1013904223u; float x = (s >> 8) % 1100 - 30.0f;
+        s = s * 1664525u + 1013904223u; float y = (s >> 8) % 1100 - 30.0f;
+        draw_disk(&big, x, y, 1.5f + (i % 3), rgb(1, (float)(i & 1), 0));
+    }
+    int red = 0, yellow = 0;
+    for (int i = 0; i < 1024 * 1024; i++) {
+        if (big.px[i].r == 1 && big.px[i].g == 0) red++;
+        if (big.px[i].r == 1 && big.px[i].g == 1) yellow++;
+    }
+    CHECK_INT(red, 401322);
+    CHECK_INT(yellow, 397744);
+    image_free(&big);
+    return TEST_END();
+}
+
+=== exercise img_line
+title: Images, step 5: Bresenham lines
+continues: img_disk
+--- prompt
+Add `void draw_line(Image *im, int x0, int y0, int x1, int y1, Color c)`: an integer Bresenham line from `(x0, y0)` to `(x1, y1)`, both endpoints included, using `put_pixel` so parts outside the image are skipped.
+
+Requirements the tests check (any correct Bresenham variant passes):
+
+- exactly `max(|dx|, |dy|) + 1` pixels: one per column for shallow lines, one per row for steep ones;
+- each pixel is the one nearest the ideal line (at most half a pixel away along the minor axis);
+- all eight directions work, and a zero-length line is a single pixel;
+- a line far longer than the image still finishes quickly (it walks off-screen pixels, which is fine up to a few hundred thousand).
+
+No floats in the loop: one comparison and up to two integer additions per pixel. The usual all-octant form keeps `dx = |x1 - x0|`, `dy = -|y1 - y0|`, `err = dx + dy`, and each step looks at `e2 = 2 * err`: step in x if `e2 >= dy`, step in y if `e2 <= dx`.
+--- solution
+#include <math.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+typedef struct { float r, g, b; } Color;
+typedef struct { int w, h; Color *px; } Image;
+
+static inline Color rgb(float r, float g, float b) { return (Color){ r, g, b }; }
+
+Image image_new(int w, int h) {
+    Image im = { w, h, calloc((size_t)w * (size_t)h, sizeof(Color)) };
+    return im;
+}
+
+void image_free(Image *im) {
+    free(im->px);
+    im->px = NULL;
+    im->w = im->h = 0;
+}
+
+Color *image_at(Image *im, int x, int y) {
+    return &im->px[(size_t)y * im->w + x];
+}
+
+void image_fill(Image *im, Color c) {
+    size_t n = (size_t)im->w * im->h;
+    for (size_t i = 0; i < n; i++) im->px[i] = c;
+}
+
+uint8_t to_byte(float v) {
+    if (!(v > 0.0f)) return 0;
+    if (v >= 1.0f) return 255;
+    return (uint8_t)(v * 255.0f + 0.5f);
+}
+
+uint32_t pack_rgb(Color c) {
+    return 0xFF000000u | (uint32_t)to_byte(c.r) << 16 | (uint32_t)to_byte(c.g) << 8 | to_byte(c.b);
+}
+
+Color unpack_rgb(uint32_t p) {
+    return rgb(((p >> 16) & 0xFF) / 255.0f, ((p >> 8) & 0xFF) / 255.0f, (p & 0xFF) / 255.0f);
+}
+
+void image_write_ppm(const Image *im, FILE *f) {
+    fprintf(f, "P3\n%d %d\n255\n", im->w, im->h);
+    for (int y = 0; y < im->h; y++) {
+        const Color *row = im->px + (size_t)y * im->w;
+        for (int x = 0; x < im->w; x++)
+            fprintf(f, x ? " %d %d %d" : "%d %d %d", to_byte(row[x].r), to_byte(row[x].g), to_byte(row[x].b));
+        fputc('\n', f);
+    }
+}
+
+float srgb_encode(float l) {
+    if (!(l > 0.0f)) return 0.0f;
+    if (l >= 1.0f) return 1.0f;
+    return l <= 0.0031308f ? 12.92f * l : 1.055f * powf(l, 1.0f / 2.4f) - 0.055f;
+}
+
+float srgb_decode(float s) {
+    if (!(s > 0.0f)) return 0.0f;
+    if (s >= 1.0f) return 1.0f;
+    return s <= 0.04045f ? s / 12.92f : powf((s + 0.055f) / 1.055f, 2.4f);
+}
+
+void srgb_lut_init(uint8_t lut[4096]) {
+    for (int i = 0; i < 4096; i++) lut[i] = to_byte(srgb_encode(i / 4095.0f));
+}
+
+static inline int lut_index(float v) {
+    if (!(v > 0.0f)) return 0;
+    if (v >= 1.0f) return 4095;
+    return (int)(v * 4095.0f + 0.5f);
+}
+
+void image_write_ppm_srgb(const Image *im, FILE *f, const uint8_t lut[4096]) {
+    fprintf(f, "P3\n%d %d\n255\n", im->w, im->h);
+    for (int y = 0; y < im->h; y++) {
+        const Color *row = im->px + (size_t)y * im->w;
+        for (int x = 0; x < im->w; x++)
+            fprintf(f, x ? " %d %d %d" : "%d %d %d", lut[lut_index(row[x].r)], lut[lut_index(row[x].g)],
+                    lut[lut_index(row[x].b)]);
+        fputc('\n', f);
+    }
+}
+
+void put_pixel(Image *im, int x, int y, Color c) {
+    if (x < 0 || y < 0 || x >= im->w || y >= im->h) return;
+    im->px[(size_t)y * im->w + x] = c;
+}
+
+static inline int clampi(int v, int lo, int hi) { return v < lo ? lo : v > hi ? hi : v; }
+
+void draw_disk(Image *im, float cx, float cy, float r, Color c) {
+    int x0 = clampi((int)floorf(cx - r), 0, im->w), x1 = clampi((int)floorf(cx + r), -1, im->w - 1);
+    int y0 = clampi((int)floorf(cy - r), 0, im->h), y1 = clampi((int)floorf(cy + r), -1, im->h - 1);
+    float r2 = r * r;
+    for (int y = y0; y <= y1; y++) {
+        float dy = y + 0.5f - cy;
+        Color *row = im->px + (size_t)y * im->w;
+        for (int x = x0; x <= x1; x++) {
+            float dx = x + 0.5f - cx;
+            if (dx * dx + dy * dy <= r2) row[x] = c;
+        }
+    }
+}
+
+void draw_line(Image *im, int x0, int y0, int x1, int y1, Color c) {
+    int dx = abs(x1 - x0), sx = x0 < x1 ? 1 : -1;
+    int dy = -abs(y1 - y0), sy = y0 < y1 ? 1 : -1;
+    int err = dx + dy;
+    for (;;) {
+        put_pixel(im, x0, y0, c);
+        if (x0 == x1 && y0 == y1) break;
+        int e2 = 2 * err;
+        if (e2 >= dy) { err += dy; x0 += sx; }
+        if (e2 <= dx) { err += dx; y0 += sy; }
+    }
+}
+
+int main(void) {
+    static uint8_t lut[4096];
+    srgb_lut_init(lut);
+    Image im = image_new(128, 128);
+    if (!im.px) return 1;
+    for (int i = 0; i < 64; i++) {
+        float a = i * 6.2831853f / 64;
+        int x = 64 + (int)lroundf(60 * cosf(a)), y = 64 + (int)lroundf(60 * sinf(a));
+        draw_line(&im, 64, 64, x, y, rgb(0.5f + 0.5f * cosf(a), 0.5f + 0.5f * sinf(a), 0.6f));
+    }
+    for (int i = 0; i <= 16; i++) {
+        draw_line(&im, 0, i * 8, i * 8, 127, rgb(0.2f, 0.2f, 0.3f));
+    }
+    image_write_ppm_srgb(&im, stdout, lut);
+    image_free(&im);
+    return 0;
+}
+--- stubs
+void draw_line(Image *im, int x0, int y0, int x1, int y1, Color c) {
+    put_pixel(im, x0, y0, c);
+    put_pixel(im, x1, y1, c);
+}
+--- hint
+Copy the loop from the chapter text; then convince yourself why `e2 >= dy` and `e2 <= dx` can both be true in one iteration (a diagonal step).
+--- hint
+Stop when you've *drawn* the end point: test `x0 == x1 && y0 == y1` after `put_pixel`, before stepping.
+--- harness
+static int lit(const Image *im, int x, int y) { return image_at((Image *)im, x, y)->r > 0.5f; }
+
+static int count_lit(const Image *im) {
+    int n = 0;
+    for (int i = 0; i < im->w * im->h; i++) n += im->px[i].r > 0.5f;
+    return n;
+}
+
+static int check_line(int x0, int y0, int x1, int y1) {
+    Image im = image_new(64, 64);
+    if (!im.px) return 0;
+    draw_line(&im, x0, y0, x1, y1, rgb(1, 1, 1));
+    int dx = abs(x1 - x0), dy = abs(y1 - y0), ok = 1;
+    int major = dx > dy ? dx : dy;
+    if (count_lit(&im) != major + 1) ok = 0;
+    if (!lit(&im, x0, y0) || !lit(&im, x1, y1)) ok = 0;
+    for (int y = 0; y < 64; y++)
+        for (int x = 0; x < 64; x++) {
+            if (!lit(&im, x, y)) continue;
+            if (dx >= dy) {
+                if (x < (x0 < x1 ? x0 : x1) || x > (x0 > x1 ? x0 : x1)) ok = 0;
+                double ideal = dx ? y0 + (double)(y1 - y0) * (x - x0) / (x1 - x0) : y0;
+                if (fabs(y - ideal) > 0.5 + 1e-9) ok = 0;
+            } else {
+                if (y < (y0 < y1 ? y0 : y1) || y > (y0 > y1 ? y0 : y1)) ok = 0;
+                double ideal = x0 + (double)(x1 - x0) * (y - y0) / (y1 - y0);
+                if (fabs(x - ideal) > 0.5 + 1e-9) ok = 0;
+            }
+        }
+    image_free(&im);
+    return ok;
+}
+
+int main(void) {
+    CHECK(check_line(1, 1, 20, 8));
+    CHECK(check_line(20, 8, 1, 1));
+    CHECK(check_line(3, 2, 9, 40));
+    CHECK(check_line(9, 40, 3, 2));
+    CHECK(check_line(5, 50, 60, 30));
+    CHECK(check_line(60, 30, 5, 50));
+    CHECK(check_line(30, 60, 33, 0));
+    CHECK(check_line(0, 0, 63, 63));
+    CHECK(check_line(63, 0, 0, 63));
+    CHECK(check_line(10, 10, 10, 10));
+    CHECK(check_line(0, 7, 63, 7));
+    CHECK(check_line(7, 63, 7, 0));
+    CHECK(check_line(2, 3, 61, 33));
+    CHECK(check_line(40, 1, 0, 21));
+
+    Image im = image_new(32, 16);
+    if (!im.px) { CHECK(!"image_new failed"); return TEST_END(); }
+    draw_line(&im, -10, 5, 50, 5, rgb(1, 1, 1));
+    CHECK_INT(count_lit(&im), 32);
+    image_fill(&im, rgb(0, 0, 0));
+    draw_line(&im, -200000, 3, 200000, 12, rgb(1, 1, 1));
+    CHECK_INT(count_lit(&im), 32);
+    image_fill(&im, rgb(0, 0, 0));
+    draw_line(&im, 40, 40, 60, 90, rgb(1, 1, 1));
+    CHECK_INT(count_lit(&im), 0);
+    image_free(&im);
+    return TEST_END();
+}
+
+=== exercise img_blend
+title: Images, step 6: blending and premultiplied alpha
+continues: img_line
+--- prompt
+Add compositing. Straight-alpha operations on `Color`:
+
+- `Color color_lerp(Color a, Color b, float t)`: `a + (b - a) * t` per channel.
+- `Color blend_over(Color dst, Color src, float alpha)`: paint `src` with opacity `alpha` over `dst`. It *is* `color_lerp(dst, src, alpha)`; give it its own name because call sites read better.
+- `Color blend_add(Color dst, Color src, float k)`: `dst + src * k`, no clamping (light can exceed 1; clamping happens once, at output).
+
+And premultiplied RGBA:
+
+```c
+typedef struct { float r, g, b, a; } RGBA;   // put this in your code
+```
+
+- `RGBA premultiply(RGBA c)`: `(r*a, g*a, b*a, a)`.
+- `RGBA over_premul(RGBA src, RGBA dst)`: `src + dst * (1 - src.a)`, all four channels.
+
+The tests check that premultiplied "over" is **associative**, which is why layers can be merged in any grouping, and that a pixel with `a = 0` but nonzero color adds light (pure additive glow in the same operator).
+--- solution
+#include <math.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+typedef struct { float r, g, b; } Color;
+typedef struct { int w, h; Color *px; } Image;
+
+static inline Color rgb(float r, float g, float b) { return (Color){ r, g, b }; }
+
+Image image_new(int w, int h) {
+    Image im = { w, h, calloc((size_t)w * (size_t)h, sizeof(Color)) };
+    return im;
+}
+
+void image_free(Image *im) {
+    free(im->px);
+    im->px = NULL;
+    im->w = im->h = 0;
+}
+
+Color *image_at(Image *im, int x, int y) {
+    return &im->px[(size_t)y * im->w + x];
+}
+
+void image_fill(Image *im, Color c) {
+    size_t n = (size_t)im->w * im->h;
+    for (size_t i = 0; i < n; i++) im->px[i] = c;
+}
+
+uint8_t to_byte(float v) {
+    if (!(v > 0.0f)) return 0;
+    if (v >= 1.0f) return 255;
+    return (uint8_t)(v * 255.0f + 0.5f);
+}
+
+uint32_t pack_rgb(Color c) {
+    return 0xFF000000u | (uint32_t)to_byte(c.r) << 16 | (uint32_t)to_byte(c.g) << 8 | to_byte(c.b);
+}
+
+Color unpack_rgb(uint32_t p) {
+    return rgb(((p >> 16) & 0xFF) / 255.0f, ((p >> 8) & 0xFF) / 255.0f, (p & 0xFF) / 255.0f);
+}
+
+void image_write_ppm(const Image *im, FILE *f) {
+    fprintf(f, "P3\n%d %d\n255\n", im->w, im->h);
+    for (int y = 0; y < im->h; y++) {
+        const Color *row = im->px + (size_t)y * im->w;
+        for (int x = 0; x < im->w; x++)
+            fprintf(f, x ? " %d %d %d" : "%d %d %d", to_byte(row[x].r), to_byte(row[x].g), to_byte(row[x].b));
+        fputc('\n', f);
+    }
+}
+
+float srgb_encode(float l) {
+    if (!(l > 0.0f)) return 0.0f;
+    if (l >= 1.0f) return 1.0f;
+    return l <= 0.0031308f ? 12.92f * l : 1.055f * powf(l, 1.0f / 2.4f) - 0.055f;
+}
+
+float srgb_decode(float s) {
+    if (!(s > 0.0f)) return 0.0f;
+    if (s >= 1.0f) return 1.0f;
+    return s <= 0.04045f ? s / 12.92f : powf((s + 0.055f) / 1.055f, 2.4f);
+}
+
+void srgb_lut_init(uint8_t lut[4096]) {
+    for (int i = 0; i < 4096; i++) lut[i] = to_byte(srgb_encode(i / 4095.0f));
+}
+
+static inline int lut_index(float v) {
+    if (!(v > 0.0f)) return 0;
+    if (v >= 1.0f) return 4095;
+    return (int)(v * 4095.0f + 0.5f);
+}
+
+void image_write_ppm_srgb(const Image *im, FILE *f, const uint8_t lut[4096]) {
+    fprintf(f, "P3\n%d %d\n255\n", im->w, im->h);
+    for (int y = 0; y < im->h; y++) {
+        const Color *row = im->px + (size_t)y * im->w;
+        for (int x = 0; x < im->w; x++)
+            fprintf(f, x ? " %d %d %d" : "%d %d %d", lut[lut_index(row[x].r)], lut[lut_index(row[x].g)],
+                    lut[lut_index(row[x].b)]);
+        fputc('\n', f);
+    }
+}
+
+void put_pixel(Image *im, int x, int y, Color c) {
+    if (x < 0 || y < 0 || x >= im->w || y >= im->h) return;
+    im->px[(size_t)y * im->w + x] = c;
+}
+
+static inline int clampi(int v, int lo, int hi) { return v < lo ? lo : v > hi ? hi : v; }
+
+void draw_disk(Image *im, float cx, float cy, float r, Color c) {
+    int x0 = clampi((int)floorf(cx - r), 0, im->w), x1 = clampi((int)floorf(cx + r), -1, im->w - 1);
+    int y0 = clampi((int)floorf(cy - r), 0, im->h), y1 = clampi((int)floorf(cy + r), -1, im->h - 1);
+    float r2 = r * r;
+    for (int y = y0; y <= y1; y++) {
+        float dy = y + 0.5f - cy;
+        Color *row = im->px + (size_t)y * im->w;
+        for (int x = x0; x <= x1; x++) {
+            float dx = x + 0.5f - cx;
+            if (dx * dx + dy * dy <= r2) row[x] = c;
+        }
+    }
+}
+
+void draw_line(Image *im, int x0, int y0, int x1, int y1, Color c) {
+    int dx = abs(x1 - x0), sx = x0 < x1 ? 1 : -1;
+    int dy = -abs(y1 - y0), sy = y0 < y1 ? 1 : -1;
+    int err = dx + dy;
+    for (;;) {
+        put_pixel(im, x0, y0, c);
+        if (x0 == x1 && y0 == y1) break;
+        int e2 = 2 * err;
+        if (e2 >= dy) { err += dy; x0 += sx; }
+        if (e2 <= dx) { err += dx; y0 += sy; }
+    }
+}
+
+typedef struct { float r, g, b, a; } RGBA;
+
+Color color_lerp(Color a, Color b, float t) {
+    return rgb(a.r + (b.r - a.r) * t, a.g + (b.g - a.g) * t, a.b + (b.b - a.b) * t);
+}
+
+Color blend_over(Color dst, Color src, float alpha) {
+    return color_lerp(dst, src, alpha);
+}
+
+Color blend_add(Color dst, Color src, float k) {
+    return rgb(dst.r + src.r * k, dst.g + src.g * k, dst.b + src.b * k);
+}
+
+RGBA premultiply(RGBA c) {
+    return (RGBA){ c.r * c.a, c.g * c.a, c.b * c.a, c.a };
+}
+
+RGBA over_premul(RGBA src, RGBA dst) {
+    float k = 1.0f - src.a;
+    return (RGBA){ src.r + dst.r * k, src.g + dst.g * k, src.b + dst.b * k, src.a + dst.a * k };
+}
+
+int main(void) {
+    static uint8_t lut[4096];
+    srgb_lut_init(lut);
+    Image im = image_new(128, 64);
+    if (!im.px) return 1;
+    for (int y = 0; y < im.h; y++)
+        for (int x = 0; x < im.w; x++)
+            *image_at(&im, x, y) = ((x / 8 + y / 8) & 1) ? rgb(0.6f, 0.6f, 0.6f) : rgb(0.3f, 0.3f, 0.3f);
+    for (int y = 8; y < 56; y++)
+        for (int x = 8; x < 120; x++) {
+            Color *p = image_at(&im, x, y);
+            float t = (x - 8) / 112.0f;
+            *p = y < 32 ? blend_over(*p, rgb(0.9f, 0.2f, 0.1f), t)   // top: paint, 0..100% opacity
+                        : blend_add(*p, rgb(0.1f, 0.3f, 0.9f), t);  // bottom: add light
+        }
+    image_write_ppm_srgb(&im, stdout, lut);
+    image_free(&im);
+    return 0;
+}
+--- stubs
+typedef struct { float r, g, b, a; } RGBA;
+
+Color color_lerp(Color a, Color b, float t) {
+    (void)b; (void)t;
+    return a;
+}
+
+Color blend_over(Color dst, Color src, float alpha) {
+    (void)src; (void)alpha;
+    return dst;
+}
+
+Color blend_add(Color dst, Color src, float k) {
+    (void)src; (void)k;
+    return dst;
+}
+
+RGBA premultiply(RGBA c) {
+    return c;
+}
+
+RGBA over_premul(RGBA src, RGBA dst) {
+    (void)dst;
+    return src;
+}
+--- hint
+`over_premul` is the same formula for all four channels: `src.c + dst.c * (1 - src.a)`.
+--- harness
+static int near_rgba(RGBA a, RGBA b) {
+    return fabsf(a.r - b.r) < 1e-5f && fabsf(a.g - b.g) < 1e-5f && fabsf(a.b - b.b) < 1e-5f && fabsf(a.a - b.a) < 1e-5f;
+}
+
+int main(void) {
+    Color c = color_lerp(rgb(0, 1, 0.5f), rgb(1, 0, 0.5f), 0.25f);
+    CHECK_DBL(c.r, 0.25);
+    CHECK_DBL(c.g, 0.75);
+    CHECK_DBL(c.b, 0.5);
+    c = blend_over(rgb(0.2f, 0.2f, 0.2f), rgb(1, 0, 0.6f), 0.5f);
+    CHECK_DBL(c.r, 0.6);
+    CHECK_DBL(c.g, 0.1);
+    CHECK_DBL(c.b, 0.4);
+    c = blend_over(rgb(0.3f, 0.4f, 0.5f), rgb(1, 1, 1), 0);
+    CHECK_DBL(c.g, 0.4);
+    c = blend_over(rgb(0.3f, 0.4f, 0.5f), rgb(0.9f, 0.8f, 0.7f), 1);
+    CHECK_DBL(c.b, 0.7);
+    c = blend_add(rgb(0.8f, 0.1f, 0), rgb(1, 0.5f, 0.25f), 0.5f);
+    CHECK_DBL(c.r, 1.3);
+    CHECK_DBL(c.g, 0.35);
+    CHECK_DBL(c.b, 0.125);
+
+    RGBA p = premultiply((RGBA){ 1, 0.5f, 0.2f, 0.5f });
+    CHECK_DBL(p.r, 0.5);
+    CHECK_DBL(p.g, 0.25);
+    CHECK_DBL(p.b, 0.1);
+    CHECK_DBL(p.a, 0.5);
+    RGBA o = over_premul(p, (RGBA){ 0, 0, 1, 1 });
+    CHECK_DBL(o.r, 0.5);
+    CHECK_DBL(o.b, 0.6);
+    CHECK_DBL(o.a, 1.0);
+    o = over_premul((RGBA){ 0.3f, 0.2f, 0.1f, 0 }, (RGBA){ 0.1f, 0.1f, 0.1f, 1 });
+    CHECK_DBL(o.r, 0.4);
+    CHECK_DBL(o.a, 1.0);
+    o = over_premul((RGBA){ 0, 0, 0, 0 }, (RGBA){ 0.1f, 0.2f, 0.3f, 0.4f });
+    CHECK(near_rgba(o, (RGBA){ 0.1f, 0.2f, 0.3f, 0.4f }));
+    RGBA a = premultiply((RGBA){ 1, 0, 0, 0.5f });
+    RGBA b = premultiply((RGBA){ 0, 1, 0, 0.25f });
+    RGBA d = premultiply((RGBA){ 0, 0, 1, 0.75f });
+    CHECK(near_rgba(over_premul(over_premul(a, b), d), over_premul(a, over_premul(b, d))));
+    RGBA x = premultiply((RGBA){ 0.9f, 0.4f, 0.1f, 0.3f });
+    RGBA y = premultiply((RGBA){ 0.2f, 0.7f, 0.5f, 0.6f });
+    RGBA z = { 0.05f, 0.05f, 0.3f, 1 };
+    CHECK(near_rgba(over_premul(over_premul(x, y), z), over_premul(x, over_premul(y, z))));
+    CHECK(near_rgba(over_premul(x, z), (RGBA){ 0.27f + 0.035f, 0.12f + 0.035f, 0.03f + 0.21f, 1 }));
+    return TEST_END();
+}
+
+=== exercise img_aa
+title: Images, step 7: anti-aliased disks and rings
+continues: img_blend
+--- prompt
+Hard edges alias. Add coverage-based shapes that blend into the image:
+
+- `void draw_disk_aa(Image *im, float cx, float cy, float r, Color c, float alpha)`: for each pixel, `d` is the distance from its center to `(cx, cy)`, `coverage = clamp(r + 0.5 - d, 0, 1)`, and the pixel becomes `blend_over(pixel, c, coverage * alpha)`. Pixels with zero coverage must not be written at all.
+- `void draw_ring_aa(Image *im, float cx, float cy, float radius, float thickness, Color c, float alpha)`: the same with `coverage = clamp(thickness / 2 + 0.5 - |d - radius|, 0, 1)`.
+
+Loop over the bounding box, which now extends half a pixel further (`cx - r - 0.5` to `cx + r + 0.5`; for the ring use `radius + thickness / 2` as the outer radius), clipped to the image.
+
+> **Performance:** most pixels of a big disk are fully inside. Skip the `sqrtf` for them: with `d²` already computed, full coverage is `d² <= (r - 0.5)²` (when `r >= 0.5`), zero coverage is `d² >= (r + 0.5)²`, and only the one-pixel band in between needs the square root. Not required by the tests, but it's the kind of thinking that matters in per-pixel code.
+--- solution
+#include <math.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+typedef struct { float r, g, b; } Color;
+typedef struct { int w, h; Color *px; } Image;
+
+static inline Color rgb(float r, float g, float b) { return (Color){ r, g, b }; }
+
+Image image_new(int w, int h) {
+    Image im = { w, h, calloc((size_t)w * (size_t)h, sizeof(Color)) };
+    return im;
+}
+
+void image_free(Image *im) {
+    free(im->px);
+    im->px = NULL;
+    im->w = im->h = 0;
+}
+
+Color *image_at(Image *im, int x, int y) {
+    return &im->px[(size_t)y * im->w + x];
+}
+
+void image_fill(Image *im, Color c) {
+    size_t n = (size_t)im->w * im->h;
+    for (size_t i = 0; i < n; i++) im->px[i] = c;
+}
+
+uint8_t to_byte(float v) {
+    if (!(v > 0.0f)) return 0;
+    if (v >= 1.0f) return 255;
+    return (uint8_t)(v * 255.0f + 0.5f);
+}
+
+uint32_t pack_rgb(Color c) {
+    return 0xFF000000u | (uint32_t)to_byte(c.r) << 16 | (uint32_t)to_byte(c.g) << 8 | to_byte(c.b);
+}
+
+Color unpack_rgb(uint32_t p) {
+    return rgb(((p >> 16) & 0xFF) / 255.0f, ((p >> 8) & 0xFF) / 255.0f, (p & 0xFF) / 255.0f);
+}
+
+void image_write_ppm(const Image *im, FILE *f) {
+    fprintf(f, "P3\n%d %d\n255\n", im->w, im->h);
+    for (int y = 0; y < im->h; y++) {
+        const Color *row = im->px + (size_t)y * im->w;
+        for (int x = 0; x < im->w; x++)
+            fprintf(f, x ? " %d %d %d" : "%d %d %d", to_byte(row[x].r), to_byte(row[x].g), to_byte(row[x].b));
+        fputc('\n', f);
+    }
+}
+
+float srgb_encode(float l) {
+    if (!(l > 0.0f)) return 0.0f;
+    if (l >= 1.0f) return 1.0f;
+    return l <= 0.0031308f ? 12.92f * l : 1.055f * powf(l, 1.0f / 2.4f) - 0.055f;
+}
+
+float srgb_decode(float s) {
+    if (!(s > 0.0f)) return 0.0f;
+    if (s >= 1.0f) return 1.0f;
+    return s <= 0.04045f ? s / 12.92f : powf((s + 0.055f) / 1.055f, 2.4f);
+}
+
+void srgb_lut_init(uint8_t lut[4096]) {
+    for (int i = 0; i < 4096; i++) lut[i] = to_byte(srgb_encode(i / 4095.0f));
+}
+
+static inline int lut_index(float v) {
+    if (!(v > 0.0f)) return 0;
+    if (v >= 1.0f) return 4095;
+    return (int)(v * 4095.0f + 0.5f);
+}
+
+void image_write_ppm_srgb(const Image *im, FILE *f, const uint8_t lut[4096]) {
+    fprintf(f, "P3\n%d %d\n255\n", im->w, im->h);
+    for (int y = 0; y < im->h; y++) {
+        const Color *row = im->px + (size_t)y * im->w;
+        for (int x = 0; x < im->w; x++)
+            fprintf(f, x ? " %d %d %d" : "%d %d %d", lut[lut_index(row[x].r)], lut[lut_index(row[x].g)],
+                    lut[lut_index(row[x].b)]);
+        fputc('\n', f);
+    }
+}
+
+void put_pixel(Image *im, int x, int y, Color c) {
+    if (x < 0 || y < 0 || x >= im->w || y >= im->h) return;
+    im->px[(size_t)y * im->w + x] = c;
+}
+
+static inline int clampi(int v, int lo, int hi) { return v < lo ? lo : v > hi ? hi : v; }
+
+void draw_disk(Image *im, float cx, float cy, float r, Color c) {
+    int x0 = clampi((int)floorf(cx - r), 0, im->w), x1 = clampi((int)floorf(cx + r), -1, im->w - 1);
+    int y0 = clampi((int)floorf(cy - r), 0, im->h), y1 = clampi((int)floorf(cy + r), -1, im->h - 1);
+    float r2 = r * r;
+    for (int y = y0; y <= y1; y++) {
+        float dy = y + 0.5f - cy;
+        Color *row = im->px + (size_t)y * im->w;
+        for (int x = x0; x <= x1; x++) {
+            float dx = x + 0.5f - cx;
+            if (dx * dx + dy * dy <= r2) row[x] = c;
+        }
+    }
+}
+
+void draw_line(Image *im, int x0, int y0, int x1, int y1, Color c) {
+    int dx = abs(x1 - x0), sx = x0 < x1 ? 1 : -1;
+    int dy = -abs(y1 - y0), sy = y0 < y1 ? 1 : -1;
+    int err = dx + dy;
+    for (;;) {
+        put_pixel(im, x0, y0, c);
+        if (x0 == x1 && y0 == y1) break;
+        int e2 = 2 * err;
+        if (e2 >= dy) { err += dy; x0 += sx; }
+        if (e2 <= dx) { err += dx; y0 += sy; }
+    }
+}
+
+typedef struct { float r, g, b, a; } RGBA;
+
+Color color_lerp(Color a, Color b, float t) {
+    return rgb(a.r + (b.r - a.r) * t, a.g + (b.g - a.g) * t, a.b + (b.b - a.b) * t);
+}
+
+Color blend_over(Color dst, Color src, float alpha) {
+    return color_lerp(dst, src, alpha);
+}
+
+Color blend_add(Color dst, Color src, float k) {
+    return rgb(dst.r + src.r * k, dst.g + src.g * k, dst.b + src.b * k);
+}
+
+RGBA premultiply(RGBA c) {
+    return (RGBA){ c.r * c.a, c.g * c.a, c.b * c.a, c.a };
+}
+
+RGBA over_premul(RGBA src, RGBA dst) {
+    float k = 1.0f - src.a;
+    return (RGBA){ src.r + dst.r * k, src.g + dst.g * k, src.b + dst.b * k, src.a + dst.a * k };
+}
+
+static inline float clampf(float v, float lo, float hi) { return v < lo ? lo : v > hi ? hi : v; }
+
+void draw_disk_aa(Image *im, float cx, float cy, float r, Color c, float alpha) {
+    float ro = r + 0.5f, ri = r - 0.5f;
+    float ro2 = ro * ro, ri2 = ri > 0 ? ri * ri : -1.0f;
+    int x0 = clampi((int)floorf(cx - ro), 0, im->w), x1 = clampi((int)floorf(cx + ro), -1, im->w - 1);
+    int y0 = clampi((int)floorf(cy - ro), 0, im->h), y1 = clampi((int)floorf(cy + ro), -1, im->h - 1);
+    for (int y = y0; y <= y1; y++) {
+        float dy = y + 0.5f - cy;
+        Color *row = im->px + (size_t)y * im->w;
+        for (int x = x0; x <= x1; x++) {
+            float dx = x + 0.5f - cx, d2 = dx * dx + dy * dy;
+            if (d2 >= ro2) continue;
+            float cov = d2 <= ri2 ? 1.0f : clampf(ro - sqrtf(d2), 0.0f, 1.0f);
+            row[x] = blend_over(row[x], c, cov * alpha);
+        }
+    }
+}
+
+void draw_ring_aa(Image *im, float cx, float cy, float radius, float thickness, Color c, float alpha) {
+    float ro = radius + thickness * 0.5f + 0.5f, half = thickness * 0.5f + 0.5f;
+    int x0 = clampi((int)floorf(cx - ro), 0, im->w), x1 = clampi((int)floorf(cx + ro), -1, im->w - 1);
+    int y0 = clampi((int)floorf(cy - ro), 0, im->h), y1 = clampi((int)floorf(cy + ro), -1, im->h - 1);
+    for (int y = y0; y <= y1; y++) {
+        float dy = y + 0.5f - cy;
+        Color *row = im->px + (size_t)y * im->w;
+        for (int x = x0; x <= x1; x++) {
+            float dx = x + 0.5f - cx;
+            float cov = clampf(half - fabsf(sqrtf(dx * dx + dy * dy) - radius), 0.0f, 1.0f);
+            if (cov > 0.0f) row[x] = blend_over(row[x], c, cov * alpha);
+        }
+    }
+}
+
+int main(void) {
+    static uint8_t lut[4096];
+    srgb_lut_init(lut);
+    Image im = image_new(128, 128);
+    if (!im.px) return 1;
+    image_fill(&im, rgb(0.9f, 0.88f, 0.8f));
+    for (int i = 0; i < 6; i++)
+        draw_ring_aa(&im, 64, 64, 10 + i * 9, 0.6f + i * 0.8f, rgb(0.05f, 0.1f, 0.3f), 1);
+    draw_disk_aa(&im, 40, 44, 14.3f, rgb(0.9f, 0.2f, 0.1f), 0.7f);
+    draw_disk_aa(&im, 52, 60, 14.3f, rgb(0.1f, 0.7f, 0.2f), 0.7f);
+    draw_disk_aa(&im, 36, 64, 14.3f, rgb(0.1f, 0.3f, 0.9f), 0.7f);
+    for (int i = 0; i < 10; i++) draw_disk_aa(&im, 90 + (i % 5) * 6.3f, 90 + (i / 5) * 9.7f, 0.3f + i * 0.25f, rgb(0, 0, 0), 1);
+    image_write_ppm_srgb(&im, stdout, lut);
+    image_free(&im);
+    return 0;
+}
+--- stubs
+void draw_disk_aa(Image *im, float cx, float cy, float r, Color c, float alpha) {
+    draw_disk(im, cx, cy, r, blend_over(rgb(0, 0, 0), c, alpha));
+}
+
+void draw_ring_aa(Image *im, float cx, float cy, float radius, float thickness, Color c, float alpha) {
+    (void)im; (void)cx; (void)cy; (void)radius; (void)thickness; (void)c; (void)alpha;
+}
+--- hint
+Coverage for the disk: `clampf(r + 0.5f - sqrtf(dx*dx + dy*dy), 0, 1)`. Skip the pixel when it is 0, otherwise `row[x] = blend_over(row[x], c, cov * alpha)`.
+--- hint
+Outer radius of the ring's box: `radius + thickness / 2 + 0.5`.
+--- harness
+int main(void) {
+    Image im = image_new(32, 32);
+    if (!im.px) { CHECK(!"image_new failed"); return TEST_END(); }
+    image_fill(&im, rgb(0.2f, 0.2f, 0.2f));
+    draw_disk_aa(&im, 16, 16, 5, rgb(1, 0, 0), 1);
+    CHECK_DBL(image_at(&im, 16, 16)->r, 1.0);
+    CHECK_DBL(image_at(&im, 16, 16)->g, 0.0);
+    CHECK_DBL(image_at(&im, 13, 14)->r, 1.0);
+    float cov = 5.5f - sqrtf(4.5f * 4.5f + 0.5f * 0.5f);
+    CHECK(fabsf(image_at(&im, 20, 16)->r - (0.2f + 0.8f * cov)) < 1e-5f);
+    CHECK(fabsf(image_at(&im, 20, 16)->g - (0.2f - 0.2f * cov)) < 1e-5f);
+    cov = 5.5f - sqrtf(3.5f * 3.5f + 3.5f * 3.5f);
+    CHECK(fabsf(image_at(&im, 19, 19)->r - (0.2f + 0.8f * cov)) < 1e-5f);
+    CHECK_DBL(image_at(&im, 21, 16)->r, 0.2);
+    CHECK_DBL(image_at(&im, 20, 20)->r, 0.2);
+    CHECK_DBL(image_at(&im, 0, 0)->r, 0.2);
+    double sum = 0;
+    for (int i = 0; i < 32 * 32; i++) sum += im.px[i].r - 0.2;
+    CHECK(fabs(sum / 0.8 - 3.14159265 * 25) < 1.0);
+
+    image_fill(&im, rgb(0, 0, 0));
+    draw_disk_aa(&im, 10.5f, 10.5f, 0.25f, rgb(1, 1, 1), 1);
+    CHECK_DBL(image_at(&im, 10, 10)->r, 0.75);
+    CHECK_DBL(image_at(&im, 11, 10)->r, 0.0);
+    draw_disk_aa(&im, 4, 4, 3, rgb(0, 0, 1), 0.5f);
+    CHECK_DBL(image_at(&im, 3, 3)->b, 0.5);
+    draw_disk_aa(&im, -1, 30, 3, rgb(1, 1, 1), 1);
+    draw_disk_aa(&im, 31.5f, -0.5f, 2, rgb(1, 1, 1), 1);
+    CHECK_DBL(image_at(&im, 31, 0)->g, 1.0);
+    draw_disk_aa(&im, 1000, -1000, 5, rgb(1, 1, 1), 1);
+
+    image_fill(&im, rgb(0, 0, 0));
+    draw_ring_aa(&im, 16, 16, 10, 2, rgb(0, 1, 0), 1);
+    CHECK_DBL(image_at(&im, 16, 16)->g, 0.0);
+    CHECK_DBL(image_at(&im, 25, 16)->g, 1.0);
+    CHECK_DBL(image_at(&im, 6, 16)->g, 1.0);
+    cov = 1.5f - fabsf(sqrtf(7.5f * 7.5f + 0.5f * 0.5f) - 10);
+    CHECK(fabsf(image_at(&im, 23, 16)->g - (cov > 0 ? cov : 0)) < 1e-5f);
+    cov = 1.5f - fabsf(sqrtf(8.5f * 8.5f + 0.5f * 0.5f) - 10);
+    CHECK(fabsf(image_at(&im, 24, 16)->g - cov) < 1e-5f);
+    CHECK_DBL(image_at(&im, 28, 16)->g, 0.0);
+    sum = 0;
+    for (int i = 0; i < 32 * 32; i++) sum += im.px[i].g;
+    CHECK(fabs(sum - 2 * 3.14159265 * 10 * 2) < 1.5);
+    image_free(&im);
+
+    Image big = image_new(1024, 1024);
+    if (!big.px) { CHECK(!"image_new failed"); return TEST_END(); }
+    uint32_t s = 7;
+    for (int i = 0; i < 60000; i++) {
+        s = s * 1664525u + 1013904223u; float x = (s >> 8) % 1024;
+        s = s * 1664525u + 1013904223u; float y = (s >> 8) % 1024;
+        draw_disk_aa(&big, x, y, 2.5f, rgb(1, 1, 1), 0.25f);
+    }
+    double total = 0;
+    for (int i = 0; i < 1024 * 1024; i++) total += big.px[i].r;
+    CHECK(fabs(total - 268096.0) < 20);
+    image_free(&big);
+    return TEST_END();
+}
+
+=== exercise img_ramp
+title: Images, step 8: smoothstep, ramps and cosine palettes
+continues: img_aa
+--- prompt
+Procedural textures compute a number `t` per pixel and map it to a color. Add the mapping tools:
+
+- `float lerpf(float a, float b, float t)`.
+- `float smoothstepf(float e0, float e1, float x)`: `t = clamp((x - e0) / (e1 - e0), 0, 1)`, return `t * t * (3 - 2 * t)`.
+- A color ramp. Put this type in your code:
+
+```c
+typedef struct { float pos; Color c; } Stop;
+```
+
+  `Color ramp_sample(const Stop *s, int n, float t)`: stops are sorted by `pos`. Below the first stop return the first color, above the last return the last. Otherwise find `i` with `s[i].pos <= t <= s[i+1].pos` and lerp between their colors. Two stops at the same position make a hard edge: don't divide by zero (take the later color).
+- `void ramp_bake(const Stop *s, int n, Color *lut, int size)`: `lut[i] = ramp_sample(s, n, i / (float)(size - 1))`. Sample a baked ramp with one multiply and one load per pixel.
+- `Color cosine_palette(float t, Color a, Color b, Color c, Color d)`: Quilez's palette, per channel `a + b * cosf(6.2831853f * (c * t + d))`.
+
+The Run output shows a terrain-style ramp, its baked version and four cosine palettes.
+--- solution
+#include <math.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+typedef struct { float r, g, b; } Color;
+typedef struct { int w, h; Color *px; } Image;
+
+static inline Color rgb(float r, float g, float b) { return (Color){ r, g, b }; }
+
+Image image_new(int w, int h) {
+    Image im = { w, h, calloc((size_t)w * (size_t)h, sizeof(Color)) };
+    return im;
+}
+
+void image_free(Image *im) {
+    free(im->px);
+    im->px = NULL;
+    im->w = im->h = 0;
+}
+
+Color *image_at(Image *im, int x, int y) {
+    return &im->px[(size_t)y * im->w + x];
+}
+
+void image_fill(Image *im, Color c) {
+    size_t n = (size_t)im->w * im->h;
+    for (size_t i = 0; i < n; i++) im->px[i] = c;
+}
+
+uint8_t to_byte(float v) {
+    if (!(v > 0.0f)) return 0;
+    if (v >= 1.0f) return 255;
+    return (uint8_t)(v * 255.0f + 0.5f);
+}
+
+uint32_t pack_rgb(Color c) {
+    return 0xFF000000u | (uint32_t)to_byte(c.r) << 16 | (uint32_t)to_byte(c.g) << 8 | to_byte(c.b);
+}
+
+Color unpack_rgb(uint32_t p) {
+    return rgb(((p >> 16) & 0xFF) / 255.0f, ((p >> 8) & 0xFF) / 255.0f, (p & 0xFF) / 255.0f);
+}
+
+void image_write_ppm(const Image *im, FILE *f) {
+    fprintf(f, "P3\n%d %d\n255\n", im->w, im->h);
+    for (int y = 0; y < im->h; y++) {
+        const Color *row = im->px + (size_t)y * im->w;
+        for (int x = 0; x < im->w; x++)
+            fprintf(f, x ? " %d %d %d" : "%d %d %d", to_byte(row[x].r), to_byte(row[x].g), to_byte(row[x].b));
+        fputc('\n', f);
+    }
+}
+
+float srgb_encode(float l) {
+    if (!(l > 0.0f)) return 0.0f;
+    if (l >= 1.0f) return 1.0f;
+    return l <= 0.0031308f ? 12.92f * l : 1.055f * powf(l, 1.0f / 2.4f) - 0.055f;
+}
+
+float srgb_decode(float s) {
+    if (!(s > 0.0f)) return 0.0f;
+    if (s >= 1.0f) return 1.0f;
+    return s <= 0.04045f ? s / 12.92f : powf((s + 0.055f) / 1.055f, 2.4f);
+}
+
+void srgb_lut_init(uint8_t lut[4096]) {
+    for (int i = 0; i < 4096; i++) lut[i] = to_byte(srgb_encode(i / 4095.0f));
+}
+
+static inline int lut_index(float v) {
+    if (!(v > 0.0f)) return 0;
+    if (v >= 1.0f) return 4095;
+    return (int)(v * 4095.0f + 0.5f);
+}
+
+void image_write_ppm_srgb(const Image *im, FILE *f, const uint8_t lut[4096]) {
+    fprintf(f, "P3\n%d %d\n255\n", im->w, im->h);
+    for (int y = 0; y < im->h; y++) {
+        const Color *row = im->px + (size_t)y * im->w;
+        for (int x = 0; x < im->w; x++)
+            fprintf(f, x ? " %d %d %d" : "%d %d %d", lut[lut_index(row[x].r)], lut[lut_index(row[x].g)],
+                    lut[lut_index(row[x].b)]);
+        fputc('\n', f);
+    }
+}
+
+void put_pixel(Image *im, int x, int y, Color c) {
+    if (x < 0 || y < 0 || x >= im->w || y >= im->h) return;
+    im->px[(size_t)y * im->w + x] = c;
+}
+
+static inline int clampi(int v, int lo, int hi) { return v < lo ? lo : v > hi ? hi : v; }
+
+void draw_disk(Image *im, float cx, float cy, float r, Color c) {
+    int x0 = clampi((int)floorf(cx - r), 0, im->w), x1 = clampi((int)floorf(cx + r), -1, im->w - 1);
+    int y0 = clampi((int)floorf(cy - r), 0, im->h), y1 = clampi((int)floorf(cy + r), -1, im->h - 1);
+    float r2 = r * r;
+    for (int y = y0; y <= y1; y++) {
+        float dy = y + 0.5f - cy;
+        Color *row = im->px + (size_t)y * im->w;
+        for (int x = x0; x <= x1; x++) {
+            float dx = x + 0.5f - cx;
+            if (dx * dx + dy * dy <= r2) row[x] = c;
+        }
+    }
+}
+
+void draw_line(Image *im, int x0, int y0, int x1, int y1, Color c) {
+    int dx = abs(x1 - x0), sx = x0 < x1 ? 1 : -1;
+    int dy = -abs(y1 - y0), sy = y0 < y1 ? 1 : -1;
+    int err = dx + dy;
+    for (;;) {
+        put_pixel(im, x0, y0, c);
+        if (x0 == x1 && y0 == y1) break;
+        int e2 = 2 * err;
+        if (e2 >= dy) { err += dy; x0 += sx; }
+        if (e2 <= dx) { err += dx; y0 += sy; }
+    }
+}
+
+typedef struct { float r, g, b, a; } RGBA;
+
+Color color_lerp(Color a, Color b, float t) {
+    return rgb(a.r + (b.r - a.r) * t, a.g + (b.g - a.g) * t, a.b + (b.b - a.b) * t);
+}
+
+Color blend_over(Color dst, Color src, float alpha) {
+    return color_lerp(dst, src, alpha);
+}
+
+Color blend_add(Color dst, Color src, float k) {
+    return rgb(dst.r + src.r * k, dst.g + src.g * k, dst.b + src.b * k);
+}
+
+RGBA premultiply(RGBA c) {
+    return (RGBA){ c.r * c.a, c.g * c.a, c.b * c.a, c.a };
+}
+
+RGBA over_premul(RGBA src, RGBA dst) {
+    float k = 1.0f - src.a;
+    return (RGBA){ src.r + dst.r * k, src.g + dst.g * k, src.b + dst.b * k, src.a + dst.a * k };
+}
+
+static inline float clampf(float v, float lo, float hi) { return v < lo ? lo : v > hi ? hi : v; }
+
+void draw_disk_aa(Image *im, float cx, float cy, float r, Color c, float alpha) {
+    float ro = r + 0.5f, ri = r - 0.5f;
+    float ro2 = ro * ro, ri2 = ri > 0 ? ri * ri : -1.0f;
+    int x0 = clampi((int)floorf(cx - ro), 0, im->w), x1 = clampi((int)floorf(cx + ro), -1, im->w - 1);
+    int y0 = clampi((int)floorf(cy - ro), 0, im->h), y1 = clampi((int)floorf(cy + ro), -1, im->h - 1);
+    for (int y = y0; y <= y1; y++) {
+        float dy = y + 0.5f - cy;
+        Color *row = im->px + (size_t)y * im->w;
+        for (int x = x0; x <= x1; x++) {
+            float dx = x + 0.5f - cx, d2 = dx * dx + dy * dy;
+            if (d2 >= ro2) continue;
+            float cov = d2 <= ri2 ? 1.0f : clampf(ro - sqrtf(d2), 0.0f, 1.0f);
+            row[x] = blend_over(row[x], c, cov * alpha);
+        }
+    }
+}
+
+void draw_ring_aa(Image *im, float cx, float cy, float radius, float thickness, Color c, float alpha) {
+    float ro = radius + thickness * 0.5f + 0.5f, half = thickness * 0.5f + 0.5f;
+    int x0 = clampi((int)floorf(cx - ro), 0, im->w), x1 = clampi((int)floorf(cx + ro), -1, im->w - 1);
+    int y0 = clampi((int)floorf(cy - ro), 0, im->h), y1 = clampi((int)floorf(cy + ro), -1, im->h - 1);
+    for (int y = y0; y <= y1; y++) {
+        float dy = y + 0.5f - cy;
+        Color *row = im->px + (size_t)y * im->w;
+        for (int x = x0; x <= x1; x++) {
+            float dx = x + 0.5f - cx;
+            float cov = clampf(half - fabsf(sqrtf(dx * dx + dy * dy) - radius), 0.0f, 1.0f);
+            if (cov > 0.0f) row[x] = blend_over(row[x], c, cov * alpha);
+        }
+    }
+}
+
+typedef struct { float pos; Color c; } Stop;
+
+float lerpf(float a, float b, float t) {
+    return a + (b - a) * t;
+}
+
+float smoothstepf(float e0, float e1, float x) {
+    float t = clampf((x - e0) / (e1 - e0), 0.0f, 1.0f);
+    return t * t * (3.0f - 2.0f * t);
+}
+
+Color ramp_sample(const Stop *s, int n, float t) {
+    if (t <= s[0].pos) return s[0].c;
+    if (t >= s[n - 1].pos) return s[n - 1].c;
+    int i = 0;
+    while (i < n - 2 && t > s[i + 1].pos) i++;
+    float span = s[i + 1].pos - s[i].pos;
+    if (span <= 0.0f) return s[i + 1].c;
+    return color_lerp(s[i].c, s[i + 1].c, (t - s[i].pos) / span);
+}
+
+void ramp_bake(const Stop *s, int n, Color *lut, int size) {
+    for (int i = 0; i < size; i++) lut[i] = ramp_sample(s, n, i / (float)(size - 1));
+}
+
+Color cosine_palette(float t, Color a, Color b, Color c, Color d) {
+    const float tau = 6.2831853f;
+    return rgb(a.r + b.r * cosf(tau * (c.r * t + d.r)), a.g + b.g * cosf(tau * (c.g * t + d.g)),
+               a.b + b.b * cosf(tau * (c.b * t + d.b)));
+}
+
+int main(void) {
+    static uint8_t lut[4096];
+    srgb_lut_init(lut);
+    Stop terrain[] = {
+        { 0.00f, { 0.01f, 0.03f, 0.15f } }, { 0.40f, { 0.05f, 0.25f, 0.50f } },
+        { 0.45f, { 0.75f, 0.65f, 0.40f } }, { 0.50f, { 0.12f, 0.35f, 0.05f } },
+        { 0.75f, { 0.20f, 0.15f, 0.10f } }, { 0.90f, { 0.40f, 0.40f, 0.40f } },
+        { 0.92f, { 0.95f, 0.95f, 1.00f } },
+    };
+    Color baked[16];
+    ramp_bake(terrain, 7, baked, 16);
+    Image im = image_new(128, 96);
+    if (!im.px) return 1;
+    Color half = rgb(0.5f, 0.5f, 0.5f);
+    Color cs[4] = { { 1, 1, 1 }, { 1, 1, 1 }, { 1, 1, 0.5f }, { 2, 1, 0 } };
+    Color ds[4] = { { 0, 0.33f, 0.67f }, { 0, 0.1f, 0.2f }, { 0.8f, 0.9f, 0.3f }, { 0.5f, 0.2f, 0.25f } };
+    for (int y = 0; y < im.h; y++)
+        for (int x = 0; x < im.w; x++) {
+            float t = (x + 0.5f) / im.w;
+            Color c;
+            if (y < 24) c = ramp_sample(terrain, 7, t);
+            else if (y < 32) c = baked[(int)(t * 15 + 0.5f)];
+            else {
+                int k = (y - 32) / 16;
+                c = cosine_palette(t, half, half, cs[k], ds[k]);
+                c = rgb(srgb_decode(c.r), srgb_decode(c.g), srgb_decode(c.b));  // designed in sRGB
+            }
+            *image_at(&im, x, y) = c;
+        }
+    image_write_ppm_srgb(&im, stdout, lut);
+    image_free(&im);
+    return 0;
+}
+--- stubs
+typedef struct { float pos; Color c; } Stop;
+
+float lerpf(float a, float b, float t) {
+    (void)b; (void)t;
+    return a;
+}
+
+float smoothstepf(float e0, float e1, float x) {
+    (void)e0; (void)e1;
+    return x;
+}
+
+Color ramp_sample(const Stop *s, int n, float t) {
+    (void)n; (void)t;
+    return s[0].c;
+}
+
+void ramp_bake(const Stop *s, int n, Color *lut, int size) {
+    (void)s; (void)n; (void)lut; (void)size;
+}
+
+Color cosine_palette(float t, Color a, Color b, Color c, Color d) {
+    (void)t; (void)b; (void)c; (void)d;
+    return a;
+}
+--- hint
+In `ramp_sample`, after the two clamps, walk `i` forward while `t > s[i + 1].pos`; the last stop is never a segment start, so stop at `n - 2`.
+--- hint
+`smoothstepf` reuses the `clampf` helper from the previous step.
+--- harness
+int main(void) {
+    CHECK_DBL(lerpf(2, 6, 0.25f), 3.0);
+    CHECK_DBL(lerpf(2, 6, 1.5f), 8.0);
+    CHECK_DBL(smoothstepf(0, 1, 0.5f), 0.5);
+    CHECK_DBL(smoothstepf(0, 1, 0.25f), 0.15625);
+    CHECK_DBL(smoothstepf(0, 1, -2), 0.0);
+    CHECK_DBL(smoothstepf(0, 1, 2), 1.0);
+    CHECK_DBL(smoothstepf(10, 20, 17.5f), 0.84375);
+    CHECK_DBL(smoothstepf(1, 0, 0.25f), 0.84375);
+
+    Stop s[] = { { 0.2f, { 1, 0, 0 } }, { 0.5f, { 0, 1, 0 } }, { 0.5f, { 0, 0, 1 } }, { 0.9f, { 1, 1, 1 } } };
+    Color c = ramp_sample(s, 4, 0.0f);
+    CHECK_DBL(c.r, 1.0);
+    c = ramp_sample(s, 4, 1.0f);
+    CHECK_DBL(c.g, 1.0);
+    CHECK_DBL(c.b, 1.0);
+    c = ramp_sample(s, 4, 0.35f);
+    CHECK_DBL(c.r, 0.5);
+    CHECK_DBL(c.g, 0.5);
+    CHECK_DBL(c.b, 0.0);
+    c = ramp_sample(s, 4, 0.7f);
+    CHECK_DBL(c.r, 0.5);
+    CHECK_DBL(c.g, 0.5);
+    CHECK_DBL(c.b, 1.0);
+    c = ramp_sample(s, 4, 0.5f);
+    CHECK(c.r == c.r && c.g == c.g && c.b == c.b);
+    CHECK(fabsf(c.r) < 1e-6f && fabsf(c.g + c.b - 1) < 1e-6f);
+    c = ramp_sample(s, 4, 0.499f);
+    CHECK(c.g > 0.99f);
+    c = ramp_sample(s, 4, 0.501f);
+    CHECK(c.b > 0.99f && c.r < 0.01f);
+    Stop one[] = { { 0.5f, { 0.1f, 0.2f, 0.3f } } };
+    CHECK_DBL(ramp_sample(one, 1, 0.9f).b, 0.3);
+    CHECK_DBL(ramp_sample(one, 1, 0.1f).g, 0.2);
+
+    Color lut[5];
+    ramp_bake(s, 4, lut, 5);
+    CHECK_DBL(lut[0].r, 1.0);
+    CHECK_DBL(lut[1].r, 5.0 / 6);
+    CHECK_DBL(lut[1].g, 1.0 / 6);
+    CHECK_DBL(lut[3].b, 1.0);
+    CHECK_DBL(lut[3].r, 0.625);
+    CHECK_DBL(lut[4].g, 1.0);
+
+    Color h = rgb(0.5f, 0.5f, 0.5f);
+    c = cosine_palette(0.0f, h, h, rgb(1, 1, 1), rgb(0, 0.25f, 0.5f));
+    CHECK(fabsf(c.r - 1.0f) < 1e-5f);
+    CHECK(fabsf(c.g - 0.5f) < 1e-5f);
+    CHECK(fabsf(c.b - 0.0f) < 1e-5f);
+    c = cosine_palette(0.3f, h, rgb(0.5f, 0.4f, 0.2f), rgb(1, 2, 0.5f), rgb(0.1f, 0.2f, 0.3f));
+    CHECK(fabsf(c.r - (0.5f + 0.5f * cosf(6.2831853f * 0.4f))) < 1e-5f);
+    CHECK(fabsf(c.g - (0.5f + 0.4f * cosf(6.2831853f * 0.8f))) < 1e-5f);
+    CHECK(fabsf(c.b - (0.5f + 0.2f * cosf(6.2831853f * 0.45f))) < 1e-5f);
+    return TEST_END();
+}
+
+=== exercise img_blur
+title: Images, step 9: an O(1)-per-pixel box blur
+continues: img_ramp
+--- prompt
+Add `void box_blur(Image *im, int r, Image *tmp)`: replace each pixel by the mean of the `(2r+1)×(2r+1)` square around it, with coordinates outside the image **clamped** to the nearest edge pixel (so each output is still a mean of exactly `(2r+1)²` samples, some repeated). `tmp` is a scratch image of the same size, supplied by the caller so that blurring every frame allocates nothing. `r = 0` leaves the image unchanged. `r` may be larger than the image.
+
+Do it in two passes, each with a **sliding window**:
+
+1. Horizontal: for each row, start `sum` with the window around `x = 0` (indices `-r..r`, clamped), then for each `x` write `sum / (2r+1)` to `tmp` and update `sum += row[clamp(x + r + 1)] - row[clamp(x - r)]`.
+2. Vertical: the same down each column, from `tmp` back into `im`.
+
+Each output pixel costs a constant amount of work regardless of `r`. The last test blurs a 1024×1024 image with radius 60: the direct 2D loop is 15 billion reads and times out; even two 1D passes that re-sum the window per pixel are much slower than they need to be.
+
+Keep the three channel sums in `float`s (or `double`s if you prefer); the tests allow for the rounding drift a running sum accumulates.
+--- solution
+#include <math.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+typedef struct { float r, g, b; } Color;
+typedef struct { int w, h; Color *px; } Image;
+
+static inline Color rgb(float r, float g, float b) { return (Color){ r, g, b }; }
+
+Image image_new(int w, int h) {
+    Image im = { w, h, calloc((size_t)w * (size_t)h, sizeof(Color)) };
+    return im;
+}
+
+void image_free(Image *im) {
+    free(im->px);
+    im->px = NULL;
+    im->w = im->h = 0;
+}
+
+Color *image_at(Image *im, int x, int y) {
+    return &im->px[(size_t)y * im->w + x];
+}
+
+void image_fill(Image *im, Color c) {
+    size_t n = (size_t)im->w * im->h;
+    for (size_t i = 0; i < n; i++) im->px[i] = c;
+}
+
+uint8_t to_byte(float v) {
+    if (!(v > 0.0f)) return 0;
+    if (v >= 1.0f) return 255;
+    return (uint8_t)(v * 255.0f + 0.5f);
+}
+
+uint32_t pack_rgb(Color c) {
+    return 0xFF000000u | (uint32_t)to_byte(c.r) << 16 | (uint32_t)to_byte(c.g) << 8 | to_byte(c.b);
+}
+
+Color unpack_rgb(uint32_t p) {
+    return rgb(((p >> 16) & 0xFF) / 255.0f, ((p >> 8) & 0xFF) / 255.0f, (p & 0xFF) / 255.0f);
+}
+
+void image_write_ppm(const Image *im, FILE *f) {
+    fprintf(f, "P3\n%d %d\n255\n", im->w, im->h);
+    for (int y = 0; y < im->h; y++) {
+        const Color *row = im->px + (size_t)y * im->w;
+        for (int x = 0; x < im->w; x++)
+            fprintf(f, x ? " %d %d %d" : "%d %d %d", to_byte(row[x].r), to_byte(row[x].g), to_byte(row[x].b));
+        fputc('\n', f);
+    }
+}
+
+float srgb_encode(float l) {
+    if (!(l > 0.0f)) return 0.0f;
+    if (l >= 1.0f) return 1.0f;
+    return l <= 0.0031308f ? 12.92f * l : 1.055f * powf(l, 1.0f / 2.4f) - 0.055f;
+}
+
+float srgb_decode(float s) {
+    if (!(s > 0.0f)) return 0.0f;
+    if (s >= 1.0f) return 1.0f;
+    return s <= 0.04045f ? s / 12.92f : powf((s + 0.055f) / 1.055f, 2.4f);
+}
+
+void srgb_lut_init(uint8_t lut[4096]) {
+    for (int i = 0; i < 4096; i++) lut[i] = to_byte(srgb_encode(i / 4095.0f));
+}
+
+static inline int lut_index(float v) {
+    if (!(v > 0.0f)) return 0;
+    if (v >= 1.0f) return 4095;
+    return (int)(v * 4095.0f + 0.5f);
+}
+
+void image_write_ppm_srgb(const Image *im, FILE *f, const uint8_t lut[4096]) {
+    fprintf(f, "P3\n%d %d\n255\n", im->w, im->h);
+    for (int y = 0; y < im->h; y++) {
+        const Color *row = im->px + (size_t)y * im->w;
+        for (int x = 0; x < im->w; x++)
+            fprintf(f, x ? " %d %d %d" : "%d %d %d", lut[lut_index(row[x].r)], lut[lut_index(row[x].g)],
+                    lut[lut_index(row[x].b)]);
+        fputc('\n', f);
+    }
+}
+
+void put_pixel(Image *im, int x, int y, Color c) {
+    if (x < 0 || y < 0 || x >= im->w || y >= im->h) return;
+    im->px[(size_t)y * im->w + x] = c;
+}
+
+static inline int clampi(int v, int lo, int hi) { return v < lo ? lo : v > hi ? hi : v; }
+
+void draw_disk(Image *im, float cx, float cy, float r, Color c) {
+    int x0 = clampi((int)floorf(cx - r), 0, im->w), x1 = clampi((int)floorf(cx + r), -1, im->w - 1);
+    int y0 = clampi((int)floorf(cy - r), 0, im->h), y1 = clampi((int)floorf(cy + r), -1, im->h - 1);
+    float r2 = r * r;
+    for (int y = y0; y <= y1; y++) {
+        float dy = y + 0.5f - cy;
+        Color *row = im->px + (size_t)y * im->w;
+        for (int x = x0; x <= x1; x++) {
+            float dx = x + 0.5f - cx;
+            if (dx * dx + dy * dy <= r2) row[x] = c;
+        }
+    }
+}
+
+void draw_line(Image *im, int x0, int y0, int x1, int y1, Color c) {
+    int dx = abs(x1 - x0), sx = x0 < x1 ? 1 : -1;
+    int dy = -abs(y1 - y0), sy = y0 < y1 ? 1 : -1;
+    int err = dx + dy;
+    for (;;) {
+        put_pixel(im, x0, y0, c);
+        if (x0 == x1 && y0 == y1) break;
+        int e2 = 2 * err;
+        if (e2 >= dy) { err += dy; x0 += sx; }
+        if (e2 <= dx) { err += dx; y0 += sy; }
+    }
+}
+
+typedef struct { float r, g, b, a; } RGBA;
+
+Color color_lerp(Color a, Color b, float t) {
+    return rgb(a.r + (b.r - a.r) * t, a.g + (b.g - a.g) * t, a.b + (b.b - a.b) * t);
+}
+
+Color blend_over(Color dst, Color src, float alpha) {
+    return color_lerp(dst, src, alpha);
+}
+
+Color blend_add(Color dst, Color src, float k) {
+    return rgb(dst.r + src.r * k, dst.g + src.g * k, dst.b + src.b * k);
+}
+
+RGBA premultiply(RGBA c) {
+    return (RGBA){ c.r * c.a, c.g * c.a, c.b * c.a, c.a };
+}
+
+RGBA over_premul(RGBA src, RGBA dst) {
+    float k = 1.0f - src.a;
+    return (RGBA){ src.r + dst.r * k, src.g + dst.g * k, src.b + dst.b * k, src.a + dst.a * k };
+}
+
+static inline float clampf(float v, float lo, float hi) { return v < lo ? lo : v > hi ? hi : v; }
+
+void draw_disk_aa(Image *im, float cx, float cy, float r, Color c, float alpha) {
+    float ro = r + 0.5f, ri = r - 0.5f;
+    float ro2 = ro * ro, ri2 = ri > 0 ? ri * ri : -1.0f;
+    int x0 = clampi((int)floorf(cx - ro), 0, im->w), x1 = clampi((int)floorf(cx + ro), -1, im->w - 1);
+    int y0 = clampi((int)floorf(cy - ro), 0, im->h), y1 = clampi((int)floorf(cy + ro), -1, im->h - 1);
+    for (int y = y0; y <= y1; y++) {
+        float dy = y + 0.5f - cy;
+        Color *row = im->px + (size_t)y * im->w;
+        for (int x = x0; x <= x1; x++) {
+            float dx = x + 0.5f - cx, d2 = dx * dx + dy * dy;
+            if (d2 >= ro2) continue;
+            float cov = d2 <= ri2 ? 1.0f : clampf(ro - sqrtf(d2), 0.0f, 1.0f);
+            row[x] = blend_over(row[x], c, cov * alpha);
+        }
+    }
+}
+
+void draw_ring_aa(Image *im, float cx, float cy, float radius, float thickness, Color c, float alpha) {
+    float ro = radius + thickness * 0.5f + 0.5f, half = thickness * 0.5f + 0.5f;
+    int x0 = clampi((int)floorf(cx - ro), 0, im->w), x1 = clampi((int)floorf(cx + ro), -1, im->w - 1);
+    int y0 = clampi((int)floorf(cy - ro), 0, im->h), y1 = clampi((int)floorf(cy + ro), -1, im->h - 1);
+    for (int y = y0; y <= y1; y++) {
+        float dy = y + 0.5f - cy;
+        Color *row = im->px + (size_t)y * im->w;
+        for (int x = x0; x <= x1; x++) {
+            float dx = x + 0.5f - cx;
+            float cov = clampf(half - fabsf(sqrtf(dx * dx + dy * dy) - radius), 0.0f, 1.0f);
+            if (cov > 0.0f) row[x] = blend_over(row[x], c, cov * alpha);
+        }
+    }
+}
+
+typedef struct { float pos; Color c; } Stop;
+
+float lerpf(float a, float b, float t) {
+    return a + (b - a) * t;
+}
+
+float smoothstepf(float e0, float e1, float x) {
+    float t = clampf((x - e0) / (e1 - e0), 0.0f, 1.0f);
+    return t * t * (3.0f - 2.0f * t);
+}
+
+Color ramp_sample(const Stop *s, int n, float t) {
+    if (t <= s[0].pos) return s[0].c;
+    if (t >= s[n - 1].pos) return s[n - 1].c;
+    int i = 0;
+    while (i < n - 2 && t > s[i + 1].pos) i++;
+    float span = s[i + 1].pos - s[i].pos;
+    if (span <= 0.0f) return s[i + 1].c;
+    return color_lerp(s[i].c, s[i + 1].c, (t - s[i].pos) / span);
+}
+
+void ramp_bake(const Stop *s, int n, Color *lut, int size) {
+    for (int i = 0; i < size; i++) lut[i] = ramp_sample(s, n, i / (float)(size - 1));
+}
+
+Color cosine_palette(float t, Color a, Color b, Color c, Color d) {
+    const float tau = 6.2831853f;
+    return rgb(a.r + b.r * cosf(tau * (c.r * t + d.r)), a.g + b.g * cosf(tau * (c.g * t + d.g)),
+               a.b + b.b * cosf(tau * (c.b * t + d.b)));
+}
+
+static inline Color color_scale(Color c, float k) { return rgb(c.r * k, c.g * k, c.b * k); }
+
+/* One sliding-window pass over n samples spaced `stride` apart, from src into dst. */
+static void blur_line(const Color *src, Color *dst, int n, size_t stride, int r) {
+    float sr = 0, sg = 0, sb = 0, inv = 1.0f / (2 * r + 1);
+    for (int k = -r; k <= r; k++) {
+        const Color *p = src + (size_t)clampi(k, 0, n - 1) * stride;
+        sr += p->r; sg += p->g; sb += p->b;
+    }
+    for (int i = 0; i < n; i++) {
+        dst[(size_t)i * stride] = rgb(sr * inv, sg * inv, sb * inv);
+        const Color *add = src + (size_t)clampi(i + r + 1, 0, n - 1) * stride;
+        const Color *sub = src + (size_t)clampi(i - r, 0, n - 1) * stride;
+        sr += add->r - sub->r; sg += add->g - sub->g; sb += add->b - sub->b;
+    }
+}
+
+void box_blur(Image *im, int r, Image *tmp) {
+    if (r <= 0) return;
+    for (int y = 0; y < im->h; y++)
+        blur_line(im->px + (size_t)y * im->w, tmp->px + (size_t)y * im->w, im->w, 1, r);
+    for (int x = 0; x < im->w; x++)
+        blur_line(tmp->px + x, im->px + x, im->h, (size_t)im->w, r);
+}
+
+int main(void) {
+    static uint8_t lut[4096];
+    srgb_lut_init(lut);
+    Image im = image_new(128, 96), tmp = image_new(128, 96);
+    if (!im.px || !tmp.px) { image_free(&im); image_free(&tmp); return 1; }
+    for (int y = 0; y < im.h; y++)
+        for (int x = 0; x < im.w; x++)
+            *image_at(&im, x, y) = ((x / 8 + y / 8) & 1) ? rgb(0.9f, 0.8f, 0.2f) : rgb(0.05f, 0.1f, 0.3f);
+    for (int i = 0; i < 4; i++) {          // blur four vertical strips with growing radius
+        Image strip = image_new(32, 96), stmp = image_new(32, 96);
+        if (strip.px && stmp.px) {
+            for (int y = 0; y < 96; y++)
+                for (int x = 0; x < 32; x++) *image_at(&strip, x, y) = *image_at(&im, i * 32 + x, y);
+            box_blur(&strip, i * 2, &stmp);
+            for (int y = 0; y < 96; y++)
+                for (int x = 0; x < 32; x++) *image_at(&im, i * 32 + x, y) = *image_at(&strip, x, y);
+        }
+        image_free(&strip);
+        image_free(&stmp);
+    }
+    image_write_ppm_srgb(&im, stdout, lut);
+    image_free(&im);
+    image_free(&tmp);
+    return 0;
+}
+--- stubs
+void box_blur(Image *im, int r, Image *tmp) {
+    (void)im; (void)r; (void)tmp;
+}
+--- hint
+Write one helper that blurs a line of `n` samples spaced `stride` apart (`stride = 1` for rows, `w` for columns) from `src` to `dst`, then call it for every row and every column.
+--- hint
+Clamp the sample index, not the window: `src[clampi(i + r + 1, 0, n - 1) * stride]` enters, `src[clampi(i - r, 0, n - 1) * stride]` leaves.
+--- harness
+static Color ref_at(const Image *im, int x, int y, int r) {
+    double sr = 0, sg = 0, sb = 0;
+    for (int dy = -r; dy <= r; dy++)
+        for (int dx = -r; dx <= r; dx++) {
+            int xx = x + dx < 0 ? 0 : x + dx >= im->w ? im->w - 1 : x + dx;
+            int yy = y + dy < 0 ? 0 : y + dy >= im->h ? im->h - 1 : y + dy;
+            Color c = im->px[(size_t)yy * im->w + xx];
+            sr += c.r; sg += c.g; sb += c.b;
+        }
+    double n = (2.0 * r + 1) * (2.0 * r + 1);
+    return rgb((float)(sr / n), (float)(sg / n), (float)(sb / n));
+}
+
+static int test_small(int w, int h, int r) {
+    Image a = image_new(w, h), b = image_new(w, h), t = image_new(w, h);
+    int ok = a.px && b.px && t.px;
+    if (ok) {
+        uint32_t s = (uint32_t)(w * 31 + h * 7 + r);
+        for (int i = 0; i < w * h; i++) {
+            s = s * 1664525u + 1013904223u; a.px[i].r = (s >> 8) / 16777216.0f;
+            s = s * 1664525u + 1013904223u; a.px[i].g = (s >> 8) / 16777216.0f;
+            a.px[i].b = (i % 3) * 0.5f;
+            b.px[i] = a.px[i];
+        }
+        box_blur(&b, r, &t);
+        for (int y = 0; y < h; y++)
+            for (int x = 0; x < w; x++) {
+                Color e = ref_at(&a, x, y, r), g = b.px[y * w + x];
+                if (fabsf(e.r - g.r) > 1e-4f || fabsf(e.g - g.g) > 1e-4f || fabsf(e.b - g.b) > 1e-4f) ok = 0;
+            }
+    }
+    image_free(&a); image_free(&b); image_free(&t);
+    return ok;
+}
+
+int main(void) {
+    CHECK(test_small(13, 9, 1));
+    CHECK(test_small(13, 9, 3));
+    CHECK(test_small(5, 17, 2));
+    CHECK(test_small(8, 8, 20));
+    CHECK(test_small(1, 6, 2));
+    CHECK(test_small(40, 30, 7));
+    CHECK(test_small(6, 6, 0));
+
+    Image c = image_new(50, 40), t = image_new(50, 40);
+    if (c.px && t.px) {
+        image_fill(&c, rgb(0.25f, 0.5f, 0.75f));
+        box_blur(&c, 9, &t);
+        int same = 1;
+        for (int i = 0; i < 2000; i++)
+            if (fabsf(c.px[i].r - 0.25f) > 1e-5f || fabsf(c.px[i].b - 0.75f) > 1e-5f) same = 0;
+        CHECK(same);
+    } else CHECK(!"image_new failed");
+    image_free(&c); image_free(&t);
+
+    int n = 1024;
+    Image big = image_new(n, n), orig = image_new(n, n), tmp = image_new(n, n);
+    if (big.px && orig.px && tmp.px) {
+        for (int y = 0; y < n; y++)
+            for (int x = 0; x < n; x++)
+                big.px[y * n + x] = rgb(((x / 16 + y / 16) & 1) ? 1.0f : 0.0f, (float)x / n, (float)y / n);
+        memcpy(orig.px, big.px, sizeof(Color) * n * n);
+        box_blur(&big, 60, &tmp);
+        int pts[][2] = { { 0, 0 }, { 512, 512 }, { 1023, 0 }, { 37, 900 }, { 1000, 1023 }, { 300, 61 } };
+        int ok = 1;
+        for (int i = 0; i < 6; i++) {
+            Color e = ref_at(&orig, pts[i][0], pts[i][1], 60), g = big.px[pts[i][1] * n + pts[i][0]];
+            if (fabsf(e.r - g.r) > 2e-3f || fabsf(e.g - g.g) > 2e-3f || fabsf(e.b - g.b) > 2e-3f) ok = 0;
+        }
+        CHECK(ok);
+    } else CHECK(!"image_new failed");
+    image_free(&big); image_free(&orig); image_free(&tmp);
+    return TEST_END();
+}
+
+=== exercise img_bloom
+title: Images, step 10: bloom and a neon scene
+continues: img_blur
+--- prompt
+Finish the library with **bloom**, the glow around bright lights, built from what you have:
+
+`void bloom(Image *im, float threshold, int r, int passes, float strength, Image *bright, Image *tmp)`
+
+1. Bright pass: `bright` gets `max(c - threshold, 0)` for each channel of each pixel of `im`.
+2. Blur `bright` `passes` times with `box_blur(bright, r, tmp)`. Three box passes approximate a Gaussian closely.
+3. Add it back: each pixel of `im` becomes `blend_add(pixel, bright_pixel, strength)`.
+
+`bright` and `tmp` are caller-owned scratch images the same size as `im`.
+
+Bloom only works in linear light with values allowed above 1, which is why the library computes in floats and clamps only at output. Everything below the threshold is untouched, so a dark image comes out identical.
+
+The Run program draws a neon scene, rings and lines in cosine-palette colors at intensities above 1, and blooms it. Experiment with the threshold, radius and passes.
+--- solution
+#include <math.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+typedef struct { float r, g, b; } Color;
+typedef struct { int w, h; Color *px; } Image;
+
+static inline Color rgb(float r, float g, float b) { return (Color){ r, g, b }; }
+
+Image image_new(int w, int h) {
+    Image im = { w, h, calloc((size_t)w * (size_t)h, sizeof(Color)) };
+    return im;
+}
+
+void image_free(Image *im) {
+    free(im->px);
+    im->px = NULL;
+    im->w = im->h = 0;
+}
+
+Color *image_at(Image *im, int x, int y) {
+    return &im->px[(size_t)y * im->w + x];
+}
+
+void image_fill(Image *im, Color c) {
+    size_t n = (size_t)im->w * im->h;
+    for (size_t i = 0; i < n; i++) im->px[i] = c;
+}
+
+uint8_t to_byte(float v) {
+    if (!(v > 0.0f)) return 0;
+    if (v >= 1.0f) return 255;
+    return (uint8_t)(v * 255.0f + 0.5f);
+}
+
+uint32_t pack_rgb(Color c) {
+    return 0xFF000000u | (uint32_t)to_byte(c.r) << 16 | (uint32_t)to_byte(c.g) << 8 | to_byte(c.b);
+}
+
+Color unpack_rgb(uint32_t p) {
+    return rgb(((p >> 16) & 0xFF) / 255.0f, ((p >> 8) & 0xFF) / 255.0f, (p & 0xFF) / 255.0f);
+}
+
+void image_write_ppm(const Image *im, FILE *f) {
+    fprintf(f, "P3\n%d %d\n255\n", im->w, im->h);
+    for (int y = 0; y < im->h; y++) {
+        const Color *row = im->px + (size_t)y * im->w;
+        for (int x = 0; x < im->w; x++)
+            fprintf(f, x ? " %d %d %d" : "%d %d %d", to_byte(row[x].r), to_byte(row[x].g), to_byte(row[x].b));
+        fputc('\n', f);
+    }
+}
+
+float srgb_encode(float l) {
+    if (!(l > 0.0f)) return 0.0f;
+    if (l >= 1.0f) return 1.0f;
+    return l <= 0.0031308f ? 12.92f * l : 1.055f * powf(l, 1.0f / 2.4f) - 0.055f;
+}
+
+float srgb_decode(float s) {
+    if (!(s > 0.0f)) return 0.0f;
+    if (s >= 1.0f) return 1.0f;
+    return s <= 0.04045f ? s / 12.92f : powf((s + 0.055f) / 1.055f, 2.4f);
+}
+
+void srgb_lut_init(uint8_t lut[4096]) {
+    for (int i = 0; i < 4096; i++) lut[i] = to_byte(srgb_encode(i / 4095.0f));
+}
+
+static inline int lut_index(float v) {
+    if (!(v > 0.0f)) return 0;
+    if (v >= 1.0f) return 4095;
+    return (int)(v * 4095.0f + 0.5f);
+}
+
+void image_write_ppm_srgb(const Image *im, FILE *f, const uint8_t lut[4096]) {
+    fprintf(f, "P3\n%d %d\n255\n", im->w, im->h);
+    for (int y = 0; y < im->h; y++) {
+        const Color *row = im->px + (size_t)y * im->w;
+        for (int x = 0; x < im->w; x++)
+            fprintf(f, x ? " %d %d %d" : "%d %d %d", lut[lut_index(row[x].r)], lut[lut_index(row[x].g)],
+                    lut[lut_index(row[x].b)]);
+        fputc('\n', f);
+    }
+}
+
+void put_pixel(Image *im, int x, int y, Color c) {
+    if (x < 0 || y < 0 || x >= im->w || y >= im->h) return;
+    im->px[(size_t)y * im->w + x] = c;
+}
+
+static inline int clampi(int v, int lo, int hi) { return v < lo ? lo : v > hi ? hi : v; }
+
+void draw_disk(Image *im, float cx, float cy, float r, Color c) {
+    int x0 = clampi((int)floorf(cx - r), 0, im->w), x1 = clampi((int)floorf(cx + r), -1, im->w - 1);
+    int y0 = clampi((int)floorf(cy - r), 0, im->h), y1 = clampi((int)floorf(cy + r), -1, im->h - 1);
+    float r2 = r * r;
+    for (int y = y0; y <= y1; y++) {
+        float dy = y + 0.5f - cy;
+        Color *row = im->px + (size_t)y * im->w;
+        for (int x = x0; x <= x1; x++) {
+            float dx = x + 0.5f - cx;
+            if (dx * dx + dy * dy <= r2) row[x] = c;
+        }
+    }
+}
+
+void draw_line(Image *im, int x0, int y0, int x1, int y1, Color c) {
+    int dx = abs(x1 - x0), sx = x0 < x1 ? 1 : -1;
+    int dy = -abs(y1 - y0), sy = y0 < y1 ? 1 : -1;
+    int err = dx + dy;
+    for (;;) {
+        put_pixel(im, x0, y0, c);
+        if (x0 == x1 && y0 == y1) break;
+        int e2 = 2 * err;
+        if (e2 >= dy) { err += dy; x0 += sx; }
+        if (e2 <= dx) { err += dx; y0 += sy; }
+    }
+}
+
+typedef struct { float r, g, b, a; } RGBA;
+
+Color color_lerp(Color a, Color b, float t) {
+    return rgb(a.r + (b.r - a.r) * t, a.g + (b.g - a.g) * t, a.b + (b.b - a.b) * t);
+}
+
+Color blend_over(Color dst, Color src, float alpha) {
+    return color_lerp(dst, src, alpha);
+}
+
+Color blend_add(Color dst, Color src, float k) {
+    return rgb(dst.r + src.r * k, dst.g + src.g * k, dst.b + src.b * k);
+}
+
+RGBA premultiply(RGBA c) {
+    return (RGBA){ c.r * c.a, c.g * c.a, c.b * c.a, c.a };
+}
+
+RGBA over_premul(RGBA src, RGBA dst) {
+    float k = 1.0f - src.a;
+    return (RGBA){ src.r + dst.r * k, src.g + dst.g * k, src.b + dst.b * k, src.a + dst.a * k };
+}
+
+static inline float clampf(float v, float lo, float hi) { return v < lo ? lo : v > hi ? hi : v; }
+
+void draw_disk_aa(Image *im, float cx, float cy, float r, Color c, float alpha) {
+    float ro = r + 0.5f, ri = r - 0.5f;
+    float ro2 = ro * ro, ri2 = ri > 0 ? ri * ri : -1.0f;
+    int x0 = clampi((int)floorf(cx - ro), 0, im->w), x1 = clampi((int)floorf(cx + ro), -1, im->w - 1);
+    int y0 = clampi((int)floorf(cy - ro), 0, im->h), y1 = clampi((int)floorf(cy + ro), -1, im->h - 1);
+    for (int y = y0; y <= y1; y++) {
+        float dy = y + 0.5f - cy;
+        Color *row = im->px + (size_t)y * im->w;
+        for (int x = x0; x <= x1; x++) {
+            float dx = x + 0.5f - cx, d2 = dx * dx + dy * dy;
+            if (d2 >= ro2) continue;
+            float cov = d2 <= ri2 ? 1.0f : clampf(ro - sqrtf(d2), 0.0f, 1.0f);
+            row[x] = blend_over(row[x], c, cov * alpha);
+        }
+    }
+}
+
+void draw_ring_aa(Image *im, float cx, float cy, float radius, float thickness, Color c, float alpha) {
+    float ro = radius + thickness * 0.5f + 0.5f, half = thickness * 0.5f + 0.5f;
+    int x0 = clampi((int)floorf(cx - ro), 0, im->w), x1 = clampi((int)floorf(cx + ro), -1, im->w - 1);
+    int y0 = clampi((int)floorf(cy - ro), 0, im->h), y1 = clampi((int)floorf(cy + ro), -1, im->h - 1);
+    for (int y = y0; y <= y1; y++) {
+        float dy = y + 0.5f - cy;
+        Color *row = im->px + (size_t)y * im->w;
+        for (int x = x0; x <= x1; x++) {
+            float dx = x + 0.5f - cx;
+            float cov = clampf(half - fabsf(sqrtf(dx * dx + dy * dy) - radius), 0.0f, 1.0f);
+            if (cov > 0.0f) row[x] = blend_over(row[x], c, cov * alpha);
+        }
+    }
+}
+
+typedef struct { float pos; Color c; } Stop;
+
+float lerpf(float a, float b, float t) {
+    return a + (b - a) * t;
+}
+
+float smoothstepf(float e0, float e1, float x) {
+    float t = clampf((x - e0) / (e1 - e0), 0.0f, 1.0f);
+    return t * t * (3.0f - 2.0f * t);
+}
+
+Color ramp_sample(const Stop *s, int n, float t) {
+    if (t <= s[0].pos) return s[0].c;
+    if (t >= s[n - 1].pos) return s[n - 1].c;
+    int i = 0;
+    while (i < n - 2 && t > s[i + 1].pos) i++;
+    float span = s[i + 1].pos - s[i].pos;
+    if (span <= 0.0f) return s[i + 1].c;
+    return color_lerp(s[i].c, s[i + 1].c, (t - s[i].pos) / span);
+}
+
+void ramp_bake(const Stop *s, int n, Color *lut, int size) {
+    for (int i = 0; i < size; i++) lut[i] = ramp_sample(s, n, i / (float)(size - 1));
+}
+
+Color cosine_palette(float t, Color a, Color b, Color c, Color d) {
+    const float tau = 6.2831853f;
+    return rgb(a.r + b.r * cosf(tau * (c.r * t + d.r)), a.g + b.g * cosf(tau * (c.g * t + d.g)),
+               a.b + b.b * cosf(tau * (c.b * t + d.b)));
+}
+
+static inline Color color_scale(Color c, float k) { return rgb(c.r * k, c.g * k, c.b * k); }
+
+/* One sliding-window pass over n samples spaced `stride` apart, from src into dst. */
+static void blur_line(const Color *src, Color *dst, int n, size_t stride, int r) {
+    float sr = 0, sg = 0, sb = 0, inv = 1.0f / (2 * r + 1);
+    for (int k = -r; k <= r; k++) {
+        const Color *p = src + (size_t)clampi(k, 0, n - 1) * stride;
+        sr += p->r; sg += p->g; sb += p->b;
+    }
+    for (int i = 0; i < n; i++) {
+        dst[(size_t)i * stride] = rgb(sr * inv, sg * inv, sb * inv);
+        const Color *add = src + (size_t)clampi(i + r + 1, 0, n - 1) * stride;
+        const Color *sub = src + (size_t)clampi(i - r, 0, n - 1) * stride;
+        sr += add->r - sub->r; sg += add->g - sub->g; sb += add->b - sub->b;
+    }
+}
+
+void box_blur(Image *im, int r, Image *tmp) {
+    if (r <= 0) return;
+    for (int y = 0; y < im->h; y++)
+        blur_line(im->px + (size_t)y * im->w, tmp->px + (size_t)y * im->w, im->w, 1, r);
+    for (int x = 0; x < im->w; x++)
+        blur_line(tmp->px + x, im->px + x, im->h, (size_t)im->w, r);
+}
+
+void bloom(Image *im, float threshold, int r, int passes, float strength, Image *bright, Image *tmp) {
+    size_t n = (size_t)im->w * im->h;
+    for (size_t i = 0; i < n; i++) {
+        Color c = im->px[i];
+        bright->px[i] = rgb(fmaxf(c.r - threshold, 0.0f), fmaxf(c.g - threshold, 0.0f), fmaxf(c.b - threshold, 0.0f));
+    }
+    for (int p = 0; p < passes; p++) box_blur(bright, r, tmp);
+    for (size_t i = 0; i < n; i++) im->px[i] = blend_add(im->px[i], bright->px[i], strength);
+}
+
+int main(void) {
+    static uint8_t lut[4096];
+    srgb_lut_init(lut);
+    int W = 128, H = 128;
+    Image im = image_new(W, H), bright = image_new(W, H), tmp = image_new(W, H);
+    if (!im.px || !bright.px || !tmp.px) { image_free(&im); image_free(&bright); image_free(&tmp); return 1; }
+    for (int y = 0; y < H; y++)
+        for (int x = 0; x < W; x++)
+            *image_at(&im, x, y) = rgb(0.004f, 0.002f + 0.01f * y / H, 0.02f + 0.03f * y / H);
+    Color h = rgb(0.5f, 0.5f, 0.5f), c = rgb(1, 1, 1), d = rgb(0.0f, 0.33f, 0.67f);
+    for (int i = 0; i < 7; i++) {
+        Color k = color_scale(cosine_palette(i / 7.0f, h, h, c, d), 2.5f);
+        draw_ring_aa(&im, 64, 58, 8 + i * 6.5f, 1.2f, k, 1);
+    }
+    for (int i = 0; i < 9; i++) {
+        Color k = color_scale(cosine_palette(0.5f + i / 18.0f, h, h, c, d), 1.5f);
+        int y = 100 + i * 3;
+        draw_line(&im, 0, y, 127, y - 8 + i, k);
+    }
+    for (int i = 0; i < 24; i++) {
+        float a = i * 0.2618f;
+        draw_disk_aa(&im, 64 + 52 * cosf(a), 58 + 40 * sinf(a), 1.2f, rgb(3, 2.6f, 2), 1);
+    }
+    bloom(&im, 0.6f, 4, 3, 1.4f, &bright, &tmp);
+    image_write_ppm_srgb(&im, stdout, lut);
+    image_free(&im);
+    image_free(&bright);
+    image_free(&tmp);
+    return 0;
+}
+--- stubs
+void bloom(Image *im, float threshold, int r, int passes, float strength, Image *bright, Image *tmp) {
+    (void)im; (void)threshold; (void)r; (void)passes; (void)strength; (void)bright; (void)tmp;
+}
+--- hint
+Three loops: build `bright` from `im`, blur `bright` `passes` times (reusing your `box_blur` and `tmp`), then add `bright * strength` into `im`.
+--- harness
+int main(void) {
+    int w = 24, h = 20;
+    Image im = image_new(w, h), b = image_new(w, h), t = image_new(w, h);
+    if (!im.px || !b.px || !t.px) { CHECK(!"image_new failed"); image_free(&im); image_free(&b); image_free(&t); return TEST_END(); }
+    for (int i = 0; i < w * h; i++) im.px[i] = rgb(0.1f + (i % 7) * 0.05f, 0.2f, 0.3f);
+    bloom(&im, 0.5f, 2, 3, 1.0f, &b, &t);
+    int same = 1;
+    for (int i = 0; i < w * h; i++)
+        if (fabsf(im.px[i].r - (0.1f + (i % 7) * 0.05f)) > 1e-6f || fabsf(im.px[i].b - 0.3f) > 1e-6f) same = 0;
+    CHECK(same);
+
+    image_fill(&im, rgb(0, 0, 0));
+    *image_at(&im, 12, 10) = rgb(5.5f, 0.5f, 3.0f);
+    bloom(&im, 0.5f, 1, 1, 2.0f, &b, &t);
+    CHECK(fabsf(image_at(&im, 12, 10)->r - (5.5f + 2.0f * 5.0f / 9)) < 1e-4f);
+    CHECK(fabsf(image_at(&im, 12, 10)->g - 0.5f) < 1e-6f);
+    CHECK(fabsf(image_at(&im, 12, 10)->b - (3.0f + 2.0f * 2.5f / 9)) < 1e-4f);
+    CHECK(fabsf(image_at(&im, 13, 11)->r - 2.0f * 5.0f / 9) < 1e-4f);
+    CHECK(fabsf(image_at(&im, 11, 9)->b - 2.0f * 2.5f / 9) < 1e-4f);
+    CHECK_DBL(image_at(&im, 14, 10)->r, 0.0);
+    CHECK_DBL(image_at(&im, 13, 11)->g, 0.0);
+
+    image_fill(&im, rgb(0, 0, 0));
+    *image_at(&im, 12, 10) = rgb(2.0f, 2.0f, 2.0f);
+    bloom(&im, 1.0f, 1, 2, 1.0f, &b, &t);
+    CHECK(fabsf(image_at(&im, 12, 10)->r - (2.0f + 9.0f / 81)) < 1e-4f);
+    CHECK(fabsf(image_at(&im, 14, 12)->g - 1.0f / 81) < 1e-5f);
+    CHECK(fabsf(image_at(&im, 13, 10)->b - 6.0f / 81) < 1e-5f);
+    CHECK_DBL(image_at(&im, 15, 10)->r, 0.0);
+    double sum = 0;
+    for (int i = 0; i < w * h; i++) sum += im.px[i].r;
+    CHECK(fabs(sum - 3.0) < 1e-3);
+    image_free(&im); image_free(&b); image_free(&t);
+
+    int n = 512;
+    Image big = image_new(n, n), bb = image_new(n, n), bt = image_new(n, n);
+    if (big.px && bb.px && bt.px) {
+        for (int i = 0; i < n * n; i++) big.px[i] = rgb((i % 97) / 40.0f, 0.1f, (i % 13) / 6.0f);
+        bloom(&big, 0.8f, 24, 3, 0.5f, &bb, &bt);
+        double s = 0;
+        for (int i = 0; i < n * n; i++) s += big.px[i].r + big.px[i].b;
+        CHECK(fabs(s / (n * n) - 2.657238) < 1e-3);
+    } else CHECK(!"image_new failed");
+    image_free(&big); image_free(&bb); image_free(&bt);
+    return TEST_END();
+}
+
+=== quiz
+run: yes
+--- q
+An `Image` of `Color { float r, g, b; }` pixels is 640 wide. At what **float** offset into `(float *)im.px` does the green channel of pixel `(x, y) = (3, 2)` live?
+--- code
+#include <stdio.h>
+
+int main(void) {
+    int w = 640, x = 3, y = 2;
+    size_t pixel = (size_t)y * w + x;
+    printf("%zu\n", pixel * 3 + 1);
+    return 0;
+}
+--- choice
+1923
+--- answer
+3850
+--- choice
+1283
+--- choice
+5763
+--- explain
+Pixel index `y*w + x = 1283`; each pixel is 3 floats, and green is the second: `1283*3 + 1 = 3850`.
+
+=== quiz
+--- q
+You average a black pixel (0) and a white pixel (255) of an sRGB image by computing `(0 + 255) / 2 = 128` on the bytes. What went wrong?
+--- choice
+Nothing: 128 is exactly half the light of 255.
+--- answer
+The bytes are sRGB-encoded; averaging must happen in linear light. Half the light is linear 0.5, which encodes to byte 188. 128 is only about 22% of the light.
+--- choice
+Integer division rounded the result down; it should be 127.5.
+--- choice
+The average should be taken of the packed `uint32_t` values instead.
+--- explain
+Decode to linear, compute, encode once at the end. Any operation that sums or mixes light (blending, blurring, resizing, anti-aliasing, lighting) is wrong on sRGB bytes.
+
+=== quiz
+run: yes
+--- q
+What does this print?
+--- code
+#include <stdint.h>
+#include <stdio.h>
+
+int main(void) {
+    uint32_t p = 0xFF000000u | 0x40u << 16 | 0x80u << 8 | 0xC0u;
+    printf("%08X %u\n", p, (unsigned)((p >> 8) & 0xFF));
+    return 0;
+}
+--- choice
+FF4080C0 64
+--- answer
+FF4080C0 128
+--- choice
+C08040FF 128
+--- choice
+FF4080C0 192
+--- explain
+Red is in bits 16-23, green in 8-15, blue in 0-7. Shifting right by 8 and masking with `0xFF` extracts green, `0x80` = 128.
+
+=== quiz
+--- q
+A box blur with radius `r` on a `w × h` image. Which costs are right?
+--- choice
+Direct 2D: `O(w h r)`; separable: `O(w h)`; sliding window: `O(w h / r)`.
+--- answer
+Direct 2D: `O(w h r²)`; separable: `O(w h r)`; separable with sliding window: `O(w h)`.
+--- choice
+All three are `O(w h r²)`; only the constant factor differs.
+--- choice
+Direct 2D: `O(w h r²)`; separable: `O(w h r²)` but with better cache use; sliding window: `O(w h r)`.
+--- explain
+Separability turns a `(2r+1)²` window into two `(2r+1)` windows. The running sum then makes each 1D output cost two additions, independent of `r`.
+
+=== quiz
+--- q
+Why does compositing with **premultiplied** alpha avoid dark halos when a sprite with transparent edges is blurred or downscaled?
+--- choice
+Premultiplied images use more bits per channel.
+--- choice
+Premultiplied images are stored in sRGB, so filtering is perceptual.
+--- answer
+In premultiplied form a fully transparent pixel is `(0,0,0,0)` and contributes nothing to a filtered color; in straight alpha its (often black) RGB is averaged into neighboring visible pixels.
+--- choice
+Filtering skips pixels whose alpha is zero only in premultiplied form.
+--- explain
+Filtering a straight-alpha image averages colors that should have been weighted by their alpha. Premultiplying does the weighting up front, so plain averaging of all four channels is correct.

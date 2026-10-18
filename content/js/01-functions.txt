@@ -88,9 +88,30 @@ a.inc(); a.inc(); b.dec();
 console.log(a.value, b.value);          // independent: each call made a new n
 ```
 
+### A seeded random number generator
+
+The canonical procedural-generation closure: a PRNG whose state lives in a closure. `mulberry32` is a tiny, fast, well-distributed 32-bit generator; every call advances the private state and returns a float in `[0, 1)`. Same seed, same sequence, forever, which is what makes a generated world reproducible from one number.
+
+```js
+function mulberry32(seed) {
+  let a = seed >>> 0;                    // private state, captured by the closure below
+  return function next() {
+    a = (a + 0x6d2b79f5) >>> 0;
+    let t = a;
+    t = Math.imul(t ^ (t >>> 15), t | 1);
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+const r1 = mulberry32(42), r2 = mulberry32(42), r3 = mulberry32(7);
+console.log(r1().toFixed(6), r1().toFixed(6), r2().toFixed(6), r3().toFixed(6));
+```
+
+`r1` and `r2` have separate states that happen to start equal; `r3` is a different stream. Nothing outside can touch `a`, so no other code can disturb the sequence by accident.
+
 Closures are how JavaScript did private state for 20 years before `#private` fields existed, and they are still the lightest way to do it.
 
-> **Performance:** creating a closure allocates (a function object, plus a context object for captured variables). That's nothing at setup time and a real cost in a frame loop. `enemies.forEach(e => e.update(dt))` inside `update()` allocates a fresh arrow every frame; `setTimeout(() => ..., 0)` per bullet allocates per bullet. Hoist callbacks out of hot paths, or use a plain `for` loop, which allocates nothing. Same for `fn.bind(this)` in a loop: bind once in the constructor, not every frame.
+> **Performance:** creating a closure allocates (a function object, plus a context object for captured variables). That's nothing at setup time and a real cost in a hot loop. A texture generator that does `for (let i = 0; i < w * h; i++) { const shade = v => v * light; ... }` creates a million closures for a 1024x1024 image; `points.forEach(p => ...)` inside a per-frame function allocates a fresh arrow every frame. Hoist functions out of per-pixel and per-frame code (define them once, outside the loop), or use a plain `for` loop, which allocates nothing. Same for `fn.bind(this)` in a loop: bind once, up front.
 
 ### The loop capture classic
 
@@ -159,29 +180,28 @@ loggedAdd(2, 3);
 
 The wrapper uses `function` and `fn.apply(this, args)` rather than an arrow and `fn(...args)` so that it passes `this` through when the wrapped function is used as a method. That's the standard pattern for decorators like `once`, `memoize`, `debounce`.
 
-### Game flavour: behaviours as functions
+### Procgen flavour: shaping functions
 
-Games use higher-order functions for things like easing curves, AI behaviours and event handlers. A function returning a function is a tiny, allocation-free-at-runtime way to configure behaviour up front:
+Procedural textures are built from small numeric functions composed together: interpolation, fade curves, remapping. Functions that build functions let you configure a pattern once and evaluate it per pixel:
 
 ```js
-// Easing functions map t in [0, 1] to progress in [0, 1]
-const linear = t => t;
-const easeOutQuad = t => 1 - (1 - t) * (1 - t);
-const reverse = ease => t => 1 - ease(1 - t);
+const lerp = (a, b, t) => a + (b - a) * t;
+const clamp01 = x => Math.min(1, Math.max(0, x));
+const smoothstep = (e0, e1, x) => { const t = clamp01((x - e0) / (e1 - e0)); return t * t * (3 - 2 * t); };
+const fade = t => t * t * t * (t * (t * 6 - 15) + 10);        // Perlin's quintic fade curve
 
-function tween(from, to, duration, ease = linear) {
-  return elapsed => {
-    const t = Math.min(1, elapsed / duration);
-    return from + (to - from) * ease(t);
-  };
-}
-const slide = tween(0, 100, 500, easeOutQuad);   // configured once...
-const fadeIn = tween(0, 1, 200, reverse(easeOutQuad));
-console.log([0, 125, 250, 500, 900].map(ms => slide(ms)));   // ...called every frame
-console.log(fadeIn(100));
+// stripes(freq) returns a pattern function f(x) in [0, 1]
+const stripes = freq => x => 0.5 + 0.5 * Math.sin(x * freq * 2 * Math.PI);
+const sharpen = (f, lo, hi) => x => smoothstep(lo, hi, f(x));  // a function of a function
+const marbleish = sharpen(stripes(3), 0.3, 0.7);               // built once...
+
+const row = [];
+for (let x = 0; x < 16; x++) row.push(marbleish(x / 16).toFixed(1));  // ...evaluated per pixel
+console.log(row.join(' '));
+console.log(fade(0.5), lerp(10, 20, 0.25), smoothstep(0, 1, 0.5));
 ```
 
-The closures are created once, when the tween starts; calling `slide(ms)` per frame allocates nothing.
+The closures are created once; calling `marbleish(x)` per pixel allocates nothing. (Whether the extra function-call layers cost anything is up to the JIT, which usually inlines small functions like these. Measure before flattening them by hand.)
 
 ### Partial application and currying
 
@@ -274,7 +294,7 @@ The recursive calls go through `fib`, the *memoized* wrapper, because the arrow 
 === exercise once
 title: once
 --- prompt
-Some things must happen exactly once however many times the code path is hit: unlocking an achievement, initializing the audio context on the first click. Write `once(fn)` returning a function that calls `fn` the first time it is called (passing all arguments and preserving `this`) and returns its result. Every later call returns that same first result without calling `fn` again.
+Some things must happen exactly once however many times the code path is hit: building a noise permutation table, compiling a shader, creating the GPU device. Write `once(fn)` returning a function that calls `fn` the first time it is called (passing all arguments and preserving `this`) and returns its result. Every later call returns that same first result without calling `fn` again.
 
 The result may legitimately be `undefined`; that still counts as "already called". If `fn` throws, the error propagates and the next call tries again.
 --- starter
@@ -323,10 +343,91 @@ Return a `function` (not an arrow) and call `fn.apply(this, args)` so method cal
   eq([f1(), f2(), f1()], [1, 2, 1], 'independent instances');
 }
 
+=== exercise seeded
+title: A seeded RNG object
+--- prompt
+Build a small deterministic random toolkit on top of the `mulberry32` closure from the chapter (copy it into your code). Write `makeRng(seed)` returning an object with:
+
+- `next()`: the next float in `[0, 1)` from mulberry32's sequence for `seed`.
+- `float(min, max)`: `min + next() * (max - min)`.
+- `int(min, max)`: an integer in `[min, max]` inclusive: `min + Math.floor(next() * (max - min + 1))`.
+- `pick(arr)`: `arr[int(0, arr.length - 1)]`; for an empty array return `undefined` **without** advancing the state.
+- `fork()`: a new, independent generator `makeRng(Math.floor(next() * 4294967296))`. Forking advances the parent by one step. Procedural generators fork a child stream per chunk or per object, so adding a tree in one place doesn't shift every random number after it.
+
+Each method must consume exactly one `next()` (except an empty `pick`), because the tests compare exact sequences. Generators made with the same seed must be independent of each other and of any other generator.
+--- starter
+function makeRng(seed) {
+  return {
+    next: () => Math.random(),
+    int: (min, max) => min + Math.floor(Math.random() * (max - min)),
+  };
+}
+--- solution
+function mulberry32(seed) {
+  let a = seed >>> 0;
+  return function next() {
+    a = (a + 0x6d2b79f5) >>> 0;
+    let t = a;
+    t = Math.imul(t ^ (t >>> 15), t | 1);
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+function makeRng(seed) {
+  const next = mulberry32(seed);
+  const int = (min, max) => min + Math.floor(next() * (max - min + 1));
+  return {
+    next,
+    float: (min, max) => min + next() * (max - min),
+    int,
+    pick: arr => (arr.length ? arr[int(0, arr.length - 1)] : undefined),
+    fork: () => makeRng(Math.floor(next() * 4294967296)),
+  };
+}
+--- hint
+Create `const next = mulberry32(seed)` inside `makeRng`; every method closes over that one `next`, so they all share and advance the same state.
+--- hint
+`fork` just calls `makeRng` recursively with a seed drawn from the parent.
+--- harness
+{
+  const ref = (seed) => {
+    let a = seed >>> 0;
+    return () => {
+      a = (a + 0x6d2b79f5) >>> 0;
+      let t = a;
+      t = Math.imul(t ^ (t >>> 15), t | 1);
+      t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  };
+  const r = makeRng(42), q = ref(42);
+  eq([r.next(), r.next(), r.next()], [q(), q(), q()], 'next follows mulberry32');
+  const r2 = makeRng(42), q2 = ref(42);
+  eq(r2.float(-1, 1), -1 + q2() * 2, 'float');
+  const ints = [], want = [];
+  for (let i = 0; i < 50; i++) { ints.push(r2.int(1, 6)); want.push(1 + Math.floor(q2() * 6)); }
+  eq(ints, want, 'int sequence');
+  check(ints.every(v => v >= 1 && v <= 6) && ints.includes(6) && ints.includes(1), 'int is inclusive');
+  eq(r2.pick(['oak', 'pine', 'birch']), ['oak', 'pine', 'birch'][Math.floor(q2() * 3)], 'pick');
+  eq(r2.pick([]), undefined);
+  eq(r2.next(), q2(), 'empty pick does not advance');
+  const parent = makeRng(7), pref = ref(7);
+  const child = parent.fork();
+  const cref = ref(Math.floor(pref() * 4294967296));
+  eq([child.next(), child.next()], [cref(), cref()], 'fork seeds a child stream');
+  eq(parent.next(), pref(), 'fork advanced the parent by one');
+  const a = makeRng(1), b = makeRng(1);
+  a.next(); a.next();
+  eq(b.next(), ref(1)(), 'same-seed generators are independent');
+  check(makeRng(1).next() !== makeRng(2).next(), 'different seeds differ');
+  eq(makeRng(-1).next(), ref(4294967295)(), 'negative seed treated as uint32');
+}
+
 === exercise counters
 title: Counter factory
 --- prompt
-Score counters, ammo, combo meters: a clamped counter is everywhere in game code. Write `makeCounter({ start = 0, step = 1, min = -Infinity, max = Infinity } = {})` returning an object with methods:
+Zoom levels, level-of-detail steps, octave counts in a generator's UI: a clamped stepping counter shows up everywhere. Write `makeCounter({ start = 0, step = 1, min = -Infinity, max = Infinity } = {})` returning an object with methods:
 
 - `next()`: adds `step` and returns the new value, but never goes above `max` (clamps to it).
 - `prev()`: subtracts `step`, clamped to `min`.
@@ -443,13 +544,13 @@ Store the result at the leaf under a unique key (a `Symbol` works well), and sta
 }
 
 === exercise debounceSync
-title: Weapon cooldown
+title: Throttled regeneration
 --- prompt
-Holding the fire button calls `fire()` every frame, but the gun should only shoot every `interval` ms. Write a general `throttle(fn, interval, now)` where `now` is a function returning the current time in milliseconds (the tests pass a fake clock, so no real timers are involved; games use a game clock for exactly this reason, so that pausing and replays work).
+Dragging a "roughness" slider fires dozens of input events per second, but regenerating the 1024x1024 texture takes 40 ms. Regenerate at most once every `interval` ms. Write a general `throttle(fn, interval, now)` where `now` is a function returning the current time in milliseconds (the tests pass a fake clock, so no real timers are involved; injecting the clock is also what makes time-dependent code testable and replayable).
 
 The returned function calls `fn` (with its arguments and `this`) if at least `interval` ms have passed since the last call **that actually ran** (the first call always runs), and returns `fn`'s result. Otherwise it skips `fn` and returns the result of the last call that ran.
 
-It will be called every frame, so don't allocate anything per call beyond what `fn` itself does (no new arrays or closures in the hot path).
+It will be called very often, so don't allocate anything per call beyond what `fn` itself does (no new arrays or closures in the hot path).
 --- starter
 function throttle(fn, interval, now) {
   return (...args) => fn(...args);

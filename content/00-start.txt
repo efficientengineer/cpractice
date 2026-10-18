@@ -147,14 +147,17 @@ Shortcuts: **Ctrl+Enter** runs, **Ctrl+Shift+Enter** checks against the tests.
 
 > **Performance:** `-O0` with sanitizers is the right setting for *finding bugs*, and the wrong one for *measuring speed*: code here runs several times slower than an optimized build. When you care how fast something is, build with `gcc -O2` (and no sanitizers) on your own machine and measure before and after; never guess. Some exercises here have large-input tests with a 10 second limit. Those are not checking micro-optimizations; they fail a solution that does the wrong *amount* of work (an O(n²) loop where O(n) was possible), which no optimizer can save.
 
-## Thinking like a game programmer
+## Thinking like a graphics programmer
 
-The examples and exercises lean toward game code: health and damage, tile maps, entities, particles, inventories. A game is a loop that must finish all its work in a fixed **frame budget**: 16.7 ms at 60 frames per second, 6.9 ms at 144. That budget shapes the habits this course teaches from the start:
+The examples and exercises lean toward graphics and procedural generation: pixels and colors, image buffers, vectors, noise, meshes, tile maps and height fields, with some game code (health, entities, cooldowns) along the way. Real-time graphics lives inside a **frame budget**: 16.7 ms at 60 frames per second, 6.9 ms at 144, and a procedural texture can mean a function called once per pixel, 16 million times for a 4096x4096 image. That shapes the habits this course teaches from the start:
 
-- **Do the expensive work once, outside the loop**: allocate memory at load time, convert units when data is loaded, look up names once and keep the result.
-- **Keep data contiguous**: arrays of plain values, walked in order, are what CPUs are fastest at.
-- **Count the work**: an O(n²) loop over 10,000 entities is 100 million steps, every frame.
+- **Do the expensive work once, outside the loop**: allocate memory at load time, convert units when data is loaded, precompute tables, look up names once and keep the result.
+- **Keep data contiguous**: flat arrays of plain values (pixels, vertices, floats), walked in memory order, are what CPUs are fastest at.
+- **Count the work**: an O(n²) loop over 10,000 vertices is 100 million steps; a per-pixel cost multiplies by millions.
+- **Be deterministic**: a generator given the same seed must produce the same output, which is also what makes it testable.
 - **Measure** before optimizing, with an optimized build.
+
+C programs here can also *draw*: print a plain-text PPM image (`P3`, then `W H`, then `255`, then one `r g b` triple per pixel) and the output panel shows it as a picture. Keep such images at 128x128 or smaller.
 
 Notes marked **Performance** throughout the chapters point out the cheap way to do things and the habits to avoid.
 

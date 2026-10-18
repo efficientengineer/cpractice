@@ -6,7 +6,7 @@ blurb: How this site runs JavaScript, let/const and the TDZ, the type system, eq
 
 You have written JavaScript before, and you know C#. This course assumes both and goes for depth: the parts of JavaScript that a C# brain gets subtly wrong, and the modern features (ES2015 to ES2025) that changed how idiomatic code looks.
 
-The examples lean towards game code (entities, inventories, vectors, tile maps, timers, input), and **Performance** notes point out habits that matter in a 60 fps loop, where you have 16.7 ms per frame and every allocation is future work for the garbage collector. The point is to learn the cheap way first rather than unlearn the expensive way later.
+The examples lean towards graphics and procedural generation: pixels and colors, vectors, seeded random numbers, hash functions, meshes, height fields. **Performance** notes point out habits that matter when code runs once per pixel (a 1024x1024 texture is a million calls) or once per frame (16.7 ms at 60 fps), where every allocation is future work for the garbage collector. The point is to learn the cheap way first rather than unlearn the expensive way later.
 
 The headline differences from C#:
 
@@ -29,7 +29,7 @@ Your code runs in your own browser, inside a **Web Worker**. There is no DOM (`d
 - Your whole program is the body of an **`async` function**. That means top-level `await` works, and `return` at the top level is legal (it ends the program).
 - `import`/`export` statements are not allowed (it is not a module). Dynamic `import('https://...')` works in principle but no course code needs it.
 - The *result* of a run (what tests and quizzes compare) is the output printed before that async body finishes. The worker stays alive afterwards, so timers and `requestAnimationFrame` loops keep running and their output streams in late, until you press Run again. In test runs, anything after the body ends doesn't count: `await` what you want checked.
-- Code that mentions `canvas` gets a 512x512 `OffscreenCanvas` (`canvas.getContext('2d')`), and input globals for games: `keys` (a `Set` of held `KeyboardEvent.code` values like `'ArrowLeft'`, `'KeyW'`, `'Space'`), `mouse` (`{ x, y, down }`), and `input.onKeyDown(fn)`. This course mostly sticks to logic; the Game development track uses the canvas heavily.
+- Code that mentions `canvas` gets a 512x512 `OffscreenCanvas`: `canvas.getContext('2d')` and `ctx.putImageData(...)` show a procedural texture you computed into a pixel array. There are also input globals (`keys`, a `Set` of held key codes, and `mouse`, `{ x, y, down }`) for interactive demos. This course mostly sticks to logic and tests; the graphics tracks use the canvas heavily.
 - The body runs in *sloppy mode* (not strict), like an old-fashioned script. Real modules and class bodies are always strict. Where the difference shows, the course says so; put `'use strict';` as the very first line to get strict semantics.
 - There is a 5 second timeout, so infinite loops die instead of hanging the tab.
 
@@ -176,7 +176,27 @@ console.log(1 / 0, -1 / 0, 0 / 0);
 - `bigint` is exact for any size but can't mix with `number` (`1n + 1` throws) and has no fractional part.
 - Bitwise operators (`|`, `&`, `<<`, `>>`, `~`) convert to **32-bit signed integers**. `x | 0` truncates to int32, and `>>> 0` reinterprets as unsigned. Values above 2^31 wrap.
 
-> **Performance:** engines don't really store every number as a double. Small integers (31-bit on V8, "Smis") live unboxed in the value itself and integer arithmetic stays on fast paths; doubles that escape into objects may be *boxed* on the heap. Keeping hot values integral (tile coordinates, indexes, entity ids) and not mixing `undefined` or strings into numeric arrays keeps arrays in their fast "packed numbers" mode. For bulk numeric data (positions of 10,000 particles) use typed arrays like `Float32Array`: contiguous, fixed type, no boxing. They get their own chapter.
+> **Performance:** engines don't really store every number as a double. Small integers (31-bit on V8, "Smis") live unboxed in the value itself and integer arithmetic stays on fast paths; doubles that escape into objects may be *boxed* on the heap. Keeping hot values integral (pixel coordinates, indexes, hash states) and not mixing `undefined` or strings into numeric arrays keeps arrays in their fast "packed numbers" mode. For bulk numeric data (the RGBA bytes of a texture, the positions of 100,000 vertices) use typed arrays like `Uint8ClampedArray` and `Float32Array`: contiguous, fixed type, no boxing, and exactly what canvas and WebGPU consume. They get their own chapter.
+
+### Integer hashing: Math.imul and >>> 0
+
+Procedural generation runs on **deterministic** randomness: the same seed and coordinates must always give the same value, so a texture or terrain can be regenerated, tiled, or computed in any order. That's done with integer hash functions, which need 32-bit multiplication that wraps like C's `uint32_t`. Plain `*` on doubles doesn't wrap (it loses low bits once the product passes 2^53), so use `Math.imul(a, b)` (32-bit wrapping multiply) and `>>> 0` (reinterpret as unsigned):
+
+```js
+// A small 2D integer hash: same inputs, same output, on every machine
+function hash2(x, y, seed) {
+  let h = Math.imul(x, 0x27d4eb2d) ^ Math.imul(y, 0x165667b1) ^ seed;
+  h = Math.imul(h ^ (h >>> 15), 0x2c1b3c6d);
+  h = Math.imul(h ^ (h >>> 12), 0x297a2d39);
+  return (h ^ (h >>> 15)) >>> 0;               // unsigned 32-bit
+}
+const toUnit = h => h / 4294967296;             // map to [0, 1)
+console.log(hash2(0, 0, 1), hash2(1, 0, 1), hash2(0, 0, 1) === hash2(0, 0, 1));
+console.log(toUnit(hash2(10, 20, 42)).toFixed(4));
+console.log(0x7fffffff * 0x7fffffff, Math.imul(0x7fffffff, 0x7fffffff));
+```
+
+`Math.random()` is the opposite: unseeded and unrepeatable. Use it for nothing that must look the same twice.
 
 ### NaN
 
@@ -207,7 +227,7 @@ console.log('ab'.repeat(3), 'a-b-c'.replaceAll('-', '+'), 'é'.length, '😀'.le
 
 `+` with a string on either side concatenates: `1 + '2'` is `'12'`, but `'3' * '4'` is `12` because `*` only does numbers. `length` counts UTF-16 code units, so an emoji is 2; `[...str]` iterates by code point.
 
-> **Performance:** every template literal or `+` concatenation creates a new string. Building a HUD string like `` `HP ${hp}/${max}` `` every frame is 60 short-lived strings a second per label: cheap individually, but it adds GC churn for text that rarely changes. Rebuild it only when `hp` changes. Don't use string keys like `` `${x},${y}` `` for per-frame lookups in hot loops either; compute a numeric index `y * width + x` instead.
+> **Performance:** every template literal or `+` concatenation creates a new string. A debug overlay that rebuilds `` `fps ${fps.toFixed(1)}` `` every frame is cheap; building a string per *pixel* or per *vertex* is not. Never use string keys like `` `${x},${y}` `` for lookups in a per-pixel loop: compute a numeric index `y * width + x` instead. And never build image data as text (`'rgb(' + r + ...`) when you can write bytes into a typed array.
 
 ## Optional chaining and nullish coalescing
 
@@ -264,9 +284,9 @@ Watch out for `for (const k in obj)`: `for...in` iterates *keys* (as strings, in
 === exercise orDefault
 title: Defaults done right
 --- prompt
-A game reads its settings from a save file that may be missing fields, or missing entirely. Write `withDefaults(opts)` that takes an options object (possibly `null` or `undefined`) and returns a **new** object `{ width, height, title, visible }` where each field is taken from `opts` if it is not `null`/`undefined`, otherwise defaults to `width: 800`, `height: 600`, `title: 'Untitled'`, `visible: true`.
+A renderer reads its output options from a preset file that may be missing fields, or missing entirely. Write `withDefaults(opts)` that takes an options object (possibly `null` or `undefined`) and returns a **new** object `{ width, height, title, visible }` where each field is taken from `opts` if it is not `null`/`undefined`, otherwise defaults to `width: 800`, `height: 600`, `title: 'Untitled'`, `visible: true`.
 
-Legitimate values like `0`, `''` and `false` must be kept: a player who turned the window to `visible: false` or chose a width of `0` (whatever that means) must not have it silently reset. Ignore any other properties of `opts`.
+Legitimate values like `0`, `''` and `false` must be kept: a preset that says `visible: false` (render offscreen) or an empty `title` must not have it silently reset. Ignore any other properties of `opts`.
 
 ```js
 withDefaults({ width: 0, title: '' })  // { width: 0, height: 600, title: '', visible: true }
@@ -361,10 +381,10 @@ eq(parseIntStrict('-9007199254740991'), -9007199254740991);
 === exercise intdiv
 title: Integer math with doubles
 --- prompt
-JavaScript has no integer division, and tile games need it constantly. Write two functions that work on integer-valued numbers:
+JavaScript has no integer division, and texture and grid code needs it constantly. Write two functions that work on integer-valued numbers:
 
 - `idiv(a, b)`: division truncated toward zero, like C# `a / b` on ints. Throw an `Error` if `b` is `0`.
-- `mod(a, b)`: the mathematical modulo, always in `[0, |b|)`, so `mod(-1, 5)` is `4` (C#'s and JS's `%` give `-1`). This is what you want for a world that wraps around: moving left from column `0` of a 5-column map must land on column `4`, and an animation frame index must cycle `0..n-1` however long the game runs.
+- `mod(a, b)`: the mathematical modulo, always in `[0, |b|)`, so `mod(-1, 5)` is `4` (C#'s and JS's `%` give `-1`). This is *wrap* addressing for tileable textures: sampling column `-1` of a 5-pixel-wide texture must read column `4`, so the pattern repeats seamlessly in both directions.
 
 Make sure neither ever returns `-0`.
 --- starter
@@ -458,18 +478,18 @@ eq(typeName(Object.create(null)), 'object');
 === exercise getPath
 title: Safe deep property access
 --- prompt
-Save files and level data come in as loosely structured JSON. Write `getPath(obj, path, fallback)` where `path` is a dotted string like `'player.inventory.0.name'`. Walk the path one key at a time and return the value found. If any step hits `null` or `undefined` (including the final value), return `fallback`.
+Scene and material files come in as loosely structured JSON. Write `getPath(obj, path, fallback)` where `path` is a dotted string like `'material.layers.0.color'`. Walk the path one key at a time and return the value found. If any step hits `null` or `undefined` (including the final value), return `fallback`.
 
 Only `null`/`undefined` count as missing: a final value of `0`, `''` or `false` is returned as is. An empty path returns `obj` itself (or `fallback` if `obj` is nullish). Array indexes are just keys (`arr['0']` works).
 
 ```js
-const save = { player: { name: 'Ada', inventory: ['sword', 'potion'], gold: 0 } };
-getPath(save, 'player.inventory.1')        // 'potion'
-getPath(save, 'player.gold', 99)           // 0
-getPath(save, 'player.pet.name', 'none')   // 'none'
+const scene = { material: { name: 'marble', layers: ['base', 'veins'], roughness: 0 } };
+getPath(scene, 'material.layers.1')            // 'veins'
+getPath(scene, 'material.roughness', 0.5)      // 0
+getPath(scene, 'material.normalMap.url', '')   // ''
 ```
 
-> **Performance:** splitting a path string is fine for loading a save file once. Don't do lookups like this per entity per frame: parsing strings in a hot loop is pure overhead compared to `entity.pos.x`.
+> **Performance:** splitting a path string is fine for loading a scene once. Don't do lookups like this per vertex or per pixel: parsing strings in a hot loop is pure overhead compared to `mat.roughness`. Resolve the path once, keep the result in a local, then loop.
 --- starter
 function getPath(obj, path, fallback) {
   // walk the path
@@ -506,6 +526,82 @@ Split on `'.'`, then loop: `cur = cur[key]`, bailing out with `fallback` as soon
   eq(getPath(null, '', 7), 7);
   eq(getPath(null, 'a', 7), 7);
   eq(getPath('abc', 'length'), 3);
+}
+
+=== exercise prng
+title: An integer hash for procedural noise
+--- prompt
+Procedural textures need a function from integer coordinates to a random-looking but **deterministic** value. Implement the well-known *lowbias32* integer hash:
+
+```text
+x ^= x >>> 16
+x  = x * 0x7feb352d      (32-bit wrapping multiply)
+x ^= x >>> 15
+x  = x * 0x846ca68b      (32-bit wrapping multiply)
+x ^= x >>> 16
+return x as an unsigned 32-bit integer
+```
+
+- `hashInt(x)` takes any integer (negative ones included; treat it as its 32-bit two's complement pattern) and returns an integer in `[0, 2^32)`.
+- `valueAt(x, y, seed)` returns `hashInt(x + hashInt(y + hashInt(seed))) / 2^32`, a value in `[0, 1)`. This is "value noise" before smoothing: one random value per lattice point.
+
+The starter uses `*`, which looks right but isn't: the products exceed 2^53, so low bits are lost to double rounding. The tests compare against an exact BigInt reference.
+--- starter
+function hashInt(x) {
+  x ^= x >>> 16;
+  x = x * 0x7feb352d;
+  x ^= x >>> 15;
+  x = x * 0x846ca68b;
+  x ^= x >>> 16;
+  return x;
+}
+
+function valueAt(x, y, seed) {
+  return hashInt(x + hashInt(y + hashInt(seed))) / 4294967296;
+}
+--- solution
+function hashInt(x) {
+  x ^= x >>> 16;
+  x = Math.imul(x, 0x7feb352d);
+  x ^= x >>> 15;
+  x = Math.imul(x, 0x846ca68b);
+  x ^= x >>> 16;
+  return x >>> 0;
+}
+
+function valueAt(x, y, seed) {
+  return hashInt(x + hashInt(y + hashInt(seed))) / 4294967296;
+}
+--- hint
+`Math.imul(a, b)` multiplies as 32-bit integers and keeps the low 32 bits, exactly like C's `uint32_t` multiply.
+--- hint
+`^` and `>>>` produce signed and unsigned 32-bit results respectively. Finish with `>>> 0` so the result is never negative.
+--- harness
+{
+  const M = 0xffffffffn;
+  const ref = (x) => {
+    let v = BigInt.asUintN(32, BigInt(x));
+    v ^= v >> 16n; v = (v * 0x7feb352dn) & M;
+    v ^= v >> 15n; v = (v * 0x846ca68bn) & M;
+    v ^= v >> 16n;
+    return Number(v);
+  };
+  for (const x of [0, 1, 2, 3, 42, 255, 65535, 65536, 123456789, 2147483647, -1, -2, -123456, 4294967295]) {
+    eq(hashInt(x), ref(x), 'hashInt(' + x + ')');
+  }
+  let ok = true;
+  for (let x = -500; x < 500; x++) if (hashInt(x * 7919) !== ref(x * 7919)) ok = false;
+  check(ok, 'hashInt matches the reference on 1000 inputs');
+  check(hashInt(-1) >= 0, 'unsigned result');
+  const refVal = (x, y, s) => ref(x + ref(y + ref(s))) / 4294967296;
+  for (const [x, y, s] of [[0, 0, 0], [1, 2, 3], [-5, 7, 42], [100, -100, 1337], [65535, 65536, 7]]) {
+    eq(valueAt(x, y, s), refVal(x, y, s), `valueAt(${x}, ${y}, ${s})`);
+  }
+  let inRange = true;
+  for (let i = 0; i < 2000; i++) { const v = valueAt(i, i * 3, 9); if (!(v >= 0 && v < 1)) inRange = false; }
+  check(inRange, 'values in [0, 1)');
+  eq(valueAt(3, 4, 5), valueAt(3, 4, 5), 'deterministic');
+  check(valueAt(3, 4, 5) !== valueAt(3, 4, 6), 'seed changes the value');
 }
 
 === exercise fizz
@@ -656,6 +752,24 @@ console.log(vals.map(v => !!v));
 [ true, false, false, false, false, false, true, false, false, false ]
 --- explain
 The falsy values are exactly `false`, `0`, `-0`, `0n`, `NaN`, `''`, `null` and `undefined`. Non-empty strings (even `'0'` and `'false'`) and all objects (even empty arrays and objects) are truthy.
+
+=== quiz
+run: yes
+--- q
+What does this print?
+--- code
+const a = 0x9E3779B9, b = 0x85EBCA6B;
+console.log((a * b) % 2 ** 32 === (Math.imul(a, b) >>> 0), a | 0, (a | 0) >>> 0 === a);
+--- choice
+true -1640531527 true
+--- answer
+false -1640531527 true
+--- choice
+false 2654435769 false
+--- choice
+true 2654435769 true
+--- explain
+The exact product of two 32-bit numbers needs up to 64 bits, more than a double's 53-bit mantissa, so `a * b` is rounded and its low 32 bits are wrong. `Math.imul` computes the exact low 32 bits. `| 0` reinterprets `0x9E3779B9` as a signed int32 (negative, since the top bit is set) and `>>> 0` turns it back into the unsigned value.
 
 === quiz
 --- q
