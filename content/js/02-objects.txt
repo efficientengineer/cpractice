@@ -7,19 +7,26 @@ blurb: Literals, shorthand, computed keys, destructuring, spread, references and
 A JavaScript object is a collection of properties: string (or symbol) keys mapped to values. There's no class required, no fixed shape, and you can add or delete properties at any time. Think `Dictionary<string, object>` with nicer syntax, plus a link to a *prototype* (the classes chapter).
 
 ```js
-const user = {
-  name: 'Ada',
-  'favourite language': 'js',     // any string works as a key if quoted
-  42: 'answer',                   // number keys become strings
-  greet() { return `Hi, I'm ${this.name}`; },   // method shorthand
+const goblin = {
+  name: 'Goblin',
+  hp: 7,
+  'loot table': ['coin', 'dagger'],   // any string works as a key if quoted
+  42: 'answer',                       // number keys become strings
+  describe() { return `${this.name} (${this.hp} hp)`; },   // method shorthand
 };
-user.age = 36;                    // add
-delete user[42];                  // remove
-console.log(user.name, user['favourite language'], user.greet());
-console.log('age' in user, user.missing, Object.keys(user));
+goblin.angry = true;                  // add
+delete goblin[42];                    // remove (but see the performance note below)
+console.log(goblin.name, goblin['loot table'], goblin.describe());
+console.log('angry' in goblin, goblin.missing, Object.keys(goblin));
 ```
 
 Dot access needs a valid identifier; bracket access takes any expression. Reading a missing property gives `undefined` (no exception, unlike a C# dictionary indexer), which is why typos produce `undefined` instead of errors.
+
+### Shapes: how engines make objects fast
+
+Under the hood, V8, SpiderMonkey and JavaScriptCore give every object a hidden *shape* (also called a hidden class or map): the list of its property names in order. Objects created the same way share a shape, and code like `e.x += e.vx` gets compiled into "load from offset 0, offset 2", almost like a C# struct field access. That fast path, an *inline cache*, holds as long as the objects flowing through a piece of code have one shape (monomorphic) or a few.
+
+> **Performance:** keep entity objects shape-stable. Create every field up front in the same order, even if it starts as `null` or `0` (`{ x, y, vx: 0, vy: 0, target: null }`), instead of adding `target` later on some objects. Never `delete` a property from a hot object: it typically drops the object into slow "dictionary mode". Set it to `null` or `undefined` instead. Don't mix types in one field (`hp` sometimes a number, sometimes a string). And don't use plain objects as dynamic dictionaries with keys you add and remove constantly (like entity id to entity): that's what `Map` is for.
 
 ### Shorthand and computed keys
 
@@ -114,6 +121,8 @@ try { structuredClone({ f() {} }); } catch (e) { console.log(e.name); }
 
 The old trick `JSON.parse(JSON.stringify(x))` loses `undefined`, functions, `Date` (becomes a string), `Map`/`Set` (become `{}`), `NaN`/`Infinity` (become `null`), and throws on cycles. Don't use it as a clone.
 
+> **Performance:** spread, `Object.assign`, `structuredClone` and the immutable-update style ("copy with changes") all allocate. That's the right trade for UI state, save files and undo snapshots. It's the wrong one for per-frame entity updates: `entities = entities.map(e => ({ ...e, x: e.x + e.vx }))` creates thousands of objects every frame for the collector to chase. Mutate hot game state in place; copy at the boundaries (saving, networking, undo).
+
 ### Equality
 
 There's no built-in structural equality for objects. `===` is identity. You'll write (or import) a `deepEqual` when you need it; one of the exercises below is exactly that.
@@ -181,7 +190,6 @@ const temp = {
 temp.fahrenheit = 212;
 console.log(temp.celsius, temp.fahrenheit);
 try { temp.celsius = 'hot'; } catch (e) { console.log(e.message); }
-temp.fahrenheit;          // a getter with no setter...
 ```
 
 A getter without a setter makes the property read-only: assignments are silently ignored in sloppy mode and throw in strict mode. Getters run every time, so keep them cheap.
@@ -225,10 +233,34 @@ console.log(parsed.when.getUTCFullYear(), parsed.n);
 
 `JSON.parse` throws a `SyntaxError` on bad input, including trailing commas and single-quoted strings: JSON is stricter than JavaScript literal syntax.
 
+### Save files
+
+JSON is the natural save format for a browser game: `localStorage.setItem('save', JSON.stringify(state))`. A few habits keep saves robust:
+
+```js
+const SAVE_VERSION = 2;
+function serialize(state) {
+  // save only what you can't recompute; derived data (sprites, caches) stays out
+  return JSON.stringify({ v: SAVE_VERSION, level: state.level, player: { x: state.player.x, y: state.player.y, hp: state.player.hp }, inventory: [...state.inventory] });
+}
+function load(text) {
+  let data;
+  try { data = JSON.parse(text); } catch { return null; }    // corrupt save
+  if (data.v === 1) data.inventory ??= [];                 // migrate old versions
+  return { level: data.level ?? 1, player: { x: 0, y: 0, hp: 10, ...data.player }, inventory: new Set(data.inventory) };
+}
+const state = { level: 3, player: { x: 5, y: 7, hp: 4, sprite: '<image>' }, inventory: new Set(['key', 'map']) };
+const text = serialize(state);
+console.log(text);
+console.log(load(text), load('{oops'));
+```
+
+Version the format from day one, merge loaded data over defaults so new fields get values, and treat parse failure as "no save" rather than a crash.
+
 === exercise pick
 title: pick and omit
 --- prompt
-Write two functions:
+Useful for sending only part of an entity over the network or into a save file. Write two functions:
 
 - `pick(obj, keys)` returns a new object with only the listed keys that `obj` actually has as **own** properties (keys not present are skipped, not set to `undefined`). A property whose value is `undefined` but which exists is included.
 - `omit(obj, keys)` returns a new object with all own enumerable properties except the listed ones.
@@ -349,7 +381,7 @@ eq(deepEqual(['1'], [1]), false);
 === exercise deepMerge
 title: deepMerge
 --- prompt
-Write `deepMerge(target, source)` that returns a **new** object combining two configuration objects:
+Games layer configuration: built-in defaults, then a difficulty preset, then the player's own settings. Write `deepMerge(target, source)` that returns a **new** object combining two such layers:
 
 - Every key of `target` and `source` appears in the result.
 - If both sides have a key whose values are both plain objects (not arrays, not `null`), merge them recursively.
@@ -358,8 +390,8 @@ Write `deepMerge(target, source)` that returns a **new** object combining two co
 - Neither input is modified.
 
 ```js
-deepMerge({ a: 1, ui: { theme: 'dark', size: 12 } }, { ui: { size: 14 }, b: 2 })
-// { a: 1, ui: { theme: 'dark', size: 14 }, b: 2 }
+deepMerge({ volume: 1, controls: { jump: 'Space', fire: 'KeyZ' } }, { controls: { fire: 'KeyX' }, hard: true })
+// { volume: 1, controls: { jump: 'Space', fire: 'KeyX' }, hard: true }
 ```
 --- starter
 function deepMerge(target, source) {
@@ -464,7 +496,7 @@ For unflatten, walk all but the last key part creating objects with `node = node
 === exercise immutableUpdate
 title: Immutable nested update
 --- prompt
-Write `setIn(obj, path, value)` where `path` is an array of keys. It returns a new object with the value at `path` replaced, **without modifying `obj`**, copying only the objects along the path (everything else is shared with the original, which is what makes this cheap; React and Redux depend on it).
+Undo stacks, replays and network snapshots want each game state to be its own value, never mutated afterwards. Write `setIn(obj, path, value)` where `path` is an array of keys. It returns a new object with the value at `path` replaced, **without modifying `obj`**, copying only the objects along the path (everything else is shared with the original, which is what makes this cheap: an undo stack of 100 states shares almost all its data; React and Redux depend on the same trick).
 
 - Missing intermediate objects are created as `{}`.
 - If an object on the path is an array, copy it as an array (`[...arr]`), so array identity is preserved as "array".
@@ -490,18 +522,18 @@ Recursion fits: copy the current level, then set `copy[head] = setIn(obj[head], 
 When `obj` is `undefined` (a missing intermediate), `{ ...undefined }` is `{}`, and `obj?.[head]` keeps going safely.
 --- harness
 {
-  const state = { user: { name: 'Ada', prefs: { theme: 'dark' } }, todos: [{ id: 1, done: false }, { id: 2, done: false }], meta: { v: 1 } };
+  const state = { player: { name: 'Ada', stats: { hp: 10 } }, enemies: [{ id: 1, hp: 5 }, { id: 2, hp: 5 }], level: { n: 1 } };
   const snapshot = structuredClone(state);
-  const s2 = setIn(state, ['user', 'prefs', 'theme'], 'light');
-  eq(s2.user.prefs.theme, 'light');
+  const s2 = setIn(state, ['player', 'stats', 'hp'], 7);
+  eq(s2.player.stats.hp, 7);
   eq(state, snapshot, 'original unchanged');
-  check(s2 !== state && s2.user !== state.user && s2.user.prefs !== state.user.prefs, 'path copied');
-  check(s2.todos === state.todos && s2.meta === state.meta, 'siblings shared');
-  const s3 = setIn(state, ['todos', 1, 'done'], true);
-  eq(s3.todos[1], { id: 2, done: true });
-  check(Array.isArray(s3.todos), 'arrays stay arrays');
-  check(s3.todos[0] === state.todos[0], 'other elements shared');
-  eq(state.todos[1].done, false);
+  check(s2 !== state && s2.player !== state.player && s2.player.stats !== state.player.stats, 'path copied');
+  check(s2.enemies === state.enemies && s2.level === state.level, 'siblings shared');
+  const s3 = setIn(state, ['enemies', 1, 'hp'], 0);
+  eq(s3.enemies[1], { id: 2, hp: 0 });
+  check(Array.isArray(s3.enemies), 'arrays stay arrays');
+  check(s3.enemies[0] === state.enemies[0], 'other elements shared');
+  eq(state.enemies[1].hp, 5);
   eq(setIn({}, ['a', 'b', 'c'], 1), { a: { b: { c: 1 } } }, 'creates missing objects');
   eq(setIn({ a: 1 }, [], 'whole'), 'whole');
   eq(setIn({ a: 1 }, ['b'], 2), { a: 1, b: 2 });
@@ -511,7 +543,7 @@ When `obj` is `undefined` (a missing intermediate), `{ ...undefined }` is `{}`, 
 === exercise jsonDates
 title: JSON with dates, maps and sets
 --- prompt
-Plain JSON loses `Date`, `Map` and `Set`. Write `toJSONText(value)` and `fromJSONText(text)` that round-trip them, using `JSON.stringify` with a replacer and `JSON.parse` with a reviver.
+A save file holds an inventory `Set`, a `Map` of quest flags and the date the game was saved. Plain JSON loses `Date`, `Map` and `Set`. Write `toJSONText(value)` and `fromJSONText(text)` that round-trip them, using `JSON.stringify` with a replacer and `JSON.parse` with a reviver.
 
 Encode them as tagged objects: a `Date` as `{ "$date": isoString }`, a `Map` as `{ "$map": [[k, v], ...] }`, a `Set` as `{ "$set": [...] }`. Nested ones (a map inside a set inside an object) must work.
 

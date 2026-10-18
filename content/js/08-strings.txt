@@ -28,6 +28,8 @@ Things that differ from C#:
 - Comparison with `<` compares UTF-16 code units, which is ordinal: `'Z' < 'a'` is true. For human sorting use `localeCompare` or `Intl.Collator`.
 - String concatenation in a loop is fine. Engines use ropes, so there is no need for a `StringBuilder`; building an array and calling `join` is also idiomatic.
 
+> **Performance:** strings are immutable, so every `+`, template literal, `slice`, `split` and `toUpperCase` allocates a new string. That is fine at load time and a bad habit in a frame loop: a HUD that rebuilds `` `Score: ${score}` `` sixty times a second makes garbage for the collector even when the score did not change. Rebuild text only when its value changes (keep the last value and compare), and never `split` or regex-parse data per frame: parse level files, configs and dialogue once at load into numbers, arrays and objects.
+
 ## UTF-16: code units, code points and graphemes
 
 `length` counts **UTF-16 code units**. Characters outside the Basic Multilingual Plane (most emoji, many CJK extension characters, mathematical letters) take two code units, a *surrogate pair*. Indexing, `slice`, `length` and `charCodeAt` all work in code units and can cut a pair in half. The string iterator (`for...of`, spread, `Array.from`) works in **code points**:
@@ -53,6 +55,8 @@ const seg = new Intl.Segmenter('en', { granularity: 'grapheme' });
 console.log([...seg.segment(family)].length);
 console.log([...seg.segment('e\u0301🇯🇵!')].map(x => x.segment));
 ```
+
+> **Performance:** `[...s]` allocates an array plus one string per code point. To count or scan, iterate with `for...of` or step through with `codePointAt` instead of spreading.
 
 Rule of thumb: count `length` for storage and protocol limits, code points when you have to process characters, graphemes when you truncate or display.
 
@@ -128,6 +132,8 @@ console.log('Due: 2024-03-15, paid 2024-04-01'.match(/\d{4}-\d{2}-\d{2}/g));
 for (const x of 'a1b22c333'.matchAll(/[a-z](\d+)/g)) console.log(x[0], x[1], x.index);
 console.log('one  two   three'.split(/\s+/), 'a1b2c'.split(/(\d)/));
 ```
+
+> **Performance:** a regex literal is compiled once and the compiled form is cached, but `new RegExp(...)` inside a function called per frame or per item recompiles every time: hoist it to the top level. `match`, `matchAll`, `exec` and `split` allocate result arrays; when you only need a yes/no, `test` allocates nothing.
 
 The `g` flag makes a regex object stateful: `test` and `exec` start from `lastIndex` and store where they stopped. Reusing a global regex across different strings with `test` is a classic bug, so do not put `g` on a regex you only `test` with.
 
@@ -220,6 +226,8 @@ console.log(tokenize('x = 2 ** (y + 3.5)').map(t => `${t.type}:${t.text}`).join(
 try { tokenize('a + #'); } catch (e) { console.log(e.message); }
 ```
 
+> **Performance:** the sticky regex never copies the input. The common naive tokenizer does `src = src.slice(token.length)` and matches `^...` again, creating a new string per token; on a large file that is a lot of garbage, and in engines that copy on `slice` it turns tokenizing quadratic. Track a position instead.
+
 Order matters in the alternation: `\*\*` must come before `*`, and keywords before general identifiers if they are separate types. When a token can be empty the loop would never advance, so make sure no alternative matches the empty string. The capstone chapter builds a parser on top of this.
 
 === exercise codepoints
@@ -292,7 +300,7 @@ eq(countCodePoints('\uD83D'), 1, 'a lone surrogate counts as one');
 === exercise casing
 title: Case conversions
 --- prompt
-Write `words(s)` that splits an identifier in any common style into lowercase words, then `camelCase(s)`, `snakeCase(s)` and `kebabCase(s)` built on it.
+Asset pipelines constantly convert names between styles (`PlayerShip_v2.png`, `player-ship`, `playerShip`). Write `words(s)` that splits an identifier in any common style into lowercase words, then `camelCase(s)`, `snakeCase(s)` and `kebabCase(s)` built on it.
 
 `words` must handle:
 
@@ -501,34 +509,34 @@ Make a tiny class whose instances hold a string and whose `toString()` returns i
 }
 
 === exercise table
-title: A padded table
+title: A padded leaderboard
 --- prompt
-Print this table using `padStart`/`padEnd` (and `toFixed`), computing column widths from the data rather than hard-coding them. Name is left aligned, the numbers right aligned; each column is as wide as its widest cell (header included), and columns are separated by ` | `. The separator line uses `-` for each column and `-+-` between them.
+Print this end-of-match leaderboard using `padStart`/`padEnd` (and `toFixed`), computing column widths from the data rather than hard-coding them. The player name is left aligned, the numbers right aligned; each column is as wide as its widest cell (header included), and columns are separated by ` | `. The separator line uses `-` for each column and `-+-` between them.
 
 ```text
-name       |  qty |   price
------------+------+--------
-apple      |    3 |    0.50
-watermelon |    1 |   12.00
-fig        | 1200 | 1234.56
+player     | kills |   acc%
+-----------+-------+-------
+zed        |     3 |  50.00
+blackwidow |    17 |   8.25
+ox         |  1200 | 100.00
 ```
 
-The starter has the data. Prices are printed with two decimals.
+The starter has the data. Accuracy is printed with two decimals. This is load-time or end-of-round code, so building strings freely is fine here.
 --- starter
-const header = ['name', 'qty', 'price'];
+const header = ['player', 'kills', 'acc%'];
 const rows = [
-  ['apple', 3, 0.5],
-  ['watermelon', 1, 12],
-  ['fig', 1200, 1234.56],
+  ['zed', 3, 50],
+  ['blackwidow', 17, 8.25],
+  ['ox', 1200, 100],
 ];
 console.log(header.join(' | '));
 for (const r of rows) console.log(r.join(' | '));
 --- solution
-const header = ['name', 'qty', 'price'];
+const header = ['player', 'kills', 'acc%'];
 const rows = [
-  ['apple', 3, 0.5],
-  ['watermelon', 1, 12],
-  ['fig', 1200, 1234.56],
+  ['zed', 3, 50],
+  ['blackwidow', 17, 8.25],
+  ['ox', 1200, 100],
 ];
 const cells = [header, ...rows.map(([n, q, p]) => [n, String(q), p.toFixed(2)])];
 const widths = header.map((_, c) => Math.max(...cells.map(r => r[c].length)));
@@ -540,16 +548,16 @@ for (const r of cells.slice(1)) console.log(line(r));
 Convert every cell to its final string first (including `toFixed(2)`), then compute each column's width with `Math.max(...cells.map(r => r[c].length))`.
 --- test
 --- out
-name       |  qty |   price
------------+------+--------
-apple      |    3 |    0.50
-watermelon |    1 |   12.00
-fig        | 1200 | 1234.56
+player     | kills |   acc%
+-----------+-------+-------
+zed        |     3 |  50.00
+blackwidow |    17 |   8.25
+ox         |  1200 | 100.00
 
 === exercise lexer
 title: A tokenizer for a small language
 --- prompt
-Write `tokenize(src)` for a C-like mini language. It returns an array of `{ type, value, line, col }` tokens (line and col are 1-based, pointing at the token's first character; col counts UTF-16 units) and skips whitespace and `//` comments to end of line.
+Games often embed a small scripting language for quests and cutscenes. Write `tokenize(src)` for such a C-like mini language. It returns an array of `{ type, value, line, col }` tokens (line and col are 1-based, pointing at the token's first character; col counts UTF-16 units) and skips whitespace and `//` comments to end of line.
 
 | type | matches | value |
 |---|---|---|
