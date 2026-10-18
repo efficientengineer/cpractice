@@ -1,0 +1,840 @@
+=== chapter functions
+title: Functions and scope
+blurb: Prototypes, pass-by-value, recursion, static locals and static functions, globals and extern, headers, inline, variadics, and life without overloading.
+--- body
+## Functions are the only unit of code
+
+C has no classes, methods, namespaces, lambdas or closures. A program is a set of top-level functions plus data. A function definition looks like a C# static method without the `static` class around it:
+
+```c
+#include <stdio.h>
+
+double average(const int *values, int count);   // prototype: a declaration
+
+int main(void) {
+    int scores[] = {90, 72, 85};
+    printf("%.2f\n", average(scores, 3));
+    return 0;
+}
+
+double average(const int *values, int count) {  // definition
+    if (count == 0) return 0.0;
+    long sum = 0;
+    for (int i = 0; i < count; i++) sum += values[i];
+    return (double)sum / count;
+}
+```
+
+## Prototypes
+
+The compiler reads a file once, top to bottom, and needs to know a function's signature before a call. A **prototype** (declaration) gives the return type and parameter types; the **definition** gives the body. Parameter names in the prototype are optional but good documentation.
+
+Two old-C traps:
+
+- **`int f()` is not `int f(void)`.** Before C23, empty parentheses in a declaration mean "takes unspecified arguments", which switches off argument checking: `f(1, 2, 3)` compiles. Always write `(void)` for "no parameters". (C23 finally makes `()` mean `(void)`.)
+- **Calling an undeclared function** used to be allowed, with the compiler guessing it returns `int`. gcc 13 warns (`implicit declaration of function`), gcc 14 makes it an error. If you see that warning, you forgot an `#include` or a prototype.
+
+## Everything is passed by value
+
+Every argument is **copied** into the parameter. That includes structs (the whole struct is copied, like a C# `struct`), and there is no `ref`, `out` or `in`:
+
+```c
+#include <stdio.h>
+
+struct point { int x, y; };
+
+void try_to_change(int n, struct point p) {
+    n = 100;          // changes the local copy only
+    p.x = 100;        // ditto: the caller's struct is untouched
+    printf("inside: %d %d\n", n, p.x);   // inside: 100 100
+}
+
+int main(void) {
+    int n = 1;
+    struct point p = {1, 2};
+    try_to_change(n, p);
+    printf("%d %d\n", n, p.x);   // 1 1
+    return 0;
+}
+```
+
+To let a function modify the caller's variable, you pass its *address* (a pointer) by value; that is the next chapter, and it is how C does C#'s `ref` and `out`. Arrays look like an exception: an array argument "decays" to a pointer to its first element, so the function sees the caller's elements, not a copy. More on that in the arrays chapter.
+
+## Return values
+
+A function returns one value (or `void`). To return several, either return a struct or write through pointer parameters. Some rules:
+
+- Falling off the end of a non-`void` function and then using the result is undefined behavior. `-Wall` (`-Wreturn-type`) warns; take it seriously.
+- `main` is special: reaching its closing brace returns 0.
+- C has no exceptions, so errors come back as return values. Common conventions: return 0 for success and nonzero (or negative) for an error code; return `NULL` for "no object"; return -1 and set `errno` (the POSIX style).
+
+## Recursion
+
+Recursion works exactly as in C#. Each call gets a fresh set of locals on the call stack, which is usually 8 MB on Linux. There is no guaranteed tail-call optimization (gcc does it at `-O2` in simple cases, but don't rely on it), and running out of stack is a segmentation fault, not a catchable `StackOverflowException`.
+
+```c
+#include <stdio.h>
+
+unsigned long long factorial(unsigned n) {
+    return n <= 1 ? 1 : n * factorial(n - 1);
+}
+
+// Print n in binary using recursion to reverse the digit order.
+void print_binary(unsigned n) {
+    if (n > 1) print_binary(n / 2);
+    putchar('0' + n % 2);
+}
+
+int main(void) {
+    printf("%llu\n", factorial(20));   // 2432902008176640000: 21! would overflow 64 bits
+    print_binary(10);                  // 1010
+    putchar('\n');
+    return 0;
+}
+```
+
+## Uninitialized locals
+
+Local variables (*automatic storage*) are **not initialized**. Their starting value is whatever was on the stack, and reading it is a bug (often undefined behavior). C# refuses to compile a read of an unassigned local; C at best warns with `-Wall`, and only when it can see the problem. Initialize when you declare.
+
+Variables at file scope and `static` variables, on the other hand, are zero-initialized before `main` starts.
+
+## static local variables
+
+A `static` local lives for the whole program but is visible only inside its function. Its initializer runs once, before the program starts, so it must be a constant expression. It behaves like a private static field that only one method can see:
+
+```c
+#include <stdio.h>
+
+int next_ticket(void) {
+    static int counter = 0;   // initialized once, keeps its value between calls
+    counter++;
+    return counter;
+}
+
+int main(void) {
+    for (int i = 0; i < 3; i++)
+        printf("ticket %d\n", next_ticket());
+    return 0;
+}
+```
+
+Typical uses: counters, caches, memo tables, and "first call" flags. The downside is shared hidden state: such functions are not thread-safe and not reentrant (the C library's `strtok` is the infamous example).
+
+## Global variables, linkage, extern and static
+
+A variable defined outside any function is a global: it exists for the whole program and any function in the file can use it after its definition.
+
+Each name at file scope also has **linkage**, which decides whether other `.c` files can see it:
+
+| At file scope | Linkage | Visible from |
+|---|---|---|
+| `int count = 0;` | external | every file (others declare it with `extern`) |
+| `extern int count;` | external | declares only: "this is defined in some file" |
+| `static int count = 0;` | internal | this `.c` file only |
+| `void helper(void) { ... }` | external | every file |
+| `static void helper(void) { ... }` | internal | this `.c` file only |
+
+So `static` means two unrelated things: on a local it means *lives forever*; at file scope it means *private to this file*. Make every function and global `static` unless another file needs it. That is C's `private`/`internal`, and it avoids name clashes at link time, because all non-static names in a program share one global namespace.
+
+## Splitting into headers and source files
+
+A real project has one `.h` and one `.c` per module. The header holds what callers need: prototypes, type definitions, `extern` declarations, constants. The `.c` file holds the definitions and private `static` helpers. Every `.c` file is compiled on its own, then the linker joins them.
+
+```text
+// stack.h
+#ifndef STACK_H          // include guard: makes a second #include harmless
+#define STACK_H
+
+void stack_push(int value);
+int stack_pop(void);
+extern int stack_size;   // declaration: the variable lives in stack.c
+
+#endif
+```
+
+```text
+// stack.c
+#include "stack.h"       // so the compiler checks that the definitions match
+
+#define CAPACITY 100
+static int items[CAPACITY];   // private to stack.c
+int stack_size = 0;           // the one definition of the extern variable
+
+void stack_push(int value) { if (stack_size < CAPACITY) items[stack_size++] = value; }
+int stack_pop(void) { return stack_size > 0 ? items[--stack_size] : 0; }
+```
+
+```text
+// main.c
+#include <stdio.h>
+#include "stack.h"       // quotes: search next to this file first
+
+int main(void) {
+    stack_push(1); stack_push(2);
+    printf("%d %d\n", stack_pop(), stack_size);
+    return 0;
+}
+```
+
+```text
+gcc -Wall -Wextra -c stack.c        # -> stack.o
+gcc -Wall -Wextra -c main.c         # -> main.o
+gcc stack.o main.o -o app           # link
+```
+
+Never *define* functions or variables in a header (without `static inline`): two `.c` files including it would both define them, and the link fails with "multiple definition". The prefix `stack_` is the C substitute for a namespace. The preprocessor chapter covers headers and guards in depth.
+
+## Block scope and shadowing
+
+Every `{ }` opens a scope. An inner declaration may hide (shadow) an outer one with the same name, which C# forbids for locals. gcc only warns with `-Wshadow`, which is not part of `-Wall -Wextra`:
+
+```c
+#include <stdio.h>
+
+int limit = 10;              // global
+
+int main(void) {
+    printf("%d\n", limit);   // 10
+    int limit = 20;          // shadows the global from here on
+    {
+        int limit = 30;      // shadows the local
+        printf("%d\n", limit);   // 30
+    }
+    printf("%d\n", limit);   // 20
+    for (int i = 0; i < 2; i++) {
+        int limit = i;       // a fresh variable each iteration
+        printf("%d ", limit);
+    }
+    printf("\n");
+    return 0;
+}
+```
+
+## inline
+
+`inline` is a hint that the function is small and calls to it may be replaced by its body. Modern compilers inline on their own at `-O2` and mostly ignore the hint. Its real effect is on linkage, and plain `inline` in C has confusing rules. The pattern to remember: a small helper in a header is `static inline int max_int(int a, int b) { return a > b ? a : b; }`. Each file that includes it gets its own private copy, so there is no "multiple definition" error.
+
+## Variadic functions
+
+`printf` takes a variable number of arguments, and you can write such functions with `<stdarg.h>`. Unlike C#'s `params int[]`, the callee gets no count and no types: it must be told, by a count argument, a sentinel value, or a format string. Arguments undergo the *default argument promotions*: `char` and `short` arrive as `int`, `float` as `double`.
+
+```c
+#include <stdio.h>
+#include <stdarg.h>
+
+double mean(int count, ...) {
+    va_list args;
+    va_start(args, count);            // start after the last named parameter
+    double total = 0;
+    for (int i = 0; i < count; i++)
+        total += va_arg(args, double);   // you must name the type; get it wrong and it's UB
+    va_end(args);
+    return count > 0 ? total / count : 0;
+}
+
+int main(void) {
+    printf("%.2f\n", mean(3, 1.0, 2.0, 4.0));   // 2.33
+    // mean(2, 1, 2) would be UB: the ints are read as doubles
+    return 0;
+}
+```
+
+Variadic functions throw away type safety. Use them sparingly, mostly for printf-style wrappers (with `vprintf` and friends).
+
+## No overloading, no default arguments
+
+C has neither. Each function has exactly one signature, and a second function with the same name is an error ("conflicting types"). The workarounds:
+
+- **Different names.** The standard library does this: `abs`, `labs`, `llabs`, `fabs`, `fabsf`; `strtol`, `strtoll`, `strtod`. Use a type suffix.
+- **A wrapper for the common case**, in place of default arguments: `int parse(const char *s)` calls `parse_base(s, 10)`.
+- **An options struct** for many optional parameters, using designated initializers (structs chapter): `make_window((struct window_opts){ .width = 800, .title = "x" })`. Unnamed fields are zero, which acts as the default.
+- **`_Generic`** (C11) can pick a function by argument type inside a macro, which is how `<tgmath.h>` makes `sqrt` work on `float` and `double`. Rarely worth it in your own code.
+
+=== exercise gcd
+title: gcd and lcm
+--- prompt
+Write a **recursive** `int gcd(int a, int b)` using Euclid's algorithm: `gcd(a, 0) = a`, otherwise `gcd(a, b) = gcd(b, a % b)`. The result must never be negative: `gcd(-12, 18)` is 6. Define `gcd(0, 0)` as 0.
+
+Then write `int lcm(int a, int b)`, the least common multiple, also non-negative, with `lcm(0, x)` = 0. Use `gcd`, and arrange the arithmetic so that it does not overflow when the *result* fits in an `int` (the tests include `lcm(100000, 30000)`).
+
+You may assume no argument is `INT_MIN`.
+--- starter
+int gcd(int a, int b) {
+    return 1;
+}
+
+int lcm(int a, int b) {
+    return a * b;
+}
+--- solution
+int gcd(int a, int b) {
+    if (b == 0) return a < 0 ? -a : a;
+    return gcd(b, a % b);
+}
+
+int lcm(int a, int b) {
+    if (a == 0 || b == 0) return 0;
+    int r = a / gcd(a, b) * b;
+    return r < 0 ? -r : r;
+}
+--- harness
+int main(void) {
+    CHECK_INT(gcd(12, 18), 6);
+    CHECK_INT(gcd(18, 12), 6);
+    CHECK_INT(gcd(17, 5), 1);
+    CHECK_INT(gcd(0, 7), 7);
+    CHECK_INT(gcd(7, 0), 7);
+    CHECK_INT(gcd(0, 0), 0);
+    CHECK_INT(gcd(-12, 18), 6);
+    CHECK_INT(gcd(12, -18), 6);
+    CHECK_INT(gcd(-12, -18), 6);
+    CHECK_INT(gcd(0, -5), 5);
+    CHECK_INT(gcd(2147483647, 2147483646), 1);
+    CHECK_INT(gcd(1071, 462), 21);
+    CHECK_INT(lcm(4, 6), 12);
+    CHECK_INT(lcm(6, 4), 12);
+    CHECK_INT(lcm(-4, 6), 12);
+    CHECK_INT(lcm(4, -6), 12);
+    CHECK_INT(lcm(0, 5), 0);
+    CHECK_INT(lcm(5, 0), 0);
+    CHECK_INT(lcm(7, 7), 7);
+    CHECK_INT(lcm(1, 1), 1);
+    CHECK_INT(lcm(100000, 30000), 300000);
+    CHECK_INT(lcm(65536, 32768), 65536);
+    return TEST_END();
+}
+--- hint
+In C, `%` can return a negative remainder for negative operands. That is fine for the recursion; just take the absolute value in the base case.
+--- hint
+`a * b / gcd(a, b)` overflows for `100000` and `30000` even though the answer is small. Divide first: `a / gcd(a, b) * b`.
+
+=== exercise ipow
+title: Fast integer power
+--- prompt
+Write `long long ipow(long long base, unsigned exp)` returning `base` to the power `exp`, with `ipow(x, 0) == 1` for every `x` (including 0).
+
+It must take O(log exp) steps, because the tests include `ipow(1, 4000000000u)`. Use recursion and **exponentiation by squaring**:
+
+- x^0 = 1
+- x^n = (x^(n/2))^2 when n is even
+- x^n = x * x^(n-1) when n is odd
+
+You can assume the final result fits in a `long long`. Make sure no *intermediate* value overflows either.
+--- starter
+long long ipow(long long base, unsigned exp) {
+    long long result = 1;
+    for (unsigned i = 0; i < exp; i++)
+        result *= base;
+    return result;
+}
+--- solution
+long long ipow(long long base, unsigned exp) {
+    if (exp == 0) return 1;
+    if (exp % 2 == 0) {
+        long long half = ipow(base, exp / 2);
+        return half * half;
+    }
+    return base * ipow(base, exp - 1);
+}
+--- harness
+#include <limits.h>
+int main(void) {
+    CHECK_INT(ipow(2, 0), 1);
+    CHECK_INT(ipow(0, 0), 1);
+    CHECK_INT(ipow(0, 5), 0);
+    CHECK_INT(ipow(2, 1), 2);
+    CHECK_INT(ipow(2, 10), 1024);
+    CHECK_INT(ipow(-3, 3), -27);
+    CHECK_INT(ipow(-3, 4), 81);
+    CHECK_INT(ipow(10, 18), 1000000000000000000LL);
+    CHECK_INT(ipow(2, 62), 4611686018427387904LL);
+    CHECK_INT(ipow(-2, 63), LLONG_MIN);
+    CHECK_INT(ipow(3, 39), 4052555153018976267LL);
+    CHECK_INT(ipow(1, 4000000000u), 1);
+    CHECK_INT(ipow(-1, 4000000000u), 1);
+    CHECK_INT(ipow(-1, 4000000001u), -1);
+    return TEST_END();
+}
+--- hint
+Compute the half power once and store it in a local; calling `ipow(base, exp / 2) * ipow(base, exp / 2)` makes the whole thing linear again.
+--- hint
+The recursion depth is at most about 2 * 32 calls for a 32-bit exponent, so stack depth is not a concern.
+
+=== exercise ids
+title: An ID generator
+--- prompt
+Write two functions that share hidden state:
+
+- `int next_id(void)` returns 1 on the first call, then 2, 3, and so on.
+- `void reset_ids(void)` makes the next `next_id()` return 1 again.
+
+A `static` local inside `next_id` would be invisible to `reset_ids`, so the counter must live at file scope. Make it `static` so no other source file can touch it.
+--- starter
+int next_id(void) {
+    return 1;
+}
+
+void reset_ids(void) {
+}
+--- solution
+static int last_id = 0;
+
+int next_id(void) {
+    return ++last_id;
+}
+
+void reset_ids(void) {
+    last_id = 0;
+}
+--- harness
+int main(void) {
+    CHECK_INT(next_id(), 1);
+    CHECK_INT(next_id(), 2);
+    CHECK_INT(next_id(), 3);
+    reset_ids();
+    CHECK_INT(next_id(), 1);
+    CHECK_INT(next_id(), 2);
+    reset_ids();
+    reset_ids();
+    CHECK_INT(next_id(), 1);
+    int last = 0;
+    for (int i = 0; i < 1000; i++) last = next_id();
+    CHECK_INT(last, 1001);
+    return TEST_END();
+}
+--- hint
+Declare `static int last_id = 0;` above both functions. File-scope variables are zero-initialized anyway, but saying so is clearer.
+
+=== exercise varsum
+title: Variadic sum and max
+--- prompt
+Write two variadic functions with `<stdarg.h>`. The first argument says how many `int`s follow:
+
+- `int sum_ints(int count, ...)`: their sum (0 when `count` is 0).
+- `int max_ints(int count, ...)`: the largest. `count` is at least 1.
+
+For example `sum_ints(3, 4, -1, 10)` is 13 and `max_ints(3, -7, -2, -9)` is -2.
+--- starter
+#include <stdarg.h>
+
+int sum_ints(int count, ...) {
+    (void)count;
+    return 0;
+}
+
+int max_ints(int count, ...) {
+    (void)count;
+    return 0;
+}
+--- solution
+#include <stdarg.h>
+
+int sum_ints(int count, ...) {
+    va_list ap;
+    va_start(ap, count);
+    int total = 0;
+    for (int i = 0; i < count; i++)
+        total += va_arg(ap, int);
+    va_end(ap);
+    return total;
+}
+
+int max_ints(int count, ...) {
+    va_list ap;
+    va_start(ap, count);
+    int best = va_arg(ap, int);
+    for (int i = 1; i < count; i++) {
+        int v = va_arg(ap, int);
+        if (v > best) best = v;
+    }
+    va_end(ap);
+    return best;
+}
+--- harness
+#include <limits.h>
+int main(void) {
+    CHECK_INT(sum_ints(0), 0);
+    CHECK_INT(sum_ints(1, 42), 42);
+    CHECK_INT(sum_ints(3, 4, -1, 10), 13);
+    CHECK_INT(sum_ints(5, 1, 2, 3, 4, 5), 15);
+    CHECK_INT(sum_ints(2, -5, -6), -11);
+    CHECK_INT(sum_ints(3, 0, 0, 0), 0);
+    CHECK_INT(max_ints(1, 7), 7);
+    CHECK_INT(max_ints(3, -7, -2, -9), -2);
+    CHECK_INT(max_ints(4, 1, 9, 3, 9), 9);
+    CHECK_INT(max_ints(3, 5, 4, 3), 5);
+    CHECK_INT(max_ints(3, 3, 4, 5), 5);
+    CHECK_INT(max_ints(2, INT_MIN, INT_MIN), INT_MIN);
+    CHECK_INT(max_ints(2, INT_MAX, 0), INT_MAX);
+    return TEST_END();
+}
+--- hint
+The pattern: `va_list ap; va_start(ap, count);` then `va_arg(ap, int)` once per value, then `va_end(ap);`.
+--- hint
+For the max, start from the first argument rather than from 0 or some magic small number: all the values might be negative.
+
+=== exercise hanoi
+title: Towers of Hanoi
+--- prompt
+Read `n` (0 to 10) from stdin and print the moves that transfer `n` disks from peg `A` to peg `C` using peg `B`, never placing a larger disk on a smaller one. Then print the total number of moves.
+
+The recursive plan for moving `n` disks from `from` to `to` via `via`: move `n - 1` disks from `from` to `via`, move disk `n` from `from` to `to`, then move `n - 1` disks from `via` to `to`. Following this plan exactly gives the expected order. For `n = 2`:
+
+```text
+disk 1: A -> B
+disk 2: A -> C
+disk 1: B -> C
+3 moves
+```
+
+Write the recursive function as a `static void` helper.
+--- starter
+#include <stdio.h>
+
+int main(void) {
+    int n;
+    if (scanf("%d", &n) != 1) return 1;
+    printf("%d moves\n", 0);
+    return 0;
+}
+--- solution
+#include <stdio.h>
+
+static long moves = 0;
+
+static void hanoi(int n, char from, char to, char via) {
+    if (n == 0) return;
+    hanoi(n - 1, from, via, to);
+    printf("disk %d: %c -> %c\n", n, from, to);
+    moves++;
+    hanoi(n - 1, via, to, from);
+}
+
+int main(void) {
+    int n;
+    if (scanf("%d", &n) != 1) return 1;
+    hanoi(n, 'A', 'C', 'B');
+    printf("%ld moves\n", moves);
+    return 0;
+}
+--- hint
+The base case is `n == 0`: nothing to move.
+--- hint
+`static void hanoi(int n, char from, char to, char via)`. The first recursive call swaps the roles of `to` and `via`; the second swaps `from` and `via`.
+--- hint
+Count the moves in a `static` variable, or compute them: it is always 2^n - 1.
+--- test
+2
+--- out
+disk 1: A -> B
+disk 2: A -> C
+disk 1: B -> C
+3 moves
+--- test
+1
+--- out
+disk 1: A -> C
+1 moves
+--- test
+0
+--- out
+0 moves
+--- test
+4
+--- out
+disk 1: A -> B
+disk 2: A -> C
+disk 1: B -> C
+disk 3: A -> B
+disk 1: C -> A
+disk 2: C -> B
+disk 1: A -> B
+disk 4: A -> C
+disk 1: B -> C
+disk 2: B -> A
+disk 1: C -> A
+disk 3: B -> C
+disk 1: A -> B
+disk 2: A -> C
+disk 1: B -> C
+15 moves
+
+=== exercise fibmemo
+title: Memoized Fibonacci
+--- prompt
+Write `long long fib(int n)` returning the n-th Fibonacci number (`fib(0) = 0`, `fib(1) = 1`) for 0 <= n <= 92, and -1 for any other `n` (`fib(93)` does not fit in a `long long`).
+
+Keep the classic recursive definition `fib(n - 1) + fib(n - 2)`, but make it fast by caching results in a **`static` local array** inside `fib`. Without the cache, `fib(92)` makes about 10^19 calls and the tests time out.
+--- starter
+long long fib(int n) {
+    if (n < 2) return n;
+    return fib(n - 1) + fib(n - 2);
+}
+--- solution
+long long fib(int n) {
+    static long long memo[93];   // zero-initialized: 0 means "not computed yet"
+    if (n < 0 || n > 92) return -1;
+    if (n < 2) return n;
+    if (memo[n] == 0)
+        memo[n] = fib(n - 1) + fib(n - 2);
+    return memo[n];
+}
+--- harness
+int main(void) {
+    CHECK_INT(fib(-1), -1);
+    CHECK_INT(fib(93), -1);
+    CHECK_INT(fib(1000), -1);
+    CHECK_INT(fib(0), 0);
+    CHECK_INT(fib(1), 1);
+    CHECK_INT(fib(2), 1);
+    CHECK_INT(fib(10), 55);
+    CHECK_INT(fib(50), 12586269025LL);
+    CHECK_INT(fib(92), 7540113804746346429LL);
+    CHECK_INT(fib(90), 2880067194370816120LL);
+    int ok = 1;
+    for (int n = 2; n <= 92; n++)
+        if (fib(n) != fib(n - 1) + fib(n - 2)) ok = 0;
+    CHECK(ok);
+    return TEST_END();
+}
+--- hint
+`static long long memo[93];` is zero-initialized and keeps its contents between calls. Since only `fib(0)` is 0, a stored 0 can mean "not computed yet".
+--- hint
+Range-check `n` before touching `memo[n]`: indexing out of bounds is undefined behavior, and the sanitizer will catch it.
+
+=== exercise change
+title: Counting change
+--- prompt
+In how many ways can you make `amount` cents from coins of 1, 5, 10, 25 and 50 cents? Order does not matter: 6 cents is `5+1` or `1+1+1+1+1+1`, so 2 ways.
+
+Write `long long change_ways(int amount)`. `change_ways(0)` is 1 (the empty way), and any negative amount has 0 ways.
+
+The neat recursive solution needs an extra parameter: the number of coin kinds still allowed. C has no default arguments, so write a `static` helper with that parameter and have `change_ways` call it. The idea: the ways to make `a` with the first `k` kinds = the ways that never use kind `k` + the ways that use kind `k` at least once (make `a - coin[k]`, still allowing all `k` kinds).
+--- starter
+long long change_ways(int amount) {
+    return amount >= 0;
+}
+--- solution
+static const int coins[] = {1, 5, 10, 25, 50};
+
+static long long ways(int amount, int kinds) {
+    if (amount == 0) return 1;
+    if (amount < 0 || kinds == 0) return 0;
+    return ways(amount, kinds - 1) + ways(amount - coins[kinds - 1], kinds);
+}
+
+long long change_ways(int amount) {
+    return ways(amount, 5);
+}
+--- harness
+int main(void) {
+    CHECK_INT(change_ways(0), 1);
+    CHECK_INT(change_ways(-1), 0);
+    CHECK_INT(change_ways(-50), 0);
+    CHECK_INT(change_ways(1), 1);
+    CHECK_INT(change_ways(4), 1);
+    CHECK_INT(change_ways(5), 2);
+    CHECK_INT(change_ways(6), 2);
+    CHECK_INT(change_ways(11), 4);
+    CHECK_INT(change_ways(25), 13);
+    CHECK_INT(change_ways(100), 292);
+    CHECK_INT(change_ways(300), 9590);
+    return TEST_END();
+}
+--- hint
+Base cases: amount exactly 0 is one way; a negative amount or no coin kinds left is zero ways.
+--- hint
+`static long long ways(int amount, int kinds)` with `coins[kinds - 1]` as the kind being decided. Then `change_ways(a)` is `ways(a, 5)`.
+
+=== quiz
+run: yes
+--- q
+What does this print?
+--- code
+#include <stdio.h>
+
+void increment(int x) {
+    x++;
+}
+
+int main(void) {
+    int a = 1;
+    increment(a);
+    increment(a);
+    printf("%d\n", a);
+    return 0;
+}
+--- answer
+1
+--- choice
+2
+--- choice
+3
+--- choice
+It does not compile
+--- explain
+`increment` receives a copy of `a`. To change the caller's variable you must pass its address, `increment(&a)`, with a parameter of type `int *`.
+
+=== quiz
+run: yes
+--- q
+What does this print?
+--- code
+#include <stdio.h>
+
+int counter(void) {
+    static int n = 10;
+    n++;
+    return n;
+}
+
+int main(void) {
+    counter();
+    counter();
+    printf("%d\n", counter());
+    return 0;
+}
+--- choice
+11
+--- choice
+10
+--- answer
+13
+--- choice
+12
+--- explain
+The `static` local is initialized once, before the program runs, and keeps its value across calls: 11, 12, then 13.
+
+=== quiz
+run: yes
+--- q
+What does this print?
+--- code
+#include <stdio.h>
+
+int x = 1;
+
+void show(void) {
+    printf("%d ", x);
+}
+
+int main(void) {
+    int x = 2;
+    {
+        int x = 3;
+        x++;
+        show();
+    }
+    x++;
+    show();
+    printf("%d\n", x);
+    return 0;
+}
+--- choice
+4 3 3
+--- answer
+1 1 3
+--- choice
+1 1 1
+--- choice
+4 3 1
+--- explain
+Scope is lexical. `show` can only see the global `x`, which is never changed. Inside `main`, the inner block's `x` (3, then 4) disappears at its closing brace, and `x++` afterwards increments `main`'s own `x` from 2 to 3.
+
+=== quiz
+run: yes
+--- q
+What does this print?
+--- code
+#include <stdio.h>
+
+void f(int n) {
+    if (n == 0) return;
+    printf("%d ", n);
+    f(n - 1);
+    printf("%d ", n);
+}
+
+int main(void) {
+    f(3);
+    printf("\n");
+    return 0;
+}
+--- choice
+3 2 1
+--- choice
+3 2 1 0 1 2 3
+--- answer
+3 2 1 1 2 3
+--- choice
+1 2 3 3 2 1
+--- explain
+Each call prints `n` on the way down, recurses, then prints `n` again on the way back up, after all deeper calls have finished.
+
+=== quiz
+run: yes
+--- q
+What does this print?
+--- code
+#include <stdio.h>
+
+int g;
+
+int main(void) {
+    static int s;
+    printf("%d %d\n", g, s);
+    return 0;
+}
+--- answer
+0 0
+--- choice
+Two unpredictable values
+--- choice
+0 and an unpredictable value
+--- choice
+It does not compile
+--- explain
+Variables with static storage duration (file-scope globals and `static` locals) are zero-initialized before `main` runs. Only automatic (ordinary local) variables start with garbage.
+
+=== quiz
+--- q
+`static int helper(int x) { ... }` appears at file scope in `util.c`. What does `static` mean here?
+--- choice
+The function keeps its local variables between calls.
+--- answer
+The function can only be called from code in `util.c`.
+--- choice
+The function is evaluated at compile time.
+--- choice
+The function cannot be recursive.
+--- explain
+At file scope, `static` gives a name *internal linkage*: it is private to its translation unit, and other files can use the same name for something else. On a local variable, the same keyword means "static storage duration" instead.
+
+=== quiz
+--- q
+`next()` returns 1 the first time it is called and 2 the second time. What can you say about the output of `printf("%d %d\n", next(), next());`?
+--- choice
+It prints `1 2`, because arguments are evaluated left to right.
+--- choice
+It prints `2 1`, because arguments are pushed right to left.
+--- answer
+It may print `1 2` or `2 1`: the order is unspecified.
+--- choice
+It is a compile error.
+--- explain
+C leaves the evaluation order of function arguments unspecified (unlike C# and JS, which guarantee left to right). Each call is still complete before the other, so it is not undefined behavior, but you can't rely on the order. Call them in separate statements.
+
+=== quiz
+--- q
+You want `area(int)` and `area(double)` in C. What happens if you define both?
+--- choice
+The compiler picks the right one by argument type, as in C#.
+--- choice
+The second definition silently replaces the first.
+--- answer
+Compile error: conflicting types for `area`.
+--- choice
+It compiles but the linker picks one at random.
+--- explain
+C has no overloading: one name, one signature. Use distinct names (`area_i`, `area_d`, like the library's `abs`/`labs`/`fabs`), or `_Generic` in a macro if you really need type dispatch.

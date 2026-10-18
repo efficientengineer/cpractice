@@ -1,0 +1,1118 @@
+=== chapter preprocessor
+title: The preprocessor and multi-file programs
+blurb: #include, macros and their traps, conditional compilation, X-macros, _Generic, and how headers, extern and the linker fit together.
+--- body
+## A text processor bolted on the front
+
+Before the compiler sees your code, the **preprocessor** rewrites it. It knows nothing about types, scopes or functions: it works on *tokens*, and every line starting with `#` is an instruction to it. `gcc -E file.c` shows you what comes out, and that is the first thing to look at when a macro misbehaves.
+
+C# has a cut-down preprocessor (`#if DEBUG`, `#define` with no values, `#region`); JavaScript has none, though bundlers do similar things. C's is much more powerful and much easier to hurt yourself with. Modern C style is: use it for includes, include guards, conditional compilation and the few things only it can do; use `enum`, `const` and `static inline` functions for everything else.
+
+## #include
+
+`#include` pastes another file's text in place. Nothing more clever than that.
+
+- `#include <stdio.h>` searches the *system* include paths (`/usr/include` and friends).
+- `#include "parser.h"` searches the directory of the current file first, then the system paths.
+- `-I dir` on the command line adds a directory to search: `gcc -I include src/main.c`.
+
+`gcc -E -v` prints the search list. Because it is pure text pasting, a header included twice is pasted twice, which is why headers need include guards (below).
+
+## Object-like macros
+
+```c
+#include <stdio.h>
+
+#define BUFFER_SIZE 256
+#define GREETING "hello"
+#define PI 3.14159265358979
+
+int main(void) {
+    char buf[BUFFER_SIZE];   // the compiler sees: char buf[256];
+    snprintf(buf, sizeof buf, "%s %.2f", GREETING, PI);
+    puts(buf);
+    return 0;
+}
+```
+
+A macro is replaced by its body wherever its name appears as a token (not inside strings or comments). By convention macro names are `ALL_CAPS` so readers know text substitution is happening. A macro has no type and no scope: it is visible from its `#define` to the end of the translation unit, or until `#undef NAME`.
+
+For constants, prefer an `enum` (integers, visible in the debugger, scoped like any identifier) or a `static const` variable. A `#define` is still needed for array sizes at file scope in older code and for strings you want to paste together.
+
+```c
+enum { MAX_PLAYERS = 8 };                 // a true integer constant expression
+static const double GRAVITY = 9.81;       // typed, but not a constant expression in C
+```
+
+## Function-like macros
+
+```c
+#define SQUARE(x) ((x) * (x))
+```
+
+No space is allowed between the name and the `(`: `#define SQUARE (x) ...` defines an object-like macro whose body starts with `(x)`.
+
+Arguments are substituted as **text**. That makes parentheses mandatory, both around each use of an argument and around the whole body:
+
+```c
+#include <stdio.h>
+
+#define BAD_SQUARE(x) x * x
+#define BAD_DOUBLE(x) (x) + (x)
+#define SQUARE(x) ((x) * (x))
+#define DOUBLE(x) ((x) + (x))
+
+int main(void) {
+    printf("%d\n", BAD_SQUARE(1 + 2));   // 1 + 2 * 1 + 2  = 5
+    printf("%d\n", 10 * BAD_DOUBLE(3));  // 10 * (3) + (3) = 33
+    printf("%d\n", SQUARE(1 + 2));       // 9
+    printf("%d\n", 10 * DOUBLE(3));      // 60
+    return 0;
+}
+```
+
+### The double-evaluation trap
+
+Parentheses cannot fix this one. Each mention of `x` in the body is a separate copy of the argument expression, so side effects happen more than once:
+
+```c
+#include <stdio.h>
+
+#define MAX(a, b) ((a) > (b) ? (a) : (b))
+
+static int calls = 0;
+static int next(void) { return ++calls; }
+
+int main(void) {
+    int i = 5;
+    int m = MAX(i++, 3);       // ((i++) > (3) ? (i++) : (3))
+    printf("m=%d i=%d\n", m, i);           // m=6 i=7
+
+    int n = MAX(next(), 0);
+    printf("n=%d calls=%d\n", n, calls);   // n=2 calls=2
+    return 0;
+}
+```
+
+The fix is to not use a macro. A `static inline` function evaluates each argument exactly once, is type checked, can be stepped through in a debugger, and at `-O1` and above generates the same code:
+
+```c
+static inline int max_int(int a, int b) { return a > b ? a : b; }
+```
+
+`static` gives it internal linkage, so putting it in a header that several `.c` files include causes no duplicate-symbol errors; `inline` is a hint and silences "unused function" warnings. Reach for a macro only when a function genuinely cannot do the job: you need the argument's *text* (`#`), you need to build names (`##`), you need the caller's `__FILE__`/`__LINE__`, or it must work for any type.
+
+### Multi-statement macros: do { } while (0)
+
+A macro that expands to several statements breaks under an unbraced `if`:
+
+```c
+#define LOG_TWICE(msg) puts(msg); puts(msg)
+
+if (verbose) LOG_TWICE("hi");   // the second puts runs unconditionally
+```
+
+Wrapping the body in braces fixes that but breaks `if (c) MACRO(); else ...` because of the stray `;` after the `}`. The idiom that works everywhere is `do { ... } while (0)`: it is exactly one statement and demands a trailing semicolon, like a function call.
+
+```c
+#include <stdio.h>
+
+#define SWAP_INT(a, b) do { int swap_tmp_ = (a); (a) = (b); (b) = swap_tmp_; } while (0)
+
+int main(void) {
+    int x = 1, y = 2;
+    if (x < y)
+        SWAP_INT(x, y);
+    else
+        puts("already ordered");
+    printf("%d %d\n", x, y);   // 2 1
+    return 0;
+}
+```
+
+Notice the odd local name `swap_tmp_`. Macros are not *hygienic*: if the body declared `tmp` and the caller wrote `SWAP_INT(tmp, other)`, the body's `tmp` would shadow the caller's and the swap would silently do nothing. Use names nobody would pass in.
+
+## # and ##
+
+Inside a function-like macro body, `#param` turns the argument into a string literal, and `a ## b` glues two tokens into one.
+
+```c
+#include <stdio.h>
+
+#define SHOW(expr) printf("%s = %d\n", #expr, (expr))
+#define MAKE_GETTER(field) \
+    static int get_##field(const struct point *p) { return p->field; }
+
+struct point { int x, y; };
+MAKE_GETTER(x)    // defines get_x
+MAKE_GETTER(y)    // defines get_y
+
+int main(void) {
+    struct point p = {3, 4};
+    SHOW(p.x * p.y + 1);          // p.x * p.y + 1 = 13
+    SHOW(get_x(&p) - get_y(&p));  // get_x(&p) - get_y(&p) = -1
+    return 0;
+}
+```
+
+A trailing backslash continues a macro onto the next line. Adjacent string literals are concatenated by the compiler (`"ab" "cd"` is `"abcd"`), which combines nicely with `#`.
+
+One subtlety: arguments next to `#` or `##` are *not* macro-expanded first. To stringify the *value* of a macro, go through a second level:
+
+```c
+#include <stdio.h>
+
+#define VERSION_MAJOR 2
+#define STR(x) #x
+#define XSTR(x) STR(x)
+
+int main(void) {
+    puts(STR(VERSION_MAJOR));   // VERSION_MAJOR
+    puts(XSTR(VERSION_MAJOR));  // 2: expanded by XSTR, then stringified by STR
+    return 0;
+}
+```
+
+## Predefined macros and assert
+
+| Macro | Meaning |
+|---|---|
+| `__FILE__` | current file name, a string literal |
+| `__LINE__` | current line number, an integer |
+| `__func__` | current function name (technically a `static const char[]`, not a macro) |
+| `__DATE__`, `__TIME__` | when this file was compiled |
+| `__STDC_VERSION__` | `201710L` for C17, `201112L` for C11 |
+| `NDEBUG` | not predefined: you define it (`-DNDEBUG`) to switch `assert` off |
+
+These are why logging and assertion macros are still macros: a function cannot know its caller's line.
+
+```c
+#include <stdio.h>
+
+#define TRACE(msg) fprintf(stdout, "%s:%d in %s: %s\n", __FILE__, __LINE__, __func__, msg)
+
+static void load(void) { TRACE("loading"); }
+
+int main(void) {
+    TRACE("start");
+    load();
+    return 0;
+}
+```
+
+`<assert.h>` gives you `assert(cond)`: if `cond` is false it prints the expression, file and line and calls `abort()`. Use it for *programmer errors* ("this pointer is never NULL here"), never for user input or I/O failures, because release builds compile with `-DNDEBUG` and every `assert` vanishes, side effects included. `assert(fclose(f) == 0)` is a bug.
+
+C11 also has `static_assert(cond, "message")` (from `<assert.h>`; the keyword is `_Static_assert`), checked at compile time:
+
+```c
+#include <assert.h>
+#include <stdint.h>
+
+static_assert(sizeof(int32_t) == 4, "int32_t must be 4 bytes");
+
+int main(void) {
+    int x = 3;
+    assert(x > 0);   // fine; assert(x > 5) would abort with a message
+    return 0;
+}
+```
+
+## Conditional compilation
+
+```c
+#include <stdio.h>
+
+#define LOG_LEVEL 2
+
+#if LOG_LEVEL >= 2
+#  define DEBUG_LOG(msg) puts("debug: " msg)
+#else
+#  define DEBUG_LOG(msg) ((void)0)
+#endif
+
+int main(void) {
+#ifdef _WIN32
+    puts("windows");
+#elif defined(__linux__)
+    puts("linux");
+#else
+    puts("something else");
+#endif
+    DEBUG_LOG("only in verbose builds");
+    return 0;
+}
+```
+
+- `#if expr` evaluates an integer constant expression. Unknown identifiers count as `0` (a typo silently turns code off; `-Wundef` warns).
+- `#ifdef NAME` / `#ifndef NAME` test whether a macro is defined at all; `defined(NAME)` does the same inside `#if`, so you can combine tests with `&&` and `||`.
+- `-DNAME` or `-DNAME=value` on the gcc command line defines a macro for the whole build. That is how debug and release builds differ.
+- `#if 0 ... #endif` is the reliable way to disable a block that itself contains `/* comments */`.
+- `#error "message"` stops the build: useful in `#else` branches for unsupported platforms.
+
+The `((void)0)` in the disabled branch matters: it keeps `DEBUG_LOG(x);` a valid expression statement in both builds, so `if (c) DEBUG_LOG("x"); else ...` still compiles.
+
+## X-macros
+
+When one list of things drives several pieces of code (an enum, a name table, a dispatch table), define the list once as a macro that takes another macro as a parameter, and "apply" different macros to it:
+
+```c
+#include <stdio.h>
+
+#define TOKENS(X) \
+    X(PLUS,  '+') \
+    X(MINUS, '-') \
+    X(STAR,  '*') \
+    X(SLASH, '/')
+
+#define AS_ENUM(name, ch) TOK_##name,
+#define AS_NAME(name, ch) #name,
+#define AS_CHAR(name, ch) ch,
+
+enum token { TOKENS(AS_ENUM) TOK_COUNT };
+static const char *const token_names[] = { TOKENS(AS_NAME) };
+static const char token_chars[] = { TOKENS(AS_CHAR) };
+
+int main(void) {
+    for (int t = 0; t < TOK_COUNT; t++)
+        printf("%d %-5s %c\n", t, token_names[t], token_chars[t]);
+    return 0;
+}
+```
+
+Adding a token is now a one-line change and the tables can never get out of step. You will see this pattern in interpreters, opcode tables and error-code lists.
+
+## _Generic, briefly
+
+C11's `_Generic` picks an expression based on the *type* of its controlling expression, at compile time. It is how `<tgmath.h>` makes `sqrt` work on `float` and `double`. Combined with a macro it gives you crude overloading:
+
+```c
+#include <stdio.h>
+
+static void print_int(int x) { printf("int %d\n", x); }
+static void print_double(double x) { printf("double %g\n", x); }
+static void print_str(const char *s) { printf("string %s\n", s); }
+
+#define print(x) _Generic((x), \
+    int: print_int,            \
+    double: print_double,      \
+    char *: print_str,         \
+    const char *: print_str)(x)
+
+int main(void) {
+    print(42);
+    print(2.5);
+    print("hi");
+    print('A');      // a character constant has type int in C
+    return 0;
+}
+```
+
+The controlling expression is not evaluated, only its type is inspected. A type with no matching association and no `default:` is a compile error.
+
+## Multi-file programs
+
+Real programs are split into modules. The rule is the same as in the first chapter: each `.c` file is compiled separately, knowing only what it has seen declared.
+
+### Declarations vs definitions
+
+- A **declaration** says a name exists and what type it has: `int add(int, int);`, `extern int counter;`, `struct node;`.
+- A **definition** creates the thing: the function body, or the storage for a variable: `int counter = 0;`.
+- **One definition rule**: anything with external linkage is defined exactly once in the whole program. Declare it as often as you like.
+
+### What goes where
+
+| `module.h` (the public interface) | `module.c` (the implementation) |
+|---|---|
+| include guard | `#include "module.h"` first, so the header is checked to be self-contained |
+| `#include`s the header itself needs | private helpers marked `static` |
+| type definitions callers need | file-scope state marked `static` |
+| function prototypes | the function definitions |
+| `extern` declarations of shared globals | the one definition of each global |
+| `static inline` helpers and macros | |
+
+`static` at file scope means **internal linkage**: the name is private to this `.c` file, like `private` on a C# class whose class is the file. Every helper that is not part of the interface should be `static`. Without it, two modules that both define a helper called `parse` collide at link time.
+
+```c
+/* ======== counter.h ======== */
+#ifndef COUNTER_H
+#define COUNTER_H
+extern int counter_total;      // declaration: "this exists somewhere"
+void counter_add(int n);
+#endif
+
+/* ======== counter.c ======== */
+/* #include "counter.h" */
+int counter_total = 0;         // the single definition
+static int calls = 0;          // private to counter.c
+void counter_add(int n) { counter_total += n; calls++; }
+
+/* ======== main.c ======== */
+#include <stdio.h>
+/* #include "counter.h" */
+int main(void) {
+    counter_add(5);
+    printf("%d\n", counter_total);
+    return 0;
+}
+```
+
+In a real project those are three files, and `main.c` would see only what `counter.h` declares; `calls` is invisible to it. (Here they are sections of one file, written the way the exercises do it, so you can run it.)
+
+Put `int counter_total = 0;` in the header instead and every `.c` file that includes it defines its own copy: "multiple definition of `counter_total`" at link time.
+
+### Include guards and #pragma once
+
+```c
+#ifndef PARSER_H
+#define PARSER_H
+/* ... contents ... */
+#endif
+```
+
+The first inclusion defines `PARSER_H`; later inclusions in the same translation unit skip everything. `#pragma once` at the top does the same thing in one line. It is not in the standard but every mainstream compiler supports it. Either is fine; pick one per project.
+
+### Building: the Makefile
+
+Each `.c` compiles to a `.o`, then the linker combines them. Recompiling only what changed is what `make` is for:
+
+```text
+CC = gcc
+CFLAGS = -std=c17 -Wall -Wextra -g
+OBJS = main.o counter.o parser.o
+
+app: $(OBJS)
+	$(CC) $(CFLAGS) -o app $(OBJS)
+
+%.o: %.c
+	$(CC) $(CFLAGS) -c $< -o $@
+
+main.o: main.c counter.h parser.h
+counter.o: counter.c counter.h
+
+clean:
+	rm -f app $(OBJS)
+```
+
+A rule is `target: prerequisites` followed by tab-indented commands (a tab, not spaces). `make` rebuilds a target when any prerequisite is newer. `$@` is the target, `$<` the first prerequisite. The header dependencies matter: change `counter.h` and both `main.o` and `counter.o` must rebuild. Larger projects let gcc write those lines for them with `-MMD -MP`, or use CMake or Meson.
+
+The exercise runner here compiles one file, so multi-file exercises put each "file" in a commented section of the same source. The rules about what goes where still apply.
+
+=== exercise parens
+title: Fix the macros
+--- prompt
+The starter has four macros that give wrong answers when called with expressions, plus a `max_int` macro that evaluates its arguments twice.
+
+- Fix `SQUARE(x)`, `ABS(x)`, `IS_EVEN(x)` and `BETWEEN(x, lo, hi)` (true if `lo <= x <= hi`) so they work with any expression arguments and in any surrounding expression. Keep them macros.
+- Replace the `max_int` macro with a `static inline int max_int(int a, int b)` function, so `max_int(i++, 3)` increments `i` once.
+
+The tests do things like `10 / SQUARE(2)`, `ABS(a - b)`, `!IS_EVEN(3)` and `BETWEEN(x & 7, 2, 4)`.
+--- starter
+#define SQUARE(x) x * x
+#define ABS(x) x < 0 ? -x : x
+#define IS_EVEN(x) x % 2 == 0
+#define BETWEEN(x, lo, hi) lo <= x && x <= hi
+
+#define max_int(a, b) ((a) > (b) ? (a) : (b))
+--- solution
+#define SQUARE(x) ((x) * (x))
+#define ABS(x) ((x) < 0 ? -(x) : (x))
+#define IS_EVEN(x) ((x) % 2 == 0)
+#define BETWEEN(x, lo, hi) ((lo) <= (x) && (x) <= (hi))
+
+static inline int max_int(int a, int b) { return a > b ? a : b; }
+--- hint
+Two rules: parenthesize every use of a parameter, and parenthesize the whole body.
+--- hint
+`!IS_EVEN(3)` with the starter expands to `!3 % 2 == 0`. `!` binds tighter than `%`.
+--- harness
+int main(void) {
+    CHECK_INT(SQUARE(1 + 2), 9);
+    CHECK_INT(10 / SQUARE(2), 2);
+    CHECK_INT(SQUARE(-3), 9);
+    int a = 2, b = 7;
+    CHECK_INT(ABS(a - b), 5);
+    CHECK_INT(ABS(b - a), 5);
+    CHECK_INT(ABS(a - b) * 2, 10);
+    CHECK_INT(IS_EVEN(3 + 1), 1);
+    CHECK_INT(!IS_EVEN(3), 1);
+    CHECK_INT(!IS_EVEN(4), 0);
+    CHECK_INT(IS_EVEN(5) + 10, 10);
+    int x = 13;
+    CHECK_INT(BETWEEN(x & 7, 2, 4), 0);
+    CHECK_INT(BETWEEN(x & 6, 2, 4), 1);
+    CHECK_INT(BETWEEN(1, 0, 2) * 5, 5);
+    CHECK_INT(!BETWEEN(5, 0, 2), 1);
+    int i = 5;
+    CHECK_INT(max_int(i++, 3), 5);
+    CHECK_INT(i, 6);
+    CHECK_INT(max_int(3, i++), 6);
+    CHECK_INT(i, 7);
+    return TEST_END();
+}
+
+=== exercise swap
+title: A hygienic SWAP
+--- prompt
+Write a macro `SWAP(type, a, b)` that swaps two lvalues of the given type. It must:
+
+- work as a single statement, including as the body of an unbraced `if` with an `else`;
+- require a semicolon after it, like a function call;
+- work when the caller's variables are named `tmp`, `temp` or `t`;
+- work with array elements like `SWAP(int, v[i], v[j])` and struct fields.
+
+The tests also use it inside a bubble sort.
+--- starter
+#define SWAP(type, a, b) ((void)0)
+--- solution
+#define SWAP(type, a, b) do { type swap_tmp_ = (a); (a) = (b); (b) = swap_tmp_; } while (0)
+--- hint
+Wrap the body in `do { ... } while (0)` (with no trailing semicolon in the macro).
+--- hint
+The local inside the macro must have a name no caller would use, otherwise `SWAP(int, tmp, x)` declares a new `tmp` that shadows the caller's.
+--- harness
+struct pt { int x, y; };
+
+static void sort(int *v, int n) {
+    for (int i = 0; i < n; i++)
+        for (int j = 0; j + 1 < n - i; j++)
+            if (v[j] > v[j + 1])
+                SWAP(int, v[j], v[j + 1]);
+}
+
+int main(void) {
+    int tmp = 1, x = 2;
+    SWAP(int, tmp, x);
+    CHECK_INT(tmp, 2);
+    CHECK_INT(x, 1);
+    double temp = 1.5, t = -2.0;
+    SWAP(double, temp, t);
+    CHECK_DBL(temp, -2.0);
+    CHECK_DBL(t, 1.5);
+    int a = 1, b = 2, took_else = 0;
+    if (a > b)
+        SWAP(int, a, b);
+    else
+        took_else = 1;
+    CHECK_INT(took_else, 1);
+    CHECK_INT(a, 1);
+    if (a < b)
+        SWAP(int, a, b);
+    else
+        took_else = 2;
+    CHECK_INT(took_else, 1);
+    CHECK_INT(a, 2);
+    struct pt p = {3, 4};
+    SWAP(int, p.x, p.y);
+    CHECK_INT(p.x, 4);
+    CHECK_INT(p.y, 3);
+    const char *s1 = "one", *s2 = "two";
+    SWAP(const char *, s1, s2);
+    CHECK_STR(s1, "two");
+    CHECK_STR(s2, "one");
+    int v[] = {5, 1, 4, 2, 3};
+    sort(v, 5);
+    for (int i = 0; i < 5; i++) CHECK_INT(v[i], i + 1);
+    return TEST_END();
+}
+
+=== exercise show
+title: Stringify for debugging
+--- prompt
+Define three debugging macros so that the given `main` prints exactly the expected output. Do not change `main` or `twice`.
+
+- `SHOW_INT(e)` prints the source text of `e`, ` = `, and its `int` value. It must evaluate `e` exactly once.
+- `SHOW_STR(e)` prints the source text, ` = `, and the string value in double quotes.
+- `TRACE()` prints `enter ` followed by the name of the function it appears in.
+
+Expected output:
+
+```text
+enter main
+a * b = 42
+enter twice
+twice(a) + b = 19
+"con" "cat" = "concat"
+(int)strlen("hello") = 5
+counter++ = 0
+counter = 1
+```
+--- starter
+#include <stdio.h>
+#include <string.h>
+
+#define SHOW_INT(e) ((void)(e))
+#define SHOW_STR(e) ((void)(e))
+#define TRACE() ((void)0)
+
+static int twice(int x) {
+    TRACE();
+    return 2 * x;
+}
+
+int main(void) {
+    int a = 6, b = 7, counter = 0;
+    TRACE();
+    SHOW_INT(a * b);
+    SHOW_INT(twice(a) + b);
+    SHOW_STR("con" "cat");
+    SHOW_INT((int)strlen("hello"));
+    SHOW_INT(counter++);
+    SHOW_INT(counter);
+    return 0;
+}
+--- solution
+#include <stdio.h>
+#include <string.h>
+
+#define SHOW_INT(e) printf("%s = %d\n", #e, (e))
+#define SHOW_STR(e) printf("%s = \"%s\"\n", #e, (e))
+#define TRACE() printf("enter %s\n", __func__)
+
+static int twice(int x) {
+    TRACE();
+    return 2 * x;
+}
+
+int main(void) {
+    int a = 6, b = 7, counter = 0;
+    TRACE();
+    SHOW_INT(a * b);
+    SHOW_INT(twice(a) + b);
+    SHOW_STR("con" "cat");
+    SHOW_INT((int)strlen("hello"));
+    SHOW_INT(counter++);
+    SHOW_INT(counter);
+    return 0;
+}
+--- hint
+`#e` turns the argument into a string literal, quotes and all: stringifying `"con" "cat"` produces a literal that prints as `"con" "cat"`.
+--- hint
+Pass `#e` as an argument to `%s` rather than pasting it into the format string, or a `%` in the expression would be read as a format directive.
+--- hint
+`__func__` is the current function's name.
+--- test
+--- out
+enter main
+a * b = 42
+enter twice
+twice(a) + b = 19
+"con" "cat" = "concat"
+(int)strlen("hello") = 5
+counter++ = 0
+counter = 1
+
+=== exercise xcolors
+title: X-macro color table
+--- prompt
+The starter defines a color list once with an X-macro and generates `enum color` from it (`COLOR_BLACK` ... `COLOR_WHITE`, then `COLOR_COUNT`). Use the same list to implement:
+
+- `const char *color_name(enum color c)`: `"BLACK"`, `"RED"`, ... and `"?"` for anything out of range.
+- `unsigned color_rgb(enum color c)`: the hex value from the list, `0` when out of range.
+- `int color_from_name(const char *name)`: the enum value for an exact name like `"CYAN"`, or `-1`.
+
+Do not write the names or values out a second time: generate tables from `COLORS`. If someone adds a color to the list, everything should keep working.
+--- starter
+#include <string.h>
+
+#define COLORS(X) \
+    X(BLACK,   0x000000) \
+    X(RED,     0xFF0000) \
+    X(GREEN,   0x00FF00) \
+    X(BLUE,    0x0000FF) \
+    X(YELLOW,  0xFFFF00) \
+    X(CYAN,    0x00FFFF) \
+    X(MAGENTA, 0xFF00FF) \
+    X(WHITE,   0xFFFFFF)
+
+#define COLOR_AS_ENUM(name, rgb) COLOR_##name,
+enum color { COLORS(COLOR_AS_ENUM) COLOR_COUNT };
+
+const char *color_name(enum color c) {
+    (void)c;
+    return "?";
+}
+
+unsigned color_rgb(enum color c) {
+    (void)c;
+    return 0;
+}
+
+int color_from_name(const char *name) {
+    (void)name;
+    return -1;
+}
+--- solution
+#include <string.h>
+
+#define COLORS(X) \
+    X(BLACK,   0x000000) \
+    X(RED,     0xFF0000) \
+    X(GREEN,   0x00FF00) \
+    X(BLUE,    0x0000FF) \
+    X(YELLOW,  0xFFFF00) \
+    X(CYAN,    0x00FFFF) \
+    X(MAGENTA, 0xFF00FF) \
+    X(WHITE,   0xFFFFFF)
+
+#define COLOR_AS_ENUM(name, rgb) COLOR_##name,
+enum color { COLORS(COLOR_AS_ENUM) COLOR_COUNT };
+
+#define COLOR_AS_NAME(name, rgb) #name,
+#define COLOR_AS_RGB(name, rgb) rgb,
+static const char *const color_names[] = { COLORS(COLOR_AS_NAME) };
+static const unsigned color_values[] = { COLORS(COLOR_AS_RGB) };
+
+const char *color_name(enum color c) {
+    if ((unsigned)c >= COLOR_COUNT) return "?";
+    return color_names[c];
+}
+
+unsigned color_rgb(enum color c) {
+    if ((unsigned)c >= COLOR_COUNT) return 0;
+    return color_values[c];
+}
+
+int color_from_name(const char *name) {
+    for (int i = 0; i < COLOR_COUNT; i++)
+        if (strcmp(color_names[i], name) == 0) return i;
+    return -1;
+}
+--- hint
+Define `#define COLOR_AS_NAME(name, rgb) #name,` and build `static const char *const color_names[] = { COLORS(COLOR_AS_NAME) };`.
+--- hint
+Casting to `unsigned` before comparing with `COLOR_COUNT` rejects negative values too.
+--- harness
+int main(void) {
+    CHECK_INT(COLOR_COUNT, 8);
+    CHECK_STR(color_name(COLOR_BLACK), "BLACK");
+    CHECK_STR(color_name(COLOR_RED), "RED");
+    CHECK_STR(color_name(COLOR_MAGENTA), "MAGENTA");
+    CHECK_STR(color_name(COLOR_WHITE), "WHITE");
+    CHECK_STR(color_name(COLOR_COUNT), "?");
+    CHECK_STR(color_name((enum color)-1), "?");
+    CHECK_UINT(color_rgb(COLOR_RED), 0xFF0000);
+    CHECK_UINT(color_rgb(COLOR_CYAN), 0x00FFFF);
+    CHECK_UINT(color_rgb(COLOR_YELLOW), 0xFFFF00);
+    CHECK_UINT(color_rgb(COLOR_COUNT), 0);
+    CHECK_INT(color_from_name("BLACK"), COLOR_BLACK);
+    CHECK_INT(color_from_name("BLUE"), COLOR_BLUE);
+    CHECK_INT(color_from_name("WHITE"), COLOR_WHITE);
+    CHECK_INT(color_from_name("white"), -1);
+    CHECK_INT(color_from_name(""), -1);
+    CHECK_INT(color_from_name("REDDISH"), -1);
+    for (int i = 0; i < COLOR_COUNT; i++)
+        CHECK_INT(color_from_name(color_name((enum color)i)), i);
+    return TEST_END();
+}
+
+=== exercise generic
+title: Type dispatch with _Generic
+--- prompt
+Write two macros using `_Generic`:
+
+- `TYPE_NAME(x)` evaluates to a string naming the type of `x`: `"char"`, `"int"`, `"unsigned"`, `"long"`, `"long long"`, `"float"`, `"double"`, `"char *"`, `"const char *"`, or `"other"` for anything else.
+- `ABS_ANY(x)` returns the absolute value of `x` *with the same type as* `x`, for `int`, `long`, `long long`, `float` and `double`, by calling `abs`, `labs`, `llabs`, `fabsf` or `fabs`.
+
+The tests check things like `TYPE_NAME('a')` (what type is a character constant in C?), `TYPE_NAME("hi")`, and `TYPE_NAME(ABS_ANY(-2.5f))`, which must be `"float"`.
+--- starter
+#include <stdlib.h>
+#include <math.h>
+
+#define TYPE_NAME(x) "other"
+#define ABS_ANY(x) (x)
+--- solution
+#include <stdlib.h>
+#include <math.h>
+
+#define TYPE_NAME(x) _Generic((x), \
+    char: "char",                  \
+    int: "int",                    \
+    unsigned: "unsigned",          \
+    long: "long",                  \
+    long long: "long long",        \
+    float: "float",                \
+    double: "double",              \
+    char *: "char *",              \
+    const char *: "const char *",  \
+    default: "other")
+
+#define ABS_ANY(x) _Generic((x), \
+    int: abs,                    \
+    long: labs,                  \
+    long long: llabs,            \
+    float: fabsf,                \
+    double: fabs)(x)
+--- hint
+`_Generic((x), int: "int", double: "double", default: "other")` is an expression; each association is `type: expression`.
+--- hint
+For `ABS_ANY`, let `_Generic` select the *function* and call the result: `_Generic((x), int: abs, ...)(x)`.
+--- hint
+A character constant like `'a'` has type `int` in C (unlike C++), and a string literal decays to `char *`.
+--- harness
+int main(void) {
+    char c = 'z';
+    const char *cs = "x";
+    short sh = 1;
+    CHECK_STR(TYPE_NAME(c), "char");
+    CHECK_STR(TYPE_NAME('a'), "int");
+    CHECK_STR(TYPE_NAME(42), "int");
+    CHECK_STR(TYPE_NAME(42u), "unsigned");
+    CHECK_STR(TYPE_NAME(42L), "long");
+    CHECK_STR(TYPE_NAME(42LL), "long long");
+    CHECK_STR(TYPE_NAME(1.0f), "float");
+    CHECK_STR(TYPE_NAME(1.0), "double");
+    CHECK_STR(TYPE_NAME("hi"), "char *");
+    CHECK_STR(TYPE_NAME(cs), "const char *");
+    CHECK_STR(TYPE_NAME(sh), "other");
+    CHECK_STR(TYPE_NAME(sh + sh), "int");
+    CHECK_STR(TYPE_NAME(c + 1), "int");
+    CHECK_STR(TYPE_NAME(1.0f * 2), "float");
+    CHECK_STR(TYPE_NAME(1.0f * 2.0), "double");
+    CHECK_INT(ABS_ANY(-3), 3);
+    CHECK_INT(ABS_ANY(-3000000000LL), 3000000000LL);
+    CHECK_INT(ABS_ANY(-7L), 7);
+    CHECK_DBL(ABS_ANY(-2.5f), 2.5);
+    CHECK_DBL(ABS_ANY(-1e300), 1e300);
+    CHECK_STR(TYPE_NAME(ABS_ANY(-2.5f)), "float");
+    CHECK_STR(TYPE_NAME(ABS_ANY(-2.5)), "double");
+    CHECK_STR(TYPE_NAME(ABS_ANY(-2L)), "long");
+    return TEST_END();
+}
+
+=== exercise module
+title: A module in sections
+--- prompt
+This exercise simulates three files in one: `ring.h` (the public interface), `ring.c` (the implementation) and your tests standing in for `main.c`. Implement a FIFO **ring buffer** of `int`s holding at most `RING_CAP` (8) values, as a module with private state:
+
+- The storage, head and count live in `ring.c` as file-scope `static` variables. Nothing outside `ring.c` can touch them.
+- `bool ring_push(int v)`: append; if the ring is full, do nothing, increment `ring_overflows` and return `false`.
+- `bool ring_pop(int *out)`: remove the oldest value into `*out` and return `true`, or return `false` if empty (leaving `*out` alone).
+- `size_t ring_count(void)` and `void ring_clear(void)` (empties the ring; does not reset `ring_overflows`).
+- `ring_overflows` is a public global: declared `extern` in the header, defined exactly once in `ring.c`.
+
+The tests push and pop past the end of the array many times, so the indices must wrap.
+--- starter
+#include <stdbool.h>
+#include <stddef.h>
+
+/* ======== ring.h ======== */
+#ifndef RING_H
+#define RING_H
+
+#define RING_CAP 8
+
+extern int ring_overflows;   /* pushes rejected because the ring was full */
+
+bool ring_push(int v);
+bool ring_pop(int *out);
+size_t ring_count(void);
+void ring_clear(void);
+
+#endif
+
+/* ======== ring.c ======== */
+/* #include "ring.h" */
+
+int ring_overflows = 0;
+
+bool ring_push(int v) {
+    (void)v;
+    return false;
+}
+
+bool ring_pop(int *out) {
+    (void)out;
+    return false;
+}
+
+size_t ring_count(void) {
+    return 0;
+}
+
+void ring_clear(void) {
+}
+--- solution
+#include <stdbool.h>
+#include <stddef.h>
+
+/* ======== ring.h ======== */
+#ifndef RING_H
+#define RING_H
+
+#define RING_CAP 8
+
+extern int ring_overflows;   /* pushes rejected because the ring was full */
+
+bool ring_push(int v);
+bool ring_pop(int *out);
+size_t ring_count(void);
+void ring_clear(void);
+
+#endif
+
+/* ======== ring.c ======== */
+/* #include "ring.h" */
+
+int ring_overflows = 0;
+
+static int items[RING_CAP];
+static size_t head = 0;    /* index of the oldest item */
+static size_t count = 0;
+
+bool ring_push(int v) {
+    if (count == RING_CAP) {
+        ring_overflows++;
+        return false;
+    }
+    items[(head + count) % RING_CAP] = v;
+    count++;
+    return true;
+}
+
+bool ring_pop(int *out) {
+    if (count == 0) return false;
+    *out = items[head];
+    head = (head + 1) % RING_CAP;
+    count--;
+    return true;
+}
+
+size_t ring_count(void) {
+    return count;
+}
+
+void ring_clear(void) {
+    head = 0;
+    count = 0;
+}
+--- hint
+Keep `head` (index of the oldest item) and `count`. The next free slot is `(head + count) % RING_CAP`.
+--- hint
+Mark the storage and indices `static` so they have internal linkage: in a real build `main.c` could not even name them.
+--- harness
+int main(void) {
+    int v = -1;
+    CHECK_INT(ring_count(), 0);
+    CHECK(!ring_pop(&v));
+    CHECK_INT(v, -1);
+    for (int i = 0; i < RING_CAP; i++) CHECK(ring_push(i * 10));
+    CHECK_INT(ring_count(), 8);
+    CHECK(!ring_push(999));
+    CHECK(!ring_push(998));
+    CHECK_INT(ring_overflows, 2);
+    CHECK(ring_pop(&v));
+    CHECK_INT(v, 0);
+    CHECK(ring_pop(&v));
+    CHECK_INT(v, 10);
+    CHECK(ring_push(80));
+    CHECK(ring_push(90));
+    CHECK(!ring_push(100));
+    CHECK_INT(ring_overflows, 3);
+    int want[] = {20, 30, 40, 50, 60, 70, 80, 90};
+    for (int i = 0; i < 8; i++) {
+        CHECK(ring_pop(&v));
+        CHECK_INT(v, want[i]);
+    }
+    CHECK(!ring_pop(&v));
+    int next_in = 0, next_out = 0, ok = 1;
+    for (int round = 0; round < 50; round++) {
+        for (int k = 0; k < 3; k++) ok &= ring_push(next_in++);
+        for (int k = 0; k < 3; k++) { ok &= ring_pop(&v); ok &= (v == next_out++); }
+    }
+    CHECK(ok);
+    CHECK_INT(ring_count(), 0);
+    ring_push(1); ring_push(2); ring_push(3);
+    ring_clear();
+    CHECK_INT(ring_count(), 0);
+    CHECK(!ring_pop(&v));
+    CHECK_INT(ring_overflows, 3);
+    ring_overflows = 0;
+    for (int i = 0; i < 20; i++) ring_push(i);
+    CHECK_INT(ring_overflows, 12);
+    CHECK(ring_pop(&v));
+    CHECK_INT(v, 0);
+    return TEST_END();
+}
+
+=== quiz
+run: yes
+--- q
+What does this print?
+--- code
+#include <stdio.h>
+
+#define SQUARE(x) x * x
+
+int main(void) {
+    printf("%d %d\n", SQUARE(1 + 2), 18 / SQUARE(3));
+    return 0;
+}
+--- choice
+9 2
+--- answer
+5 18
+--- choice
+9 18
+--- choice
+5 2
+--- explain
+`SQUARE(1 + 2)` becomes `1 + 2 * 1 + 2` = 5, and `18 / SQUARE(3)` becomes `18 / 3 * 3` = 18. Parenthesize each argument and the whole body: `((x) * (x))`.
+
+=== quiz
+run: yes
+--- q
+What does this print?
+--- code
+#include <stdio.h>
+
+#define MAX(a, b) ((a) > (b) ? (a) : (b))
+
+int main(void) {
+    int i = 3, j = 3;
+    int m = MAX(i++, j++);
+    printf("%d %d %d\n", m, i, j);
+    return 0;
+}
+--- choice
+3 4 4
+--- choice
+3 4 5
+--- answer
+4 4 5
+--- choice
+4 5 4
+--- explain
+It expands to `((i++) > (j++) ? (i++) : (j++))`. The comparison is `3 > 3`, false, and leaves both at 4. Then the third operand runs `j++` a *second* time: it yields 4 (so `m` is 4) and leaves `j` at 5. A `static inline` function would evaluate each argument once.
+
+=== quiz
+run: yes
+--- q
+What does this print?
+--- code
+#include <stdio.h>
+
+#define LIMIT 100
+#define STR(x) #x
+#define XSTR(x) STR(x)
+
+int main(void) {
+    printf("%s %s\n", STR(LIMIT), XSTR(LIMIT));
+    return 0;
+}
+--- choice
+100 100
+--- choice
+LIMIT LIMIT
+--- answer
+LIMIT 100
+--- choice
+100 LIMIT
+--- explain
+An argument used with `#` is not macro-expanded first, so `STR(LIMIT)` gives `"LIMIT"`. `XSTR(LIMIT)` passes its argument on normally, which expands it to `100` before `STR` stringifies it.
+
+=== quiz
+run: yes
+--- q
+`DEBUG_LEVL` is a typo and is never defined anywhere. What does this print?
+--- code
+#include <stdio.h>
+
+int main(void) {
+#if DEBUG_LEVL > 0
+    puts("debug");
+#elif DEBUG_LEVL == 0
+    puts("zero");
+#else
+    puts("negative");
+#endif
+    return 0;
+}
+--- choice
+debug
+--- answer
+zero
+--- choice
+negative
+--- choice
+It does not compile: DEBUG_LEVL is undeclared
+--- explain
+In `#if`, any identifier that is not a macro is replaced by `0`. Typos silently select the wrong branch; `-Wundef` makes gcc warn about it.
+
+=== quiz
+run: yes
+--- q
+What does this print?
+--- code
+#include <stdio.h>
+
+#define TYPE(x) _Generic((x), char: "char", int: "int", default: "other")
+
+int main(void) {
+    char c = 'a';
+    printf("%s %s %s\n", TYPE(c), TYPE('a'), TYPE(c + c));
+    return 0;
+}
+--- choice
+char char char
+--- choice
+char char int
+--- answer
+char int int
+--- choice
+int int int
+--- explain
+A character constant like `'a'` has type `int` in C (in C++ it is `char`). `c + c` undergoes integer promotion, so it is also `int`. Only the variable `c` itself is a `char`.
+
+=== quiz
+run: yes
+--- q
+What does this print?
+--- code
+#include <stdio.h>
+
+#define CAT(a, b) a##b
+#define FIELD(n) item_##n
+
+int main(void) {
+    int xy = 7, item_2 = 40;
+    printf("%d\n", CAT(x, y) + FIELD(2));
+    return 0;
+}
+--- answer
+47
+--- choice
+xy + item_2
+--- choice
+It does not compile
+--- choice
+7
+--- explain
+`##` pastes tokens: `CAT(x, y)` becomes the identifier `xy` and `FIELD(2)` becomes `item_2`, so the expression is `xy + item_2`.
+
+=== quiz
+--- q
+`config.h` contains `int verbose = 0;` and is included by both `main.c` and `log.c`. The build is `gcc main.c log.c`. What happens?
+--- choice
+It works: the include guard prevents the second definition
+--- choice
+Each file gets its own private `verbose`, which is confusing but legal
+--- answer
+The link fails with a multiple definition of `verbose`
+--- choice
+The compiler reports a redefinition while compiling `log.c`
+--- explain
+Include guards only prevent double inclusion *within one translation unit*. Each `.c` file is compiled separately and each defines `verbose`, so the linker sees two definitions (gcc 10+ defaults to `-fno-common`). The header should say `extern int verbose;` and exactly one `.c` file should define it.
+
+=== quiz
+--- q
+Why is a multi-statement macro written as `do { ... } while (0)` rather than just `{ ... }`?
+--- choice
+`do`/`while` loops are faster than plain blocks
+--- answer
+So that `if (c) MACRO(x); else ...` still compiles: `{ ... };` would end the `if` before the `else`
+--- choice
+So that local variables inside the macro do not clash with the caller's
+--- choice
+So that the macro's arguments are evaluated only once
+--- explain
+With plain braces, the caller's semicolon becomes an empty statement after the block, and the `else` no longer has an `if` to attach to. `do { } while (0)` is a single statement that consumes the semicolon. It does nothing about name clashes or double evaluation.

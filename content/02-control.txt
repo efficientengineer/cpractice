@@ -1,0 +1,979 @@
+=== chapter control
+title: Operators and control flow
+blurb: Precedence traps, truthiness without bool, = vs ==, short-circuit, switch fallthrough, loops, goto for cleanup, bitwise vs logical, and sequencing.
+--- body
+## Familiar syntax, fewer guard rails
+
+C# took its operators and statements from C, so `if`, `while`, `for`, `switch`, `? :` and the arithmetic operators look the same. The differences are in what the compiler *lets through*. C# rejects `if (x = 5)` and `if (n)` for an `int n`, because conditions must be `bool`. C accepts both. Many C#-isms that are compile errors become silent bugs in C, so compile with `-Wall -Wextra` and treat warnings as errors in your head.
+
+## Precedence, and where it bites
+
+From tightest to loosest binding:
+
+| Level | Operators | Associativity |
+|---|---|---|
+| 1 | `x()` `a[i]` `s.f` `p->f` `x++` `x--` | left to right |
+| 2 | `++x` `--x` `+x` `-x` `!` `~` `*p` `&x` `(type)` `sizeof` | right to left |
+| 3 | `*` `/` `%` | left to right |
+| 4 | `+` `-` | left to right |
+| 5 | `<<` `>>` | left to right |
+| 6 | `<` `<=` `>` `>=` | left to right |
+| 7 | `==` `!=` | left to right |
+| 8 | `&` | left to right |
+| 9 | `^` | left to right |
+| 10 | `\|` | left to right |
+| 11 | `&&` | left to right |
+| 12 | `\|\|` | left to right |
+| 13 | `? :` | right to left |
+| 14 | `=` `+=` `-=` `*=` `/=` `%=` `<<=` `>>=` `&=` `^=` `\|=` | right to left |
+| 15 | `,` | left to right |
+
+The famous mistakes all come from levels 5 and 8-10 being in odd places (a historical accident: `&` and `|` once doubled as logical operators):
+
+```c
+#include <stdio.h>
+
+int main(void) {
+    int x = 4;
+    if (x & 1 == 0) puts("even?");   // parsed as x & (1 == 0), i.e. x & 0: never true
+    if ((x & 1) == 0) puts("even");  // what was meant
+    printf("%d\n", 1 << 2 + 1);      // 8: parsed as 1 << (2 + 1)
+    printf("%d\n", (1 << 2) + 1);    // 5
+    int a = 5, b = 3, c = 1;
+    printf("%d\n", a > b > c);       // 0: (5 > 3) is 1, then 1 > 1 is 0
+    return 0;
+}
+```
+
+In C# `x & 1 == 0` is a type error (`int & bool`), so you never learned this one. gcc's `-Wparentheses` (part of `-Wall`) warns about all three. The rule of thumb: **parenthesize whenever you mix bitwise operators, shifts, or comparisons**.
+
+## Truth is an int
+
+C has no boolean conditions. Any scalar works: zero (or a null pointer) is false, everything else is true. Comparison and logical operators produce an `int`, `0` or `1`.
+
+```c
+#include <stdio.h>
+#include <stdbool.h>
+
+int main(void) {
+    int n = 42;
+    if (n) puts("nonzero is true");
+    printf("%d %d %d\n", 5 > 3, 5 < 3, !7);   // 1 0 0
+    printf("%d\n", !!n);                       // 1: the normalize-to-0/1 idiom
+
+    int big = 256;
+    bool flag = big;             // any nonzero converts to exactly 1
+    unsigned char byte = big;    // keeps the low 8 bits: 0
+    printf("%d %d\n", flag, byte);             // 1 0
+
+    const char *p = NULL;
+    if (!p) puts("a null pointer is false");
+    return 0;
+}
+```
+
+C99 added `_Bool`, a 1-byte type that only holds 0 or 1. `<stdbool.h>` gives it the names `bool`, `true` and `false` (C23 makes them keywords). Use it for flags and predicate return types; it documents intent. But plenty of C code (including the standard library: `isdigit`, `strcmp`) still returns `int` and means "zero or not zero", so never write `if (isdigit(c) == true)`: `isdigit` may return 2048.
+
+JavaScript habit to drop: `||` does not return an operand. `int port = cfg_port || 8080;` sets `port` to `1`. Write `cfg_port ? cfg_port : 8080`.
+
+## = versus ==
+
+`if (x = 0)` assigns 0 and tests it: always false, and `x` is now 0. It is legal C, because assignment is an expression whose value is the assigned value. gcc warns ("suggest parentheses around assignment used as truth value"). When you *do* mean it, the convention is to add parentheses and an explicit comparison, as in the most common loop in C:
+
+```c
+#include <stdio.h>
+
+int main(void) {
+    int c, lines = 0, chars = 0;
+    while ((c = getchar()) != EOF) {   // assign, then compare
+        chars++;
+        if (c == '\n') lines++;
+    }
+    printf("%d lines, %d chars\n", lines, chars);
+    return 0;
+}
+```
+
+`c` must be an `int`, not a `char`: `getchar` returns every byte value 0..255 *plus* `EOF` (-1), 257 possibilities that do not fit in a `char`.
+
+## Short-circuit and the ternary
+
+`&&` and `||` evaluate left to right and stop as soon as the answer is known, exactly as in C# and JS. That makes guards like `if (p != NULL && p->count > 0)` and `if (d != 0 && n / d > 2)` safe. The bitwise `&` and `|` always evaluate both sides.
+
+`cond ? a : b` evaluates only one of `a` and `b`. Both branches are converted to a common type, the usual arithmetic conversions again: `n > 0 ? 1 : 0.5` has type `double`. It nests right to left, so a chain reads like `else if`:
+
+```c
+#include <stdio.h>
+
+const char *size_name(int n) {
+    return n < 10   ? "small"
+         : n < 100  ? "medium"
+         : n < 1000 ? "large"
+         :            "huge";
+}
+
+int main(void) {
+    printf("%s %s %s %s\n", size_name(3), size_name(42), size_name(999), size_name(5000));
+    return 0;
+}
+```
+
+## The comma operator
+
+`a, b` evaluates `a`, throws its value away, then evaluates `b`; the result is `b`. Its only common use is packing two updates into a `for` header:
+
+```c
+#include <stdio.h>
+
+int main(void) {
+    char s[] = "stressed";
+    int i, j;
+    for (i = 0, j = 7; i < j; i++, j--) {   // comma operator, twice
+        char t = s[i]; s[i] = s[j]; s[j] = t;
+    }
+    printf("%s\n", s);                      // desserts
+    int x = (puts("side effect"), 42);      // x = 42
+    printf("%d\n", x);
+    return 0;
+}
+```
+
+The commas separating function arguments and declarators (`int i, j;`) are *not* the comma operator, and do not guarantee left-to-right order.
+
+## switch
+
+`switch` works only on integer types (including `char` and `enum`). No strings, no patterns, no ranges (gcc has `case 1 ... 5:` as an extension). Case labels must be integer constant expressions. The big difference from C#: **control falls through** from one case into the next unless you `break`. C# makes implicit fallthrough a compile error; C makes it the default.
+
+```c
+#include <stdio.h>
+
+const char *kind(int c) {
+    switch (c) {
+    case 'a': case 'e': case 'i': case 'o': case 'u':   // stacked labels share code
+        return "vowel";
+    case ' ':
+    case '\t':
+        return "space";
+    default:
+        if (c >= '0' && c <= '9') return "digit";
+        return "other";
+    }
+}
+
+int main(void) {
+    const char *s = "hi 42";
+    for (int i = 0; s[i] != '\0'; i++)
+        printf("'%c' %s\n", s[i], kind(s[i]));
+    return 0;
+}
+```
+
+Deliberate fallthrough is occasionally neat. `-Wextra` enables `-Wimplicit-fallthrough`, which warns unless you mark it with a `/* fall through */` comment (or C23's `[[fallthrough]];`):
+
+```c
+#include <stdio.h>
+
+int main(void) {
+    for (int level = 0; level <= 3; level++) {
+        printf("level %d:", level);
+        switch (level) {
+        case 3:
+            printf(" debug");
+            /* fall through */
+        case 2:
+            printf(" info");
+            /* fall through */
+        case 1:
+            printf(" errors");
+            break;
+        default:
+            printf(" nothing");
+        }
+        printf("\n");
+    }
+    return 0;
+}
+```
+
+Two more rules: before C23 a label must be followed by a statement, so `case 1: int x = 5;` is an error; wrap the case body in braces `case 1: { int x = 5; ... break; }`. And `default` can go anywhere, but put it last.
+
+## Loops
+
+`while`, `do ... while` and `for` behave as in C#. There is no `foreach`: you loop over indices or pointers. Since C99 you can declare the loop variable in the `for` header, scoped to the loop. `for (;;)` is the idiomatic infinite loop.
+
+```c
+#include <stdio.h>
+
+int main(void) {
+    int i = 10;
+    while (i < 3) puts("never");
+    do {
+        printf("do-while runs at least once: %d\n", i);
+    } while (i < 3);
+
+    for (int a = 0, b = 10; a < b; a += 3, b -= 3)
+        printf("%d %d\n", a, b);
+
+    for (int row = 0; row < 10; row++) {
+        if (row == 1) continue;   // skip to the next iteration (runs row++)
+        if (row == 4) break;      // leave the innermost loop or switch
+        printf("row %d\n", row);
+    }
+    return 0;
+}
+```
+
+`break` inside a `switch` inside a loop leaves the `switch`, not the loop. There is no labeled `break` like Java's; to leave nested loops, use a flag, move the loops into a function and `return`, or use `goto`.
+
+## goto
+
+`goto label;` jumps to `label:` anywhere in the same function. Dijkstra was right that spaghetti `goto` is bad, but two uses are standard, idiomatic C, used all over the Linux kernel, SQLite and CPython:
+
+```c
+#include <stdio.h>
+
+int main(void) {
+    int grid[3][3] = {{1, 2, 3}, {4, 5, 6}, {7, 8, 9}};
+    int target = 5;
+    for (int r = 0; r < 3; r++)
+        for (int c = 0; c < 3; c++)
+            if (grid[r][c] == target) {
+                printf("found at %d,%d\n", r, c);
+                goto done;            // leave both loops at once
+            }
+    puts("not found");
+done:
+    return 0;
+}
+```
+
+The second is **cleanup on error**. C has no `using`, `finally` or destructors. When a function acquires several resources and any step can fail, you jump forward to a single cleanup block instead of repeating `free`s in every error branch:
+
+```c
+#include <stdio.h>
+#include <stdlib.h>
+
+// Sum of i*i for i in 0..n-1, computed the long way with two scratch buffers.
+// Returns -1 on failure.
+long work(int n) {
+    long result = -1;
+    long *squares = NULL, *totals = NULL;
+
+    if (n <= 0) goto cleanup;
+    squares = malloc(n * sizeof *squares);
+    if (squares == NULL) goto cleanup;
+    totals = malloc(n * sizeof *totals);
+    if (totals == NULL) goto cleanup;
+
+    for (int i = 0; i < n; i++) {
+        squares[i] = (long)i * i;
+        totals[i] = squares[i] + (i > 0 ? totals[i - 1] : 0);
+    }
+    result = totals[n - 1];
+
+cleanup:
+    free(totals);     // free(NULL) does nothing, so this is safe on every path
+    free(squares);
+    return result;
+}
+
+int main(void) {
+    printf("%ld %ld\n", work(4), work(0));   // 14 -1
+    return 0;
+}
+```
+
+Only jump *forward* and *out*, never into a block or backwards to emulate a loop.
+
+## Bitwise versus logical
+
+| Logical (on truth values) | Bitwise (on every bit) |
+|---|---|
+| `a && b`: 0 or 1, short-circuits | `a & b`: bit by bit AND, evaluates both |
+| `a \|\| b`: 0 or 1, short-circuits | `a \| b`: bit by bit OR |
+| `!a`: 0 or 1 | `~a`: flips every bit |
+| | `a ^ b`: XOR; `a << n`, `a >> n`: shifts |
+
+```c
+#include <stdio.h>
+
+int main(void) {
+    int a = 6, b = 1;                     // binary 110 and 001
+    printf("%d %d\n", a & b, a && b);     // 0 1
+    printf("%d %d\n", a | b, a || b);     // 7 1
+    printf("%d %d\n", ~a, !a);            // -7 0
+    printf("%d\n", a ^ 3);                // 5: 110 ^ 011 = 101
+    printf("%d %d\n", a << 2, a >> 1);    // 24 3
+
+    enum { READ = 1, WRITE = 2, EXEC = 4 };
+    int perms = READ | WRITE;
+    if (perms & WRITE) puts("writable");
+    if (!(perms & EXEC)) puts("not executable");
+    return 0;
+}
+```
+
+Shift `unsigned` values when you can. Left-shifting a negative number, or shifting by a negative count or by the width of the type or more, is undefined; right-shifting a negative number is implementation-defined (gcc does an arithmetic shift). The bits chapter goes deeper.
+
+## Increment and sequencing
+
+`i++` yields the old value, `++i` the new one; that part is the same as C#. The difference: C# and JavaScript guarantee left-to-right evaluation of everything. **C does not.** In `f() + g()` or `printf("%d %d", f(), g())`, either call may run first (the order is *unspecified*). And modifying a variable twice, or modifying it and also reading it for another purpose, without a *sequence point* in between is **undefined behavior**:
+
+```c
+#include <stdio.h>
+
+int main(void) {
+    int i = 5;
+    int a = i++;          // a = 5, i = 6
+    int b = ++i;          // i = 7, b = 7
+    printf("%d %d %d\n", a, b, i);
+
+    // All undefined behavior. gcc -Wall warns "operation on 'i' may be undefined":
+    // i = i++ + 1;
+    // arr[i] = i++;
+    // printf("%d %d\n", i++, i++);
+
+    int j = 0;
+    int ok = (j++, j++, j);   // fine: the comma operator is a sequence point
+    printf("%d\n", ok);       // 2
+    return 0;
+}
+```
+
+The sequence points you can rely on: the end of each full expression (`;`), after the left operand of `&&`, `||`, `?` and the comma operator, and before a function is called (after all its arguments are evaluated). The safe habit is boring: **one side effect per variable per statement**, and use `++` as a statement on its own line unless it is the standard `*p++` idiom.
+
+=== exercise signs
+title: Count the signs
+--- prompt
+Read integers from stdin until end of input. Print how many were positive, negative and zero, in exactly this format:
+
+```text
+positive 3
+negative 1
+zero 2
+```
+
+No input at all is valid and gives three zero counts.
+--- starter
+#include <stdio.h>
+
+int main(void) {
+    int n;
+    int pos = 0, neg = 0, zero = 0;
+    // loop while scanf succeeds
+
+    return 0;
+}
+--- solution
+#include <stdio.h>
+
+int main(void) {
+    int n;
+    int pos = 0, neg = 0, zero = 0;
+    while (scanf("%d", &n) == 1) {
+        if (n > 0) pos++;
+        else if (n < 0) neg++;
+        else zero++;
+    }
+    printf("positive %d\nnegative %d\nzero %d\n", pos, neg, zero);
+    return 0;
+}
+--- hint
+`scanf` returns the number of items it converted: 1 while there are numbers, and `EOF` (or 0 on garbage) at the end. Loop `while (scanf("%d", &n) == 1)`.
+--- test
+3 -1 0 7 0 12
+--- out
+positive 3
+negative 1
+zero 2
+--- test
+--- out
+positive 0
+negative 0
+zero 0
+--- test
+-2147483648 2147483647 -5
+--- out
+positive 1
+negative 2
+zero 0
+
+=== exercise months
+title: Days in a month
+--- prompt
+Write `int days_in_month(int month, int year)` using a `switch` with stacked case labels. `month` is 1-12. Return 0 for an invalid month.
+
+February has 29 days in a leap year. Gregorian rule: a year is a leap year if it is divisible by 4, except years divisible by 100, which are leap years only if also divisible by 400. So 2024 and 2000 are leap years; 1900 and 2023 are not.
+
+Also write `bool is_leap(int year)` (include `<stdbool.h>`).
+--- starter
+#include <stdbool.h>
+
+bool is_leap(int year) {
+    return false;
+}
+
+int days_in_month(int month, int year) {
+    switch (month) {
+    default:
+        return 0;
+    }
+}
+--- solution
+#include <stdbool.h>
+
+bool is_leap(int year) {
+    return (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
+}
+
+int days_in_month(int month, int year) {
+    switch (month) {
+    case 1: case 3: case 5: case 7: case 8: case 10: case 12:
+        return 31;
+    case 4: case 6: case 9: case 11:
+        return 30;
+    case 2:
+        return is_leap(year) ? 29 : 28;
+    default:
+        return 0;
+    }
+}
+--- harness
+int main(void) {
+    CHECK(is_leap(2024));
+    CHECK(is_leap(2000));
+    CHECK(is_leap(1600));
+    CHECK(!is_leap(1900));
+    CHECK(!is_leap(2100));
+    CHECK(!is_leap(2023));
+    CHECK(!is_leap(1));
+    CHECK(is_leap(0));
+    CHECK_INT(days_in_month(1, 2023), 31);
+    CHECK_INT(days_in_month(2, 2023), 28);
+    CHECK_INT(days_in_month(2, 2024), 29);
+    CHECK_INT(days_in_month(2, 1900), 28);
+    CHECK_INT(days_in_month(2, 2000), 29);
+    CHECK_INT(days_in_month(3, 2023), 31);
+    CHECK_INT(days_in_month(4, 2023), 30);
+    CHECK_INT(days_in_month(6, 2023), 30);
+    CHECK_INT(days_in_month(7, 2023), 31);
+    CHECK_INT(days_in_month(8, 2023), 31);
+    CHECK_INT(days_in_month(9, 2023), 30);
+    CHECK_INT(days_in_month(11, 2023), 30);
+    CHECK_INT(days_in_month(12, 2023), 31);
+    CHECK_INT(days_in_month(0, 2023), 0);
+    CHECK_INT(days_in_month(13, 2023), 0);
+    CHECK_INT(days_in_month(-1, 2023), 0);
+    return TEST_END();
+}
+--- hint
+Stack labels for months with the same length: `case 4: case 6: case 9: case 11: return 30;`.
+--- hint
+The leap rule in one expression: `(y % 4 == 0 && y % 100 != 0) || y % 400 == 0`.
+
+=== exercise powtwo
+title: Bits, not booleans
+--- prompt
+Write two functions using bitwise operators:
+
+- `int popcount(unsigned x)`: the number of 1 bits in `x`.
+- `int is_power_of_two(unsigned x)`: 1 if `x` is a power of two (1, 2, 4, ...), else 0. Do this in one expression with no loop.
+
+Use the trick that `x & (x - 1)` clears the lowest set bit of `x`. (gcc has `__builtin_popcount`, but write it yourself here.)
+--- starter
+int popcount(unsigned x) {
+    int count = 0;
+    return count;
+}
+
+int is_power_of_two(unsigned x) {
+    return 0;
+}
+--- solution
+int popcount(unsigned x) {
+    int count = 0;
+    while (x) {
+        x &= x - 1;
+        count++;
+    }
+    return count;
+}
+
+int is_power_of_two(unsigned x) {
+    return x != 0 && (x & (x - 1)) == 0;
+}
+--- harness
+int main(void) {
+    CHECK_INT(popcount(0), 0);
+    CHECK_INT(popcount(1), 1);
+    CHECK_INT(popcount(6), 2);
+    CHECK_INT(popcount(255), 8);
+    CHECK_INT(popcount(0xF0F0u), 8);
+    CHECK_INT(popcount(0x80000000u), 1);
+    CHECK_INT(popcount(0xFFFFFFFFu), 32);
+    CHECK_INT(popcount(0xAAAAAAAAu), 16);
+    CHECK_INT(is_power_of_two(0), 0);
+    CHECK_INT(is_power_of_two(1), 1);
+    CHECK_INT(is_power_of_two(2), 1);
+    CHECK_INT(is_power_of_two(3), 0);
+    CHECK_INT(is_power_of_two(64), 1);
+    CHECK_INT(is_power_of_two(96), 0);
+    CHECK_INT(is_power_of_two(0x80000000u), 1);
+    CHECK_INT(is_power_of_two(0x80000001u), 0);
+    CHECK_INT(is_power_of_two(0xFFFFFFFFu), 0);
+    return TEST_END();
+}
+--- hint
+`popcount`: each `x &= x - 1` removes exactly one 1 bit, so count how many times you can do it before `x` is 0.
+--- hint
+A power of two has exactly one bit set, so clearing its lowest set bit leaves 0. Mind the precedence: `(x & (x - 1)) == 0` needs the parentheses.
+--- hint
+Zero is not a power of two, but `0 & (0 - 1)` is 0. Guard it with `x != 0 &&`.
+
+=== exercise reverse
+title: Reverse the digits
+--- prompt
+Read integers (each fits in an `int`) until end of input. For each, print its decimal digits in reverse order on its own line, keeping a leading minus sign:
+
+```text
+123   ->  321
+-45   ->  -54
+1200  ->  0021
+0     ->  0
+```
+
+Work digit by digit with `%` and `/`; don't print the number into a string. Watch out for two edge cases: `0` still has one digit (a `do`/`while` loop handles that naturally), and `-2147483648` cannot be negated in an `int`.
+--- starter
+#include <stdio.h>
+
+int main(void) {
+    int n;
+    while (scanf("%d", &n) == 1) {
+        // print n's digits backwards
+    }
+    return 0;
+}
+--- solution
+#include <stdio.h>
+
+int main(void) {
+    int n;
+    while (scanf("%d", &n) == 1) {
+        if (n < 0) putchar('-');
+        do {
+            int d = n % 10;          // negative for negative n
+            if (d < 0) d = -d;
+            putchar('0' + d);
+            n /= 10;
+        } while (n != 0);
+        putchar('\n');
+    }
+    return 0;
+}
+--- hint
+`n % 10` is the last digit and `n / 10` drops it. Loop until `n` is 0, but run the body at least once.
+--- hint
+For negative `n`, `n % 10` is negative (`-45 % 10 == -5`) and `n / 10` truncates toward zero. So you never need to negate `n` itself, only each digit.
+--- test
+123
+-45
+1200
+0
+7
+--- out
+321
+-54
+0021
+0
+7
+--- test
+-2147483648
+2147483647
+-10
+--- out
+-8463847412
+7463847412
+-01
+
+=== exercise primes
+title: Primes up to n
+--- prompt
+Read one integer `n` and print every prime number from 2 to `n` inclusive on one line, separated by single spaces. If there are none (including for zero and negative `n`), print an empty line.
+
+Use trial division: for each candidate `k`, try divisors `d` while `d * d <= k`; `break` out as soon as one divides, and `continue` to the next candidate.
+--- starter
+#include <stdio.h>
+
+int main(void) {
+    int n;
+    if (scanf("%d", &n) != 1) return 1;
+    for (int k = 2; k <= n; k++) {
+        // test k
+    }
+    printf("\n");
+    return 0;
+}
+--- solution
+#include <stdio.h>
+
+int main(void) {
+    int n;
+    if (scanf("%d", &n) != 1) return 1;
+    int first = 1;
+    for (int k = 2; k <= n; k++) {
+        int prime = 1;
+        for (int d = 2; d * d <= k; d++) {
+            if (k % d == 0) {
+                prime = 0;
+                break;
+            }
+        }
+        if (!prime) continue;
+        if (!first) putchar(' ');
+        printf("%d", k);
+        first = 0;
+    }
+    printf("\n");
+    return 0;
+}
+--- hint
+A `break` in the inner loop only leaves the inner loop. Record what happened in a flag, then test it in the outer loop.
+--- hint
+To avoid a trailing or leading space, print the separator *before* every number except the first.
+--- test
+30
+--- out
+2 3 5 7 11 13 17 19 23 29
+--- test
+2
+--- out
+2
+--- test
+1
+--- out
+
+--- test
+0
+--- out
+
+--- test
+-7
+--- out
+
+--- test
+100
+--- out
+2 3 5 7 11 13 17 19 23 29 31 37 41 43 47 53 59 61 67 71 73 79 83 89 97
+
+=== exercise collatz
+title: Collatz steps
+--- prompt
+The Collatz rule: if `n` is even, halve it; if odd, replace it with `3n + 1`. It is conjectured that every positive start eventually reaches 1.
+
+Write `int collatz_steps(long long n)` that returns how many steps it takes to reach 1 (so `collatz_steps(1)` is 0 and `collatz_steps(6)` is 8: 6, 3, 10, 5, 16, 8, 4, 2, 1). Return -1 if `n` is not positive.
+
+The intermediate values get much bigger than the start: from 837799 the sequence peaks near three billion, beyond `int`.
+--- starter
+int collatz_steps(long long n) {
+    int steps = 0;
+    return steps;
+}
+--- solution
+int collatz_steps(long long n) {
+    if (n < 1) return -1;
+    int steps = 0;
+    while (n != 1) {
+        n = (n % 2 == 0) ? n / 2 : 3 * n + 1;
+        steps++;
+    }
+    return steps;
+}
+--- harness
+int main(void) {
+    CHECK_INT(collatz_steps(1), 0);
+    CHECK_INT(collatz_steps(2), 1);
+    CHECK_INT(collatz_steps(6), 8);
+    CHECK_INT(collatz_steps(7), 16);
+    CHECK_INT(collatz_steps(27), 111);
+    CHECK_INT(collatz_steps(97), 118);
+    CHECK_INT(collatz_steps(837799), 524);
+    CHECK_INT(collatz_steps(63728127), 949);
+    CHECK_INT(collatz_steps(0), -1);
+    CHECK_INT(collatz_steps(-5), -1);
+    return TEST_END();
+}
+--- hint
+A `while (n != 1)` loop with a ternary for the update. Keep `n` a `long long` throughout; don't copy it into an `int`.
+--- hint
+Check `n < 1` first, or the loop never ends for 0 (0 is even, and half of 0 is 0).
+
+=== exercise runs
+title: Longest run
+--- prompt
+Read integers until end of input. Print the value and the length of the longest run of equal *consecutive* values, separated by a space. If several runs tie, report the first one. If there is no input, print `empty`.
+
+```text
+input:  1 1 2 2 2 1
+output: 2 3
+```
+
+Be careful how you initialize "the previous value": the input may well start with 0.
+--- starter
+#include <stdio.h>
+
+int main(void) {
+    int x;
+    while (scanf("%d", &x) == 1) {
+    }
+    puts("empty");
+    return 0;
+}
+--- solution
+#include <stdio.h>
+
+int main(void) {
+    int x, prev = 0, run = 0;
+    int best_len = 0, best_val = 0;
+    while (scanf("%d", &x) == 1) {
+        if (run > 0 && x == prev) {
+            run++;
+        } else {
+            prev = x;
+            run = 1;
+        }
+        if (run > best_len) {
+            best_len = run;
+            best_val = prev;
+        }
+    }
+    if (best_len == 0)
+        puts("empty");
+    else
+        printf("%d %d\n", best_val, best_len);
+    return 0;
+}
+--- hint
+Track three things as you go: the previous value, the length of the current run, and the best run so far (value and length).
+--- hint
+Updating the best only on a strictly longer run (`>` not `>=`) keeps the first of equal runs.
+--- hint
+"No previous value yet" is a state of its own. Using `run == 0` for it avoids treating a leading 0 as continuing a run.
+--- test
+1 1 2 2 2 1
+--- out
+2 3
+--- test
+5
+--- out
+5 1
+--- test
+--- out
+empty
+--- test
+3 3 4 4
+--- out
+3 2
+--- test
+0 0 7
+--- out
+0 2
+--- test
+-1 -1 -1 0 0 0 0 9
+--- out
+0 4
+--- test
+1 2 3 4
+--- out
+1 1
+
+=== quiz
+run: yes
+--- q
+What does this print?
+--- code
+#include <stdio.h>
+
+int main(void) {
+    int x = 4;
+    if (x & 1 == 0)
+        puts("even");
+    else
+        puts("odd");
+    return 0;
+}
+--- choice
+even
+--- answer
+odd
+--- choice
+It does not compile
+--- explain
+`==` binds tighter than `&`, so this is `x & (1 == 0)`, which is `4 & 0`, which is 0 (false). Write `(x & 1) == 0`. gcc warns with `-Wparentheses`.
+
+=== quiz
+run: yes
+--- q
+What does this print?
+--- code
+#include <stdio.h>
+
+int main(void) {
+    int x = 5;
+    if (x = 0)
+        puts("zero");
+    else
+        printf("nonzero %d\n", x);
+    return 0;
+}
+--- choice
+zero
+--- choice
+nonzero 5
+--- answer
+nonzero 0
+--- choice
+It does not compile
+--- explain
+`x = 0` is an assignment expression with value 0, which is false, so the `else` branch runs, and by then `x` is 0. C# would reject this; C only warns.
+
+=== quiz
+run: yes
+--- q
+What does this print?
+--- code
+#include <stdio.h>
+
+int main(void) {
+    int a = 0, b = 0, c = 0;
+    if (a++ && b++) c = 1;
+    if (a++ || b++) c += 2;
+    printf("%d %d %d\n", a, b, c);
+    return 0;
+}
+--- choice
+2 2 3
+--- choice
+2 1 2
+--- answer
+2 0 2
+--- choice
+1 0 2
+--- explain
+First `if`: `a++` yields 0 (and sets `a` to 1), so `&&` stops; `b++` never runs. Second: `a++` yields 1 (and sets `a` to 2), so `||` stops; `b++` again never runs. Only the second condition is true, so `c` is 2.
+
+=== quiz
+run: yes
+--- q
+What does this print?
+--- code
+#include <stdio.h>
+
+int main(void) {
+    int x = 2;
+    switch (x) {
+    case 1: printf("one ");
+    case 2: printf("two ");
+    case 3: printf("three ");
+        break;
+    default: printf("other ");
+    }
+    printf("\n");
+    return 0;
+}
+--- choice
+two
+--- answer
+two three
+--- choice
+two three other
+--- choice
+one two three
+--- explain
+Execution jumps to `case 2` and falls through into `case 3` until the `break`. Labels are just entry points; they do not end the previous case.
+
+=== quiz
+run: yes
+--- q
+What does this print?
+--- code
+#include <stdio.h>
+
+int main(void) {
+    printf("%d %d %d %d\n", 7 && 2, 7 & 2, 7 || 0, !!-3);
+    return 0;
+}
+--- choice
+1 1 1 1
+--- answer
+1 2 1 1
+--- choice
+2 2 7 -3
+--- choice
+1 2 7 1
+--- explain
+Logical operators always give 0 or 1. Bitwise `7 & 2` is `111 & 010 = 010`, which is 2. `!!x` turns any nonzero into 1.
+
+=== quiz
+run: yes
+--- q
+What does this print?
+--- code
+#include <stdio.h>
+
+int main(void) {
+    for (int i = 0; i < 10; i++) {
+        if (i % 3) continue;
+        printf("%d ", i);
+        if (i > 5) break;
+    }
+    printf("\n");
+    return 0;
+}
+--- choice
+0 3 6 9
+--- answer
+0 3 6
+--- choice
+1 2 4 5
+--- choice
+0 3
+--- explain
+`i % 3` is nonzero (true) unless `i` is a multiple of 3, so only 0, 3, 6, 9 get printed, and the `break` fires right after printing 6.
+
+=== quiz
+run: yes
+--- q
+What does this print?
+--- code
+#include <stdio.h>
+
+int main(void) {
+    int a = 1, b = 2;
+    int x = (a++, b++, a + b);
+    printf("%d %d %d\n", a, b, x);
+    return 0;
+}
+--- choice
+1 2 3
+--- choice
+2 3 3
+--- answer
+2 3 5
+--- choice
+It is undefined behavior
+--- explain
+The comma operator evaluates left to right with a sequence point after each operand, and yields the last one: `a` becomes 2, `b` becomes 3, then `a + b` is 5. This is well defined, unlike `a++ + a++`.
+
+=== quiz
+--- q
+Which statement has undefined behavior?
+--- choice
+`i = i + 1;`
+--- answer
+`i = i++ + 1;`
+--- choice
+`i = (i++, i + 1);`
+--- choice
+`if (i++ > 0 && i < 10) i = 0;`
+--- explain
+`i = i++ + 1` modifies `i` twice (the `++` and the assignment) with no sequence point between them. The comma operator and `&&` both introduce sequence points, so the other two are well defined.

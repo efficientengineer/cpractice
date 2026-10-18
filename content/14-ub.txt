@@ -1,0 +1,991 @@
+=== chapter ub
+title: Undefined behavior
+blurb: What UB really means, why optimizers exploit it, the common cases, how -O2 deletes your checks, and the sanitizers and habits that catch it.
+--- body
+## Three kinds of "it depends"
+
+The C standard describes what a program does, except where it deliberately doesn't. There are three levels of not saying:
+
+| Kind | Meaning | Examples |
+|---|---|---|
+| **Implementation-defined** | the compiler must pick a behavior *and document it* | `sizeof(int)`, whether `char` is signed, `-8 >> 1` (arithmetic shift on gcc) |
+| **Unspecified** | one of several allowed behaviors, need not be documented or consistent | order of evaluating function arguments: `f(a(), b())` |
+| **Undefined** | the standard imposes **no requirements at all** | signed overflow, out-of-bounds access, null dereference, data races |
+
+Implementation-defined and unspecified behavior are portability concerns: your program is still a program. Undefined behavior is different in kind. The standard's definition is "behavior ... for which this International Standard imposes no requirements". Not "returns garbage", not "crashes": *no requirements*. It may crash, may print what you expected, may do something else at `-O2`, and may change behavior when you add an unrelated `printf`.
+
+In C# almost everything here is defined: integer overflow wraps (or throws in a `checked` block), array indexing throws, null dereference throws. JavaScript has no UB at all. C chose otherwise for speed: if the compiler may assume signed arithmetic never overflows and pointers are never null when dereferenced, it can generate tighter code without inserting checks.
+
+## Why "it worked when I tried it" means nothing
+
+The compiler does not *detect* UB and do something malicious. It **assumes UB never happens** and optimizes on that basis. Each assumption is locally reasonable; chained together they produce results that look insane.
+
+### Example 1: an overflow check that vanishes
+
+```c
+#include <limits.h>
+#include <stdio.h>
+
+int will_overflow(int x) {
+    return x + 1 < x;   // "if adding 1 made it smaller, it wrapped"
+}
+
+int main(void) {
+    printf("%d\n", will_overflow(INT_MAX));
+    return 0;
+}
+```
+
+The programmer reasons with two's complement wrapping. The compiler reasons: `x + 1` cannot overflow (that would be UB), so `x + 1 < x` is always false, so the function is `return 0;`. At `-O0` you may see `1`; at `-O2` you see `0`. The check has to be written *before* the operation, in terms that cannot overflow: `x == INT_MAX`, or more generally `b > 0 && a > INT_MAX - b`.
+
+### Example 2: a null check after the dereference
+
+```c
+#include <stdio.h>
+
+struct conn { int fd; };
+
+int get_fd(struct conn *c) {
+    int fd = c->fd;          // dereference first
+    if (c == NULL) return -1;  // the compiler deletes this line
+    return fd;
+}
+
+int main(void) {
+    struct conn c = {3};
+    printf("%d\n", get_fd(&c));
+    return 0;
+}
+```
+
+Since `c->fd` already ran, `c` cannot be null (or the program already had UB), so the `if` is dead code. This exact pattern caused a Linux kernel vulnerability in 2009; the kernel now builds with `-fno-delete-null-pointer-checks`.
+
+### Example 3: a loop that never ends, or ends early
+
+```c
+#include <stdio.h>
+
+int main(void) {
+    int table[4] = {1, 2, 3, 4};
+    int found = 0;
+    for (int i = 0; i <= 4; i++)       // reads table[4]: out of bounds
+        if (table[i] == 99) found = 1;
+    printf("%d\n", found);
+    return 0;
+}
+```
+
+At `-O2`, gcc has been observed to reason "the loop body runs for `i == 4`, which is UB, so that iteration never happens; so ..." and emit code that does odd things such as returning early or looping forever. You cannot reason about what *will* happen. You can only not do it.
+
+### Example 4: strict aliasing
+
+```c
+#include <stdio.h>
+
+int set_both(int *i, float *f) {
+    *i = 1;
+    *f = 0.0f;
+    return *i;   // at -O2 gcc returns the constant 1
+}
+
+int main(void) {
+    int x = 0;
+    printf("%d\n", set_both(&x, (float *)&x));  // UB: x accessed as float
+    return 0;
+}
+```
+
+The **strict aliasing rule** says an object may only be accessed through an lvalue of its own type (or a compatible type, a signed/unsigned variant, or a character type). So an `int *` and a `float *` are assumed never to point at the same memory, and `*i` need not be reloaded after the `float` store. To reinterpret bytes, use `memcpy` (compilers turn it into a single move) or a union:
+
+```c
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+
+static uint32_t float_bits(float f) {
+    uint32_t u;
+    memcpy(&u, &f, sizeof u);   // well defined, and free after optimization
+    return u;
+}
+
+int main(void) {
+    printf("%08x\n", (unsigned)float_bits(1.0f));   // 3f800000
+    return 0;
+}
+```
+
+## The common undefined behaviors
+
+| UB | Typical source | Caught by |
+|---|---|---|
+| Array / pointer out of bounds | `<=` instead of `<`, `strcpy` into a small buffer, missing `+ 1` for the terminator | ASan |
+| Signed integer overflow | `INT_MAX + 1`, `abs(INT_MIN)`, `INT_MIN / -1`, `a * b` with big inputs | UBSan |
+| Null pointer dereference | unchecked `malloc`/`fopen` result | crash; UBSan for some cases |
+| Reading uninitialized memory | `int x; x++;`, `malloc` without filling | MSan (clang), valgrind |
+| Use after free / double free | dangling pointers, freeing in a loop then reading `->next` | ASan |
+| Returning the address of a local | `char buf[64]; ...; return buf;` | gcc warning, ASan (`detect_stack_use_after_return`) |
+| Shift by negative or >= width | `1 << 32`, `x << n` with `n` from input, `1 << 31` on `int` | UBSan |
+| Unsequenced modifications | `i = i++ + 1;`, `a[i] = i++;`, `f(i++, i++)` | `-Wall` (`-Wsequence-point`) |
+| Strict aliasing violations | `*(uint32_t *)&my_float` | `-Wstrict-aliasing` (partly) |
+| Data races | two threads touching the same non-atomic variable, at least one writing | TSan |
+| Modifying a string literal | `char *s = "hi"; s[0] = 'H';` | crash (literals live in read-only memory) |
+| Misaligned access | casting a `char *` into a buffer to `int *` | UBSan (`-fsanitize=alignment`) |
+| Falling off the end of a non-void function, then using the result | missing `return` | `-Wall` (`-Wreturn-type`) |
+| Invalid `printf` format / argument mismatch | `printf("%d", 3.0)` | `-Wall` (`-Wformat`) |
+
+A few that surprise C# developers:
+
+- **Unsigned** overflow is *defined*: it wraps modulo 2^N. Only signed overflow is UB.
+- Integer promotion means `uint16_t` and `char` arithmetic is done in `int`, so `(uint16_t)a * (uint16_t)b` can overflow a *signed* `int`. `65535 * 65535` does.
+- `i = i++` is not "unspecified which order"; it is fully undefined. Between two *sequence points* (roughly: full statement ends, `&&`, `||`, `?:`, `,` operator, function call entry) you may modify an object at most once, and not read it for any other purpose.
+- Converting an out-of-range `double` to `int` is UB: `(int)1e10`.
+- Computing a pointer more than one past the end of an array is UB even if you never dereference it: `p + n + 1`.
+
+## Sanitizers
+
+Sanitizers are compiler instrumentation that check at run time. They are the most effective C debugging tool there is. This site compiles with `-fsanitize=address,undefined` by default.
+
+| Flag | Name | Catches | Cost |
+|---|---|---|---|
+| `-fsanitize=address` | AddressSanitizer (ASan) | heap/stack/global out of bounds, use after free, double free, use after return (opt-in) | ~2x slower, ~3x memory |
+| (part of ASan) | LeakSanitizer (LSan) | memory still allocated at exit with no pointer to it | at exit only |
+| `-fsanitize=undefined` | UBSan | signed overflow, bad shifts, null deref, misalignment, out-of-range float conversions, invalid `bool`/`enum` loads, VLA sizes | small |
+| `-fsanitize=thread` | ThreadSanitizer (TSan) | data races | 5-15x; not combinable with ASan |
+| `-fsanitize=memory` | MemorySanitizer (clang only) | reads of uninitialized memory | ~3x; everything must be instrumented |
+
+Notes:
+
+- UBSan reports and **continues** by default. Add `-fno-sanitize-recover=all` to make the first report fatal, which you want in tests.
+- ASan's reports are precise: the kind of error, the faulting access with a stack trace, *and* where the memory was allocated and freed. Read the whole report.
+- Sanitizers only catch bugs on the paths you execute. They are a complement to tests, not a replacement.
+- ASan fills fresh `malloc` memory with `0xbe` bytes, so an "uninitialized" counter often shows up as `-1094795586` (`0xbebebebe`). If you see that number, you forgot to initialize something.
+
+```c
+#include <stdio.h>
+#include <stdlib.h>
+
+int main(void) {
+    int *v = malloc(4 * sizeof *v);
+    for (int i = 0; i < 4; i++) v[i] = i;
+    printf("%d\n", v[1]);
+    free(v);
+    printf("%d\n", v[1]);   // ASan: heap-use-after-free READ of size 4
+    return 0;
+}
+```
+
+**valgrind** (`valgrind ./prog`) finds many of the same memory errors and uninitialized reads without recompiling, by running the program on a simulated CPU. It is 20-50x slower and misses stack overflows, but needs no special build, which is handy for third-party binaries.
+
+## Warnings are free bug reports
+
+```text
+gcc -std=c17 -Wall -Wextra -Wpedantic -Wshadow -Wconversion -Werror -g main.c
+```
+
+- `-Wall -Wextra`: the baseline. Despite the name, `-Wall` is not all warnings.
+- `-Wconversion`: implicit narrowing like `int` to `char` or `size_t` to `int`. Noisy on old code, valuable on new code.
+- `-Wshadow`: a local hides another variable.
+- `-Werror`: warnings fail the build, so they cannot pile up. Common in CI; sometimes painful when a new compiler adds warnings.
+- Some warnings need optimization to fire (`-Wmaybe-uninitialized` uses data-flow analysis), so also build with `-O2` now and then.
+- Static analyzers go further: `gcc -fanalyzer`, `clang --analyze`, `clang-tidy`, `cppcheck`.
+
+## Defensive patterns
+
+- **Check before the operation, not after.** Overflow checks compare against limits (`a > INT_MAX - b`) or use `__builtin_add_overflow` / `__builtin_mul_overflow` (gcc and clang; C23 standardizes them as `ckd_add` and `ckd_mul` in `<stdckdint.h>`).
+- **Prefer unsigned types for sizes and bit manipulation**, signed for quantities that can be negative. Mixing them in comparisons is a classic bug: `-1 < 0u` is false.
+- **Always size buffers with `sizeof`** and pass sizes alongside pointers: `snprintf(buf, sizeof buf, ...)`, `fgets(buf, sizeof buf, f)`, `scanf("%63s", buf)` for a 64-byte buffer.
+- **Initialize at declaration.** `int count = 0;`, `struct opts o = {0};`, `calloc` when you need zeroed memory.
+- **Null after free** (`free(p); p = NULL;`) turns some use-after-free bugs into clean null-dereference crashes and makes double free harmless.
+- **One owner per allocation**, documented. Error paths free what they allocated: the `goto cleanup` pattern from the memory chapter.
+- **`memcpy` to reinterpret bytes**, never a pointer cast between unrelated types.
+- **Run with sanitizers in development and CI**, run tests at both `-O0` and `-O2`, and treat every sanitizer report as a real bug even if the output "looks right".
+
+### Checked arithmetic
+
+```c
+#include <limits.h>
+#include <stdbool.h>
+#include <stdio.h>
+
+static bool add_ok(int a, int b, int *out) {
+    if ((b > 0 && a > INT_MAX - b) || (b < 0 && a < INT_MIN - b)) return false;
+    *out = a + b;
+    return true;
+}
+
+int main(void) {
+    int r;
+    printf("%d\n", add_ok(INT_MAX, 1, &r));      // 0
+    printf("%d\n", add_ok(-5, 3, &r) ? r : 0);   // -2
+
+    long long big;
+    if (__builtin_mul_overflow(3000000000LL, 4000000000LL, &big))
+        puts("multiply overflowed");
+    return 0;
+}
+```
+
+The `__builtin_*_overflow` functions work for any integer types, compute the result as if with infinite precision, store the wrapped result, and return `true` if it did not fit. They compile to a single instruction plus a flag check.
+
+## How to think about it
+
+C is a contract: you promise not to do the things on the list, and the compiler promises fast code. When you break the contract, the compiler is not obliged to tell you, and the program that runs is not the one you wrote. Treat "it works" as no evidence; treat a clean sanitizer run on good tests, at more than one optimization level, as evidence.
+
+=== exercise dupupper
+title: Find the bug: dup_upper
+--- prompt
+`dup_upper` should return a newly allocated uppercase copy of `s` (ASCII letters only change; the caller frees it). It produces the right text when you print it, yet the tests crash under AddressSanitizer. Find and fix the bug.
+
+Then also make it return `NULL` if `s` is `NULL` or if `malloc` fails.
+--- starter
+#include <stdlib.h>
+#include <string.h>
+
+char *dup_upper(const char *s) {
+    size_t n = strlen(s);
+    char *out = malloc(n);
+    for (size_t i = 0; i <= n; i++) {
+        char c = s[i];
+        out[i] = (c >= 'a' && c <= 'z') ? (char)(c - 'a' + 'A') : c;
+    }
+    return out;
+}
+--- solution
+#include <stdlib.h>
+#include <string.h>
+
+char *dup_upper(const char *s) {
+    if (!s) return NULL;
+    size_t n = strlen(s);
+    char *out = malloc(n + 1);
+    if (!out) return NULL;
+    for (size_t i = 0; i <= n; i++) {
+        char c = s[i];
+        out[i] = (c >= 'a' && c <= 'z') ? (char)(c - 'a' + 'A') : c;
+    }
+    return out;
+}
+--- hint
+Read the ASan report: it says "heap-buffer-overflow ... WRITE of size 1" and shows the allocation was `n` bytes. How many bytes does a string of length `n` need?
+--- hint
+The loop correctly copies the terminator at index `n`; the allocation is what is short.
+--- harness
+int main(void) {
+    char *a = dup_upper("hello, World 42");
+    CHECK_STR(a, "HELLO, WORLD 42");
+    free(a);
+    char *b = dup_upper("");
+    CHECK_STR(b, "");
+    free(b);
+    char *c = dup_upper("abcdefghijklmnopqrstuvwxyz");
+    CHECK_STR(c, "ABCDEFGHIJKLMNOPQRSTUVWXYZ");
+    free(c);
+    CHECK(dup_upper(NULL) == NULL);
+    return TEST_END();
+}
+
+=== exercise removeall
+title: Find the bug: remove from a list
+--- prompt
+`remove_all` deletes every node whose `value` equals `value` from a singly linked list, frees those nodes, and returns the new head. The list-building helpers are in the tests.
+
+It "works" without sanitizers on most machines. Under ASan it fails with `heap-use-after-free`. Find and fix it without changing the function's interface.
+--- starter
+#include <stdlib.h>
+
+struct node {
+    int value;
+    struct node *next;
+};
+
+struct node *remove_all(struct node *head, int value) {
+    struct node **link = &head;
+    for (struct node *p = head; p != NULL; p = p->next) {
+        if (p->value == value) {
+            *link = p->next;
+            free(p);
+        } else {
+            link = &p->next;
+        }
+    }
+    return head;
+}
+--- solution
+#include <stdlib.h>
+
+struct node {
+    int value;
+    struct node *next;
+};
+
+struct node *remove_all(struct node *head, int value) {
+    struct node **link = &head;
+    struct node *p = head;
+    while (p != NULL) {
+        struct node *next = p->next;
+        if (p->value == value) {
+            *link = next;
+            free(p);
+        } else {
+            link = &p->next;
+        }
+        p = next;
+    }
+    return head;
+}
+--- hint
+After `free(p)`, the loop's increment expression `p = p->next` reads a field of the freed node.
+--- hint
+Save `p->next` in a local before you free `p`.
+--- harness
+static struct node *build(const int *v, int n) {
+    struct node *head = NULL;
+    for (int i = n - 1; i >= 0; i--) {
+        struct node *nd = malloc(sizeof *nd);
+        nd->value = v[i];
+        nd->next = head;
+        head = nd;
+    }
+    return head;
+}
+
+static int matches(struct node *h, const int *v, int n) {
+    for (int i = 0; i < n; i++, h = h->next)
+        if (!h || h->value != v[i]) return 0;
+    return h == NULL;
+}
+
+static void free_list(struct node *h) {
+    while (h) { struct node *n = h->next; free(h); h = n; }
+}
+
+int main(void) {
+    int a[] = {1, 2, 3, 2, 4};
+    struct node *l = remove_all(build(a, 5), 2);
+    int ra[] = {1, 3, 4};
+    CHECK(matches(l, ra, 3));
+    free_list(l);
+
+    int b[] = {7, 7, 7};
+    l = remove_all(build(b, 3), 7);
+    CHECK(l == NULL);
+
+    int c[] = {5, 1, 5, 5, 2, 5};
+    l = remove_all(build(c, 6), 5);
+    int rc[] = {1, 2};
+    CHECK(matches(l, rc, 2));
+    free_list(l);
+
+    int d[] = {1, 2, 3};
+    l = remove_all(build(d, 3), 9);
+    CHECK(matches(l, d, 3));
+    free_list(l);
+
+    CHECK(remove_all(NULL, 1) == NULL);
+    return TEST_END();
+}
+
+=== exercise histogram
+title: Find the bugs: histogram
+--- prompt
+`histogram` counts how many of the `n` values fall in each bucket `0 .. buckets-1` and returns a newly allocated array of `buckets` counts. Values outside that range are ignored. The caller frees the result.
+
+There are **two** bugs. One makes the counts come out as huge negative numbers like `-1094795586` under ASan (on another machine they might look right by luck); the other writes out of bounds. Fix both.
+--- starter
+#include <stdlib.h>
+
+int *histogram(const int *values, size_t n, int buckets) {
+    int *counts = malloc((size_t)buckets * sizeof *counts);
+    if (!counts) return NULL;
+    for (size_t i = 0; i < n; i++) {
+        int v = values[i];
+        if (v >= 0 && v <= buckets)
+            counts[v]++;
+    }
+    return counts;
+}
+--- solution
+#include <stdlib.h>
+
+int *histogram(const int *values, size_t n, int buckets) {
+    int *counts = calloc((size_t)buckets, sizeof *counts);
+    if (!counts) return NULL;
+    for (size_t i = 0; i < n; i++) {
+        int v = values[i];
+        if (v >= 0 && v < buckets)
+            counts[v]++;
+    }
+    return counts;
+}
+--- hint
+`-1094795586` is `0xbebebebe`: ASan fills new `malloc` memory with `0xbe` bytes. What value did the counters start from?
+--- hint
+`calloc(count, size)` allocates and zeroes. Then look at the range check: which index is the last valid one?
+--- harness
+int main(void) {
+    int v[] = {0, 1, 1, 2, 2, 2, 4, 4, 9, -1, 5};
+    int *h = histogram(v, sizeof v / sizeof v[0], 5);
+    CHECK(h != NULL);
+    if (h) {
+        CHECK_INT(h[0], 1);
+        CHECK_INT(h[1], 2);
+        CHECK_INT(h[2], 3);
+        CHECK_INT(h[3], 0);
+        CHECK_INT(h[4], 2);
+    }
+    free(h);
+    int w[] = {3, 3, 3};
+    h = histogram(w, 3, 3);
+    CHECK_INT(h[0] + h[1] + h[2], 0);
+    free(h);
+    h = histogram(w, 0, 4);
+    CHECK_INT(h[3], 0);
+    free(h);
+    return TEST_END();
+}
+
+=== exercise longest
+title: Find the bug: longest word
+--- prompt
+This program reads whitespace-separated words from stdin and prints the longest one and its length (the first one wins ties). Words are at most 63 characters long. With short words it works; with a long word it crashes with `stack-buffer-overflow`.
+
+Fix it so that it handles any word up to 63 characters, and so that it **cannot** overflow its buffers even if the input breaks that promise. If there are no words, print `none`.
+
+For input `the quick brown fox`:
+
+```text
+quick 5
+```
+--- starter
+#include <stdio.h>
+#include <string.h>
+
+int main(void) {
+    char word[16];
+    char longest[16] = "";
+    size_t best = 0;
+    while (scanf("%s", word) == 1) {
+        size_t n = strlen(word);
+        if (n > best) {
+            best = n;
+            strcpy(longest, word);
+        }
+    }
+    printf("%s %zu\n", longest, best);
+    return 0;
+}
+--- solution
+#include <stdio.h>
+#include <string.h>
+
+int main(void) {
+    char word[64];
+    char longest[64] = "";
+    size_t best = 0;
+    while (scanf("%63s", word) == 1) {
+        size_t n = strlen(word);
+        if (n > best) {
+            best = n;
+            memcpy(longest, word, n + 1);
+        }
+    }
+    if (best == 0) {
+        puts("none");
+        return 0;
+    }
+    printf("%s %zu\n", longest, best);
+    return 0;
+}
+--- hint
+`%s` in `scanf` has no idea how big your buffer is. Give it a width: `%63s` reads at most 63 characters and then writes the terminator, filling 64 bytes.
+--- hint
+Both buffers need room for 63 characters plus the `'\0'`.
+--- test
+the quick brown fox
+--- out
+quick 5
+--- test
+a pneumonoultramicroscopicsilicovolcanoconiosis is a long word
+--- out
+pneumonoultramicroscopicsilicovolcanoconiosis 45
+--- test
+abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!
+x
+--- out
+abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789! 63
+--- test
+--- out
+none
+
+=== exercise parseints
+title: Find the bugs: leaky parser
+--- prompt
+`parse_ints` parses a comma-separated list of integers such as `"12,-4,7"` into a newly allocated array and stores the element count in `*count`. On any invalid input it must return `NULL` **without leaking memory** and without touching `*count`. Invalid means: an empty string, an empty element (`"1,,2"`, `"1,"`, `",1"`), anything that is not a decimal integer (`"1,x"`, `"1 ,2"`), or a value that does not fit in an `int`.
+
+The starter returns the right arrays for good input, but the leak detector fails the tests: it leaks on error paths. It also accepts several invalid inputs. Fix it.
+--- starter
+#include <stdlib.h>
+#include <errno.h>
+#include <limits.h>
+
+int *parse_ints(const char *s, size_t *count) {
+    size_t cap = 4, n = 0;
+    int *out = malloc(cap * sizeof *out);
+    if (!out) return NULL;
+    while (*s) {
+        char *end;
+        long v = strtol(s, &end, 10);
+        if (end == s) return NULL;
+        if (n == cap) {
+            cap *= 2;
+            out = realloc(out, cap * sizeof *out);
+        }
+        out[n++] = (int)v;
+        s = end;
+        if (*s == ',') s++;
+        else if (*s != '\0') return NULL;
+    }
+    *count = n;
+    return out;
+}
+--- solution
+#include <stdlib.h>
+#include <errno.h>
+#include <limits.h>
+
+int *parse_ints(const char *s, size_t *count) {
+    if (*s == '\0') return NULL;
+    size_t cap = 4, n = 0;
+    int *out = malloc(cap * sizeof *out);
+    if (!out) return NULL;
+    for (;;) {
+        if (!(*s == '-' || *s == '+' || (*s >= '0' && *s <= '9'))) goto fail;
+        char *end;
+        errno = 0;
+        long v = strtol(s, &end, 10);
+        if (end == s || errno == ERANGE || v < INT_MIN || v > INT_MAX) goto fail;
+        if (n == cap) {
+            int *bigger = realloc(out, cap * 2 * sizeof *out);
+            if (!bigger) goto fail;
+            out = bigger;
+            cap *= 2;
+        }
+        out[n++] = (int)v;
+        s = end;
+        if (*s == '\0') break;
+        if (*s != ',') goto fail;
+        s++;
+    }
+    *count = n;
+    return out;
+fail:
+    free(out);
+    return NULL;
+}
+--- hint
+Every `return NULL` after the `malloc` leaks `out`. Use a single `fail:` label that frees and returns, and `goto fail` from each error.
+--- hint
+`strtol` skips leading whitespace, so `"1, 2"` would be accepted: check that each element starts with a digit or sign. A trailing comma makes the loop exit normally: after the comma you must require another number.
+--- hint
+`strtol` reports out-of-range values by returning `LONG_MAX`/`LONG_MIN` and setting `errno = ERANGE`, so set `errno = 0` first. A `long` is 64 bits here, so also compare against `INT_MIN`/`INT_MAX`. And `p = realloc(p, ...)` loses the old block if it fails: use a temporary.
+--- harness
+#include <limits.h>
+
+static int same(const int *a, size_t n, const int *want, size_t wn) {
+    if (!a || n != wn) return 0;
+    for (size_t i = 0; i < n; i++) if (a[i] != want[i]) return 0;
+    return 1;
+}
+
+int main(void) {
+    size_t n = 999;
+    int *r = parse_ints("12,-4,7", &n);
+    int w1[] = {12, -4, 7};
+    CHECK(same(r, n, w1, 3));
+    free(r);
+
+    r = parse_ints("1,2,3,4,5,6,7,8,9,10,11", &n);
+    int w2[] = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11};
+    CHECK(same(r, n, w2, 11));
+    free(r);
+
+    r = parse_ints("2147483647,-2147483648,+5", &n);
+    int w3[] = {INT_MAX, INT_MIN, 5};
+    CHECK(same(r, n, w3, 3));
+    free(r);
+
+    const char *bad[] = {"", "1,,2", "1,", ",1", "1,x", "1 ,2", "1, 2", "x",
+                         "1,2,3,4,5,6,abc", "2147483648", "1,-2147483649",
+                         "99999999999999999999999", "3.5"};
+    for (size_t i = 0; i < sizeof bad / sizeof bad[0]; i++) {
+        n = 999;
+        r = parse_ints(bad[i], &n);
+        if (r != NULL) printf("  should reject \"%s\"\n", bad[i]);
+        CHECK(r == NULL);
+        CHECK_INT(n, 999);
+        free(r);
+    }
+    return TEST_END();
+}
+
+=== exercise checked
+title: Overflow-safe arithmetic
+--- prompt
+Write checked arithmetic helpers. Each returns `true` and stores the result in `*out` if the mathematically exact result fits, and returns `false` **without** touching `*out` otherwise. None of them may execute an overflowing signed operation (the tests run under UBSan).
+
+- `bool checked_add(int a, int b, int *out)`
+- `bool checked_mul(int a, int b, int *out)`: do this one with comparisons against `INT_MAX`/`INT_MIN` (no builtins, no wider type), as practice. Mind `INT_MIN * -1`.
+- `void *alloc_array(size_t count, size_t size)`: like `malloc(count * size)` but returns `NULL` if the multiplication would wrap. Use `__builtin_mul_overflow` here. (`calloc` does this check internally; this is how.)
+
+The classic bug `malloc(count * size)` with an attacker-chosen `count` wraps to a small number and then the code writes `count` elements into it.
+--- starter
+#include <stdbool.h>
+#include <stdlib.h>
+#include <limits.h>
+
+bool checked_add(int a, int b, int *out) {
+    *out = a + b;
+    return true;
+}
+
+bool checked_mul(int a, int b, int *out) {
+    *out = a * b;
+    return true;
+}
+
+void *alloc_array(size_t count, size_t size) {
+    return malloc(count * size);
+}
+--- solution
+#include <stdbool.h>
+#include <stdlib.h>
+#include <limits.h>
+
+bool checked_add(int a, int b, int *out) {
+    if (b > 0 && a > INT_MAX - b) return false;
+    if (b < 0 && a < INT_MIN - b) return false;
+    *out = a + b;
+    return true;
+}
+
+bool checked_mul(int a, int b, int *out) {
+    if (a > 0) {
+        if (b > 0) { if (a > INT_MAX / b) return false; }
+        else if (b < INT_MIN / a) return false;
+    } else if (a < 0) {
+        if (b > 0) { if (a < INT_MIN / b) return false; }
+        else if (b < 0 && a < INT_MAX / b) return false;
+    }
+    *out = a * b;
+    return true;
+}
+
+void *alloc_array(size_t count, size_t size) {
+    size_t bytes;
+    if (__builtin_mul_overflow(count, size, &bytes)) return NULL;
+    return malloc(bytes);
+}
+--- hint
+For addition: if `b > 0`, overflow happens exactly when `a > INT_MAX - b`, and `INT_MAX - b` cannot itself overflow. Mirror it for `b < 0`.
+--- hint
+For multiplication, split on the signs of `a` and `b`. With both positive, `a * b > INT_MAX` iff `a > INT_MAX / b`. With both negative the product is positive: `a * b > INT_MAX` iff `a < INT_MAX / b` (dividing by a negative flips the inequality).
+--- hint
+`__builtin_mul_overflow(count, size, &bytes)` returns `true` on overflow.
+--- harness
+#include <stdint.h>
+#include <limits.h>
+
+int main(void) {
+    int r = 12345;
+    CHECK(checked_add(2, 3, &r)); CHECK_INT(r, 5);
+    CHECK(checked_add(INT_MAX, 0, &r)); CHECK_INT(r, INT_MAX);
+    CHECK(checked_add(INT_MAX, INT_MIN, &r)); CHECK_INT(r, -1);
+    CHECK(checked_add(INT_MIN, 0, &r)); CHECK_INT(r, INT_MIN);
+    r = 12345;
+    CHECK(!checked_add(INT_MAX, 1, &r));
+    CHECK(!checked_add(1, INT_MAX, &r));
+    CHECK(!checked_add(INT_MIN, -1, &r));
+    CHECK(!checked_add(INT_MIN, INT_MIN, &r));
+    CHECK_INT(r, 12345);
+
+    CHECK(checked_mul(6, 7, &r)); CHECK_INT(r, 42);
+    CHECK(checked_mul(-6, 7, &r)); CHECK_INT(r, -42);
+    CHECK(checked_mul(-6, -7, &r)); CHECK_INT(r, 42);
+    CHECK(checked_mul(0, INT_MIN, &r)); CHECK_INT(r, 0);
+    CHECK(checked_mul(INT_MIN, 1, &r)); CHECK_INT(r, INT_MIN);
+    CHECK(checked_mul(INT_MAX, -1, &r)); CHECK_INT(r, -INT_MAX);
+    CHECK(checked_mul(46340, 46341, &r)); CHECK_INT(r, 2147441940);
+    CHECK(checked_mul(-65536, 32768, &r)); CHECK_INT(r, INT_MIN);
+    CHECK(checked_mul(32768, -65536, &r)); CHECK_INT(r, INT_MIN);
+    r = 12345;
+    CHECK(!checked_mul(46341, 46341, &r));
+    CHECK(!checked_mul(-46341, 46341, &r));
+    CHECK(!checked_mul(-46341, -46341, &r));
+    CHECK(!checked_mul(INT_MIN, -1, &r));
+    CHECK(!checked_mul(-1, INT_MIN, &r));
+    CHECK(!checked_mul(65536, 32768, &r));
+    CHECK(!checked_mul(-65536, -32768, &r));
+    CHECK(!checked_mul(2, INT_MIN, &r));
+    CHECK_INT(r, 12345);
+
+    int *p = alloc_array(10, sizeof(int));
+    CHECK(p != NULL);
+    for (int i = 0; i < 10; i++) p[i] = i;
+    free(p);
+    void *q = alloc_array(SIZE_MAX / 4 + 2, 8);
+    CHECK(q == NULL);
+    free(q);
+    q = alloc_array((size_t)1 << 33, (size_t)1 << 31);
+    CHECK(q == NULL);
+    free(q);
+    return TEST_END();
+}
+
+=== exercise safesum
+title: A sum that knows when it overflowed
+--- prompt
+Read whitespace-separated integers from stdin until end of input. Each one fits in a `long long`. Print their sum, or print `overflow` if the sum (at any point, adding left to right) does not fit in a `long long`. Also print the count of numbers read on a second line.
+
+For input `1 2 3`:
+
+```text
+6
+3
+```
+
+Do not let any signed operation actually overflow. `__builtin_add_overflow` is the easy way; the comparison approach from `checked_add` works too.
+--- starter
+#include <stdio.h>
+
+int main(void) {
+    long long x, sum = 0;
+    int count = 0;
+    while (scanf("%lld", &x) == 1) {
+        sum += x;
+        count++;
+    }
+    printf("%lld\n%d\n", sum, count);
+    return 0;
+}
+--- solution
+#include <stdio.h>
+#include <stdbool.h>
+
+int main(void) {
+    long long x, sum = 0;
+    int count = 0;
+    bool overflow = false;
+    while (scanf("%lld", &x) == 1) {
+        if (!overflow && __builtin_add_overflow(sum, x, &sum)) overflow = true;
+        count++;
+    }
+    if (overflow) puts("overflow");
+    else printf("%lld\n", sum);
+    printf("%d\n", count);
+    return 0;
+}
+--- hint
+`__builtin_add_overflow(a, b, &result)` returns `true` if `a + b` did not fit in `result`'s type.
+--- hint
+Once it has overflowed, remember that and keep counting; later numbers must not "bring it back".
+--- test
+1 2 3
+--- out
+6
+3
+--- test
+9223372036854775807 1
+--- out
+overflow
+2
+--- test
+9223372036854775807 -1 1
+--- out
+9223372036854775807
+3
+--- test
+-9223372036854775807 -1
+--- out
+-9223372036854775808
+2
+--- test
+-9223372036854775808 -1 5
+--- out
+overflow
+3
+--- test
+9223372036854775807 9223372036854775807 -9223372036854775808 -9223372036854775808
+--- out
+overflow
+4
+--- test
+--- out
+0
+0
+
+=== quiz
+--- q
+Which of these has **undefined** behavior in C (assume 32-bit `int`)?
+--- choice
+`unsigned u = 0; u = u - 1;`
+--- answer
+`int i = INT_MAX; i = i + 1;`
+--- choice
+`unsigned char c = 300;`
+--- choice
+`int x = -7 / 2;`
+--- explain
+Unsigned arithmetic is defined to wrap modulo 2^N, and converting 300 to `unsigned char` is defined (it becomes 44). Integer division truncates toward zero. Signed overflow is undefined.
+
+=== quiz
+run: yes
+--- q
+What does this print?
+--- code
+#include <stdio.h>
+
+int main(void) {
+    unsigned u = 0;
+    u--;
+    unsigned char c = 300;
+    printf("%u %d\n", u, c);
+    return 0;
+}
+--- choice
+-1 300
+--- answer
+4294967295 44
+--- choice
+0 255
+--- choice
+It is undefined behavior
+--- explain
+Unsigned types wrap: `0 - 1` is `UINT_MAX`, and 300 converted to an 8-bit unsigned type is `300 % 256 = 44`. Both are fully defined, though gcc warns about the second (`-Woverflow` is on by default).
+
+=== quiz
+run: yes
+flags: -O2 -fno-sanitize=all
+--- q
+Compiled with `gcc -O2` (no sanitizers), what does this print?
+--- code
+#include <limits.h>
+#include <stdio.h>
+
+int will_overflow(int x) {
+    return x + 1 < x;
+}
+
+int main(void) {
+    volatile int big = INT_MAX;
+    printf("%d\n", will_overflow(big));
+    return 0;
+}
+--- choice
+1, because INT_MAX + 1 wraps to INT_MIN
+--- answer
+0
+--- choice
+It crashes with an overflow exception
+--- choice
+It does not compile
+--- explain
+Signed overflow is undefined, so the compiler may assume `x + 1` never overflows, and then `x + 1 < x` is always false. gcc folds the function to `return 0`. The check must be written so it cannot overflow: `x == INT_MAX`.
+
+=== quiz
+run: yes
+--- q
+What does this print?
+--- code
+#include <stdio.h>
+
+int main(void) {
+    int i = 1;
+    size_t s = sizeof(i++);
+    printf("%d %zu\n", i, s);
+    return 0;
+}
+--- answer
+1 4
+--- choice
+2 4
+--- choice
+2 8
+--- choice
+It is undefined behavior
+--- explain
+The operand of `sizeof` is not evaluated (except for variable length arrays); only its type matters. So `i++` never runs and `i` stays 1.
+
+=== quiz
+run: yes
+--- q
+What does this print?
+--- code
+#include <stdio.h>
+
+int main(void) {
+    int neg = -1;
+    unsigned zero = 0;
+    if (neg < zero) puts("less");
+    else puts("not less");
+    return 0;
+}
+--- choice
+less
+--- answer
+not less
+--- choice
+It does not compile
+--- choice
+It is undefined behavior
+--- explain
+In a comparison between `int` and `unsigned`, the `int` is converted to `unsigned`, so `-1` becomes 4294967295. This is defined (and `-Wextra` warns about it with `-Wsign-compare`), but it is a classic source of bugs in bounds checks like `if (i < len)` with a negative `i`.
+
+=== quiz
+--- q
+Which of these statements has undefined behavior?
+--- choice
+`a[i] = i + 1;`
+--- answer
+`a[i] = i++;`
+--- choice
+`a[i++] = 0;`
+--- choice
+`i = (i++, i + 1);`
+--- explain
+`a[i] = i++;` modifies `i` and also reads it (to compute `a[i]`) without a sequence point in between: undefined. In the last option the comma operator *is* a sequence point, so it is well defined, if silly.
+
+=== quiz
+--- q
+A program reads an `int` that was never initialized. Which tool reliably reports it?
+--- choice
+AddressSanitizer
+--- choice
+UndefinedBehaviorSanitizer
+--- answer
+MemorySanitizer (clang) or valgrind
+--- choice
+LeakSanitizer
+--- explain
+ASan tracks which bytes are *addressable*, not which are *initialized*. MSan (clang only) and valgrind track initialization bit by bit. With gcc, `-Wall -O2` (`-Wmaybe-uninitialized`) catches many simple cases at compile time.
+
+=== quiz
+--- q
+Why may gcc delete the `if` in this function?
+
+```c
+int first(int *p) {
+    int v = *p;
+    if (p == NULL) return 0;
+    return v;
+}
+```
+--- choice
+Because comparing a pointer with NULL is undefined
+--- answer
+Because `*p` already executed, so `p` must be non-null in any program without UB
+--- choice
+Because `v` is unused when `p` is NULL
+--- choice
+It may not: removing a check is never allowed
+--- explain
+The compiler assumes the program has no UB. Dereferencing a null pointer is UB, so after `*p` it may conclude `p != NULL` and remove the check as dead code. Check first, then dereference.

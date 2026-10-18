@@ -1,0 +1,1201 @@
+=== chapter bits
+title: Bits and bytes
+blurb: Binary and hex, the bitwise operators, shift rules and their undefined corners, masks and flags, counting tricks, packing, endianness and bit fields.
+--- body
+## Why bits matter more in C
+
+In C# you mostly meet bit operations in `[Flags]` enums and hash codes. In C they're everywhere: hardware registers, file formats, network protocols, compact data structures, hashes, graphics. The operators are the same as C#'s. The rules around them are where C bites: promotions, signedness, and shifts that are undefined behavior.
+
+## Binary and hex
+
+Each hex digit is exactly 4 bits, which is why hex is the notation for bit patterns. Learn the 16 nibbles and you can read any hex number as bits:
+
+| Hex | Binary | | Hex | Binary |
+|---|---|---|---|---|
+| `0` | `0000` | | `8` | `1000` |
+| `1` | `0001` | | `9` | `1001` |
+| `2` | `0010` | | `A` | `1010` |
+| `3` | `0011` | | `B` | `1011` |
+| `4` | `0100` | | `C` | `1100` |
+| `5` | `0101` | | `D` | `1101` |
+| `6` | `0110` | | `E` | `1110` |
+| `7` | `0111` | | `F` | `1111` |
+
+So `0xA5` is `1010 0101`, and a `uint32_t` is 8 hex digits. Literals: `0x2A` (hex), `052` (octal: a leading zero! `010 == 8`), `0b101010` (binary: a gcc extension, standard only from C23). `printf` has `%x`/`%X` and `%o` but no binary specifier before C23, so you write a loop:
+
+```c
+#include <stdio.h>
+#include <stdint.h>
+
+void print_bin(uint32_t x, int width) {
+    for (int i = width - 1; i >= 0; i--) {
+        putchar((x >> i) & 1u ? '1' : '0');
+        if (i % 4 == 0 && i) putchar('_');
+    }
+    putchar('\n');
+}
+
+int main(void) {
+    print_bin(0xA5, 8);        // 1010_0101
+    print_bin(42, 16);         // 0000_0000_0010_1010
+    printf("%#x %#o %d\n", 42u, 42u, 0x2A);   // 0x2a 052 42
+    return 0;
+}
+```
+
+## The operators
+
+| Op | Name | Bit rule | Typical use |
+|---|---|---|---|
+| `a & b` | AND | 1 if both are 1 | keep only masked bits, test bits |
+| `a \| b` | OR | 1 if either is 1 | set bits, combine flags |
+| `a ^ b` | XOR | 1 if they differ | toggle bits, "what changed" |
+| `~a` | NOT | flip every bit | build "everything except" masks |
+| `a << n` | left shift | move bits up, fill with 0 | multiply by 2ⁿ, build masks |
+| `a >> n` | right shift | move bits down | divide by 2ⁿ, extract fields |
+
+Don't confuse `&`/`|` with `&&`/`||`: `2 & 1` is 0, `2 && 1` is 1. And mind precedence, which is a historical accident: `&`, `^`, `|` bind **looser** than `==`. So `x & 1 == 0` means `x & (1 == 0)`, i.e. `x & 0`, always 0. Parenthesize every bitwise expression inside a comparison: `(x & 1) == 0`. gcc's `-Wall` warns about some of these (`-Wparentheses`), not all.
+
+XOR has useful algebra: `x ^ x == 0`, `x ^ 0 == x`, and it's its own inverse, `(x ^ k) ^ k == x`. That's the basis of simple checksums, parity, RAID, and the "find the element that appears an odd number of times" trick.
+
+## Use unsigned types for bit work
+
+Bit manipulation on signed integers runs into undefined and implementation-defined behavior. On unsigned types everything is defined: arithmetic wraps modulo 2ⁿ and shifts fill with zeros. Use the fixed-width types from `<stdint.h>`: `uint8_t`, `uint16_t`, `uint32_t`, `uint64_t`. They're exactly the width they say, unlike `int` and `long` (8 bytes on Linux, 4 on Windows).
+
+**Integer promotion** catches people: any type narrower than `int` (`uint8_t`, `uint16_t`, `char`, `short`) is converted to `int` before an operator touches it. So:
+
+```c
+#include <stdio.h>
+#include <stdint.h>
+
+int main(void) {
+    uint8_t b = 0x0F;
+    printf("%d\n", ~b);                 // -16: ~ was applied to the int 0x0000000F
+    printf("%d\n", (uint8_t)~b);        // 240: cast back to keep 8 bits
+    uint8_t hi = 0xF0;
+    printf("%d\n", hi << 4);            // 3840: no truncation to 8 bits happened
+    uint16_t a = 0xFFFF, c = 0xFFFF;
+    printf("%u\n", (unsigned)a * c);    // a * c alone would be int * int: overflow, UB
+    return 0;
+}
+```
+
+Write unsigned literals with a `u` suffix (`1u`, `0xFFu`), and `UINT32_C(1)`/`UINT64_C(1)` or `(uint64_t)1` when the width matters.
+
+## Shifts and their undefined corners
+
+```c
+x << n    // x * 2^n  (bits shifted past the top are lost)
+x >> n    // x / 2^n  rounded down, for unsigned x
+```
+
+The rules:
+
+1. **Shifting by `n >= width` (or a negative `n`) is undefined.** `1u << 32` on a 32-bit `unsigned` is UB, not 0. On x86 the CPU masks the count to 5 bits, so at runtime `1u << 32` often gives `1`, while the compiler constant-folds the same expression to something else. Any code computing `(1u << len) - 1` for `len` up to 32 has this bug; special-case it.
+2. **Left-shifting a negative value is UB**, and so is shifting a 1 into or past the sign bit of a signed type. `1 << 31` is UB for a 32-bit `int`. Write `1u << 31`.
+3. **Right-shifting a negative value is implementation-defined.** gcc does an *arithmetic* shift (copies the sign bit, so `-16 >> 2 == -4`); C# does the same for `int`. Portable code shifts unsigned values (C# has `>>>` for logical shift; in C, cast to unsigned).
+4. Shift the right *type*. `1 << 40` is an `int` shift (UB) even if you assign it to a `uint64_t`. Write `(uint64_t)1 << 40`.
+
+C# masks shift counts silently (`1 << 33 == 2`). C gives you no such guarantee: UBSan on this site will report `shift exponent 32 is too large`.
+
+## Masks: set, clear, toggle, test
+
+A *mask* is a value with 1s at the bit positions you care about. The four basic operations on bit `n`:
+
+```c
+#include <stdio.h>
+#include <stdint.h>
+
+int main(void) {
+    uint32_t x = 0;
+    x |= 1u << 3;                 // set bit 3:     0b1000
+    x |= 1u << 0;                 // set bit 0:     0b1001
+    x &= ~(1u << 3);              // clear bit 3:   0b0001
+    x ^= 1u << 5;                 // toggle bit 5:  0b100001
+    int bit5 = (x >> 5) & 1u;     // test bit 5:    1
+    int bit4 = (x & (1u << 4)) != 0;   // test, other style: 0
+    printf("x=0x%x bit5=%d bit4=%d\n", x, bit5, bit4);
+
+    // Multi-bit fields: a mask of len ones is (1u << len) - 1 (for len < 32)
+    uint32_t reg = 0xDEADBEEF;
+    uint32_t mid = (reg >> 8) & 0xFFFu;                       // extract 12 bits at 8: 0xDBE
+    reg = (reg & ~(0xFFFu << 8)) | ((0x123u & 0xFFFu) << 8);   // insert 0x123 there
+    printf("mid=0x%X reg=0x%X\n", mid, reg);                   // reg = 0xDEA123EF
+    return 0;
+}
+```
+
+The insert pattern (clear the field with `& ~(mask << pos)`, then OR in the new value masked and shifted) is how you write hardware registers and packed formats.
+
+## Flags enums
+
+C#'s `[Flags] enum Perm { Read = 1, Write = 2, Exec = 4 }` is the same thing in C, without the type safety: enum constants are plain `int`s.
+
+```c
+#include <stdio.h>
+
+enum {
+    PERM_READ  = 1u << 0,
+    PERM_WRITE = 1u << 1,
+    PERM_EXEC  = 1u << 2,
+    PERM_ALL   = PERM_READ | PERM_WRITE | PERM_EXEC,
+};
+
+void show(unsigned p) {
+    printf("%c%c%c\n", p & PERM_READ ? 'r' : '-', p & PERM_WRITE ? 'w' : '-',
+           p & PERM_EXEC ? 'x' : '-');
+}
+
+int main(void) {
+    unsigned p = PERM_READ | PERM_WRITE;          // combine
+    show(p);                                      // rw-
+    p &= ~PERM_WRITE;                             // remove
+    p |= PERM_EXEC;                               // add
+    show(p);                                      // r-x
+    int has_all = (p & (PERM_READ | PERM_EXEC)) == (PERM_READ | PERM_EXEC);   // HasFlag(R|X)
+    int has_any = (p & (PERM_WRITE | PERM_EXEC)) != 0;                        // any of them
+    printf("%d %d %d\n", has_all, has_any, (p & PERM_ALL) == PERM_ALL);       // 1 1 0
+    return 0;
+}
+```
+
+Note the difference between "has all of these flags" (`(p & m) == m`) and "has any" (`(p & m) != 0`). C#'s `HasFlag` is the first. Unix permissions, `open()` flags (`O_CREAT | O_TRUNC`) and window styles all work like this.
+
+## Counting and power-of-two tricks
+
+Classic one-liners on unsigned `x`, all worth recognizing in other people's code:
+
+| Expression | Result | Example `x = 0b101000` (40) |
+|---|---|---|
+| `x & (x - 1)` | clear the lowest set bit | `0b100000` (32) |
+| `x & -x` | isolate the lowest set bit | `0b001000` (8) |
+| `x && !(x & (x - 1))` | is `x` a power of two? | 0 |
+| `x \| (x - 1)` | set all bits below the lowest set bit | `0b101111` |
+| `(x + m - 1) & ~(m - 1)` | round up to a multiple of `m` (`m` a power of two) | 48 for m = 16 |
+
+`-x` on an unsigned value is well defined (it's 2ⁿ - x), and in two's complement it equals `~x + 1`.
+
+Counting the 1 bits (population count) with Kernighan's loop runs once per set bit:
+
+```c
+#include <stdio.h>
+#include <stdint.h>
+
+int popcount(uint32_t x) {
+    int n = 0;
+    while (x) {
+        x &= x - 1;        // drop the lowest 1 bit
+        n++;
+    }
+    return n;
+}
+
+uint32_t next_pow2(uint32_t x) {   // smallest power of two >= x, for 1 <= x <= 2^31
+    x--;
+    x |= x >> 1;  x |= x >> 2;  x |= x >> 4;  x |= x >> 8;  x |= x >> 16;   // smear the top bit down
+    return x + 1;
+}
+
+int main(void) {
+    printf("%d %d %d\n", popcount(0), popcount(0xFF), popcount(0xDEADBEEF));   // 0 8 24
+    printf("%u %u %u\n", next_pow2(1), next_pow2(100), next_pow2(4096));      // 1 128 4096
+    printf("%d\n", __builtin_popcount(0xDEADBEEFu));                          // 24
+    return 0;
+}
+```
+
+Compilers offer builtins that map to single instructions: `__builtin_popcount`, `__builtin_ctz` (count trailing zeros), `__builtin_clz` (leading zeros; both undefined for 0). C23 standardizes them in `<stdbit.h>` (`stdc_count_ones`, ...). C#'s equivalent is `BitOperations.PopCount`, `TrailingZeroCount`, `Log2`.
+
+## Packing values into an integer
+
+Several small values can share one integer: colors, dates, chess moves, entity IDs (index + generation), instruction encodings. Decide a layout, then pack with shifts and ORs and unpack with shifts and masks:
+
+```c
+#include <stdio.h>
+#include <stdint.h>
+
+// Layout: year (bits 9..22, 14 bits) | month (bits 5..8, 4 bits) | day (bits 0..4, 5 bits)
+uint32_t pack_date(unsigned y, unsigned m, unsigned d) {
+    return (y & 0x3FFFu) << 9 | (m & 0xFu) << 5 | (d & 0x1Fu);
+}
+
+int main(void) {
+    uint32_t d = pack_date(2024, 2, 29);
+    printf("0x%06X -> %u-%02u-%02u\n", d, d >> 9 & 0x3FFFu, d >> 5 & 0xFu, d & 0x1Fu);
+    // packed dates compare correctly as plain integers: year is in the high bits
+    printf("%d\n", pack_date(2024, 3, 1) > d);   // 1
+
+    uint32_t rgba = 0xFF8000FFu;                 // 0xRRGGBBAA
+    printf("r=%u g=%u b=%u a=%u\n", rgba >> 24, (rgba >> 16) & 0xFF, (rgba >> 8) & 0xFF, rgba & 0xFF);
+    return 0;
+}
+```
+
+`<<` binds tighter than `&` and `|` but looser than `+`, so `y << 9 | m << 5` works as written, though parentheses never hurt. Masking each input before shifting stops an out-of-range value from smearing into its neighbors.
+
+## Endianness
+
+A `uint32_t` occupies 4 bytes; *endianness* is the order they're stored in. **Little-endian** (x86, ARM in practice) puts the least significant byte at the lowest address. **Big-endian** puts the most significant first, and is "network byte order" for most protocols and many file formats.
+
+```c
+#include <stdio.h>
+#include <stdint.h>
+#include <string.h>
+
+int main(void) {
+    uint32_t v = 0x11223344;
+    unsigned char bytes[4];
+    memcpy(bytes, &v, 4);                       // look at the in-memory representation
+    printf("%02x %02x %02x %02x\n", bytes[0], bytes[1], bytes[2], bytes[3]);   // 44 33 22 11 on x86
+
+    // Portable: build the value from bytes in a DEFINED order, whatever the host is.
+    unsigned char be[4] = {0x11, 0x22, 0x33, 0x44};
+    uint32_t r = (uint32_t)be[0] << 24 | (uint32_t)be[1] << 16 | (uint32_t)be[2] << 8 | be[3];
+    printf("0x%08X\n", r);                      // 0x11223344 on every machine
+    return 0;
+}
+```
+
+The lesson: **don't `memcpy` or `fwrite` an integer into a file or socket and expect another machine to read it back**. Serialize with shifts, byte by byte, in the order the format specifies. Shift-based code is endian-independent because shifts work on values, not on memory. (Note the `(uint32_t)` casts: `be[0] << 24` alone promotes to `int`, and `0x80 << 24` overflows it.) C# has `BinaryPrimitives.ReadUInt32BigEndian` for the same job.
+
+## Bit fields, briefly
+
+C can pack struct members into bits directly:
+
+```c
+#include <stdio.h>
+
+struct Pixel565 {
+    unsigned b : 5;      // 5 bits
+    unsigned g : 6;
+    unsigned r : 5;
+};
+
+int main(void) {
+    struct Pixel565 p = { .r = 31, .g = 0, .b = 31 };
+    unsigned v = 70;
+    p.g = v;             // too big for 6 bits: stored modulo 64 -> 6 (gcc warns for a constant)
+    printf("%u %u %u size=%zu\n", p.r, p.g, p.b, sizeof p);
+    return 0;
+}
+```
+
+Convenient, but the layout (bit order, padding, the size of the container) is implementation-defined, you can't take the address of a bit field, and only `unsigned`, `int`, `_Bool` (and implementation extras) are guaranteed as base types. Use bit fields for in-memory flags inside one program. For anything that crosses a boundary (files, network, hardware registers on a different compiler) use explicit shifts and masks, whose meaning is fixed by the language.
+
+=== exercise binprint
+title: Binary dump
+--- prompt
+Read unsigned 32-bit integers (in decimal, one or more, separated by whitespace) until end of input. For each, print one line with:
+
+- the value as 8 uppercase hex digits with a `0x` prefix,
+- its 32 bits, most significant first, in four groups of 8 separated by spaces,
+- `ones=` followed by the number of 1 bits.
+
+For input `42 4294967295`:
+
+```text
+0x0000002A 00000000 00000000 00000000 00101010 ones=3
+0xFFFFFFFF 11111111 11111111 11111111 11111111 ones=32
+```
+
+Read each number into an `unsigned long` with `%lu` and convert it to `uint32_t`.
+--- starter
+#include <stdio.h>
+#include <stdint.h>
+
+int main(void) {
+    unsigned long in;
+    while (scanf("%lu", &in) == 1) {
+        uint32_t x = (uint32_t)in;
+        // print hex, bits and count
+        (void)x;
+    }
+    return 0;
+}
+--- solution
+#include <stdio.h>
+#include <stdint.h>
+
+int main(void) {
+    unsigned long in;
+    while (scanf("%lu", &in) == 1) {
+        uint32_t x = (uint32_t)in;
+        printf("0x%08X", (unsigned)x);
+        int ones = 0;
+        for (int i = 31; i >= 0; i--) {
+            if (i % 8 == 7) putchar(' ');
+            int bit = (x >> i) & 1u;
+            ones += bit;
+            putchar(bit ? '1' : '0');
+        }
+        printf(" ones=%d\n", ones);
+    }
+    return 0;
+}
+--- hint
+Loop `i` from 31 down to 0 and print `(x >> i) & 1u`. Put a space before each group, i.e. when `i % 8 == 7`.
+--- hint
+`%08X` pads to 8 uppercase hex digits. `uint32_t` is `unsigned int` on this platform; casting to `unsigned` keeps `printf` happy everywhere.
+--- test
+42 4294967295
+--- out
+0x0000002A 00000000 00000000 00000000 00101010 ones=3
+0xFFFFFFFF 11111111 11111111 11111111 11111111 ones=32
+--- test
+0
+1
+2147483648
+305419896
+3735928559
+--- out
+0x00000000 00000000 00000000 00000000 00000000 ones=0
+0x00000001 00000000 00000000 00000000 00000001 ones=1
+0x80000000 10000000 00000000 00000000 00000000 ones=1
+0x12345678 00010010 00110100 01010110 01111000 ones=13
+0xDEADBEEF 11011110 10101101 10111110 11101111 ones=24
+--- test
+255 256 65535
+--- out
+0x000000FF 00000000 00000000 00000000 11111111 ones=8
+0x00000100 00000000 00000000 00000001 00000000 ones=1
+0x0000FFFF 00000000 00000000 11111111 11111111 ones=16
+
+=== exercise bitfield
+title: Bit and field operations
+--- prompt
+Write these on `uint32_t`, for bit positions `0..31`:
+
+- `uint32_t bit_set(uint32_t x, int n)`, `bit_clear`, `bit_toggle`: return `x` with bit `n` changed.
+- `int bit_test(uint32_t x, int n)`: 1 or 0.
+- `uint32_t field_get(uint32_t x, int pos, int len)`: the `len` bits starting at bit `pos`, shifted down to bit 0.
+- `uint32_t field_set(uint32_t x, int pos, int len, uint32_t v)`: `x` with those `len` bits replaced by the low `len` bits of `v`.
+
+`1 <= len <= 32` and `pos + len <= 32`. Beware: `len == 32` must work, and `1u << 32` is undefined. The tests run with the undefined-behavior sanitizer, and position 31 must work too (`1 << 31` on an `int` is also undefined).
+--- starter
+#include <stdint.h>
+
+uint32_t bit_set(uint32_t x, int n)    { return x | (1 << n); }
+uint32_t bit_clear(uint32_t x, int n)  { (void)n; return x; }
+uint32_t bit_toggle(uint32_t x, int n) { (void)n; return x; }
+int bit_test(uint32_t x, int n)        { (void)x; (void)n; return 0; }
+
+uint32_t field_get(uint32_t x, int pos, int len) {
+    return (x >> pos) & ((1u << len) - 1);
+}
+
+uint32_t field_set(uint32_t x, int pos, int len, uint32_t v) {
+    (void)pos; (void)len; (void)v;
+    return x;
+}
+--- solution
+#include <stdint.h>
+
+uint32_t bit_set(uint32_t x, int n)    { return x | (UINT32_C(1) << n); }
+uint32_t bit_clear(uint32_t x, int n)  { return x & ~(UINT32_C(1) << n); }
+uint32_t bit_toggle(uint32_t x, int n) { return x ^ (UINT32_C(1) << n); }
+int bit_test(uint32_t x, int n)        { return (x >> n) & 1u; }
+
+static uint32_t ones(int len) {
+    return len >= 32 ? UINT32_MAX : (UINT32_C(1) << len) - 1;
+}
+
+uint32_t field_get(uint32_t x, int pos, int len) {
+    return (x >> pos) & ones(len);
+}
+
+uint32_t field_set(uint32_t x, int pos, int len, uint32_t v) {
+    uint32_t m = ones(len);
+    return (x & ~(m << pos)) | ((v & m) << pos);
+}
+--- hint
+Use an unsigned 1: `UINT32_C(1) << n` or `1u << n`.
+--- hint
+A mask of `len` ones is `(1u << len) - 1` only for `len < 32`. For 32 it's `UINT32_MAX` (`0xFFFFFFFF`); a small helper keeps that special case in one place.
+--- hint
+`field_set`: clear the field with `x & ~(mask << pos)`, then OR in `(v & mask) << pos`.
+--- harness
+#include <stdint.h>
+int main(void) {
+    CHECK_UINT(bit_set(0, 0), 1);
+    CHECK_UINT(bit_set(0, 31), 0x80000000u);
+    CHECK_UINT(bit_set(0xF0, 4), 0xF0);
+    CHECK_UINT(bit_clear(0xFFFFFFFFu, 31), 0x7FFFFFFFu);
+    CHECK_UINT(bit_clear(0xFFu, 3), 0xF7u);
+    CHECK_UINT(bit_clear(0x10u, 3), 0x10u);
+    CHECK_UINT(bit_toggle(0xAAu, 0), 0xABu);
+    CHECK_UINT(bit_toggle(0xAAu, 1), 0xA8u);
+    CHECK_UINT(bit_toggle(0x80000000u, 31), 0);
+    CHECK_INT(bit_test(0x80000000u, 31), 1);
+    CHECK_INT(bit_test(0x80000000u, 30), 0);
+    CHECK_INT(bit_test(5, 2), 1);
+    CHECK_INT(bit_test(5, 1), 0);
+
+    CHECK_UINT(field_get(0xDEADBEEFu, 8, 12), 0xDBEu);
+    CHECK_UINT(field_get(0xDEADBEEFu, 0, 4), 0xFu);
+    CHECK_UINT(field_get(0xDEADBEEFu, 28, 4), 0xDu);
+    CHECK_UINT(field_get(0xDEADBEEFu, 31, 1), 1);
+    CHECK_UINT(field_get(0xDEADBEEFu, 0, 32), 0xDEADBEEFu);
+    CHECK_UINT(field_get(0xDEADBEEFu, 4, 28), 0x0DEADBEEu);
+
+    CHECK_UINT(field_set(0xDEADBEEFu, 8, 12, 0x123), 0xDEA123EFu);
+    CHECK_UINT(field_set(0xDEADBEEFu, 8, 12, 0xFFFF123), 0xDEA123EFu);   /* extra bits of v ignored */
+    CHECK_UINT(field_set(0, 31, 1, 1), 0x80000000u);
+    CHECK_UINT(field_set(0xFFFFFFFFu, 0, 32, 0x12345678u), 0x12345678u);
+    CHECK_UINT(field_set(0xFFFFFFFFu, 4, 8, 0), 0xFFFFF00Fu);
+    CHECK_UINT(field_set(0, 0, 5, 31), 31);
+    return TEST_END();
+}
+
+=== exercise bittricks
+title: Counting and power-of-two tricks
+--- prompt
+Write without compiler builtins (`__builtin_popcount` and friends), using the bit tricks from the chapter:
+
+- `int popcount32(uint32_t x)`: number of 1 bits.
+- `int is_pow2(uint32_t x)`: 1 if `x` is a power of two (0 is not).
+- `uint32_t next_pow2(uint32_t x)`: the smallest power of two `>= x`, for `1 <= x <= 0x80000000`.
+- `int ctz32(uint32_t x)`: number of trailing zero bits; 32 for `x == 0`.
+- `int highest_bit(uint32_t x)`: index of the most significant 1 bit (`floor(log2 x)`), or -1 for 0.
+- `uint32_t lowest_bit(uint32_t x)`: `x` with only its lowest 1 bit kept (0 for 0).
+--- starter
+#include <stdint.h>
+
+int popcount32(uint32_t x)       { (void)x; return 0; }
+int is_pow2(uint32_t x)          { return x % 2 == 0; }
+uint32_t next_pow2(uint32_t x)   { return x; }
+int ctz32(uint32_t x)            { (void)x; return 0; }
+int highest_bit(uint32_t x)      { (void)x; return -1; }
+uint32_t lowest_bit(uint32_t x)  { return x; }
+--- solution
+#include <stdint.h>
+
+int popcount32(uint32_t x) {
+    int n = 0;
+    for (; x; x &= x - 1) n++;
+    return n;
+}
+
+int is_pow2(uint32_t x) {
+    return x && !(x & (x - 1));
+}
+
+uint32_t next_pow2(uint32_t x) {
+    x--;
+    x |= x >> 1;
+    x |= x >> 2;
+    x |= x >> 4;
+    x |= x >> 8;
+    x |= x >> 16;
+    return x + 1;
+}
+
+int ctz32(uint32_t x) {
+    if (!x) return 32;
+    int n = 0;
+    while (!(x & 1u)) { x >>= 1; n++; }
+    return n;
+}
+
+int highest_bit(uint32_t x) {
+    int n = -1;
+    while (x) { x >>= 1; n++; }
+    return n;
+}
+
+uint32_t lowest_bit(uint32_t x) {
+    return x & -x;
+}
+--- hint
+`x &= x - 1` clears the lowest set bit; count how many times you can do that.
+--- hint
+`next_pow2`: subtract 1, then OR `x` with itself shifted right by 1, 2, 4, 8, 16 so every bit below the top one becomes 1, then add 1.
+--- hint
+`x & -x` keeps only the lowest set bit; `-x` on an unsigned type is well defined.
+--- harness
+#include <stdint.h>
+int main(void) {
+    CHECK_INT(popcount32(0), 0);
+    CHECK_INT(popcount32(1), 1);
+    CHECK_INT(popcount32(0xFFFFFFFFu), 32);
+    CHECK_INT(popcount32(0xDEADBEEFu), 24);
+    CHECK_INT(popcount32(0x80000001u), 2);
+
+    CHECK_INT(is_pow2(0), 0);
+    CHECK_INT(is_pow2(1), 1);
+    CHECK_INT(is_pow2(2), 1);
+    CHECK_INT(is_pow2(6), 0);
+    CHECK_INT(is_pow2(1024), 1);
+    CHECK_INT(is_pow2(0x80000000u), 1);
+    CHECK_INT(is_pow2(0x80000001u), 0);
+
+    CHECK_UINT(next_pow2(1), 1);
+    CHECK_UINT(next_pow2(2), 2);
+    CHECK_UINT(next_pow2(3), 4);
+    CHECK_UINT(next_pow2(100), 128);
+    CHECK_UINT(next_pow2(4096), 4096);
+    CHECK_UINT(next_pow2(4097), 8192);
+    CHECK_UINT(next_pow2(0x40000001u), 0x80000000u);
+    CHECK_UINT(next_pow2(0x80000000u), 0x80000000u);
+
+    CHECK_INT(ctz32(0), 32);
+    CHECK_INT(ctz32(1), 0);
+    CHECK_INT(ctz32(40), 3);
+    CHECK_INT(ctz32(0x80000000u), 31);
+
+    CHECK_INT(highest_bit(0), -1);
+    CHECK_INT(highest_bit(1), 0);
+    CHECK_INT(highest_bit(40), 5);
+    CHECK_INT(highest_bit(0xFFFFFFFFu), 31);
+    CHECK_INT(highest_bit(1000000), 19);
+
+    CHECK_UINT(lowest_bit(0), 0);
+    CHECK_UINT(lowest_bit(40), 8);
+    CHECK_UINT(lowest_bit(0x80000000u), 0x80000000u);
+    CHECK_UINT(lowest_bit(0xFFFFFFFFu), 1);
+    int ok = 1;
+    for (uint32_t i = 1; i < 70000; i++) {
+        int pc = 0;
+        for (int b = 0; b < 32; b++) pc += (i >> b) & 1;
+        if (popcount32(i) != pc) ok = 0;
+        if (is_pow2(i) != (pc == 1)) ok = 0;
+        if ((lowest_bit(i) >> ctz32(i)) != 1) ok = 0;
+    }
+    CHECK(ok);
+    return TEST_END();
+}
+
+=== exercise rgba
+title: Packed colors
+--- prompt
+Colors are packed into a `uint32_t` as `0xRRGGBBAA`: red in the top byte, alpha in the lowest. Channel index 0 is red, 1 green, 2 blue, 3 alpha.
+
+- `uint32_t rgba_pack(uint8_t r, uint8_t g, uint8_t b, uint8_t a)`
+- `uint8_t rgba_get(uint32_t c, int channel)`
+- `uint32_t rgba_set(uint32_t c, int channel, uint8_t value)`
+- `uint32_t rgba_average(uint32_t x, uint32_t y)`: the per-channel average of two colors, rounded down. No channel may overflow into its neighbor.
+- `uint32_t rgba_gray(uint32_t c)`: replace R, G and B with their average `(r + g + b) / 3` (integer division) and keep alpha.
+
+Watch the promotion trap: `r << 24` with `r` a `uint8_t` is an `int` shift, and `0x80 << 24` overflows `int`.
+--- starter
+#include <stdint.h>
+
+uint32_t rgba_pack(uint8_t r, uint8_t g, uint8_t b, uint8_t a) {
+    return r << 24 | g << 16 | b << 8 | a;
+}
+
+uint8_t rgba_get(uint32_t c, int channel) {
+    (void)c; (void)channel;
+    return 0;
+}
+
+uint32_t rgba_set(uint32_t c, int channel, uint8_t value) {
+    (void)channel; (void)value;
+    return c;
+}
+
+uint32_t rgba_average(uint32_t x, uint32_t y) {
+    return (x + y) / 2;
+}
+
+uint32_t rgba_gray(uint32_t c) {
+    return c;
+}
+--- solution
+#include <stdint.h>
+
+uint32_t rgba_pack(uint8_t r, uint8_t g, uint8_t b, uint8_t a) {
+    return (uint32_t)r << 24 | (uint32_t)g << 16 | (uint32_t)b << 8 | a;
+}
+
+static int shift_of(int channel) {
+    return (3 - channel) * 8;
+}
+
+uint8_t rgba_get(uint32_t c, int channel) {
+    return (uint8_t)(c >> shift_of(channel));
+}
+
+uint32_t rgba_set(uint32_t c, int channel, uint8_t value) {
+    int s = shift_of(channel);
+    return (c & ~(UINT32_C(0xFF) << s)) | (uint32_t)value << s;
+}
+
+uint32_t rgba_average(uint32_t x, uint32_t y) {
+    // common bits, plus half the differing bits with each byte's low bit masked off
+    return (x & y) + (((x ^ y) & 0xFEFEFEFEu) >> 1);
+}
+
+uint32_t rgba_gray(uint32_t c) {
+    unsigned avg = ((unsigned)rgba_get(c, 0) + rgba_get(c, 1) + rgba_get(c, 2)) / 3;
+    return rgba_pack((uint8_t)avg, (uint8_t)avg, (uint8_t)avg, rgba_get(c, 3));
+}
+--- hint
+Channel `i` lives at shift `(3 - i) * 8`. Extract with `(c >> s) & 0xFF` (or a cast to `uint8_t`).
+--- hint
+`rgba_average`: either unpack the four channels, average each, and repack; or use `(x & y) + (((x ^ y) & 0xFEFEFEFE) >> 1)`, which averages all four bytes at once (`a + b == 2*(a & b) + (a ^ b)`, and the mask stops bits shifting into the neighboring byte).
+--- harness
+#include <stdint.h>
+int main(void) {
+    CHECK_UINT(rgba_pack(0x12, 0x34, 0x56, 0x78), 0x12345678u);
+    CHECK_UINT(rgba_pack(0xFF, 0, 0x80, 0xFF), 0xFF0080FFu);
+    CHECK_UINT(rgba_pack(0x80, 0, 0, 0), 0x80000000u);
+    CHECK_UINT(rgba_get(0x12345678u, 0), 0x12);
+    CHECK_UINT(rgba_get(0x12345678u, 1), 0x34);
+    CHECK_UINT(rgba_get(0x12345678u, 2), 0x56);
+    CHECK_UINT(rgba_get(0x12345678u, 3), 0x78);
+    CHECK_UINT(rgba_get(0xFF000000u, 0), 0xFF);
+    CHECK_UINT(rgba_set(0x12345678u, 0, 0xAB), 0xAB345678u);
+    CHECK_UINT(rgba_set(0x12345678u, 2, 0x00), 0x12340078u);
+    CHECK_UINT(rgba_set(0x12345678u, 3, 0xFF), 0x123456FFu);
+    CHECK_UINT(rgba_set(0xFFFFFFFFu, 1, 0x00), 0xFF00FFFFu);
+
+    CHECK_UINT(rgba_average(0xFF000000u, 0x01000000u), 0x80000000u);
+    CHECK_UINT(rgba_average(0x00FF00FFu, 0x00FF0001u), 0x00FF0080u);
+    CHECK_UINT(rgba_average(0x01010101u, 0x00000000u), 0x00000000u);
+    CHECK_UINT(rgba_average(0xFFFFFFFFu, 0xFFFFFFFFu), 0xFFFFFFFFu);
+    CHECK_UINT(rgba_average(0x10203040u, 0x30405060u), 0x20304050u);
+    CHECK_UINT(rgba_average(0x01FF0003u, 0x02FE0105u), 0x01FE0004u);
+
+    CHECK_UINT(rgba_gray(0xFF000080u), 0x55555580u);
+    CHECK_UINT(rgba_gray(0x102030FFu), 0x202020FFu);
+    CHECK_UINT(rgba_gray(0xFFFFFF00u), 0xFFFFFF00u);
+    CHECK_UINT(rgba_gray(0x01010201u), 0x01010101u);
+    return TEST_END();
+}
+
+=== exercise rotate
+title: Rotations and bit reversal
+--- prompt
+Write:
+
+- `uint32_t rotl32(uint32_t x, unsigned n)`: rotate left by `n` (bits that fall off the top come back at the bottom). Any `n` is allowed; rotating by 32 is the identity, by 33 the same as by 1.
+- `uint32_t rotr32(uint32_t x, unsigned n)`: rotate right.
+- `uint32_t reverse_bits(uint32_t x)`: bit 0 swaps with bit 31, bit 1 with bit 30, and so on.
+- `uint64_t rotl64(uint64_t x, unsigned n)`: the 64-bit version.
+
+The classic `(x << n) | (x >> (32 - n))` is undefined for `n == 0` (it shifts by 32). The sanitizer will catch that.
+--- starter
+#include <stdint.h>
+
+uint32_t rotl32(uint32_t x, unsigned n) {
+    return (x << n) | (x >> (32 - n));
+}
+
+uint32_t rotr32(uint32_t x, unsigned n) {
+    (void)n;
+    return x;
+}
+
+uint32_t reverse_bits(uint32_t x) {
+    return x;
+}
+
+uint64_t rotl64(uint64_t x, unsigned n) {
+    (void)n;
+    return x;
+}
+--- solution
+#include <stdint.h>
+
+uint32_t rotl32(uint32_t x, unsigned n) {
+    n &= 31;
+    return n ? (x << n) | (x >> (32 - n)) : x;
+}
+
+uint32_t rotr32(uint32_t x, unsigned n) {
+    n &= 31;
+    return n ? (x >> n) | (x << (32 - n)) : x;
+}
+
+uint32_t reverse_bits(uint32_t x) {
+    uint32_t r = 0;
+    for (int i = 0; i < 32; i++) {
+        r = (r << 1) | (x & 1u);
+        x >>= 1;
+    }
+    return r;
+}
+
+uint64_t rotl64(uint64_t x, unsigned n) {
+    n &= 63;
+    return n ? (x << n) | (x >> (64 - n)) : x;
+}
+--- hint
+Reduce `n` first: `n % 32` (or `n & 31`). Then handle 0 separately, or use the branch-free form `(x << n) | (x >> (-n & 31))`.
+--- hint
+`reverse_bits`: shift bits out of the bottom of `x` and into the bottom of the result, 32 times.
+--- harness
+#include <stdint.h>
+int main(void) {
+    CHECK_UINT(rotl32(0x12345678u, 0), 0x12345678u);
+    CHECK_UINT(rotl32(0x12345678u, 4), 0x23456781u);
+    CHECK_UINT(rotl32(0x12345678u, 8), 0x34567812u);
+    CHECK_UINT(rotl32(0x80000001u, 1), 0x00000003u);
+    CHECK_UINT(rotl32(0x12345678u, 32), 0x12345678u);
+    CHECK_UINT(rotl32(0x12345678u, 36), 0x23456781u);
+    CHECK_UINT(rotl32(1, 31), 0x80000000u);
+    CHECK_UINT(rotr32(0x12345678u, 4), 0x81234567u);
+    CHECK_UINT(rotr32(0x12345678u, 0), 0x12345678u);
+    CHECK_UINT(rotr32(0x00000003u, 1), 0x80000001u);
+    CHECK_UINT(rotr32(0x12345678u, 64), 0x12345678u);
+    CHECK_UINT(rotr32(0x12345678u, 100), 0x81234567u);
+    int ok = 1;
+    for (unsigned n = 0; n < 70; n++)
+        if (rotr32(rotl32(0xC0FFEE11u, n), n) != 0xC0FFEE11u) ok = 0;
+    CHECK(ok);
+
+    CHECK_UINT(reverse_bits(0), 0);
+    CHECK_UINT(reverse_bits(1), 0x80000000u);
+    CHECK_UINT(reverse_bits(0x80000000u), 1);
+    CHECK_UINT(reverse_bits(0xF0000000u), 0x0000000Fu);
+    CHECK_UINT(reverse_bits(0x12345678u), 0x1E6A2C48u);
+    CHECK_UINT(reverse_bits(0xFFFFFFFFu), 0xFFFFFFFFu);
+
+    CHECK_UINT(rotl64(0x0123456789ABCDEFull, 0), 0x0123456789ABCDEFull);
+    CHECK_UINT(rotl64(0x0123456789ABCDEFull, 4), 0x123456789ABCDEF0ull);
+    CHECK_UINT(rotl64(0x8000000000000000ull, 1), 1);
+    CHECK_UINT(rotl64(0x0123456789ABCDEFull, 32), 0x89ABCDEF01234567ull);
+    CHECK_UINT(rotl64(0x0123456789ABCDEFull, 64), 0x0123456789ABCDEFull);
+    return TEST_END();
+}
+
+=== exercise endian
+title: Byte order by hand
+--- prompt
+Read and write integers in a defined byte order, independent of the machine's own:
+
+- `uint32_t read_be32(const unsigned char *p)`: `p[0]` is the most significant byte.
+- `uint32_t read_le32(const unsigned char *p)`: `p[0]` is the least significant byte.
+- `void write_be32(unsigned char *p, uint32_t v)`
+- `void write_le16(unsigned char *p, uint16_t v)`
+- `uint32_t bswap32(uint32_t v)`: reverse the byte order (`0x11223344` becomes `0x44332211`).
+
+Use shifts, not `memcpy` or pointer casts: the code must work on big-endian machines too. Bytes `>= 0x80` must work (beware `p[0] << 24` being an `int` shift).
+--- starter
+#include <stdint.h>
+
+uint32_t read_be32(const unsigned char *p) {
+    return p[0] << 24 | p[1] << 16 | p[2] << 8 | p[3];
+}
+
+uint32_t read_le32(const unsigned char *p) {
+    (void)p;
+    return 0;
+}
+
+void write_be32(unsigned char *p, uint32_t v) {
+    (void)p; (void)v;
+}
+
+void write_le16(unsigned char *p, uint16_t v) {
+    (void)p; (void)v;
+}
+
+uint32_t bswap32(uint32_t v) {
+    return v;
+}
+--- solution
+#include <stdint.h>
+
+uint32_t read_be32(const unsigned char *p) {
+    return (uint32_t)p[0] << 24 | (uint32_t)p[1] << 16 | (uint32_t)p[2] << 8 | p[3];
+}
+
+uint32_t read_le32(const unsigned char *p) {
+    return (uint32_t)p[3] << 24 | (uint32_t)p[2] << 16 | (uint32_t)p[1] << 8 | p[0];
+}
+
+void write_be32(unsigned char *p, uint32_t v) {
+    p[0] = (unsigned char)(v >> 24);
+    p[1] = (unsigned char)(v >> 16);
+    p[2] = (unsigned char)(v >> 8);
+    p[3] = (unsigned char)v;
+}
+
+void write_le16(unsigned char *p, uint16_t v) {
+    p[0] = (unsigned char)v;
+    p[1] = (unsigned char)(v >> 8);
+}
+
+uint32_t bswap32(uint32_t v) {
+    return (v >> 24) | ((v >> 8) & 0xFF00u) | ((v << 8) & 0xFF0000u) | (v << 24);
+}
+--- hint
+Cast each byte to `uint32_t` before shifting it up: `(uint32_t)p[0] << 24`.
+--- hint
+Writing: `p[0] = (unsigned char)(v >> 24);` and so on. Converting to `unsigned char` keeps the low 8 bits.
+--- hint
+`bswap32` can be `read_le32` of the bytes written by `write_be32`, or four masked shifts.
+--- harness
+#include <stdint.h>
+int main(void) {
+    unsigned char a[] = {0x11, 0x22, 0x33, 0x44};
+    unsigned char hi[] = {0xDE, 0xAD, 0xBE, 0xEF};
+    CHECK_UINT(read_be32(a), 0x11223344u);
+    CHECK_UINT(read_le32(a), 0x44332211u);
+    CHECK_UINT(read_be32(hi), 0xDEADBEEFu);
+    CHECK_UINT(read_le32(hi), 0xEFBEADDEu);
+    unsigned char ff[] = {0xFF, 0xFF, 0xFF, 0xFF};
+    CHECK_UINT(read_be32(ff), 0xFFFFFFFFu);
+    CHECK_UINT(read_le32(ff), 0xFFFFFFFFu);
+
+    unsigned char buf[6] = {0xAA, 0, 0, 0, 0, 0xAA};
+    write_be32(buf + 1, 0x80A0C0E0u);
+    CHECK(buf[0] == 0xAA && buf[1] == 0x80 && buf[2] == 0xA0 && buf[3] == 0xC0 && buf[4] == 0xE0 && buf[5] == 0xAA);
+    CHECK_UINT(read_be32(buf + 1), 0x80A0C0E0u);
+    unsigned char w[3] = {0, 0, 0x77};
+    write_le16(w, 0xBEEF);
+    CHECK(w[0] == 0xEF && w[1] == 0xBE && w[2] == 0x77);
+
+    CHECK_UINT(bswap32(0x11223344u), 0x44332211u);
+    CHECK_UINT(bswap32(0xFF000000u), 0x000000FFu);
+    CHECK_UINT(bswap32(0x000000FFu), 0xFF000000u);
+    CHECK_UINT(bswap32(0xDEADBEEFu), 0xEFBEADDEu);
+    int ok = 1;
+    unsigned char t[4];
+    for (uint32_t v = 1; v; v *= 3) {
+        write_be32(t, v);
+        if (read_be32(t) != v || read_le32(t) != bswap32(v)) ok = 0;
+        if (v > 0x40000000u) break;
+    }
+    CHECK(ok);
+    return TEST_END();
+}
+
+=== exercise chmod
+title: chmod by hand
+--- prompt
+Simulate Unix permission bits. The mode is 9 bits: owner `rwx` (bits 8..6), group `rwx` (5..3), others `rwx` (2..0). Octal shows them perfectly: one digit per class, so `0754` is `rwxr-xr--`.
+
+The first input line is a starting mode in octal (like `644`). Print it as three octal digits, a space, and the 9-character `ls` string:
+
+```text
+644 rw-r--r--
+```
+
+Each following line is a change in `chmod`'s symbolic form: one or more class letters from `u` (owner), `g`, `o`, `a` (all three), then one operator, then zero or more of `r`, `w`, `x`, with no spaces. Operators: `+` adds the permissions, `-` removes them, `=` sets exactly those (clearing the others) for the named classes. After each change print the new mode in the same format. A malformed line (no class letters, an unknown character, a missing operator) prints `invalid: LINE` and leaves the mode unchanged.
+
+Example input:
+
+```text
+644
+u+x
+go-r
+a=rw
+g+wx
+uo=
+```
+
+Output:
+
+```text
+644 rw-r--r--
+744 rwxr--r--
+700 rwx------
+666 rw-rw-rw-
+676 rw-rwxrw-
+070 ---rwx---
+```
+
+Represent the mode as an `unsigned` and do all updates with masks. Hint at the trick: a permission set `p` (3 bits, `r=4 w=2 x=1`) applies to class `c` at `p << (3 * c)` with others = 0, group = 1, owner = 2.
+--- starter
+#include <stdio.h>
+#include <string.h>
+
+int main(void) {
+    unsigned mode;
+    if (scanf("%o", &mode) != 1) return 1;
+    // print the mode, then read and apply each change
+    return 0;
+}
+--- solution
+#include <stdio.h>
+#include <string.h>
+
+static void show(unsigned mode) {
+    const char *letters = "rwx";
+    printf("%03o ", mode);
+    for (int bit = 8; bit >= 0; bit--)
+        putchar(mode & (1u << bit) ? letters[(8 - bit) % 3] : '-');
+    putchar('\n');
+}
+
+// Returns 1 and updates *mode on success, 0 if the line is malformed.
+static int apply(unsigned *mode, const char *s) {
+    unsigned who = 0;
+    for (; *s && strchr("ugoa", *s); s++) {
+        if (*s == 'u') who |= 0700;
+        if (*s == 'g') who |= 0070;
+        if (*s == 'o') who |= 0007;
+        if (*s == 'a') who |= 0777;
+    }
+    if (!who) return 0;
+    char op = *s++;
+    if (op != '+' && op != '-' && op != '=') return 0;
+    unsigned perm = 0;
+    for (; *s; s++) {
+        if (*s == 'r') perm |= 4;
+        else if (*s == 'w') perm |= 2;
+        else if (*s == 'x') perm |= 1;
+        else return 0;
+    }
+    unsigned bits = (perm << 6 | perm << 3 | perm) & who;   // replicate, keep named classes
+    if (op == '+') *mode |= bits;
+    else if (op == '-') *mode &= ~bits;
+    else *mode = (*mode & ~who) | bits;
+    *mode &= 0777;
+    return 1;
+}
+
+int main(void) {
+    unsigned mode;
+    if (scanf("%o", &mode) != 1) return 1;
+    mode &= 0777;
+    show(mode);
+    char line[128];
+    if (!fgets(line, sizeof line, stdin)) return 0;     // rest of the first line
+    while (fgets(line, sizeof line, stdin)) {
+        line[strcspn(line, "\r\n")] = '\0';
+        if (line[0] == '\0') continue;
+        if (apply(&mode, line)) show(mode);
+        else printf("invalid: %s\n", line);
+    }
+    return 0;
+}
+--- hint
+Build a `who` mask from the class letters: `u` is `0700`, `g` `0070`, `o` `0007`, `a` `0777`. Build a 3-bit `perm` from the letters.
+--- hint
+`perm << 6 | perm << 3 | perm` copies the permission into all three classes; AND it with `who` to keep only the named ones. Then `+` is OR, `-` is AND NOT, and `=` is `(mode & ~who) | bits`.
+--- hint
+Printing: walk bit 8 down to 0; the letter for bit `b` is `"rwx"[(8 - b) % 3]`. Read the first line with `scanf("%o", ...)`, then the rest line by line with `fgets` (after consuming the end of the first line).
+--- test
+644
+u+x
+go-r
+a=rw
+g+wx
+uo=
+--- out
+644 rw-r--r--
+744 rwxr--r--
+700 rwx------
+666 rw-rw-rw-
+676 rw-rwxrw-
+070 ---rwx---
+--- test
+755
+o-rx
+ug=r
+a+
++x
+uz+x
+u*x
+g+rwx
+ugo-w
+--- out
+755 rwxr-xr-x
+750 rwxr-x---
+440 r--r-----
+440 r--r-----
+invalid: +x
+invalid: uz+x
+invalid: u*x
+470 r--rwx---
+450 r--r-x---
+--- test
+0
+a+rwx
+u-rwx
+o=x
+gg=w
+--- out
+000 ---------
+777 rwxrwxrwx
+077 ---rwxrwx
+071 ---rwx--x
+021 ----w---x
+
+=== quiz
+run: yes
+--- q
+What does this print?
+--- code
+#include <stdio.h>
+
+int main(void) {
+    unsigned a = 6, b = 3;
+    printf("%u %u %u %u\n", a & b, a | b, a ^ b, a & ~b);
+    return 0;
+}
+--- choice
+1 1 0 0
+--- answer
+2 7 5 4
+--- choice
+2 7 5 0
+--- choice
+3 6 5 4
+--- explain
+6 is `110`, 3 is `011`. AND: `010` = 2. OR: `111` = 7. XOR: `101` = 5. `a & ~b` clears b's bits from a: `100` = 4.
+
+=== quiz
+run: yes
+--- q
+What does this print?
+--- code
+#include <stdio.h>
+
+int main(void) {
+    unsigned x = 4;
+    if (x & 1 == 0)
+        printf("even\n");
+    else
+        printf("odd\n");
+    return 0;
+}
+--- choice
+even
+--- answer
+odd
+--- choice
+It doesn't compile
+--- explain
+`==` binds tighter than `&`, so this is `x & (1 == 0)`, which is `x & 0`, which is 0 (false), whatever `x` is. Always write `(x & 1) == 0`. gcc warns with `-Wparentheses` (part of `-Wall`).
+
+=== quiz
+run: yes
+--- q
+What does this print?
+--- code
+#include <stdio.h>
+#include <stdint.h>
+
+int main(void) {
+    uint8_t c = 0x0F;
+    printf("%d %d\n", ~c, (uint8_t)~c);
+    return 0;
+}
+--- choice
+240 240
+--- answer
+-16 240
+--- choice
+-16 -16
+--- choice
+4294967280 240
+--- explain
+`c` is promoted to `int` (value 15) before `~` applies, so `~c` flips all 32 bits: `0xFFFFFFF0`, which is -16 as an `int`. Casting back to `uint8_t` keeps the low 8 bits, 240.
+
+=== quiz
+run: yes
+--- q
+What does this print?
+--- code
+#include <stdio.h>
+
+int main(void) {
+    unsigned x = 40;
+    printf("%u %u %d\n", x & (x - 1), x & -x, (x & (x - 1)) == 0);
+    return 0;
+}
+--- choice
+39 8 0
+--- answer
+32 8 0
+--- choice
+32 40 1
+--- choice
+8 32 0
+--- explain
+40 is `101000`. `x & (x - 1)` clears the lowest set bit: `100000` = 32. `x & -x` keeps only the lowest set bit: `1000` = 8. Not a power of two, so the last value is 0.
+
+=== quiz
+--- q
+On x86-64 with a 32-bit `int`, which of these expressions has fully defined behavior?
+--- choice
+`1 << 31`
+--- choice
+`1u << 32`
+--- answer
+`1u << 31`
+--- choice
+`-1 << 1`
+--- explain
+`1 << 31` shifts a 1 into the sign bit of a signed `int`: undefined. `1u << 32` shifts by the full width: undefined, even though it's unsigned. `-1 << 1` left-shifts a negative value: undefined. `1u << 31` is `0x80000000`, a valid `unsigned`.
+
+=== quiz
+run: yes
+--- q
+On x86-64 (little-endian), what does this print?
+--- code
+#include <stdio.h>
+#include <stdint.h>
+#include <string.h>
+
+int main(void) {
+    uint32_t v = 0x0A0B0C0D;
+    unsigned char b[4];
+    memcpy(b, &v, sizeof v);
+    printf("%02x %02x\n", b[0], b[3]);
+    return 0;
+}
+--- choice
+0a 0d
+--- answer
+0d 0a
+--- choice
+0a 0b
+--- choice
+0d 0c
+--- explain
+Little-endian stores the least significant byte (`0x0D`) at the lowest address. A big-endian machine would print `0a 0d`, which is why file formats must spell out their byte order.
+
+=== quiz
+run: yes
+--- q
+What does this print?
+--- code
+#include <stdio.h>
+
+enum { F_BOLD = 1 << 0, F_ITALIC = 1 << 1, F_UNDER = 1 << 2 };
+
+int main(void) {
+    unsigned style = F_BOLD | F_UNDER;
+    style ^= F_ITALIC | F_BOLD;
+    printf("%u %d %d\n", style, (style & (F_ITALIC | F_UNDER)) == (F_ITALIC | F_UNDER),
+           (style & F_BOLD) != 0);
+    return 0;
+}
+--- choice
+5 0 1
+--- answer
+6 1 0
+--- choice
+7 1 1
+--- choice
+2 0 0
+--- explain
+`101 ^ 011 = 110`: XOR toggled italic on and bold off, leaving underline. So `style` is 6, it has both italic and underline (1), and no bold (0).
+
+=== quiz
+run: yes
+--- q
+What does this print?
+--- code
+#include <stdio.h>
+
+int main(void) {
+    unsigned x = 0xF0u;
+    printf("%u %u %u\n", x >> 4, (x << 28) >> 28, (unsigned)-1 >> 28);
+    return 0;
+}
+--- choice
+15 15 15
+--- answer
+15 0 15
+--- choice
+15 240 1
+--- choice
+15 0 4294967295
+--- explain
+`0xF0 >> 4` is `0xF`. `0xF0 << 28` pushes the 1 bits off the top of the 32-bit value, leaving 0. `(unsigned)-1` is all ones, and an unsigned right shift fills with zeros: `0xF`.

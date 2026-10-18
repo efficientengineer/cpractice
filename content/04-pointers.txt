@@ -1,0 +1,976 @@
+=== chapter pointers
+title: Pointers
+blurb: Addresses, & and *, out-parameters in place of ref/out, NULL, pointer arithmetic, const in all four positions, pointers to pointers, void *, and dangling pointers.
+--- body
+## A pointer is an address
+
+Memory is one huge array of bytes, and every byte has a numeric address. A pointer is a variable whose value is an address, plus a *type* that says what lives there. That's all. Everything else about pointers follows from it.
+
+```c
+#include <stdio.h>
+
+int main(void) {
+    int x = 42;
+    int *p = &x;         // p holds the address of x. Read "int *p" as "*p is an int".
+
+    printf("%d\n", *p);  // 42: * follows the pointer (dereference)
+    *p = 7;              // writes to x through p
+    printf("%d\n", x);   // 7
+
+    printf("%p\n", (void *)&x);   // the address, e.g. 0x7ffc8e3a1b4c
+    printf("%p\n", (void *)p);    // the same address
+    printf("%zu %zu\n", sizeof p, sizeof *p);   // 8 4: an address, and an int
+    return 0;
+}
+```
+
+- `&x` (address-of) gives a pointer to `x`. You can take the address of any variable, array element or struct member, but not of a literal or a temporary like `a + b`.
+- `*p` (dereference) *is* the object `p` points to. You can read it and assign to it.
+- `%p` prints a pointer. It formally requires a `void *`, hence the cast.
+
+The `*` in a declaration binds to the name, not the type, which leads to a classic trap:
+
+```c
+int *a, b;     // a is int *, b is a plain int
+int *c, *d;    // two pointers
+```
+
+## Out-parameters: C's ref and out
+
+The functions chapter said every argument is copied. A pointer argument is copied too, but the copy holds the same address, so the function can reach the caller's variable through it. This is how C does C#'s `ref` and `out`, and why `scanf` needs `&`:
+
+```c
+#include <stdio.h>
+
+void swap(int *a, int *b) {        // C#: void Swap(ref int a, ref int b)
+    int t = *a;
+    *a = *b;
+    *b = t;
+}
+
+// Returns 0 on failure; on success writes two results through the pointers.
+int divide(int num, int den, int *quot, int *rem) {   // C#: out int quot, out int rem
+    if (den == 0) return 0;
+    *quot = num / den;
+    *rem = num % den;
+    return 1;
+}
+
+int main(void) {
+    int x = 1, y = 2;
+    swap(&x, &y);
+    printf("%d %d\n", x, y);          // 2 1
+
+    int q, r;
+    if (divide(17, 5, &q, &r))
+        printf("%d r %d\n", q, r);    // 3 r 2
+    if (!divide(1, 0, &q, &r))
+        puts("division by zero");
+    return 0;
+}
+```
+
+The pattern "return a status, deliver the results through pointers" is everywhere in C APIs, because there are no exceptions and only one return value. Unlike C#, nothing at the call site marks the argument as `ref`; the `&` is the only clue that the callee may change the variable.
+
+## NULL
+
+`NULL` is a null pointer constant, a pointer that points at nothing. A null pointer is false in a condition, so `if (p)` means "if p is not null". Dereferencing `NULL` is undefined behavior; on Linux it usually crashes with a segmentation fault, but there is no `NullReferenceException` to catch.
+
+An *uninitialized* pointer is worse than a null one: it holds a garbage address, and writing through it can silently corrupt anything. Initialize pointers when you declare them, to `NULL` if there is nothing better.
+
+A common idiom is the *optional out-parameter*: the caller passes `NULL` for results it does not want.
+
+```c
+#include <stdio.h>
+
+void stats(const int *v, int n, int *sum, int *count_negative) {
+    int s = 0, neg = 0;
+    for (int i = 0; i < n; i++) {
+        s += v[i];
+        if (v[i] < 0) neg++;
+    }
+    if (sum) *sum = s;                        // only if the caller asked
+    if (count_negative) *count_negative = neg;
+}
+
+int main(void) {
+    int data[] = {3, -1, 4, -1, 5};
+    int total;
+    stats(data, 5, &total, NULL);
+    printf("%d\n", total);   // 10
+    return 0;
+}
+```
+
+## Pointer types
+
+An `int *` and a `double *` may hold the same kind of address, but the type decides how many bytes `*p` reads and how they are interpreted. Assigning one to the other is a constraint violation (gcc: "incompatible pointer types"), and accessing an object through the wrong pointer type is undefined behavior (the *strict aliasing* rule, covered later). The exceptions are `void *` (below) and `char *` / `unsigned char *`, which may look at the bytes of any object:
+
+```c
+#include <stdio.h>
+
+int main(void) {
+    unsigned int value = 0x11223344;
+    unsigned char *bytes = (unsigned char *)&value;   // explicit cast needed
+    for (size_t i = 0; i < sizeof value; i++)
+        printf("%02x ", bytes[i]);   // 44 33 22 11 on x86: little-endian
+    printf("\n");
+    return 0;
+}
+```
+
+## Pointer arithmetic
+
+Adding an integer to a pointer moves it by that many *elements*, not bytes: `p + 1` on an `int *` adds `sizeof(int)`, 4, to the address. Subtracting two pointers into the same array gives the number of elements between them, as a `ptrdiff_t` (print with `%td`). And `p[i]` is defined as `*(p + i)`: indexing *is* pointer arithmetic.
+
+```c
+#include <stdio.h>
+
+int main(void) {
+    int a[5] = {10, 20, 30, 40, 50};
+    int *p = a;                  // an array name converts to a pointer to its first element
+    printf("%d %d %d\n", *p, *(p + 2), p[4]);    // 10 30 50
+
+    int *q = &a[3];
+    printf("%td\n", q - p);                      // 3 elements apart
+    printf("%td\n", (char *)q - (char *)p);      // 12 bytes apart
+
+    for (int *it = a; it < a + 5; it++)          // iterate with a pointer
+        printf("%d ", *it);
+    printf("\n");
+
+    int *end = a + 5;            // one past the end: fine to compute and compare...
+    // printf("%d", *end);       // ...but not to dereference
+    while (end > a) printf("%d ", *--end);       // backwards
+    printf("\n");
+    return 0;
+}
+```
+
+The rules: arithmetic is only valid within one array, and you may form (but not dereference) the address one past its last element. Anything else, like `a - 1` or `a + 6`, is undefined even if you never dereference it. Comparing pointers with `<` is only meaningful within the same array; `==` and `!=` work for any two pointers.
+
+`*p++` is the most famous C idiom. Postfix `++` binds tighter than `*`, so it means `*(p++)`: read the element, then advance the pointer. `(*p)++` increments the element instead.
+
+```c
+#include <stdio.h>
+
+int main(void) {
+    const char *s = "hello";
+    int len = 0;
+    while (*s++) len++;     // walk to the terminating 0 byte
+    printf("%d\n", len);    // 5
+
+    int counts[3] = {0, 0, 0};
+    int *c = counts;
+    (*c)++;                 // counts[0] becomes 1, c does not move
+    *c++ = 5;               // counts[0] = 5, then c points at counts[1]
+    *c = 9;
+    printf("%d %d %d\n", counts[0], counts[1], counts[2]);   // 5 9 0
+    return 0;
+}
+```
+
+## const and pointers: four combinations
+
+A pointer involves two objects: the pointer itself and the thing it points at. `const` can apply to either. Read the declaration **right to left** from the name:
+
+| Declaration | Read as | Change `*p`? | Change `p`? |
+|---|---|---|---|
+| `int *p` | p is a pointer to int | yes | yes |
+| `const int *p` | p is a pointer to an int that is const | no | yes |
+| `int *const p` | p is a const pointer to int | yes | no |
+| `const int *const p` | p is a const pointer to a const int | no | no |
+
+`int const *p` means the same as `const int *p`: what matters is whether `const` is left or right of the `*`.
+
+```c
+#include <stdio.h>
+
+int main(void) {
+    int x = 1, y = 2;
+
+    const int *read_only = &x;    // a "view" of x
+    // *read_only = 5;            // error: assignment of read-only location
+    read_only = &y;               // fine: the pointer itself can move
+
+    int *const fixed = &x;
+    *fixed = 5;                   // fine: x is not const
+    // fixed = &y;                // error: assignment of read-only variable
+
+    const int *const both = &y;
+    printf("%d %d %d\n", *read_only, *fixed, *both);   // 2 5 2
+    return 0;
+}
+```
+
+`const int *` is by far the most important form. In a parameter it is a promise: "this function reads your data but does not modify it". That is why `strlen` takes `const char *` and `memcpy` takes a `const void *` source. Converting `int *` to `const int *` is automatic; the reverse needs a cast, and writing to an object that was *defined* `const` through such a cast is undefined behavior. Use `const` on every pointer parameter you don't write through; it documents the contract and the compiler enforces it.
+
+## Pointers to pointers
+
+A pointer is a variable too, so it has an address. An `int **` points at an `int *`. You need one whenever a function must change the caller's *pointer* (rather than what it points at): the same out-parameter logic, one level up.
+
+```c
+#include <stdio.h>
+
+// Advance *cursor past leading spaces. The caller's pointer moves.
+void skip_spaces(const char **cursor) {
+    while (**cursor == ' ')
+        (*cursor)++;
+}
+
+int main(void) {
+    const char *text = "   indented";
+    skip_spaces(&text);
+    printf("[%s]\n", text);      // [indented]
+
+    int value = 3;
+    int *p = &value;
+    int **pp = &p;
+    **pp = 4;                    // value = 4
+    printf("%d %d %d\n", value, *p, **pp);   // 4 4 4
+    return 0;
+}
+```
+
+`main(int argc, char **argv)` uses one: `argv` points at an array of `char *`, one per command-line argument. Linked-list code uses `node **` to insert or delete without special-casing the head, which you will see in the data structures chapter.
+
+## void *: the generic pointer
+
+`void *` is "a pointer to something, type unknown". Any object pointer converts to `void *` and back implicitly, without a cast (unlike C++). You cannot dereference a `void *` or do arithmetic on it; you must convert it back to a real type first. It is C's substitute for generics and `object`: `malloc` returns one, `memcpy` and `qsort` take them.
+
+```c
+#include <stdio.h>
+#include <string.h>
+
+// Swap any two objects of the same size, byte by byte.
+void swap_any(void *a, void *b, size_t size) {
+    unsigned char *x = a, *y = b;     // implicit conversion from void *
+    for (size_t i = 0; i < size; i++) {
+        unsigned char t = x[i];
+        x[i] = y[i];
+        y[i] = t;
+    }
+}
+
+int main(void) {
+    double d1 = 1.5, d2 = 2.5;
+    swap_any(&d1, &d2, sizeof d1);
+    printf("%.1f %.1f\n", d1, d2);   // 2.5 1.5
+
+    char s1[8] = "left", s2[8] = "right";
+    swap_any(s1, s2, sizeof s1);
+    printf("%s %s\n", s1, s2);       // right left
+    return 0;
+}
+```
+
+The price is type safety: nothing stops you calling `swap_any(&d1, &x, 8)` with a 4-byte `int x`. All the type checking a C# generic would do is now your job.
+
+## Dangling pointers
+
+A local variable dies when its function returns (or its block ends). A pointer to it then *dangles*: it holds the address of memory that will be reused by the next function call. Using it is undefined behavior.
+
+```c
+int *make_counter(void) {
+    int count = 0;
+    return &count;        // gcc: "function returns address of local variable"
+}
+```
+
+gcc warns, and even replaces the returned address with `NULL` so that the bug crashes early instead of corrupting something. The subtler version, storing the address in a struct or a global, gets no warning; AddressSanitizer reports it at runtime as *stack-use-after-return* or *stack-use-after-scope*. The fixes:
+
+- return the value itself instead of its address (structs can be returned by value);
+- let the caller own the storage and pass a pointer to it (the out-parameter pattern);
+- use a `static` variable (one shared instance, not reentrant);
+- allocate with `malloc` and make the caller `free` it (memory chapter).
+
+## Compared with C# references
+
+| | C# reference | C pointer |
+|---|---|---|
+| Points to | a managed object | any byte of memory |
+| Arithmetic | no | yes |
+| Null access | `NullReferenceException` | undefined behavior, usually a crash |
+| Lifetime | GC keeps the target alive | nothing does; dangling is possible |
+| To a local variable | only `ref`, which can't outlive it | yes, and it can outlive it |
+| Reassigning the target object | the GC may move it, transparently | never moves |
+| Type check | at runtime on every cast | none after a cast |
+
+C#'s `unsafe` code with `int*` and `fixed` *is* C pointers, borrowed wholesale. A JavaScript object variable is closest to a C# reference. In C, the address is just a number, and every guarantee you had is now a rule you have to keep.
+
+=== exercise swap
+title: Swap through pointers
+--- prompt
+Write `void swap(int *a, int *b)` that exchanges the values of the two `int`s that `a` and `b` point to.
+
+It must also work when `a` and `b` point to the same variable (the value stays as it is).
+--- starter
+void swap(int *a, int *b) {
+    int t = *a;
+    *a = *b;
+}
+--- solution
+void swap(int *a, int *b) {
+    int t = *a;
+    *a = *b;
+    *b = t;
+}
+--- harness
+#include <limits.h>
+int main(void) {
+    int x = 1, y = 2;
+    swap(&x, &y);
+    CHECK_INT(x, 2);
+    CHECK_INT(y, 1);
+    swap(&x, &y);
+    CHECK_INT(x, 1);
+    CHECK_INT(y, 2);
+    int same = 5;
+    swap(&same, &same);
+    CHECK_INT(same, 5);
+    int big = INT_MAX, small = INT_MIN;
+    swap(&big, &small);
+    CHECK_INT(big, INT_MIN);
+    CHECK_INT(small, INT_MAX);
+    int arr[3] = {7, 8, 9};
+    swap(&arr[0], &arr[2]);
+    CHECK_INT(arr[0], 9);
+    CHECK_INT(arr[1], 8);
+    CHECK_INT(arr[2], 7);
+    return TEST_END();
+}
+--- hint
+Save `*a` in a temporary, copy `*b` into `*a`, then the temporary into `*b`.
+--- hint
+Avoid the XOR-swap trick: with `a == b` it zeroes the value.
+
+=== exercise divmod
+title: Floored division
+--- prompt
+C's `/` truncates toward zero and `%` takes the sign of the dividend. Python's `//` and `%` instead *floor*: the quotient rounds toward negative infinity and the remainder takes the sign of the divisor. Write the Python version:
+
+`int floor_divmod(int a, int b, int *q, int *r)`
+
+On success store the floored quotient in `*q` and the remainder in `*r`, so that `a == *q * b + *r`, and return 1. If the division is impossible (`b == 0`) or overflows (`a == INT_MIN` and `b == -1`), return 0 and **do not touch** `*q` or `*r`.
+
+| a, b | C `/`, `%` | floored q, r |
+|---|---|---|
+| 7, 2 | 3, 1 | 3, 1 |
+| -7, 2 | -3, -1 | -4, 1 |
+| 7, -2 | -3, 1 | -4, -1 |
+| -7, -2 | 3, -1 | 3, -1 |
+--- starter
+int floor_divmod(int a, int b, int *q, int *r) {
+    return 0;
+}
+--- solution
+#include <limits.h>
+
+int floor_divmod(int a, int b, int *q, int *r) {
+    if (b == 0 || (a == INT_MIN && b == -1)) return 0;
+    int quot = a / b, rem = a % b;
+    if (rem != 0 && ((rem < 0) != (b < 0))) {
+        quot--;
+        rem += b;
+    }
+    *q = quot;
+    *r = rem;
+    return 1;
+}
+--- harness
+#include <limits.h>
+static int q_, r_;
+static int fdm(int a, int b) { q_ = 111; r_ = 222; return floor_divmod(a, b, &q_, &r_); }
+int main(void) {
+    CHECK_INT(fdm(7, 2), 1);   CHECK_INT(q_, 3);  CHECK_INT(r_, 1);
+    CHECK_INT(fdm(-7, 2), 1);  CHECK_INT(q_, -4); CHECK_INT(r_, 1);
+    CHECK_INT(fdm(7, -2), 1);  CHECK_INT(q_, -4); CHECK_INT(r_, -1);
+    CHECK_INT(fdm(-7, -2), 1); CHECK_INT(q_, 3);  CHECK_INT(r_, -1);
+    CHECK_INT(fdm(6, 3), 1);   CHECK_INT(q_, 2);  CHECK_INT(r_, 0);
+    CHECK_INT(fdm(-6, 3), 1);  CHECK_INT(q_, -2); CHECK_INT(r_, 0);
+    CHECK_INT(fdm(0, 5), 1);   CHECK_INT(q_, 0);  CHECK_INT(r_, 0);
+    CHECK_INT(fdm(0, -5), 1);  CHECK_INT(q_, 0);  CHECK_INT(r_, 0);
+    CHECK_INT(fdm(-1, 10), 1); CHECK_INT(q_, -1); CHECK_INT(r_, 9);
+    CHECK_INT(fdm(1, -10), 1); CHECK_INT(q_, -1); CHECK_INT(r_, -9);
+    CHECK_INT(fdm(-1, INT_MAX), 1); CHECK_INT(q_, -1); CHECK_INT(r_, INT_MAX - 1);
+    CHECK_INT(fdm(INT_MIN, 1), 1);  CHECK_INT(q_, INT_MIN); CHECK_INT(r_, 0);
+    CHECK_INT(fdm(INT_MIN, 3), 1);  CHECK_INT(q_, -715827883); CHECK_INT(r_, 1);
+    CHECK_INT(fdm(INT_MAX, -1), 1); CHECK_INT(q_, -INT_MAX); CHECK_INT(r_, 0);
+    CHECK_INT(fdm(5, 0), 0);        CHECK_INT(q_, 111); CHECK_INT(r_, 222);
+    CHECK_INT(fdm(0, 0), 0);        CHECK_INT(q_, 111); CHECK_INT(r_, 222);
+    CHECK_INT(fdm(INT_MIN, -1), 0); CHECK_INT(q_, 111); CHECK_INT(r_, 222);
+    return TEST_END();
+}
+--- hint
+Start from C's own `a / b` and `a % b`. They differ from the floored result exactly when the remainder is nonzero and its sign differs from the sign of `b`.
+--- hint
+In that case, subtract 1 from the quotient and add `b` to the remainder. The identity `a == q * b + r` still holds.
+--- hint
+Check the two failure cases before dividing at all; `INT_MIN / -1` is undefined behavior, not just a wrong answer.
+
+=== exercise minmax
+title: Optional out-parameters
+--- prompt
+Write `void min_max(const int *v, int n, int *min, int *max)` that stores the smallest and largest of the `n` values starting at `v` (`n` is at least 1).
+
+Either output pointer may be `NULL`, meaning the caller does not want that result; then simply skip it.
+
+The `const` on `v` promises that you only read the data.
+--- starter
+void min_max(const int *v, int n, int *min, int *max) {
+    *min = v[0];
+    *max = v[0];
+}
+--- solution
+void min_max(const int *v, int n, int *min, int *max) {
+    int lo = v[0], hi = v[0];
+    for (const int *p = v + 1; p < v + n; p++) {
+        if (*p < lo) lo = *p;
+        if (*p > hi) hi = *p;
+    }
+    if (min) *min = lo;
+    if (max) *max = hi;
+}
+--- harness
+#include <limits.h>
+int main(void) {
+    int a[] = {3, -1, 4, 1, -5, 9, 2, 6};
+    int lo = 0, hi = 0;
+    min_max(a, 8, &lo, &hi);
+    CHECK_INT(lo, -5);
+    CHECK_INT(hi, 9);
+    int one[] = {42};
+    min_max(one, 1, &lo, &hi);
+    CHECK_INT(lo, 42);
+    CHECK_INT(hi, 42);
+    int neg[] = {-3, -8, -1};
+    min_max(neg, 3, &lo, &hi);
+    CHECK_INT(lo, -8);
+    CHECK_INT(hi, -1);
+    int ext[] = {0, INT_MAX, INT_MIN, 0};
+    min_max(ext, 4, &lo, &hi);
+    CHECK_INT(lo, INT_MIN);
+    CHECK_INT(hi, INT_MAX);
+    min_max(a, 3, &lo, &hi);      /* only the first three: 3 -1 4 */
+    CHECK_INT(lo, -1);
+    CHECK_INT(hi, 4);
+    lo = 100; hi = 100;
+    min_max(a, 8, NULL, &hi);
+    CHECK_INT(hi, 9);
+    min_max(a, 8, &lo, NULL);
+    CHECK_INT(lo, -5);
+    min_max(a, 8, NULL, NULL);
+    CHECK(1);
+    return TEST_END();
+}
+--- hint
+Compute into two locals first, then write each one out only `if (min)` / `if (max)` is non-null.
+--- hint
+Initialize both from `v[0]`, not from 0: the values may be all negative or all positive.
+
+=== exercise sumrange
+title: Half-open ranges
+--- prompt
+C++ iterators and many C APIs describe a sequence by two pointers: `begin` points at the first element, and `end` points *one past* the last. The range is empty when `begin == end`.
+
+Write `long long sum_range(const int *begin, const int *end)` that returns the sum of the elements in `[begin, end)`, walking with a pointer (no index variable). Use a `long long` accumulator: the tests add up values that overflow `int`.
+
+Then write `int count_in_range(const int *begin, const int *end, int lo, int hi)` returning how many elements `x` satisfy `lo <= x && x <= hi`.
+--- starter
+long long sum_range(const int *begin, const int *end) {
+    return 0;
+}
+
+int count_in_range(const int *begin, const int *end, int lo, int hi) {
+    return 0;
+}
+--- solution
+long long sum_range(const int *begin, const int *end) {
+    long long total = 0;
+    for (const int *p = begin; p != end; p++)
+        total += *p;
+    return total;
+}
+
+int count_in_range(const int *begin, const int *end, int lo, int hi) {
+    int count = 0;
+    while (begin != end) {
+        int x = *begin++;
+        if (lo <= x && x <= hi) count++;
+    }
+    return count;
+}
+--- harness
+#include <limits.h>
+int main(void) {
+    int a[] = {1, 2, 3, 4, 5};
+    CHECK_INT(sum_range(a, a + 5), 15);
+    CHECK_INT(sum_range(a, a), 0);
+    CHECK_INT(sum_range(a + 5, a + 5), 0);
+    CHECK_INT(sum_range(a + 1, a + 3), 5);
+    CHECK_INT(sum_range(a + 4, a + 5), 5);
+    int big[] = {INT_MAX, INT_MAX, INT_MAX};
+    CHECK_INT(sum_range(big, big + 3), 3LL * INT_MAX);
+    int mixed[] = {-10, 20, -30, 40};
+    CHECK_INT(sum_range(mixed, mixed + 4), 20);
+    CHECK_INT(count_in_range(a, a + 5, 2, 4), 3);
+    CHECK_INT(count_in_range(a, a + 5, 6, 10), 0);
+    CHECK_INT(count_in_range(a, a, 0, 100), 0);
+    CHECK_INT(count_in_range(a, a + 5, 5, 5), 1);
+    CHECK_INT(count_in_range(mixed, mixed + 4, -30, 0), 2);
+    CHECK_INT(count_in_range(big, big + 3, INT_MIN, INT_MAX), 3);
+    CHECK_INT(count_in_range(a, a + 5, 4, 2), 0);
+    return TEST_END();
+}
+--- hint
+`for (const int *p = begin; p != end; p++) total += *p;`. Loop with `!=` against `end`; never dereference `end`.
+--- hint
+`total += *p` converts each `int` to `long long` before adding because `total` is a `long long`.
+
+=== exercise findint
+title: Return a pointer, or NULL
+--- prompt
+Write `int *find_int(int *v, int n, int value)` returning a pointer to the **first** element of `v[0..n-1]` equal to `value`, or `NULL` if there is none (including when `n` is 0).
+
+Because you return a pointer into the caller's array rather than an index, the caller can modify the element through it: the tests do `*find_int(...) = 0;`.
+
+Also write `int *find_last(int *v, int n, int value)` that returns the **last** match, scanning backwards with a pointer.
+--- starter
+#include <stddef.h>
+
+int *find_int(int *v, int n, int value) {
+    return NULL;
+}
+
+int *find_last(int *v, int n, int value) {
+    return NULL;
+}
+--- solution
+#include <stddef.h>
+
+int *find_int(int *v, int n, int value) {
+    for (int *p = v; p < v + n; p++)
+        if (*p == value) return p;
+    return NULL;
+}
+
+int *find_last(int *v, int n, int value) {
+    for (int *p = v + n; p > v; ) {
+        p--;
+        if (*p == value) return p;
+    }
+    return NULL;
+}
+--- harness
+int main(void) {
+    int a[] = {4, 7, 1, 7, 9};
+    CHECK(find_int(a, 5, 7) == &a[1]);
+    CHECK(find_int(a, 5, 4) == &a[0]);
+    CHECK(find_int(a, 5, 9) == &a[4]);
+    CHECK(find_int(a, 5, 5) == NULL);
+    CHECK(find_int(a, 0, 4) == NULL);
+    CHECK(find_int(a, 4, 9) == NULL);
+    CHECK(find_last(a, 5, 7) == &a[3]);
+    CHECK(find_last(a, 5, 4) == &a[0]);
+    CHECK(find_last(a, 5, 9) == &a[4]);
+    CHECK(find_last(a, 5, 2) == NULL);
+    CHECK(find_last(a, 0, 4) == NULL);
+    CHECK(find_last(a, 3, 7) == &a[1]);
+    int *p = find_int(a, 5, 1);
+    CHECK(p != NULL);
+    if (p) *p = 100;
+    CHECK_INT(a[2], 100);
+    int count = 0;
+    int *it;
+    while ((it = find_int(a, 5, 7)) != NULL) { *it = 0; count++; }
+    CHECK_INT(count, 2);
+    CHECK_INT(a[1], 0);
+    CHECK_INT(a[3], 0);
+    return TEST_END();
+}
+--- hint
+Loop a pointer from `v` while `p < v + n`, and `return p;` on a match.
+--- hint
+Going backwards, don't compute `v - 1` (pointing before an array is undefined). Start at `v + n` and decrement *before* each dereference, stopping when the pointer reaches `v`.
+
+=== exercise sort3
+title: Sort three in place
+--- prompt
+Write `void sort3(int *a, int *b, int *c)` that rearranges the three values so that `*a <= *b <= *c`.
+
+Write a small `static` helper that swaps two values through pointers if they are out of order, and call it three times.
+--- starter
+void sort3(int *a, int *b, int *c) {
+}
+--- solution
+static void order(int *x, int *y) {
+    if (*x > *y) {
+        int t = *x;
+        *x = *y;
+        *y = t;
+    }
+}
+
+void sort3(int *a, int *b, int *c) {
+    order(a, b);
+    order(b, c);
+    order(a, b);
+}
+--- harness
+#include <limits.h>
+static int ok3(int x, int y, int z, int e1, int e2, int e3) {
+    sort3(&x, &y, &z);
+    return x == e1 && y == e2 && z == e3;
+}
+int main(void) {
+    CHECK(ok3(1, 2, 3, 1, 2, 3));
+    CHECK(ok3(1, 3, 2, 1, 2, 3));
+    CHECK(ok3(2, 1, 3, 1, 2, 3));
+    CHECK(ok3(2, 3, 1, 1, 2, 3));
+    CHECK(ok3(3, 1, 2, 1, 2, 3));
+    CHECK(ok3(3, 2, 1, 1, 2, 3));
+    CHECK(ok3(5, 5, 5, 5, 5, 5));
+    CHECK(ok3(2, 1, 1, 1, 1, 2));
+    CHECK(ok3(1, 2, 1, 1, 1, 2));
+    CHECK(ok3(0, -1, -2, -2, -1, 0));
+    CHECK(ok3(INT_MAX, INT_MIN, 0, INT_MIN, 0, INT_MAX));
+    return TEST_END();
+}
+--- hint
+Three compare-and-swaps in the order (a, b), (b, c), (a, b) form a sorting network: after the first two the largest is in `c`, and the last one fixes `a` and `b`.
+
+=== exercise takeint
+title: A parsing cursor
+--- prompt
+A parser often keeps a *cursor*, a `const char *` to the next unread character, and helper functions advance it. Since they must change the caller's pointer, they take a pointer to it: a `const char **`.
+
+Write `int take_int(const char **s, int *out)`:
+
+1. Skip any spaces (`' '`) at `*s`.
+2. Accept an optional `+` or `-`, then one or more digits `0`-`9`.
+3. On success: store the value in `*out`, advance `*s` to the first character after the last digit, and return 1.
+4. On failure (no digits, or a value outside `int`'s range): return 0 and leave **both** `*s` and `*out` unchanged.
+
+`"-2147483648"` is valid; `"2147483648"` is not. For example, after `take_int(&s, &v)` with `s = "  -42abc"`, `v` is -42 and `s` points at `"abc"`. Don't use library parsing functions.
+--- starter
+int take_int(const char **s, int *out) {
+    return 0;
+}
+--- solution
+int take_int(const char **s, int *out) {
+    const char *p = *s;
+    while (*p == ' ') p++;
+    int negative = 0;
+    if (*p == '+' || *p == '-') {
+        negative = (*p == '-');
+        p++;
+    }
+    if (*p < '0' || *p > '9') return 0;
+    long long value = 0;
+    while (*p >= '0' && *p <= '9') {
+        value = value * 10 + (*p - '0');
+        if (value > 2147483648LL) return 0;   // too big even for a negative int
+        p++;
+    }
+    if (negative) value = -value;
+    if (value > 2147483647LL) return 0;
+    *out = (int)value;
+    *s = p;
+    return 1;
+}
+--- harness
+#include <limits.h>
+int main(void) {
+    const char *s = "  42 rest";
+    int v = 0;
+    CHECK_INT(take_int(&s, &v), 1);
+    CHECK_INT(v, 42);
+    CHECK_STR(s, " rest");
+
+    s = "  -42abc";
+    CHECK_INT(take_int(&s, &v), 1);
+    CHECK_INT(v, -42);
+    CHECK_STR(s, "abc");
+
+    const char *list = "10 -20 +30";
+    int sum = 0, n = 0;
+    while (take_int(&list, &v)) { sum += v; n++; }
+    CHECK_INT(n, 3);
+    CHECK_INT(sum, 20);
+    CHECK_STR(list, "");
+
+    s = "007x";
+    CHECK_INT(take_int(&s, &v), 1);
+    CHECK_INT(v, 7);
+    CHECK_STR(s, "x");
+
+    s = "0";
+    CHECK_INT(take_int(&s, &v), 1);
+    CHECK_INT(v, 0);
+    CHECK_STR(s, "");
+
+    s = "2147483647";
+    CHECK_INT(take_int(&s, &v), 1);
+    CHECK_INT(v, INT_MAX);
+    s = "-2147483648!";
+    CHECK_INT(take_int(&s, &v), 1);
+    CHECK_INT(v, INT_MIN);
+    CHECK_STR(s, "!");
+
+    const char *bad[] = {"", "   ", "abc", "  -", "+", "+-3", "- 3", "2147483648",
+                         "-2147483649", "99999999999999999999999", "  x12"};
+    for (int i = 0; i < (int)(sizeof bad / sizeof bad[0]); i++) {
+        const char *start = bad[i];
+        const char *cur = start;
+        v = 1234;
+        CHECK_INT(take_int(&cur, &v), 0);
+        CHECK(cur == start);
+        CHECK_INT(v, 1234);
+    }
+    return TEST_END();
+}
+--- hint
+Work on a local copy `const char *p = *s;` and only write back `*s = p;` once you know the parse succeeded. That makes "leave it unchanged on failure" automatic.
+--- hint
+Accumulate in a `long long` and bail out as soon as the magnitude exceeds 2147483648, so even a very long digit string can't overflow the accumulator.
+--- hint
+The magnitude 2147483648 is fine only with a minus sign. Apply the sign, then check the upper bound.
+
+=== exercise reverse
+title: Print it backwards
+--- prompt
+Read up to 1000 integers from stdin (until end of input) into an array, then print them in reverse order on one line, separated by single spaces. With no input, print an empty line.
+
+Do the reverse printing with a **pointer** that starts one past the last element and walks down to the first, rather than with an index.
+--- starter
+#include <stdio.h>
+
+int main(void) {
+    int values[1000];
+    int n = 0;
+    while (n < 1000 && scanf("%d", &values[n]) == 1)
+        n++;
+    // print backwards using a pointer
+    printf("\n");
+    return 0;
+}
+--- solution
+#include <stdio.h>
+
+int main(void) {
+    int values[1000];
+    int n = 0;
+    while (n < 1000 && scanf("%d", &values[n]) == 1)
+        n++;
+    for (int *p = values + n; p > values; ) {
+        p--;
+        printf("%d", *p);
+        if (p > values) putchar(' ');
+    }
+    printf("\n");
+    return 0;
+}
+--- hint
+`int *p = values + n;` is the one-past-the-end pointer. Decrement it before each dereference, and stop when it equals `values`.
+--- hint
+After printing `*p`, you need a space only if there are more elements to come, which is when `p > values`.
+--- test
+1 2 3 4 5
+--- out
+5 4 3 2 1
+--- test
+42
+--- out
+42
+--- test
+--- out
+
+--- test
+-1 0 -2147483648 2147483647
+--- out
+2147483647 -2147483648 0 -1
+
+=== quiz
+run: yes
+--- q
+What does this print?
+--- code
+#include <stdio.h>
+
+int main(void) {
+    int a = 5, b = 10;
+    int *p = &a;
+    *p = 7;
+    p = &b;
+    *p += a;
+    printf("%d %d\n", a, b);
+    return 0;
+}
+--- choice
+5 10
+--- choice
+7 10
+--- answer
+7 17
+--- choice
+7 14
+--- explain
+`*p = 7` writes to `a`. Then `p = &b` re-points the pointer (no `*`, so it changes `p` itself), and `*p += a` adds 7 to `b`.
+
+=== quiz
+run: yes
+--- q
+What does this print?
+--- code
+#include <stdio.h>
+
+int main(void) {
+    int arr[] = {10, 20, 30, 40};
+    int *p = arr + 1;
+    printf("%d %d %d\n", *p, p[1], p[-1]);
+    return 0;
+}
+--- choice
+10 20 30
+--- answer
+20 30 10
+--- choice
+20 21 19
+--- choice
+It does not compile: negative index
+--- explain
+`p[i]` means `*(p + i)`, so it works relative to wherever `p` points. `p[-1]` is `arr[0]`, valid because it is still inside the array.
+
+=== quiz
+run: yes
+--- q
+What does this print?
+--- code
+#include <stdio.h>
+
+int main(void) {
+    int a[] = {1, 5, 9};
+    int *p = a;
+    int x = *p++;
+    int y = (*p)++;
+    printf("%d %d %d %d\n", x, y, a[1], *p);
+    return 0;
+}
+--- choice
+2 6 6 6
+--- answer
+1 5 6 6
+--- choice
+1 5 5 9
+--- choice
+1 6 6 6
+--- explain
+`*p++` is `*(p++)`: it reads `a[0]` (1) and moves `p` to `a[1]`. `(*p)++` reads `a[1]` (5) and then increments it to 6; `p` does not move.
+
+=== quiz
+run: yes
+--- q
+What does this print?
+--- code
+#include <stdio.h>
+
+int main(void) {
+    int arr[10] = {0};
+    int *p = &arr[2], *q = &arr[9];
+    printf("%td %td\n", q - p, (char *)q - (char *)p);
+    return 0;
+}
+--- choice
+7 7
+--- choice
+28 28
+--- answer
+7 28
+--- choice
+8 32
+--- explain
+Subtracting two `int *` gives the distance in `int` elements (7). Converted to `char *`, the same addresses are 7 * 4 = 28 bytes apart.
+
+=== quiz
+run: yes
+--- q
+What does this print?
+--- code
+#include <stdio.h>
+
+int main(void) {
+    int x = 1, y = 2;
+    int *p = &x;
+    int **pp = &p;
+    *pp = &y;
+    **pp = 9;
+    printf("%d %d %d\n", x, y, *p);
+    return 0;
+}
+--- choice
+9 2 9
+--- answer
+1 9 9
+--- choice
+9 9 9
+--- choice
+1 2 9
+--- explain
+`*pp` is `p` itself, so `*pp = &y` re-points `p` at `y`. Then `**pp` is `*p`, which is now `y`, set to 9. `x` is never touched.
+
+=== quiz
+run: yes
+--- q
+What does this print on 64-bit Linux?
+--- code
+#include <stdio.h>
+
+int main(void) {
+    double *d = NULL;
+    char *c = NULL;
+    printf("%zu %zu %zu %zu\n", sizeof d, sizeof *d, sizeof c, sizeof *c);
+    return 0;
+}
+--- choice
+8 8 1 1
+--- answer
+8 8 8 1
+--- choice
+It crashes: *d dereferences NULL
+--- choice
+8 0 8 0
+--- explain
+All object pointers are 8 bytes on LP64. `sizeof *d` is the size of a `double`, and `sizeof *c` of a `char`. `sizeof` does not evaluate its operand, so nothing is actually dereferenced.
+
+=== quiz
+--- q
+You need a pointer that must always point at the same `int`, but through which the `int` can be modified. Which declaration is it?
+--- choice
+`const int *p = &x;`
+--- choice
+`int const *p = &x;`
+--- answer
+`int *const p = &x;`
+--- choice
+`const int *const p = &x;`
+--- explain
+Read right to left: `p` is a `const` pointer to `int`. The first two are the same type (pointer to const int: the pointer can move but `*p` is read-only), and the last makes both read-only.
+
+=== quiz
+--- q
+What is wrong with this function?
+--- code
+int *largest(int a, int b) {
+    int result = a > b ? a : b;
+    return &result;
+}
+--- choice
+Nothing: the caller gets a copy of `result`'s address, which stays valid.
+--- choice
+It does not compile: you can't take the address of a local.
+--- answer
+`result` dies when the function returns, so the caller gets a dangling pointer; using it is undefined behavior.
+--- choice
+It leaks memory unless the caller calls `free`.
+--- explain
+Locals live on the stack only until their function returns. Return the `int` itself, or have the caller pass a pointer to storage it owns. gcc warns about this case, and may even make the function return `NULL`.

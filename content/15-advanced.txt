@@ -1,0 +1,1360 @@
+=== chapter advanced
+title: Advanced C and API design
+blurb: const correctness, restrict, opaque types, arena allocators, alignment, process memory layout, variadic functions, static assertions, generic containers, and designing C APIs that are hard to misuse.
+--- body
+## const correctness
+
+`const` in C is a promise made *through a particular name*: "I will not modify the object via this lvalue". It is not C#'s `const` (a compile-time constant) and not quite `readonly`; the closest JS analogue is nothing at all, since `Object.freeze` is a runtime property.
+
+Read declarations right to left from the name:
+
+```c
+const char *p;        // p is a pointer to const char: *p = 'x' is an error, p++ is fine
+char *const q = buf;  // q is a const pointer to char: *q = 'x' is fine, q++ is an error
+const char *const r;  // neither
+```
+
+In an API, `const` on a pointer parameter is documentation the compiler enforces: `size_t strlen(const char *s)` tells every caller that the string will not be modified, and lets them pass string literals and other `const` data. Rules of thumb:
+
+- Every pointer parameter that the function only reads should be `const T *`.
+- Return `const T *` when the caller may look but must not touch (internal storage, string tables).
+- Never cast `const` away to write through it. If the object was *defined* `const`, writing to it is UB; it may sit in read-only memory.
+- `const` does not mean "this value cannot change": another non-const pointer to the same object can change it.
+
+```c
+#include <stdio.h>
+
+static int sum(const int *v, size_t n) {   // promises not to modify v[]
+    int s = 0;
+    for (size_t i = 0; i < n; i++) s += v[i];
+    return s;
+}
+
+int main(void) {
+    int data[] = {1, 2, 3};
+    const int *view = data;
+    data[0] = 10;                 // allowed: data itself is not const
+    printf("%d %d\n", *view, sum(data, 3));   // 10 15
+    return 0;
+}
+```
+
+One wart: `char **` does not convert implicitly to `const char **` (doing so would open a hole in the type system), so functions taking arrays of strings often take `char *const *` or `const char *const *`.
+
+## restrict
+
+`restrict` on a pointer parameter promises that, for the lifetime of that pointer, the object it points to is accessed *only* through it (or pointers derived from it). It lets the compiler skip reloading memory after writes through other pointers, and vectorize loops.
+
+```c
+#include <stdio.h>
+
+void add_into(int *restrict dst, const int *restrict src, size_t n) {
+    for (size_t i = 0; i < n; i++) dst[i] += src[i];  // free to vectorize
+}
+
+int main(void) {
+    int a[4] = {1, 2, 3, 4}, b[4] = {10, 20, 30, 40};
+    add_into(a, b, 4);
+    printf("%d %d %d %d\n", a[0], a[1], a[2], a[3]);
+    return 0;
+}
+```
+
+This is the difference between `memcpy(void *restrict dst, const void *restrict src, size_t n)` (regions must not overlap) and `memmove` (they may). Breaking a `restrict` promise is UB, and nothing checks it. Use it in hot inner loops where you control the callers; leave it off elsewhere.
+
+## Opaque types: private fields in C
+
+C has no `private`, but it has something stronger: callers can be denied the struct's *definition* entirely. The header declares an incomplete type; only the `.c` file defines it.
+
+```c
+// stack.h
+typedef struct Stack Stack;            // incomplete: callers cannot see inside
+Stack *stack_new(void);
+void   stack_free(Stack *s);
+int    stack_push(Stack *s, int v);    // 0 on success, -1 on allocation failure
+int    stack_pop(Stack *s, int *out);  // 0 on success, -1 if empty
+
+// stack.c
+struct Stack { int *items; size_t len, cap; };
+```
+
+Code that includes `stack.h` can hold `Stack *` pointers and call the functions, but cannot write `s->len`, cannot declare a `Stack` on the stack, and cannot use `sizeof(Stack)`. You can change the layout without recompiling callers: this is how `FILE` works, and how stable library ABIs are built. The cost is one heap allocation per object and no inlining of accessors across files. This is the C version of a C# class with all-private fields and a factory method.
+
+## Arena (bump) allocators
+
+`malloc`/`free` per object is slow when you allocate thousands of small things, and error-prone when they all die together. An **arena** grabs one big block and hands out slices of it by bumping an offset. Individual objects are never freed; the whole arena is reset or destroyed at once.
+
+```c
+#include <stdalign.h>
+#include <stddef.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+typedef struct { unsigned char *base; size_t cap, used; } Arena;
+
+static void *arena_alloc(Arena *a, size_t size, size_t align) {
+    uintptr_t start = (uintptr_t)(a->base + a->used);
+    uintptr_t aligned = (start + (align - 1)) & ~(uintptr_t)(align - 1);
+    size_t pad = aligned - start;
+    if (pad > a->cap - a->used || size > a->cap - a->used - pad) return NULL;
+    a->used += pad + size;
+    return (void *)aligned;
+}
+
+int main(void) {
+    Arena a = { malloc(1024), 1024, 0 };
+    char *name = arena_alloc(&a, 6, 1);
+    strcpy(name, "arena");
+    double *d = arena_alloc(&a, sizeof *d, alignof(double));
+    *d = 2.5;
+    printf("%s %.1f used=%zu\n", name, *d, a.used);   // arena 2.5 used=16
+    free(a.base);   // frees everything at once
+    return 0;
+}
+```
+
+Arenas are standard in compilers, games (a per-frame arena reset every frame) and request handlers (a per-request arena). They make lifetime management trivial: no leaks within the arena, no double frees, and allocation is a few instructions.
+
+## Alignment
+
+Every type has an **alignment**: its address must be a multiple of it. On x86-64, `int` is 4-aligned, `double` and pointers 8-aligned. `alignof(T)` (from `<stdalign.h>`; keyword `_Alignof`) tells you. `malloc` returns memory aligned for any standard type (`alignof(max_align_t)`, 16 here).
+
+The compiler inserts **padding** in structs so each member is aligned, and at the end so arrays of the struct stay aligned:
+
+```c
+#include <stddef.h>
+#include <stdio.h>
+
+struct loose { char a; double b; char c; };   // 1 + 7 pad + 8 + 1 + 7 pad = 24
+struct tight { double b; char a; char c; };   // 8 + 1 + 1 + 6 pad = 16
+
+int main(void) {
+    printf("%zu %zu\n", sizeof(struct loose), sizeof(struct tight));
+    printf("offset of c in loose: %zu\n", offsetof(struct loose, c));   // 16
+    return 0;
+}
+```
+
+Order members from largest alignment to smallest to minimize padding. `offsetof(type, member)` (from `<stddef.h>`) gives a member's byte offset. Never assume a struct has no padding when writing it to a file or network: serialize field by field.
+
+To round a size or address up to a power-of-two alignment `a`: `(n + a - 1) & ~(a - 1)`. `alignas(16)` on a declaration requests stricter alignment, e.g. for SIMD.
+
+## Memory layout of a process
+
+| Region | Contains | Lifetime |
+|---|---|---|
+| text | machine code, read-only | whole run |
+| rodata | string literals, `const` globals | whole run, read-only |
+| data | initialized globals and `static` locals: `int g = 5;` | whole run |
+| bss | zero-initialized globals and statics: `static int counts[1000];` (takes no space in the file) | whole run |
+| heap | `malloc` blocks, growing up | until `free` |
+| (shared libraries, `mmap` regions) | | |
+| stack | locals, return addresses, growing down; typically 8 MB on Linux | until the function returns |
+
+```c
+#include <stdio.h>
+#include <stdlib.h>
+
+int initialized = 42;      // data
+int zeroed;                // bss
+const char *lit = "hi";    // the pointer is in data, "hi" in rodata
+
+int main(void) {
+    int local = 1;                 // stack
+    int *heap = malloc(sizeof *heap);
+    printf("text  %p\n", (void *)main);
+    printf("rodata %p\n", (void *)lit);
+    printf("data  %p\n", (void *)&initialized);
+    printf("bss   %p\n", (void *)&zeroed);
+    printf("heap  %p\n", (void *)heap);
+    printf("stack %p\n", (void *)&local);
+    free(heap);
+    return 0;
+}
+```
+
+(Casting a function pointer to `void *` is not strictly portable, but works on every mainstream platform.) Because the stack is small, large arrays belong in static storage or on the heap, never as locals: `char buf[16 * 1024 * 1024];` in a function crashes.
+
+## Variadic functions
+
+`printf` is an ordinary C function with a `...` parameter. `<stdarg.h>` lets you walk the extra arguments, but nothing tells you how many there are or their types: the function must know from a count, a sentinel or a format string.
+
+```c
+#include <stdarg.h>
+#include <stdio.h>
+
+static double average(int count, ...) {
+    va_list ap;
+    va_start(ap, count);              // start after the last named parameter
+    double sum = 0;
+    for (int i = 0; i < count; i++)
+        sum += va_arg(ap, double);    // you must name the type
+    va_end(ap);
+    return count ? sum / count : 0;
+}
+
+int main(void) {
+    printf("%.2f\n", average(3, 1.0, 2.0, 4.5));
+    printf("%.2f\n", average(2, 1.0f, 2.0f));   // floats are promoted to double
+    return 0;
+}
+```
+
+Rules:
+
+- **Default argument promotions** apply to the `...` part: `char`, `short` and `bool` arrive as `int`, `float` as `double`. `va_arg(ap, float)` or `va_arg(ap, char)` is wrong.
+- Reading a type that does not match what was passed is UB. `average(2, 1, 2)` passes `int`s and reads `double`s: garbage. This is why `printf("%f", 3)` is broken and why gcc checks `printf` formats.
+- To pass the arguments on, take a `va_list`: that is what `vprintf`, `vfprintf` and `vsnprintf` are for. Write your logger as a `...` wrapper around a `va_list` core.
+- `va_copy` duplicates a `va_list` if you need to walk it twice (for instance, `vsnprintf` once to measure, once to write).
+- Mark your own printf-like functions with `__attribute__((format(printf, 1, 2)))` so gcc checks their callers.
+
+```c
+#include <stdarg.h>
+#include <stdio.h>
+
+__attribute__((format(printf, 2, 3)))
+static void log_msg(const char *level, const char *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    printf("[%s] ", level);
+    vprintf(fmt, ap);
+    putchar('\n');
+    va_end(ap);
+}
+
+int main(void) {
+    log_msg("info", "%d items in %.1f ms", 42, 3.5);
+    return 0;
+}
+```
+
+## Static assertions
+
+`static_assert(expr, "message")` (C11, `<assert.h>`) fails the *build* if a constant expression is false. Use it to pin down assumptions your code relies on:
+
+```c
+#include <assert.h>
+#include <stdint.h>
+
+struct packet { uint32_t id; uint16_t len; uint8_t flags, kind; };
+static_assert(sizeof(struct packet) == 8, "packet must have no padding");
+
+enum color { RED, GREEN, BLUE, COLOR_COUNT };
+static const char *const color_names[] = { "red", "green", "blue" };
+static_assert(sizeof color_names / sizeof color_names[0] == COLOR_COUNT,
+              "color_names out of sync with enum color");
+
+int main(void) { return 0; }
+```
+
+## Designing C APIs
+
+Without exceptions, classes or a GC, a C API has to state explicitly what C# expresses through the type system and runtime.
+
+**Errors.** Pick one convention per library and stick to it:
+
+- Return a status code (`0` / negative, or an `enum` of error codes) and pass results through **out parameters**. This is the most common style, and leaves the return value free for errors: `int parse_port(const char *s, uint16_t *out);`.
+- Return a pointer, `NULL` on failure, with details in `errno` or a `last_error()` function: `fopen`, `malloc`.
+- Provide `const char *mylib_strerror(int code)` so callers can print something useful.
+- On failure, leave out parameters untouched (or document exactly what they hold).
+
+**Ownership.** Every pointer in an API needs a documented answer to "who frees this, and how?":
+
+```c
+/* Returns a newly allocated string; the caller must free() it. NULL on allocation failure. */
+char *path_join(const char *dir, const char *file);
+
+/* Returns a pointer into an internal table. Do not free; valid until the next call. */
+const char *color_name(int c);
+
+/* Takes ownership of buf: the list frees it in list_free(). */
+int list_append_owned(List *l, char *buf);
+```
+
+**Other habits**
+
+- Prefix every public name with the library's name (`json_parse`, `json_free`): C has one global namespace.
+- Pair constructors and destructors: `x_new`/`x_free` (heap-allocated, opaque) or `x_init`/`x_destroy` (caller provides the storage).
+- Make destructors accept `NULL`, like `free` does.
+- Let the caller provide buffers when the size is bounded (`snprintf` style: pass `buf` and `cap`, return the length needed). This avoids allocation entirely.
+- Take sizes as `size_t`, strings as `const char *`, and `const` everything you only read.
+
+## Generic containers with macros
+
+C has no generics. The options are `void *` with an element size (like `qsort`: flexible, no type checking, an indirection per element) or macros that stamp out a type-specific version per element type:
+
+```c
+#include <stdio.h>
+#include <stdlib.h>
+
+#define DEFINE_PAIR(T, Name)                                       \
+    typedef struct { T first, second; } Name;                      \
+    static inline Name Name##_make(T a, T b) { return (Name){a, b}; } \
+    static inline T Name##_max(Name p) { return p.first > p.second ? p.first : p.second; }
+
+DEFINE_PAIR(int, IntPair)
+DEFINE_PAIR(double, DoublePair)
+
+int main(void) {
+    IntPair ip = IntPair_make(3, 9);
+    DoublePair dp = DoublePair_make(2.5, -1.0);
+    printf("%d %.1f\n", IntPair_max(ip), DoublePair_max(dp));   // 9 2.5
+    return 0;
+}
+```
+
+This is template instantiation done by hand: the macro body is ordinary C with `T` substituted, and `##` builds the names. Each instantiation is fully typed and as fast as hand-written code. The downsides: errors point into a macro, debugging is awkward, and the body cannot contain `#` directives. Comments inside a multi-line macro must be `/* */`, since a `//` comment would swallow the line continuation. Libraries like `stb_ds.h` and the Linux kernel's `list.h` take this to its limit.
+
+## volatile, briefly
+
+`volatile` tells the compiler that every read and write of the object is an observable side effect: it must not cache the value in a register or remove "redundant" accesses. Legitimate uses:
+
+- memory-mapped hardware registers in embedded code;
+- variables modified by a signal handler (`volatile sig_atomic_t stop;`);
+- keeping a benchmark from optimizing away its own work.
+
+`volatile` is **not** a threading tool: it gives no atomicity and no ordering between threads, unlike C#'s `volatile`, which has acquire/release semantics. For threads use `<stdatomic.h>` (`_Atomic int`, `atomic_fetch_add`) or a mutex.
+
+=== exercise opaque
+title: An opaque stack
+--- prompt
+Implement an opaque, growable stack of `int`. The "header" part is in the starter; callers (the tests) only see `typedef struct Stack Stack;` and the functions. You define `struct Stack` and the functions.
+
+- `Stack *stack_new(void)`: an empty stack, or `NULL` if allocation fails.
+- `void stack_free(Stack *s)`: frees everything; accepts `NULL`.
+- `int stack_push(Stack *s, int v)`: `0` on success, `-1` on allocation failure. Grow the storage geometrically (double it).
+- `int stack_pop(Stack *s, int *out)`: `0` and the top value in `*out`, or `-1` if empty.
+- `int stack_peek(const Stack *s, int *out)`: like pop but does not remove.
+- `size_t stack_size(const Stack *s)`.
+--- starter
+#include <stdlib.h>
+
+/* ---- stack.h: what callers see ---- */
+typedef struct Stack Stack;
+Stack *stack_new(void);
+void stack_free(Stack *s);
+int stack_push(Stack *s, int v);
+int stack_pop(Stack *s, int *out);
+int stack_peek(const Stack *s, int *out);
+size_t stack_size(const Stack *s);
+
+/* ---- stack.c: private ---- */
+struct Stack {
+    int dummy;
+};
+
+Stack *stack_new(void) { return NULL; }
+void stack_free(Stack *s) { (void)s; }
+int stack_push(Stack *s, int v) { (void)s; (void)v; return -1; }
+int stack_pop(Stack *s, int *out) { (void)s; (void)out; return -1; }
+int stack_peek(const Stack *s, int *out) { (void)s; (void)out; return -1; }
+size_t stack_size(const Stack *s) { (void)s; return 0; }
+--- solution
+#include <stdlib.h>
+
+/* ---- stack.h: what callers see ---- */
+typedef struct Stack Stack;
+Stack *stack_new(void);
+void stack_free(Stack *s);
+int stack_push(Stack *s, int v);
+int stack_pop(Stack *s, int *out);
+int stack_peek(const Stack *s, int *out);
+size_t stack_size(const Stack *s);
+
+/* ---- stack.c: private ---- */
+struct Stack {
+    int *items;
+    size_t len, cap;
+};
+
+Stack *stack_new(void) {
+    Stack *s = malloc(sizeof *s);
+    if (!s) return NULL;
+    s->items = NULL;
+    s->len = s->cap = 0;
+    return s;
+}
+
+void stack_free(Stack *s) {
+    if (!s) return;
+    free(s->items);
+    free(s);
+}
+
+int stack_push(Stack *s, int v) {
+    if (s->len == s->cap) {
+        size_t ncap = s->cap ? s->cap * 2 : 8;
+        int *p = realloc(s->items, ncap * sizeof *p);
+        if (!p) return -1;
+        s->items = p;
+        s->cap = ncap;
+    }
+    s->items[s->len++] = v;
+    return 0;
+}
+
+int stack_pop(Stack *s, int *out) {
+    if (s->len == 0) return -1;
+    *out = s->items[--s->len];
+    return 0;
+}
+
+int stack_peek(const Stack *s, int *out) {
+    if (s->len == 0) return -1;
+    *out = s->items[s->len - 1];
+    return 0;
+}
+
+size_t stack_size(const Stack *s) {
+    return s->len;
+}
+--- hint
+`struct Stack` needs a pointer to the items, a length and a capacity. `stack_new` allocates the struct; the item array can start as `NULL`, since `realloc(NULL, n)` acts like `malloc(n)`.
+--- hint
+Assign `realloc`'s result to a temporary so a failure does not lose the old array.
+--- harness
+int main(void) {
+    Stack *s = stack_new();
+    CHECK(s != NULL);
+    if (!s) return TEST_END();
+    int v = -1;
+    CHECK_INT(stack_size(s), 0);
+    CHECK_INT(stack_pop(s, &v), -1);
+    CHECK_INT(stack_peek(s, &v), -1);
+    CHECK_INT(v, -1);
+    for (int i = 0; i < 1000; i++) CHECK_INT(stack_push(s, i * 3), 0);
+    CHECK_INT(stack_size(s), 1000);
+    CHECK_INT(stack_peek(s, &v), 0);
+    CHECK_INT(v, 2997);
+    CHECK_INT(stack_size(s), 1000);
+    int ok = 1;
+    for (int i = 999; i >= 500; i--) ok &= stack_pop(s, &v) == 0 && v == i * 3;
+    CHECK(ok);
+    CHECK_INT(stack_size(s), 500);
+    CHECK_INT(stack_push(s, -7), 0);
+    CHECK_INT(stack_pop(s, &v), 0);
+    CHECK_INT(v, -7);
+    stack_free(s);
+    Stack *t = stack_new();
+    Stack *u = stack_new();
+    stack_push(t, 1);
+    stack_push(u, 2);
+    CHECK_INT(stack_pop(t, &v), 0);
+    CHECK_INT(v, 1);
+    CHECK_INT(stack_size(u), 1);
+    stack_free(t);
+    stack_free(u);
+    stack_free(NULL);
+    return TEST_END();
+}
+
+=== exercise arena
+title: A bump allocator
+--- prompt
+Implement an arena allocator over one `malloc`ed block. The `Arena` struct is given.
+
+- `bool arena_init(Arena *a, size_t cap)`: allocate `cap` bytes; `false` on failure.
+- `void *arena_alloc(Arena *a, size_t size, size_t align)`: return a pointer to `size` bytes whose **address** is a multiple of `align` (a power of two, possibly larger than 16), or `NULL` if the remaining space cannot fit it (including padding). Never write outside the block, and make sure your size arithmetic cannot wrap.
+- `char *arena_strdup(Arena *a, const char *s)`: copy a string into the arena (`NULL` if it does not fit).
+- `size_t arena_mark(const Arena *a)` and `void arena_rewind(Arena *a, size_t mark)`: save the current position and later release everything allocated after it (scratch allocations).
+- `void arena_reset(Arena *a)`: release everything, keep the block. `void arena_destroy(Arena *a)`: free the block.
+--- starter
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
+
+typedef struct {
+    unsigned char *base;
+    size_t cap;
+    size_t used;
+} Arena;
+
+bool arena_init(Arena *a, size_t cap) {
+    (void)a; (void)cap;
+    return false;
+}
+
+void *arena_alloc(Arena *a, size_t size, size_t align) {
+    (void)a; (void)size; (void)align;
+    return NULL;
+}
+
+char *arena_strdup(Arena *a, const char *s) {
+    (void)a; (void)s;
+    return NULL;
+}
+
+size_t arena_mark(const Arena *a) {
+    (void)a;
+    return 0;
+}
+
+void arena_rewind(Arena *a, size_t mark) {
+    (void)a; (void)mark;
+}
+
+void arena_reset(Arena *a) {
+    (void)a;
+}
+
+void arena_destroy(Arena *a) {
+    (void)a;
+}
+--- solution
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
+
+typedef struct {
+    unsigned char *base;
+    size_t cap;
+    size_t used;
+} Arena;
+
+bool arena_init(Arena *a, size_t cap) {
+    a->base = malloc(cap);
+    a->cap = a->base ? cap : 0;
+    a->used = 0;
+    return a->base != NULL;
+}
+
+void *arena_alloc(Arena *a, size_t size, size_t align) {
+    uintptr_t start = (uintptr_t)(a->base + a->used);
+    uintptr_t aligned = (start + (align - 1)) & ~(uintptr_t)(align - 1);
+    size_t pad = (size_t)(aligned - start);
+    size_t left = a->cap - a->used;
+    if (pad > left || size > left - pad) return NULL;
+    a->used += pad + size;
+    return a->base + (a->used - size);
+}
+
+char *arena_strdup(Arena *a, const char *s) {
+    size_t n = strlen(s) + 1;
+    char *p = arena_alloc(a, n, 1);
+    if (p) memcpy(p, s, n);
+    return p;
+}
+
+size_t arena_mark(const Arena *a) {
+    return a->used;
+}
+
+void arena_rewind(Arena *a, size_t mark) {
+    if (mark <= a->used) a->used = mark;
+}
+
+void arena_reset(Arena *a) {
+    a->used = 0;
+}
+
+void arena_destroy(Arena *a) {
+    free(a->base);
+    a->base = NULL;
+    a->cap = a->used = 0;
+}
+--- hint
+Align the *address*, not the offset: `malloc` only guarantees 16-byte alignment, so for `align == 64` the offset trick fails. Convert `base + used` to `uintptr_t`, round up with `(p + align - 1) & ~(align - 1)`, and compute the padding.
+--- hint
+Check `pad > left || size > left - pad` rather than `used + pad + size > cap`: the subtraction form cannot wrap for huge `size`.
+--- harness
+#include <stdint.h>
+
+int main(void) {
+    Arena a;
+    CHECK(arena_init(&a, 256));
+    if (!a.base) return TEST_END();
+    char *c = arena_alloc(&a, 1, 1);
+    CHECK(c != NULL);
+    double *d = arena_alloc(&a, sizeof(double), 8);
+    CHECK(d != NULL);
+    CHECK_INT((uintptr_t)d % 8, 0);
+    CHECK((unsigned char *)d >= (unsigned char *)c + 1);
+    *c = 'x'; *d = 1.5;
+    void *big = arena_alloc(&a, 16, 64);
+    CHECK(big != NULL);
+    CHECK_INT((uintptr_t)big % 64, 0);
+    char *s = arena_strdup(&a, "hello arena");
+    CHECK_STR(s, "hello arena");
+    CHECK(*c == 'x' && *d == 1.5);
+    CHECK((unsigned char *)s >= (unsigned char *)big + 16);
+    size_t m = arena_mark(&a);
+    CHECK(arena_alloc(&a, 50, 1) != NULL);
+    arena_rewind(&a, m);
+    CHECK_INT(arena_mark(&a), m);
+    char *s2 = arena_strdup(&a, "again");
+    CHECK((void *)s2 == (void *)(a.base + m));
+    CHECK(arena_alloc(&a, 1000, 1) == NULL);
+    CHECK(arena_alloc(&a, SIZE_MAX, 1) == NULL);
+    CHECK(arena_alloc(&a, SIZE_MAX - 8, 16) == NULL);
+    CHECK_INT(arena_mark(&a), m + 6);
+    size_t left = a.cap - a.used;
+    unsigned char *rest = arena_alloc(&a, left, 1);
+    CHECK(rest != NULL);
+    if (rest) memset(rest, 0xAB, left);
+    CHECK(arena_alloc(&a, 1, 1) == NULL);
+    arena_reset(&a);
+    CHECK_INT(a.used, 0);
+    int *ints = arena_alloc(&a, 64 * sizeof(int), sizeof(int));
+    CHECK((void *)ints == (void *)a.base);
+    for (int i = 0; i < 64; i++) ints[i] = i;
+    CHECK(arena_alloc(&a, 1, 1) == NULL);
+    arena_destroy(&a);
+    CHECK(a.base == NULL);
+    return TEST_END();
+}
+
+=== exercise variadic
+title: Variadic helpers
+--- prompt
+Write two variadic functions with `<stdarg.h>`:
+
+- `long sum_ints(int count, ...)`: the sum of `count` `int` arguments (as a `long`).
+- `char *concat_all(const char *first, ...)`: concatenate any number of strings; the list ends with a `NULL` argument. Return a newly allocated string (caller frees). `concat_all(NULL)` returns an empty string.
+
+Walk the arguments twice in `concat_all`: once to measure, once to copy. You need `va_copy` or two `va_start`/`va_end` pairs.
+--- starter
+#include <stdarg.h>
+#include <stdlib.h>
+#include <string.h>
+
+long sum_ints(int count, ...) {
+    (void)count;
+    return 0;
+}
+
+char *concat_all(const char *first, ...) {
+    (void)first;
+    return NULL;
+}
+--- solution
+#include <stdarg.h>
+#include <stdlib.h>
+#include <string.h>
+
+long sum_ints(int count, ...) {
+    va_list ap;
+    va_start(ap, count);
+    long sum = 0;
+    for (int i = 0; i < count; i++) sum += va_arg(ap, int);
+    va_end(ap);
+    return sum;
+}
+
+char *concat_all(const char *first, ...) {
+    va_list ap, ap2;
+    va_start(ap, first);
+    va_copy(ap2, ap);
+    size_t total = 0;
+    for (const char *s = first; s; s = va_arg(ap, const char *)) total += strlen(s);
+    va_end(ap);
+    char *out = malloc(total + 1);
+    if (!out) { va_end(ap2); return NULL; }
+    char *w = out;
+    for (const char *s = first; s; s = va_arg(ap2, const char *)) {
+        size_t n = strlen(s);
+        memcpy(w, s, n);
+        w += n;
+    }
+    va_end(ap2);
+    *w = '\0';
+    return out;
+}
+--- hint
+`va_start(ap, first)` starts after the named parameter `first`, so handle `first` itself before reading `va_arg(ap, const char *)`.
+--- hint
+`va_copy(ap2, ap)` right after `va_start` gives you a second cursor at the same position. Every `va_start` and `va_copy` needs a matching `va_end`.
+--- harness
+int main(void) {
+    CHECK_INT(sum_ints(0), 0);
+    CHECK_INT(sum_ints(3, 1, 2, 3), 6);
+    CHECK_INT(sum_ints(4, -10, 20, -30, 40), 20);
+    CHECK_INT(sum_ints(3, 2000000000, 2000000000, 2000000000), 6000000000L);
+    char c = 'A';
+    short sh = 100;
+    CHECK_INT(sum_ints(2, c, sh), 165);
+    char *s = concat_all("foo", "bar", "baz", NULL);
+    CHECK_STR(s, "foobarbaz");
+    free(s);
+    s = concat_all("solo", NULL);
+    CHECK_STR(s, "solo");
+    free(s);
+    s = concat_all(NULL);
+    CHECK_STR(s, "");
+    free(s);
+    s = concat_all("", "a", "", "bc", "", NULL);
+    CHECK_STR(s, "abc");
+    free(s);
+    s = concat_all("/usr", "/", "local", "/", "bin", "/", "tool", NULL);
+    CHECK_STR(s, "/usr/local/bin/tool");
+    free(s);
+    return TEST_END();
+}
+
+=== exercise miniprintf
+title: Your own snprintf
+--- prompt
+Implement `int mini_snprintf(char *buf, size_t cap, const char *fmt, ...)` **without** calling any `printf`-family function. It follows `snprintf`'s contract:
+
+- It writes at most `cap - 1` characters plus a terminating `'\0'` (nothing at all if `cap` is 0, and then `buf` may be `NULL`).
+- It returns the number of characters the full output *would* have had, so a return value `>= cap` means it was truncated.
+
+Supported conversions: `%d` (`int`, including `INT_MIN`), `%u` (`unsigned`), `%x` (`unsigned`, lowercase hex), `%c`, `%s` (a `NULL` pointer prints `(null)`) and `%%`. Each may have a minimum field **width** (decimal digits) and a `-` flag for left alignment, padded with spaces: `%5d`, `%-8s`, `%3c`. Any other character after `%` is output as-is together with the `%` (`"%q"` prints `%q`).
+--- starter
+#include <stdarg.h>
+#include <stddef.h>
+
+int mini_snprintf(char *buf, size_t cap, const char *fmt, ...) {
+    (void)fmt;
+    if (cap > 0) buf[0] = '\0';
+    return 0;
+}
+--- solution
+#include <stdarg.h>
+#include <stddef.h>
+#include <string.h>
+
+typedef struct {
+    char *buf;
+    size_t cap;
+    size_t len;   /* characters produced so far, even past cap */
+} Out;
+
+static void put(Out *o, char c) {
+    if (o->cap > 0 && o->len < o->cap - 1) o->buf[o->len] = c;
+    o->len++;
+}
+
+static void put_padded(Out *o, const char *s, size_t n, int width, int left) {
+    size_t pad = (width > 0 && (size_t)width > n) ? (size_t)width - n : 0;
+    if (!left) for (size_t i = 0; i < pad; i++) put(o, ' ');
+    for (size_t i = 0; i < n; i++) put(o, s[i]);
+    if (left) for (size_t i = 0; i < pad; i++) put(o, ' ');
+}
+
+/* Writes the digits of v in the given base into the end of tmp; returns a pointer to the first. */
+static char *utoa(unsigned v, unsigned base, char *end) {
+    const char *digits = "0123456789abcdef";
+    char *p = end;
+    do {
+        *--p = digits[v % base];
+        v /= base;
+    } while (v);
+    return p;
+}
+
+int mini_snprintf(char *buf, size_t cap, const char *fmt, ...) {
+    Out o = {buf, cap, 0};
+    va_list ap;
+    va_start(ap, fmt);
+    for (const char *f = fmt; *f; f++) {
+        if (*f != '%') { put(&o, *f); continue; }
+        const char *start = f;
+        f++;
+        int left = 0, width = 0;
+        if (*f == '-') { left = 1; f++; }
+        while (*f >= '0' && *f <= '9') width = width * 10 + (*f++ - '0');
+        char tmp[16];
+        char *end = tmp + sizeof tmp;
+        switch (*f) {
+        case 'd': {
+            int v = va_arg(ap, int);
+            unsigned mag = v < 0 ? 0u - (unsigned)v : (unsigned)v;
+            char *p = utoa(mag, 10, end);
+            if (v < 0) *--p = '-';
+            put_padded(&o, p, (size_t)(end - p), width, left);
+            break;
+        }
+        case 'u': case 'x': {
+            char *p = utoa(va_arg(ap, unsigned), *f == 'x' ? 16 : 10, end);
+            put_padded(&o, p, (size_t)(end - p), width, left);
+            break;
+        }
+        case 'c': {
+            char c = (char)va_arg(ap, int);
+            put_padded(&o, &c, 1, width, left);
+            break;
+        }
+        case 's': {
+            const char *s = va_arg(ap, const char *);
+            if (!s) s = "(null)";
+            put_padded(&o, s, strlen(s), width, left);
+            break;
+        }
+        case '%':
+            put(&o, '%');
+            break;
+        case '\0':
+            for (const char *q = start; q < f; q++) put(&o, *q);
+            f--;
+            break;
+        default:
+            for (const char *q = start; q <= f; q++) put(&o, *q);
+            break;
+        }
+    }
+    va_end(ap);
+    if (cap > 0) buf[o.len < cap ? o.len : cap - 1] = '\0';
+    return (int)o.len;
+}
+--- hint
+Route every output character through one helper that stores it only while there is room (`len < cap - 1`) but always increments the count. Then truncation and the return value fall out for free, and the terminator goes at `min(len, cap - 1)`.
+--- hint
+`INT_MIN` cannot be negated as an `int`. Convert to `unsigned` first: `0u - (unsigned)v` is the magnitude, computed with defined wrap-around.
+--- hint
+Generate digits backwards into the end of a small buffer (`digits[v % base]`, `v /= base`), then pad and copy. A `%c` argument arrives as an `int` (default promotions).
+--- harness
+#include <limits.h>
+
+int main(void) {
+    char b[64];
+    CHECK_INT(mini_snprintf(b, sizeof b, "hello"), 5);
+    CHECK_STR(b, "hello");
+    CHECK_INT(mini_snprintf(b, sizeof b, "%d + %d = %d", 2, -3, -1), 11);
+    CHECK_STR(b, "2 + -3 = -1");
+    mini_snprintf(b, sizeof b, "[%d] [%d] [%d]", 0, INT_MAX, INT_MIN);
+    CHECK_STR(b, "[0] [2147483647] [-2147483648]");
+    mini_snprintf(b, sizeof b, "%u %x %x", 4294967295u, 255u, 0xdeadbeefu);
+    CHECK_STR(b, "4294967295 ff deadbeef");
+    mini_snprintf(b, sizeof b, "%s/%s %c%c 100%%", "a", "bc", 'o', 'k');
+    CHECK_STR(b, "a/bc ok 100%");
+    mini_snprintf(b, sizeof b, "<%s>", (char *)NULL);
+    CHECK_STR(b, "<(null)>");
+    mini_snprintf(b, sizeof b, "[%5d][%-5d][%3s][%-4s][%2c]", 42, 42, "abcdef", "ab", 'z');
+    CHECK_STR(b, "[   42][42   ][abcdef][ab  ][ z]");
+    mini_snprintf(b, sizeof b, "[%6x][%-3u][%5d]", 255u, 7u, -12);
+    CHECK_STR(b, "[    ff][7  ][  -12]");
+    mini_snprintf(b, sizeof b, "%q and %");
+    CHECK_STR(b, "%q and %");
+    mini_snprintf(b, sizeof b, "%12s|", "");
+    CHECK_STR(b, "            |");
+
+    char small[8];
+    memset(small, '#', sizeof small);
+    CHECK_INT(mini_snprintf(small, sizeof small, "%s-%d", "truncated", 12345), 15);
+    CHECK_STR(small, "truncat");
+    memset(small, '#', sizeof small);
+    CHECK_INT(mini_snprintf(small, 1, "abc"), 3);
+    CHECK_INT(small[0], 0);
+    CHECK_INT(small[1], '#');
+    CHECK_INT(mini_snprintf(NULL, 0, "%d items", 1000), 10);
+    CHECK_INT(mini_snprintf(small, 4, "%5d", 1), 5);
+    CHECK_STR(small, "   ");
+    return TEST_END();
+}
+
+=== exercise vecmacro
+title: A type-safe vector macro
+--- prompt
+Complete `DEFINE_VEC(T, Name)`, which stamps out a growable vector type `Name` holding elements of type `T` plus these `static inline` functions:
+
+- `void Name_init(Name *v)`: empty vector, no allocation yet.
+- `bool Name_push(Name *v, T x)`: append, doubling the capacity when full (start at 4). `false` on allocation failure.
+- `T Name_pop(Name *v)`: remove and return the last element. The caller guarantees the vector is not empty.
+- `T *Name_at(Name *v, size_t i)`: pointer to element `i`, or `NULL` if `i >= len`.
+- `void Name_free(Name *v)`: free the storage and reset to empty.
+
+The struct has public fields `data`, `len` and `cap`. The tests instantiate it for `int`, `double`, a struct type and `const char *`. The starter already builds the names with `##`; fill in the bodies.
+--- starter
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdlib.h>
+
+#define DEFINE_VEC(T, Name)                                              \
+    typedef struct { T *data; size_t len, cap; } Name;                   \
+    static inline void Name##_init(Name *v) {                            \
+        v->data = NULL; v->len = v->cap = 0;                             \
+    }                                                                    \
+    static inline bool Name##_push(Name *v, T x) {                       \
+        (void)v; (void)x; return false;                                  \
+    }                                                                    \
+    static inline T Name##_pop(Name *v) {                                \
+        (void)v; T zero_ = {0}; return zero_;                            \
+    }                                                                    \
+    static inline T *Name##_at(Name *v, size_t i) {                      \
+        (void)v; (void)i; return NULL;                                   \
+    }                                                                    \
+    static inline void Name##_free(Name *v) {                            \
+        (void)v;                                                         \
+    }
+--- solution
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdlib.h>
+
+#define DEFINE_VEC(T, Name)                                              \
+    typedef struct { T *data; size_t len, cap; } Name;                   \
+    static inline void Name##_init(Name *v) {                            \
+        v->data = NULL; v->len = v->cap = 0;                             \
+    }                                                                    \
+    static inline bool Name##_push(Name *v, T x) {                       \
+        if (v->len == v->cap) {                                          \
+            size_t ncap = v->cap ? v->cap * 2 : 4;                       \
+            T *p = realloc(v->data, ncap * sizeof *p);                   \
+            if (!p) return false;                                        \
+            v->data = p;                                                 \
+            v->cap = ncap;                                               \
+        }                                                                \
+        v->data[v->len++] = x;                                           \
+        return true;                                                     \
+    }                                                                    \
+    static inline T Name##_pop(Name *v) {                                \
+        return v->data[--v->len];                                        \
+    }                                                                    \
+    static inline T *Name##_at(Name *v, size_t i) {                      \
+        return i < v->len ? &v->data[i] : NULL;                          \
+    }                                                                    \
+    static inline void Name##_free(Name *v) {                            \
+        free(v->data);                                                   \
+        v->data = NULL; v->len = v->cap = 0;                             \
+    }
+--- hint
+Inside the macro, write ordinary C using `T` and `Name`, ending every line with a backslash. Comments must be `/* */`.
+--- hint
+`T *p = realloc(v->data, ncap * sizeof *p);` works for any `T`.
+--- harness
+typedef struct { int x, y; } Pt;
+DEFINE_VEC(int, IntVec)
+DEFINE_VEC(double, DblVec)
+DEFINE_VEC(Pt, PtVec)
+DEFINE_VEC(const char *, StrVec)
+
+int main(void) {
+    IntVec iv;
+    IntVec_init(&iv);
+    CHECK_INT(iv.len, 0);
+    CHECK(IntVec_at(&iv, 0) == NULL);
+    int ok = 1;
+    for (int i = 0; i < 1000; i++) ok &= IntVec_push(&iv, i * i);
+    CHECK(ok);
+    CHECK_INT(iv.len, 1000);
+    CHECK_INT(iv.cap, 1024);
+    CHECK_INT(*IntVec_at(&iv, 31), 961);
+    CHECK(IntVec_at(&iv, 1000) == NULL);
+    *IntVec_at(&iv, 0) = -5;
+    CHECK_INT(iv.data[0], -5);
+    CHECK_INT(IntVec_pop(&iv), 999 * 999);
+    CHECK_INT(iv.len, 999);
+    IntVec_free(&iv);
+    CHECK(iv.data == NULL);
+    CHECK_INT(iv.len, 0);
+
+    DblVec dv;
+    DblVec_init(&dv);
+    DblVec_push(&dv, 0.5);
+    DblVec_push(&dv, 1.25);
+    CHECK_INT(dv.cap, 4);
+    CHECK_DBL(DblVec_pop(&dv) + DblVec_pop(&dv), 1.75);
+    DblVec_free(&dv);
+
+    PtVec pv;
+    PtVec_init(&pv);
+    for (int i = 0; i < 5; i++) PtVec_push(&pv, (Pt){i, -i});
+    CHECK_INT(pv.cap, 8);
+    CHECK_INT(PtVec_at(&pv, 3)->y, -3);
+    Pt last = PtVec_pop(&pv);
+    CHECK_INT(last.x, 4);
+    PtVec_free(&pv);
+
+    StrVec sv;
+    StrVec_init(&sv);
+    StrVec_push(&sv, "alpha");
+    StrVec_push(&sv, "beta");
+    CHECK_STR(*StrVec_at(&sv, 1), "beta");
+    CHECK_STR(StrVec_pop(&sv), "beta");
+    StrVec_free(&sv);
+    return TEST_END();
+}
+
+=== exercise kvparse
+title: Designing an error-reporting API
+--- prompt
+Implement a small, strict parser for `key = value` lines with a C-style error API:
+
+```c
+typedef enum { KV_OK = 0, KV_ESYNTAX, KV_EKEYLEN, KV_ERANGE } kv_status;
+kv_status parse_kv(const char *line, char *key, size_t keycap, long *value);
+const char *kv_strerror(kv_status s);
+```
+
+The line format: optional spaces, a key (a letter or `_`, then letters, digits or `_`), optional spaces, `=`, optional spaces, an integer (optional `+`/`-` then at least one digit), optional spaces, end of string. "Spaces" means `' '` and `'\t'`.
+
+- Malformed line: `KV_ESYNTAX`.
+- Well-formed, but the key does not fit in `keycap` bytes including the terminator: `KV_EKEYLEN`.
+- Well-formed, but the value does not fit in a `long`: `KV_ERANGE`.
+- On success copy the key into `key`, store the value, return `KV_OK`. On **any** error, do not modify `key` or `*value`.
+
+`kv_strerror` returns `"ok"`, `"syntax error"`, `"key too long"`, `"value out of range"`, and `"unknown error"` for any other value.
+--- starter
+#include <stddef.h>
+#include <string.h>
+#include <limits.h>
+
+typedef enum { KV_OK = 0, KV_ESYNTAX, KV_EKEYLEN, KV_ERANGE } kv_status;
+
+kv_status parse_kv(const char *line, char *key, size_t keycap, long *value) {
+    (void)line; (void)key; (void)keycap; (void)value;
+    return KV_ESYNTAX;
+}
+
+const char *kv_strerror(kv_status s) {
+    (void)s;
+    return "unknown error";
+}
+--- solution
+#include <stddef.h>
+#include <string.h>
+#include <limits.h>
+#include <stdbool.h>
+
+typedef enum { KV_OK = 0, KV_ESYNTAX, KV_EKEYLEN, KV_ERANGE } kv_status;
+
+static bool is_space(char c) { return c == ' ' || c == '\t'; }
+static bool is_alpha_(char c) { return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_'; }
+static bool is_digit(char c) { return c >= '0' && c <= '9'; }
+
+kv_status parse_kv(const char *line, char *key, size_t keycap, long *value) {
+    const char *p = line;
+    while (is_space(*p)) p++;
+    if (!is_alpha_(*p)) return KV_ESYNTAX;
+    const char *kstart = p;
+    while (is_alpha_(*p) || is_digit(*p)) p++;
+    size_t klen = (size_t)(p - kstart);
+    while (is_space(*p)) p++;
+    if (*p++ != '=') return KV_ESYNTAX;
+    while (is_space(*p)) p++;
+    bool neg = false;
+    if (*p == '+' || *p == '-') neg = (*p++ == '-');
+    if (!is_digit(*p)) return KV_ESYNTAX;
+    bool overflow = false;
+    long v = 0;
+    while (is_digit(*p)) {
+        int d = *p++ - '0';
+        if (!overflow) {
+            /* accumulate as a negative number: its range is one larger */
+            if (v < (LONG_MIN + d) / 10) overflow = true;
+            else v = v * 10 - d;
+        }
+    }
+    while (is_space(*p)) p++;
+    if (*p != '\0') return KV_ESYNTAX;
+    if (klen + 1 > keycap) return KV_EKEYLEN;
+    if (overflow || (!neg && v == LONG_MIN)) return KV_ERANGE;
+    memcpy(key, kstart, klen);
+    key[klen] = '\0';
+    *value = neg ? v : -v;
+    return KV_OK;
+}
+
+const char *kv_strerror(kv_status s) {
+    switch (s) {
+    case KV_OK: return "ok";
+    case KV_ESYNTAX: return "syntax error";
+    case KV_EKEYLEN: return "key too long";
+    case KV_ERANGE: return "value out of range";
+    }
+    return "unknown error";
+}
+--- hint
+Walk the string with a pointer through each part in order, returning `KV_ESYNTAX` at the first surprise. Remember where the key starts and how long it is, but do not copy it until everything has been validated.
+--- hint
+For the range check you can use `strtol` with `errno` on the digits, or accumulate digits yourself checking `v > (LONG_MAX - d) / 10` before each step. `LONG_MIN` has no positive counterpart, so either accumulate negatively or treat it specially.
+--- hint
+Syntax is checked for the whole line first, then key length, then range: `"k=99999999999999999999 x"` is a syntax error, not a range error.
+--- harness
+#include <limits.h>
+
+int main(void) {
+    char key[8] = "init";
+    long v = 77;
+    CHECK_INT(parse_kv("port=8080", key, sizeof key, &v), KV_OK);
+    CHECK_STR(key, "port");
+    CHECK_INT(v, 8080);
+    CHECK_INT(parse_kv("  \tmax_n \t=\t -42  ", key, sizeof key, &v), KV_OK);
+    CHECK_STR(key, "max_n");
+    CHECK_INT(v, -42);
+    CHECK_INT(parse_kv("_x9=+7", key, sizeof key, &v), KV_OK);
+    CHECK_STR(key, "_x9");
+    CHECK_INT(v, 7);
+    CHECK_INT(parse_kv("lo=-9223372036854775808", key, sizeof key, &v), KV_OK);
+    CHECK(v == LONG_MIN);
+    CHECK_INT(parse_kv("hi=9223372036854775807", key, sizeof key, &v), KV_OK);
+    CHECK(v == LONG_MAX);
+    CHECK_INT(parse_kv("abcdefg=1", key, sizeof key, &v), KV_OK);
+    CHECK_STR(key, "abcdefg");
+
+    strcpy(key, "keep");
+    v = 77;
+    const char *syntax[] = {"", "=5", "9a=1", "a b=1", "a=", "a=-", "a==1", "a=1x", "a=1 2",
+                            "a 1", "a=0x10", "a=1.5", "ab", "a=--1", "a=+", "k=99999999999999999999 x"};
+    for (size_t i = 0; i < sizeof syntax / sizeof syntax[0]; i++) {
+        kv_status st = parse_kv(syntax[i], key, sizeof key, &v);
+        if (st != KV_ESYNTAX) printf("  \"%s\" gave %d\n", syntax[i], (int)st);
+        CHECK_INT(st, KV_ESYNTAX);
+    }
+    CHECK_INT(parse_kv("abcdefgh=1", key, sizeof key, &v), KV_EKEYLEN);
+    CHECK_INT(parse_kv("toolongkey=99999999999999999999", key, sizeof key, &v), KV_EKEYLEN);
+    CHECK_INT(parse_kv("a=9223372036854775808", key, sizeof key, &v), KV_ERANGE);
+    CHECK_INT(parse_kv("a=-9223372036854775809", key, sizeof key, &v), KV_ERANGE);
+    CHECK_INT(parse_kv("a=99999999999999999999999999", key, sizeof key, &v), KV_ERANGE);
+    CHECK_STR(key, "keep");
+    CHECK_INT(v, 77);
+    CHECK_INT(parse_kv("x=1", key, 1, &v), KV_EKEYLEN);
+    CHECK_INT(parse_kv("x=1", key, 2, &v), KV_OK);
+    CHECK_STR(key, "x");
+
+    CHECK_STR(kv_strerror(KV_OK), "ok");
+    CHECK_STR(kv_strerror(KV_ESYNTAX), "syntax error");
+    CHECK_STR(kv_strerror(KV_EKEYLEN), "key too long");
+    CHECK_STR(kv_strerror(KV_ERANGE), "value out of range");
+    CHECK_STR(kv_strerror((kv_status)99), "unknown error");
+    return TEST_END();
+}
+
+=== exercise layout
+title: Padding, alignment and static_assert
+--- prompt
+Three small tasks about memory layout.
+
+1. Reorder the members of `struct Record` (keep the same names and types) so that `sizeof(struct Record)` is 16 instead of 32, and add a `static_assert` that it is 16.
+2. `size_t align_up(size_t n, size_t align)`: round `n` up to a multiple of `align`, a power of two. Use bit operations, no division or loops.
+3. `size_t record_padding(void)`: the number of padding bytes in `struct Record`, computed from `sizeof` and the member sizes (so it reports `0` once the struct is tight, and would report 16 for the original order).
+--- starter
+#include <assert.h>
+#include <stddef.h>
+#include <stdint.h>
+
+struct Record {
+    char tag;
+    double score;
+    char flag;
+    int32_t id;
+    int16_t year;
+};
+
+size_t align_up(size_t n, size_t align) {
+    (void)align;
+    return n;
+}
+
+size_t record_padding(void) {
+    return 0;
+}
+--- solution
+#include <assert.h>
+#include <stddef.h>
+#include <stdint.h>
+
+struct Record {
+    double score;
+    int32_t id;
+    int16_t year;
+    char tag;
+    char flag;
+};
+static_assert(sizeof(struct Record) == 16, "struct Record should have no padding");
+
+size_t align_up(size_t n, size_t align) {
+    return (n + align - 1) & ~(align - 1);
+}
+
+size_t record_padding(void) {
+    struct Record r;
+    return sizeof r - (sizeof r.tag + sizeof r.score + sizeof r.flag + sizeof r.id + sizeof r.year);
+}
+--- hint
+Sort members by alignment, largest first: `double` (8), `int32_t` (4), `int16_t` (2), then the two `char`s.
+--- hint
+`(n + align - 1) & ~(align - 1)`: adding `align - 1` pushes any partial block over the boundary, and the mask clears the low bits.
+--- hint
+`sizeof` works on an expression without evaluating it, so `sizeof r.id` is fine for an uninitialized `r`.
+--- harness
+#include <stddef.h>
+
+int main(void) {
+    CHECK_INT(sizeof(struct Record), 16);
+    struct Record r = {0};
+    r.tag = 'T'; r.flag = 1; r.score = 9.5; r.id = 1234567; r.year = 2024;
+    CHECK_INT(r.tag, 'T');
+    CHECK_DBL(r.score, 9.5);
+    CHECK_INT(r.id + r.year + r.flag, 1234567 + 2024 + 1);
+    CHECK_INT(offsetof(struct Record, score) % 8, 0);
+    CHECK_INT(record_padding(), 0);
+    CHECK_INT(align_up(0, 8), 0);
+    CHECK_INT(align_up(1, 8), 8);
+    CHECK_INT(align_up(8, 8), 8);
+    CHECK_INT(align_up(13, 4), 16);
+    CHECK_INT(align_up(17, 16), 32);
+    CHECK_INT(align_up(5, 1), 5);
+    CHECK_INT(align_up(4097, 4096), 8192);
+    return TEST_END();
+}
+
+=== quiz
+run: yes
+--- q
+What does this print on x86-64?
+--- code
+#include <stdio.h>
+
+struct a { char c; int i; char d; };
+struct b { int i; char c; char d; };
+
+int main(void) {
+    printf("%zu %zu\n", sizeof(struct a), sizeof(struct b));
+    return 0;
+}
+--- choice
+6 6
+--- choice
+12 12
+--- answer
+12 8
+--- choice
+8 8
+--- explain
+In `struct a`, `c` is followed by 3 padding bytes so `i` is 4-aligned, and `d` is followed by 3 more so that arrays of the struct keep `i` aligned: 12. In `struct b` the two chars share the last 4-byte slot with 2 bytes of tail padding: 8.
+
+=== quiz
+run: yes
+--- q
+What does this print on x86-64?
+--- code
+#include <stddef.h>
+#include <stdio.h>
+
+struct s { char c; double d; short h; };
+
+int main(void) {
+    printf("%zu %zu\n", offsetof(struct s, h), sizeof(struct s));
+    return 0;
+}
+--- choice
+9 11
+--- choice
+16 18
+--- answer
+16 24
+--- choice
+10 16
+--- explain
+`c` at 0, 7 bytes padding, `d` at 8, `h` at 16, then 6 bytes of tail padding so the size is a multiple of 8 (the largest alignment): 24.
+
+=== quiz
+--- q
+Given `const char *p = buf;` and `char *const q = buf;`, which line compiles?
+--- choice
+`*p = 'x';`
+--- answer
+`p++;`
+--- choice
+`q++;`
+--- choice
+`p[0] = q[0] = 'x';`
+--- explain
+`p` points to `const char`: you may move the pointer but not write through it. `q` is itself `const`: you may write through it but not move it. The last line fails because it writes through `p`.
+
+=== quiz
+run: yes
+--- q
+What does this print?
+--- code
+#include <stdio.h>
+
+int main(void) {
+    int x = 1;
+    const int *p = &x;
+    x = 5;
+    printf("%d\n", *p);
+    return 0;
+}
+--- choice
+1
+--- answer
+5
+--- choice
+It does not compile: x is pointed to by a const pointer
+--- choice
+It is undefined behavior
+--- explain
+`const int *` only means you cannot modify the object *through `p`*. The object itself is a normal `int`, and changes made through its own name are visible through `p`.
+
+=== quiz
+run: yes
+--- q
+What does this print?
+--- code
+#include <stdarg.h>
+#include <stdio.h>
+
+static double sum(int n, ...) {
+    va_list ap;
+    va_start(ap, n);
+    double s = 0;
+    for (int i = 0; i < n; i++) s += va_arg(ap, double);
+    va_end(ap);
+    return s;
+}
+
+int main(void) {
+    float a = 1.5f, b = 2.5f;
+    printf("%.1f\n", sum(2, a, b));
+    return 0;
+}
+--- answer
+4.0
+--- choice
+Garbage, because the floats should be read with va_arg(ap, float)
+--- choice
+0.0
+--- choice
+It does not compile
+--- explain
+Arguments in the `...` part undergo the default argument promotions: `float` becomes `double`, `char` and `short` become `int`. So `va_arg(ap, double)` is exactly right, and `va_arg(ap, float)` would be wrong.
+
+=== quiz
+--- q
+`stack.h` contains only `typedef struct Stack Stack;` and function prototypes. In `main.c`, which of these compiles?
+--- choice
+`Stack s;`
+--- choice
+`printf("%zu", sizeof(Stack));`
+--- answer
+`Stack *s = stack_new();`
+--- choice
+`Stack *s = stack_new(); s->len = 0;`
+--- explain
+`Stack` is an *incomplete type* in `main.c`: you can declare and pass pointers to it, but anything that needs its size or members (a local variable, `sizeof`, `->len`) is an error. That is exactly the encapsulation an opaque type gives you.
+
+=== quiz
+--- q
+What does declaring a parameter `int *restrict a` promise the compiler?
+--- choice
+That `a` is never NULL
+--- choice
+That the function will not modify `*a`
+--- answer
+That while the function runs, the memory reached through `a` is not accessed through any other pointer
+--- choice
+That `a` is aligned for SIMD instructions
+--- explain
+`restrict` is an aliasing promise: no other pointer touches the same object during the pointer's lifetime. The compiler can then keep values in registers and vectorize. Breaking the promise is undefined behavior and is not checked.
+
+=== quiz
+--- q
+Two threads share a counter. One increments it in a loop; the other reads it. Which declaration makes this correct?
+--- choice
+`volatile int counter;`
+--- answer
+`_Atomic int counter;` (or protect it with a mutex)
+--- choice
+`static int counter;`
+--- choice
+`const volatile int counter;`
+--- explain
+In C, `volatile` only stops the compiler from caching or removing accesses; it provides no atomicity and no memory ordering between threads, so the program still has a data race (UB). C#'s `volatile` is different. Use `<stdatomic.h>` or a mutex.

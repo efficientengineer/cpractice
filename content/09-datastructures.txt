@@ -1,0 +1,1799 @@
+=== chapter datastructures
+title: Data structures by hand
+blurb: Linked lists, stacks, queues, hash tables and binary search trees built from structs and pointers: what C#'s collections do under the hood.
+--- body
+## There is no System.Collections
+
+C has arrays and `malloc`. Everything else you build. That sounds grim, but each structure is small, and building them once teaches you what `List<T>`, `Dictionary<K,V>` and friends actually cost:
+
+| C# | What it is underneath | Built in this chapter |
+|---|---|---|
+| `List<T>`, `Stack<T>` | a heap array that doubles when full | growable array stack |
+| `Queue<T>` | a circular array (ring buffer) | ring buffer queue |
+| `LinkedList<T>` | doubly linked nodes | singly and doubly linked lists |
+| `Dictionary<K,V>` | hash buckets with chained entries | hash table with string keys |
+| `SortedDictionary<K,V>` | a red-black tree (a balanced BST) | plain BST |
+
+The recurring C problems are always the same three: **who owns each node** (and frees it), **how a function changes the caller's pointer**, and **what happens at the empty and one-element edges**.
+
+## Singly linked list
+
+A node holds a value and a pointer to the next node. The list *is* a pointer to the first node; `NULL` is the empty list.
+
+```c
+#include <stdio.h>
+#include <stdlib.h>
+
+typedef struct Node {
+    int value;
+    struct Node *next;     // must say "struct Node": the typedef doesn't exist yet here
+} Node;
+
+// The caller's head pointer has to change, so we take its address.
+void push_front(Node **head, int value) {
+    Node *n = malloc(sizeof *n);
+    if (!n) { perror("malloc"); exit(1); }
+    n->value = value;
+    n->next = *head;
+    *head = n;
+}
+
+// Returns 1 and stores the value if there was one, 0 if the list was empty.
+int pop_front(Node **head, int *out) {
+    Node *n = *head;
+    if (!n) return 0;
+    *out = n->value;
+    *head = n->next;
+    free(n);
+    return 1;
+}
+
+void print_list(const Node *n) {
+    for (; n; n = n->next) printf("%d ", n->value);
+    printf("\n");
+}
+
+void free_list(Node *n) {
+    while (n) {
+        Node *next = n->next;   // read next BEFORE freeing n
+        free(n);
+        n = next;
+    }
+}
+
+int main(void) {
+    Node *list = NULL;
+    for (int i = 1; i <= 4; i++) push_front(&list, i);
+    print_list(list);                 // 4 3 2 1
+    int v;
+    if (pop_front(&list, &v)) printf("popped %d\n", v);
+    print_list(list);                 // 3 2 1
+    free_list(list);
+    return 0;
+}
+```
+
+Why `Node **head`? C passes everything by value. `push_front(Node *head, ...)` would get a *copy* of the caller's pointer; assigning to it changes the copy and the caller's list never sees the new node (and the node leaks). In C# you'd write `ref Node head`; in C, `ref` is spelled "pass a pointer to it". The alternative style is to return the new head: `list = push_front(list, 5);`.
+
+`sizeof *n` instead of `sizeof(Node)` keeps working if you change `n`'s type. Every `malloc` here should be checked; examples in this chapter sometimes skip it for brevity, real code shouldn't.
+
+### Inserting in sorted order
+
+Walk until the next node is not smaller, then splice in. The empty list and "new smallest" cases need the head to change, which is why a naive version grows special cases:
+
+```c
+void insert_sorted(Node **head, int value) {
+    Node *n = malloc(sizeof *n);
+    n->value = value;
+    if (*head == NULL || (*head)->value >= value) {   // special case: new head
+        n->next = *head;
+        *head = n;
+        return;
+    }
+    Node *cur = *head;
+    while (cur->next && cur->next->value < value) cur = cur->next;
+    n->next = cur->next;
+    cur->next = n;
+}
+```
+
+### The pointer-to-pointer trick
+
+Notice that "the head pointer" and "some node's `next` field" are both just *a `Node *` somewhere in memory that points at the current node*. If you walk a `Node **` that points at whichever of those links you're on, the head stops being special:
+
+```c
+#include <stdio.h>
+#include <stdlib.h>
+
+typedef struct Node { int value; struct Node *next; } Node;
+
+void insert_sorted(Node **head, int value) {
+    Node **link = head;                        // the link we might rewrite
+    while (*link && (*link)->value < value)
+        link = &(*link)->next;                 // move to the next node's link
+    Node *n = malloc(sizeof *n);
+    n->value = value;
+    n->next = *link;
+    *link = n;                                 // rewrites head OR a next field
+}
+
+// Remove the first node holding value. No "previous" pointer, no special case.
+int remove_value(Node **head, int value) {
+    for (Node **link = head; *link; link = &(*link)->next) {
+        if ((*link)->value == value) {
+            Node *dead = *link;
+            *link = dead->next;
+            free(dead);
+            return 1;
+        }
+    }
+    return 0;
+}
+
+int main(void) {
+    Node *list = NULL;
+    int xs[] = {5, 1, 4, 2, 3};
+    for (int i = 0; i < 5; i++) insert_sorted(&list, xs[i]);
+    remove_value(&list, 1);    // the head
+    remove_value(&list, 3);    // the middle
+    remove_value(&list, 5);    // the tail
+    for (Node *n = list; n; n = n->next) printf("%d ", n->value);   // 2 4
+    printf("\n");
+    while (list) { Node *next = list->next; free(list); list = next; }
+    return 0;
+}
+```
+
+Read `&(*link)->next` as "the address of the `next` field of the node `link` currently points at". Once this pattern clicks, most list code shrinks to a loop and two assignments.
+
+### Reversing in place
+
+Three pointers: what's behind you, where you are, what's ahead. Each step flips one arrow.
+
+```c
+Node *reverse(Node *head) {
+    Node *prev = NULL;
+    while (head) {
+        Node *next = head->next;   // save the rest of the list
+        head->next = prev;         // flip this node's arrow
+        prev = head;
+        head = next;
+    }
+    return prev;                   // the old tail is the new head
+}
+```
+
+No allocation: the same nodes are relinked. That matters in C because a "reverse" that builds a new list has to free the old one too, or it leaks.
+
+## Doubly linked list, briefly
+
+Add a `prev` pointer and you can remove a node in O(1) given only the node itself, and walk backwards. That is .NET's `LinkedList<T>`. The usual trick is a **sentinel**: a dummy node whose `next` is the first element and whose `prev` is the last. The list is circular through the sentinel, so there are no `NULL` checks at all:
+
+```c
+#include <stdio.h>
+#include <stdlib.h>
+
+typedef struct DNode { int value; struct DNode *prev, *next; } DNode;
+
+void dl_init(DNode *s) { s->prev = s->next = s; }        // empty: points at itself
+
+void dl_insert_after(DNode *at, int value) {
+    DNode *n = malloc(sizeof *n);
+    n->value = value;
+    n->prev = at;
+    n->next = at->next;
+    at->next->prev = n;
+    at->next = n;
+}
+
+void dl_remove(DNode *n) {          // O(1): no searching for the predecessor
+    n->prev->next = n->next;
+    n->next->prev = n->prev;
+    free(n);
+}
+
+int main(void) {
+    DNode list;                                  // the sentinel lives on the stack
+    dl_init(&list);
+    for (int i = 1; i <= 3; i++) dl_insert_after(list.prev, i);   // append
+    dl_remove(list.next);                        // remove the first element
+    for (DNode *n = list.prev; n != &list; n = n->prev) printf("%d ", n->value);
+    printf("\n");                                // 3 2 (backwards)
+    while (list.next != &list) dl_remove(list.next);
+    return 0;
+}
+```
+
+Linked lists are worse than arrays for almost everything on modern hardware (each node is a separate allocation, and walking them misses the cache). Use them when you need stable node addresses or O(1) splicing, and otherwise reach for a growable array.
+
+## Stack: the growable array
+
+`List<T>` and `Stack<T>` are an array, a count, and a capacity. When count hits capacity, allocate double and copy. `realloc` does the copying for you:
+
+```c
+#include <stdio.h>
+#include <stdlib.h>
+
+typedef struct {
+    int *data;
+    size_t len, cap;
+} IntStack;
+
+int stack_push(IntStack *s, int v) {
+    if (s->len == s->cap) {
+        size_t ncap = s->cap ? s->cap * 2 : 8;
+        int *p = realloc(s->data, ncap * sizeof *p);
+        if (!p) return 0;            // old block is still valid on failure
+        s->data = p;
+        s->cap = ncap;
+    }
+    s->data[s->len++] = v;
+    return 1;
+}
+
+int stack_pop(IntStack *s, int *out) {
+    if (s->len == 0) return 0;
+    *out = s->data[--s->len];
+    return 1;
+}
+
+int main(void) {
+    IntStack s = {0};                // NULL data, 0 len, 0 cap: a valid empty stack
+    for (int i = 0; i < 100; i++) stack_push(&s, i * i);
+    int v, sum = 0;
+    while (stack_pop(&s, &v)) sum += v;
+    printf("sum=%d cap=%zu\n", sum, s.cap);   // sum=328350 cap=128
+    free(s.data);
+    return 0;
+}
+```
+
+Doubling makes push *amortized* O(1): n pushes cost about 2n copies in total. Growing by a fixed amount (+10) makes n pushes O(n²). Note `p = realloc(...)` into a temporary: `s->data = realloc(s->data, ...)` loses the old pointer (a leak) if `realloc` fails.
+
+## Queue: the ring buffer
+
+A queue needs O(1) at both ends. Shifting an array left on every dequeue is O(n). Instead keep a `head` index and a `len`, and let indices wrap around with `%`:
+
+```c
+#include <stdio.h>
+
+#define CAP 4
+
+typedef struct { int data[CAP]; size_t head, len; } Ring;
+
+int ring_push(Ring *r, int v) {
+    if (r->len == CAP) return 0;                 // full
+    r->data[(r->head + r->len) % CAP] = v;        // tail = head + len, wrapped
+    r->len++;
+    return 1;
+}
+
+int ring_pop(Ring *r, int *out) {
+    if (r->len == 0) return 0;
+    *out = r->data[r->head];
+    r->head = (r->head + 1) % CAP;
+    r->len--;
+    return 1;
+}
+
+int main(void) {
+    Ring r = {0};
+    int v;
+    for (int i = 1; i <= 3; i++) ring_push(&r, i);   // [1 2 3 _]
+    ring_pop(&r, &v); ring_pop(&r, &v);              // [_ _ 3 _], head = 2
+    for (int i = 4; i <= 6; i++) ring_push(&r, i);   // [5 6 3 4]: wrapped
+    printf("full: %d\n", !ring_push(&r, 7));
+    while (ring_pop(&r, &v)) printf("%d ", v);       // 3 4 5 6
+    printf("\n");
+    return 0;
+}
+```
+
+Growing a ring buffer is the subtle part: after a wrap, the elements are in two pieces (`head..cap-1` then `0..tail-1`), so a plain `realloc` puts a gap in the middle. You must copy them out in order. You'll do that in an exercise. (`Queue<T>` in .NET does exactly this.) With a power-of-two capacity, `% cap` can become `& (cap - 1)`, which is why many ring buffers insist on powers of two.
+
+## Hash table with chaining
+
+`Dictionary<string,int>` is: an array of buckets; hash the key to pick a bucket; each bucket is a short linked list of entries whose keys hashed there. Lookup is "hash, then compare keys along one short chain". Keep chains short by growing the bucket array when `count / nbuckets` (the *load factor*) gets too high.
+
+```c
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+typedef struct Entry {
+    char *key;                // owned copy
+    int value;
+    struct Entry *next;       // next entry in the same bucket
+} Entry;
+
+typedef struct {
+    Entry **buckets;          // array of chain heads
+    size_t nbuckets, count;
+} Map;
+
+// FNV-1a: simple, decent spread. Unsigned so overflow wraps (well defined).
+static size_t hash_str(const char *s) {
+    size_t h = 1469598103934665603u;
+    for (; *s; s++) {
+        h ^= (unsigned char)*s;
+        h *= 1099511628211u;
+    }
+    return h;
+}
+
+static char *copy_str(const char *s) {   // strdup is POSIX/C23, not C17
+    size_t n = strlen(s) + 1;
+    char *p = malloc(n);
+    if (p) memcpy(p, s, n);
+    return p;
+}
+
+Map *map_new(size_t nbuckets) {
+    Map *m = malloc(sizeof *m);
+    m->buckets = calloc(nbuckets, sizeof *m->buckets);   // all chains empty (NULL)
+    m->nbuckets = nbuckets;
+    m->count = 0;
+    return m;
+}
+
+int *map_get(Map *m, const char *key) {
+    for (Entry *e = m->buckets[hash_str(key) % m->nbuckets]; e; e = e->next)
+        if (strcmp(e->key, key) == 0) return &e->value;
+    return NULL;
+}
+
+void map_put(Map *m, const char *key, int value) {
+    int *slot = map_get(m, key);
+    if (slot) { *slot = value; return; }                 // overwrite, like dict[key] = v
+    size_t b = hash_str(key) % m->nbuckets;
+    Entry *e = malloc(sizeof *e);
+    e->key = copy_str(key);
+    e->value = value;
+    e->next = m->buckets[b];                             // push onto the chain
+    m->buckets[b] = e;
+    m->count++;
+}
+
+void map_free(Map *m) {
+    for (size_t i = 0; i < m->nbuckets; i++) {
+        Entry *e = m->buckets[i];
+        while (e) {
+            Entry *next = e->next;
+            free(e->key);                                // free what the entry owns...
+            free(e);                                     // ...then the entry
+            e = next;
+        }
+    }
+    free(m->buckets);
+    free(m);
+}
+
+int main(void) {
+    Map *m = map_new(16);
+    const char *words[] = {"the", "cat", "sat", "on", "the", "mat", "the", "end"};
+    for (int i = 0; i < 8; i++) {
+        int *c = map_get(m, words[i]);
+        map_put(m, words[i], c ? *c + 1 : 1);
+    }
+    printf("the=%d cat=%d dog=%s count=%zu\n",
+           *map_get(m, "the"), *map_get(m, "cat"),
+           map_get(m, "dog") ? "yes" : "missing", m->count);
+    map_free(m);
+    return 0;
+}
+```
+
+Things C makes you decide that C# hides:
+
+- **Key ownership.** The map copies the key. If it stored the caller's pointer, a caller who reused a buffer (`char buf[64]` in a read loop) would silently change every key. Copy on insert, free on removal.
+- **Returning "not found".** `TryGetValue` returns `bool` with an `out` parameter; here `map_get` returns a pointer to the value or `NULL`. Returning a pointer into the table is handy but it dangles after the entry is removed or the table is resized.
+- **Resizing.** To grow, allocate a bigger bucket array and move every entry to `hash % new_size`. Entries are relinked, not copied, so it's a loop over chains. Keep the load factor around 1 or below and lookups stay O(1) on average.
+- **Hash quality.** `hash % nbuckets` with a weak hash and a power-of-two bucket count uses only the low bits. FNV-1a mixes reasonably; summing characters does not ("ab" and "ba" collide).
+
+## Binary search tree
+
+Each node's left subtree holds smaller keys, the right subtree larger. Insert and find walk one path from the root, so they're O(height): O(log n) if the tree stays bushy, O(n) if you insert sorted data and it degenerates into a list. Production trees (red-black, AVL; `SortedDictionary`) rebalance on insert. A plain BST is the core of them all.
+
+```c
+#include <stdio.h>
+#include <stdlib.h>
+
+typedef struct Tree {
+    int key;
+    struct Tree *left, *right;
+} Tree;
+
+// Recursive insert that returns the (possibly new) subtree root.
+Tree *insert(Tree *t, int key) {
+    if (!t) {
+        t = malloc(sizeof *t);
+        t->key = key;
+        t->left = t->right = NULL;
+    } else if (key < t->key) {
+        t->left = insert(t->left, key);
+    } else if (key > t->key) {
+        t->right = insert(t->right, key);
+    }                                     // equal: already present, do nothing
+    return t;
+}
+
+// Iterative find: no recursion needed for one path.
+const Tree *find(const Tree *t, int key) {
+    while (t && t->key != key) t = key < t->key ? t->left : t->right;
+    return t;
+}
+
+// In-order: left, self, right. Visits keys in sorted order.
+void print_inorder(const Tree *t) {
+    if (!t) return;
+    print_inorder(t->left);
+    printf("%d ", t->key);
+    print_inorder(t->right);
+}
+
+// Post-order free: children first, because after free(t) you may not read t->left.
+void free_tree(Tree *t) {
+    if (!t) return;
+    free_tree(t->left);
+    free_tree(t->right);
+    free(t);
+}
+
+int main(void) {
+    Tree *root = NULL;
+    int keys[] = {50, 30, 70, 20, 40, 60, 80, 40};
+    for (int i = 0; i < 8; i++) root = insert(root, keys[i]);
+    print_inorder(root);                                   // 20 30 40 50 60 70 80
+    printf("\nfind 60: %s, find 65: %s\n",
+           find(root, 60) ? "yes" : "no", find(root, 65) ? "yes" : "no");
+    free_tree(root);
+    return 0;
+}
+```
+
+The insert can also be written with the pointer-to-pointer trick: walk `Tree **link = &root` down to the `NULL` child slot, then `*link = new_node`. Same idea as the list.
+
+## Freeing recursive structures
+
+Every structure above owns heap memory in layers. The rule: **free what something owns before you free it, and never touch a node after freeing it.**
+
+- Lists: save `next` first, then free. `for (n = head; n; n = n->next) free(n);` reads `n->next` from freed memory (AddressSanitizer reports *heap-use-after-free*).
+- Entries that own strings: free the key, then the entry.
+- Trees: post-order (children, then the node). Recursion depth equals tree height, so a degenerate tree with a million nodes can overflow the stack; iterative frees (or balanced trees) avoid that.
+- Give every structure one `x_free` function and make it accept `NULL`, like `free` itself. Then error paths can call it unconditionally.
+
+C# never makes you think about this; the GC traces from roots and frees unreachable nodes in bulk. In C, if you lose the last pointer to a node without freeing it, it's leaked for the life of the process. This site's sanitizer reports leaks, so you'll find out.
+
+=== exercise listops
+title: Linked list basics
+--- prompt
+Using the `Node` type in the starter, write:
+
+- `void push_front(Node **head, int value)`: add a node at the front.
+- `void push_back(Node **head, int value)`: add a node at the end. Walk a `Node **` so the empty list needs no special case.
+- `int pop_front(Node **head, int *out)`: remove the first node, store its value in `*out` and return 1; return 0 (and leave `*out` alone) if the list is empty.
+- `size_t list_len(const Node *head)`.
+- `void list_free(Node **head)`: free every node and set `*head` to `NULL`.
+
+The tests check the contents after each step and that nothing leaks.
+--- starter
+#include <stdlib.h>
+
+typedef struct Node {
+    int value;
+    struct Node *next;
+} Node;
+
+void push_front(Node **head, int value) {
+    (void)head; (void)value;
+}
+
+void push_back(Node **head, int value) {
+    (void)head; (void)value;
+}
+
+int pop_front(Node **head, int *out) {
+    (void)head; (void)out;
+    return 0;
+}
+
+size_t list_len(const Node *head) {
+    (void)head;
+    return 0;
+}
+
+void list_free(Node **head) {
+    (void)head;
+}
+--- solution
+#include <stdlib.h>
+
+typedef struct Node {
+    int value;
+    struct Node *next;
+} Node;
+
+static Node *new_node(int value, Node *next) {
+    Node *n = malloc(sizeof *n);
+    if (!n) abort();
+    n->value = value;
+    n->next = next;
+    return n;
+}
+
+void push_front(Node **head, int value) {
+    *head = new_node(value, *head);
+}
+
+void push_back(Node **head, int value) {
+    Node **link = head;
+    while (*link) link = &(*link)->next;
+    *link = new_node(value, NULL);
+}
+
+int pop_front(Node **head, int *out) {
+    Node *n = *head;
+    if (!n) return 0;
+    *out = n->value;
+    *head = n->next;
+    free(n);
+    return 1;
+}
+
+size_t list_len(const Node *head) {
+    size_t n = 0;
+    for (; head; head = head->next) n++;
+    return n;
+}
+
+void list_free(Node **head) {
+    Node *n = *head;
+    while (n) {
+        Node *next = n->next;
+        free(n);
+        n = next;
+    }
+    *head = NULL;
+}
+--- hint
+`push_back`: `Node **link = head; while (*link) link = &(*link)->next;` leaves `link` pointing at the `NULL` at the end (which is `head` itself for an empty list). Assign the new node to `*link`.
+--- hint
+In `list_free`, save `n->next` in a local before calling `free(n)`.
+--- harness
+static int t_is(const Node *h, const int *want, size_t n) {
+    for (size_t i = 0; i < n; i++, h = h->next)
+        if (!h || h->value != want[i]) return 0;
+    return h == NULL;
+}
+
+int main(void) {
+    Node *h = NULL;
+    int v = -99;
+    CHECK_INT(list_len(h), 0);
+    CHECK_INT(pop_front(&h, &v), 0);
+    CHECK_INT(v, -99);
+
+    push_back(&h, 5);
+    CHECK(t_is(h, (int[]){5}, 1));
+    push_front(&h, 3);
+    push_front(&h, 1);
+    push_back(&h, 7);
+    push_back(&h, 9);
+    CHECK(t_is(h, (int[]){1, 3, 5, 7, 9}, 5));
+    CHECK_INT(list_len(h), 5);
+
+    CHECK_INT(pop_front(&h, &v), 1);
+    CHECK_INT(v, 1);
+    CHECK_INT(pop_front(&h, &v), 1);
+    CHECK_INT(v, 3);
+    CHECK(t_is(h, (int[]){5, 7, 9}, 3));
+
+    while (pop_front(&h, &v)) {}
+    CHECK(h == NULL);
+    CHECK_INT(v, 9);
+    push_front(&h, 42);
+    CHECK(t_is(h, (int[]){42}, 1));
+
+    for (int i = 0; i < 1000; i++) push_back(&h, i);
+    CHECK_INT(list_len(h), 1001);
+    list_free(&h);
+    CHECK(h == NULL);
+    list_free(&h);          /* freeing an empty list is fine */
+    CHECK(h == NULL);
+    return TEST_END();
+}
+
+=== exercise sortedremove
+title: Sorted insert and remove-all
+--- prompt
+Write two functions on the singly linked list, both using the pointer-to-pointer trick (no special case for the head):
+
+- `void insert_sorted(Node **head, int value)`: insert keeping the list ascending. Duplicates are allowed.
+- `size_t remove_all(Node **head, int value)`: remove and free *every* node holding `value`; return how many were removed.
+
+The tests build and free lists with their own helpers.
+--- starter
+#include <stdlib.h>
+
+typedef struct Node {
+    int value;
+    struct Node *next;
+} Node;
+
+void insert_sorted(Node **head, int value) {
+    (void)head; (void)value;
+}
+
+size_t remove_all(Node **head, int value) {
+    (void)head; (void)value;
+    return 0;
+}
+--- solution
+#include <stdlib.h>
+
+typedef struct Node {
+    int value;
+    struct Node *next;
+} Node;
+
+void insert_sorted(Node **head, int value) {
+    Node **link = head;
+    while (*link && (*link)->value < value) link = &(*link)->next;
+    Node *n = malloc(sizeof *n);
+    if (!n) abort();
+    n->value = value;
+    n->next = *link;
+    *link = n;
+}
+
+size_t remove_all(Node **head, int value) {
+    size_t removed = 0;
+    Node **link = head;
+    while (*link) {
+        if ((*link)->value == value) {
+            Node *dead = *link;
+            *link = dead->next;     // don't advance: *link is now the next node
+            free(dead);
+            removed++;
+        } else {
+            link = &(*link)->next;
+        }
+    }
+    return removed;
+}
+--- hint
+For insertion, stop at the first link whose node is not smaller than `value` (or is `NULL`), then splice the new node in there.
+--- hint
+In `remove_all`, after unlinking a node do **not** advance `link`: it already points at the link that now holds the following node. Only advance when you keep the node.
+--- harness
+static int t_is(const Node *h, const int *want, size_t n) {
+    for (size_t i = 0; i < n; i++, h = h->next)
+        if (!h || h->value != want[i]) return 0;
+    return h == NULL;
+}
+static void t_free(Node *h) {
+    while (h) { Node *n = h->next; free(h); h = n; }
+}
+static Node *t_build(const int *a, size_t n) {
+    Node *h = NULL;
+    for (size_t i = n; i-- > 0;) {
+        Node *x = malloc(sizeof *x);
+        x->value = a[i]; x->next = h; h = x;
+    }
+    return h;
+}
+
+int main(void) {
+    Node *h = NULL;
+    insert_sorted(&h, 5);
+    CHECK(t_is(h, (int[]){5}, 1));
+    insert_sorted(&h, 2);          /* new head */
+    insert_sorted(&h, 9);          /* new tail */
+    insert_sorted(&h, 7);          /* middle */
+    insert_sorted(&h, 5);          /* duplicate */
+    insert_sorted(&h, -3);
+    CHECK(t_is(h, (int[]){-3, 2, 5, 5, 7, 9}, 6));
+    t_free(h);
+
+    h = t_build((int[]){4, 4, 1, 4, 2, 4, 4}, 7);
+    CHECK_INT(remove_all(&h, 4), 5);     /* head run, middle, tail run */
+    CHECK(t_is(h, (int[]){1, 2}, 2));
+    CHECK_INT(remove_all(&h, 3), 0);
+    CHECK(t_is(h, (int[]){1, 2}, 2));
+    CHECK_INT(remove_all(&h, 2), 1);
+    CHECK_INT(remove_all(&h, 1), 1);
+    CHECK(h == NULL);
+    CHECK_INT(remove_all(&h, 1), 0);
+
+    h = t_build((int[]){8, 8, 8}, 3);
+    CHECK_INT(remove_all(&h, 8), 3);
+    CHECK(h == NULL);
+
+    for (int i = 100; i > 0; i--) insert_sorted(&h, i % 10);
+    CHECK_INT(remove_all(&h, 0), 10);
+    int prev = -1, ok = 1, n = 0;
+    for (Node *x = h; x; x = x->next, n++) { if (x->value < prev) ok = 0; prev = x->value; }
+    CHECK(ok);
+    CHECK_INT(n, 90);
+    t_free(h);
+    return TEST_END();
+}
+
+=== exercise reversemerge
+title: Reverse and merge without allocating
+--- prompt
+Write two functions that only relink existing nodes. They must not call `malloc` or `free`: the tests free the result list themselves, so any node you create or drop is reported as a leak.
+
+- `Node *list_reverse(Node *head)`: reverse the list in place and return the new head.
+- `Node *list_merge(Node *a, Node *b)`: `a` and `b` are each sorted ascending. Merge them into one ascending list and return its head. When values are equal, nodes from `a` come first (a stable merge, like the merge step of merge sort).
+
+For the merge, a `Node **tail` that always points at the link to fill next keeps the code short.
+--- starter
+#include <stdlib.h>
+
+typedef struct Node {
+    int value;
+    struct Node *next;
+} Node;
+
+Node *list_reverse(Node *head) {
+    return head;
+}
+
+Node *list_merge(Node *a, Node *b) {
+    (void)b;
+    return a;
+}
+--- solution
+#include <stdlib.h>
+
+typedef struct Node {
+    int value;
+    struct Node *next;
+} Node;
+
+Node *list_reverse(Node *head) {
+    Node *prev = NULL;
+    while (head) {
+        Node *next = head->next;
+        head->next = prev;
+        prev = head;
+        head = next;
+    }
+    return prev;
+}
+
+Node *list_merge(Node *a, Node *b) {
+    Node *result = NULL;
+    Node **tail = &result;
+    while (a && b) {
+        if (b->value < a->value) {
+            *tail = b;
+            b = b->next;
+        } else {
+            *tail = a;
+            a = a->next;
+        }
+        tail = &(*tail)->next;
+    }
+    *tail = a ? a : b;
+    return result;
+}
+--- hint
+Reverse: keep `prev` (initially `NULL`). For each node, save `next`, point the node at `prev`, then advance both.
+--- hint
+Merge: start with `Node *result = NULL; Node **tail = &result;`. Each step, attach the smaller front node to `*tail`, advance that list, then `tail = &(*tail)->next`. When one list runs out, attach the rest of the other in one assignment.
+--- hint
+Stability: take from `b` only when `b->value < a->value`, strictly.
+--- harness
+static Node *t_build(const int *a, size_t n, int tag) {
+    Node *h = NULL;
+    for (size_t i = n; i-- > 0;) {
+        Node *x = malloc(sizeof *x);
+        x->value = a[i] * 10 + tag; x->next = h; h = x;   /* last digit tags the source */
+    }
+    return h;
+}
+static int t_is(const Node *h, const int *want, size_t n) {
+    for (size_t i = 0; i < n; i++, h = h->next)
+        if (!h || h->value != want[i]) return 0;
+    return h == NULL;
+}
+static void t_free(Node *h) {
+    while (h) { Node *n = h->next; free(h); h = n; }
+}
+
+int main(void) {
+    CHECK(list_reverse(NULL) == NULL);
+    Node *h = t_build((int[]){1}, 1, 0);
+    Node *first = h;
+    h = list_reverse(h);
+    CHECK(h == first);
+    CHECK(t_is(h, (int[]){10}, 1));
+    t_free(h);
+
+    h = t_build((int[]){1, 2, 3, 4, 5}, 5, 0);
+    Node *last = h;
+    while (last->next) last = last->next;
+    h = list_reverse(h);
+    CHECK(h == last);                       /* same nodes, relinked */
+    CHECK(t_is(h, (int[]){50, 40, 30, 20, 10}, 5));
+    h = list_reverse(h);
+    CHECK(t_is(h, (int[]){10, 20, 30, 40, 50}, 5));
+    t_free(h);
+
+    Node *a = t_build((int[]){1, 3, 5, 5, 9}, 5, 0);
+    Node *b = t_build((int[]){2, 3, 5, 10, 11}, 5, 0);
+    Node *a3 = a->next, *a5 = a3->next, *b3 = b->next, *b5 = b3->next;
+    h = list_merge(a, b);
+    CHECK(t_is(h, (int[]){10, 20, 30, 30, 50, 50, 50, 90, 100, 110}, 10));
+    Node *n3 = h->next->next, *n5 = n3->next->next;
+    CHECK(n3 == a3 && n3->next == b3);                     /* stable: a's 3 first */
+    CHECK(n5 == a5 && n5->next == a5->next && n5->next->next == b5);
+    t_free(h);
+
+    CHECK(list_merge(NULL, NULL) == NULL);
+    a = t_build((int[]){1, 2}, 2, 1);
+    h = list_merge(a, NULL);
+    CHECK(h == a);
+    CHECK(t_is(h, (int[]){11, 21}, 2));
+    t_free(h);
+    b = t_build((int[]){-4, 0, 7}, 3, 1);
+    h = list_merge(NULL, b);
+    CHECK(t_is(h, (int[]){-39, 1, 71}, 3));
+    t_free(h);
+
+    a = t_build((int[]){100}, 1, 1);
+    b = t_build((int[]){1, 2, 3, 4}, 4, 1);
+    h = list_merge(a, b);
+    CHECK(t_is(h, (int[]){11, 21, 31, 41, 1001}, 5));
+    t_free(h);
+    return TEST_END();
+}
+
+=== exercise ringqueue
+title: A growable ring buffer queue
+--- prompt
+Build `Queue<int>` the way .NET does: a circular array that doubles when full.
+
+```c
+typedef struct {
+    int *data;
+    size_t cap;    // allocated slots
+    size_t head;   // index of the front element
+    size_t len;    // number of elements
+} Queue;
+```
+
+- `Queue *q_new(size_t cap)`: allocate a queue with room for `cap` (at least 1) elements.
+- `void q_push(Queue *q, int v)`: add at the back. If full, grow to double capacity first. **Careful:** if the contents have wrapped around, a plain `realloc` leaves them out of order. Copy them into the new array front-to-back (or fix up after `realloc`).
+- `int q_pop(Queue *q, int *out)`: remove from the front; return 0 if empty, else 1.
+- `int q_peek(const Queue *q, int *out)`: like pop but without removing.
+- `size_t q_len(const Queue *q)`.
+- `void q_free(Queue *q)`: free everything. Must accept `NULL`.
+--- starter
+#include <stdlib.h>
+#include <string.h>
+
+typedef struct {
+    int *data;
+    size_t cap;
+    size_t head;
+    size_t len;
+} Queue;
+
+Queue *q_new(size_t cap) {
+    (void)cap;
+    return NULL;
+}
+
+void q_push(Queue *q, int v) {
+    (void)q; (void)v;
+}
+
+int q_pop(Queue *q, int *out) {
+    (void)q; (void)out;
+    return 0;
+}
+
+int q_peek(const Queue *q, int *out) {
+    (void)q; (void)out;
+    return 0;
+}
+
+size_t q_len(const Queue *q) {
+    (void)q;
+    return 0;
+}
+
+void q_free(Queue *q) {
+    (void)q;
+}
+--- solution
+#include <stdlib.h>
+#include <string.h>
+
+typedef struct {
+    int *data;
+    size_t cap;
+    size_t head;
+    size_t len;
+} Queue;
+
+Queue *q_new(size_t cap) {
+    if (cap == 0) cap = 1;
+    Queue *q = malloc(sizeof *q);
+    if (!q) return NULL;
+    q->data = malloc(cap * sizeof *q->data);
+    if (!q->data) { free(q); return NULL; }
+    q->cap = cap;
+    q->head = 0;
+    q->len = 0;
+    return q;
+}
+
+static void grow(Queue *q) {
+    size_t ncap = q->cap * 2;
+    int *nd = malloc(ncap * sizeof *nd);
+    if (!nd) abort();
+    for (size_t i = 0; i < q->len; i++)
+        nd[i] = q->data[(q->head + i) % q->cap];
+    free(q->data);
+    q->data = nd;
+    q->cap = ncap;
+    q->head = 0;
+}
+
+void q_push(Queue *q, int v) {
+    if (q->len == q->cap) grow(q);
+    q->data[(q->head + q->len) % q->cap] = v;
+    q->len++;
+}
+
+int q_pop(Queue *q, int *out) {
+    if (q->len == 0) return 0;
+    *out = q->data[q->head];
+    q->head = (q->head + 1) % q->cap;
+    q->len--;
+    return 1;
+}
+
+int q_peek(const Queue *q, int *out) {
+    if (q->len == 0) return 0;
+    *out = q->data[q->head];
+    return 1;
+}
+
+size_t q_len(const Queue *q) {
+    return q->len;
+}
+
+void q_free(Queue *q) {
+    if (!q) return;
+    free(q->data);
+    free(q);
+}
+--- hint
+The back of the queue is at `(head + len) % cap`. The front is at `head`, and popping advances `head` with wrap-around.
+--- hint
+Easiest grow: allocate a fresh array of `2 * cap`, copy element `i` from `data[(head + i) % cap]` to `new[i]` for `i < len`, free the old array, set `head = 0`.
+--- harness
+int main(void) {
+    Queue *q = q_new(4);
+    CHECK(q != NULL);
+    int v = -1;
+    CHECK_INT(q_pop(q, &v), 0);
+    CHECK_INT(q_peek(q, &v), 0);
+    CHECK_INT(q_len(q), 0);
+
+    q_push(q, 1); q_push(q, 2); q_push(q, 3);
+    CHECK_INT(q_pop(q, &v), 1); CHECK_INT(v, 1);
+    CHECK_INT(q_pop(q, &v), 1); CHECK_INT(v, 2);
+    q_push(q, 4); q_push(q, 5); q_push(q, 6);   /* wraps around */
+    CHECK_INT(q_len(q), 4);
+    CHECK_INT(q_peek(q, &v), 1); CHECK_INT(v, 3);
+    q_push(q, 7);                               /* full and wrapped: must grow correctly */
+    q_push(q, 8);
+    CHECK_INT(q_len(q), 6);
+    int want[] = {3, 4, 5, 6, 7, 8}, ok = 1;
+    for (int i = 0; i < 6; i++) if (!q_pop(q, &v) || v != want[i]) ok = 0;
+    CHECK(ok);
+    CHECK_INT(q_len(q), 0);
+    CHECK_INT(q_pop(q, &v), 0);
+    q_free(q);
+
+    q = q_new(1);
+    int next_in = 0, next_out = 0;
+    ok = 1;
+    for (int round = 0; round < 50; round++) {      /* interleave, wrapping at every size */
+        for (int k = 0; k < round + 3; k++) q_push(q, next_in++);
+        for (int k = 0; k < round + 1; k++) {
+            if (!q_pop(q, &v) || v != next_out) ok = 0;
+            next_out++;
+        }
+    }
+    CHECK(ok);
+    CHECK_INT(q_len(q), next_in - next_out);
+    while (q_pop(q, &v)) { if (v != next_out) ok = 0; next_out++; }
+    CHECK(ok);
+    CHECK_INT(next_out, next_in);
+    q_free(q);
+    q_free(NULL);
+    return TEST_END();
+}
+
+=== exercise hashmap
+title: Dictionary<string, int>
+--- prompt
+Write a hash table from strings to ints with separate chaining. The starter declares one possible layout; you may change the structs since the tests only use the functions.
+
+- `Map *map_new(void)`
+- `void map_put(Map *m, const char *key, int value)`: insert or overwrite. **Copy the key**: the caller may reuse its buffer.
+- `int map_get(const Map *m, const char *key, int *out)`: like `TryGetValue`: return 1 and set `*out` if found, else return 0 and leave `*out` alone.
+- `int map_remove(Map *m, const char *key)`: return 1 if a key was removed, else 0.
+- `size_t map_count(const Map *m)`
+- `void map_free(Map *m)`: free every key, entry, the bucket array and the map.
+
+The tests insert 20,000 keys, so a fixed handful of buckets will be slow. Grow the bucket array (double it and rehash every entry) when `count` exceeds the number of buckets.
+
+`strdup` is not available under `-std=c17`; write your own copy with `malloc` and `memcpy`.
+--- starter
+#include <stdlib.h>
+#include <string.h>
+
+typedef struct Entry {
+    char *key;
+    int value;
+    struct Entry *next;
+} Entry;
+
+typedef struct {
+    Entry **buckets;
+    size_t nbuckets;
+    size_t count;
+} Map;
+
+Map *map_new(void) {
+    return NULL;
+}
+
+void map_put(Map *m, const char *key, int value) {
+    (void)m; (void)key; (void)value;
+}
+
+int map_get(const Map *m, const char *key, int *out) {
+    (void)m; (void)key; (void)out;
+    return 0;
+}
+
+int map_remove(Map *m, const char *key) {
+    (void)m; (void)key;
+    return 0;
+}
+
+size_t map_count(const Map *m) {
+    (void)m;
+    return 0;
+}
+
+void map_free(Map *m) {
+    (void)m;
+}
+--- solution
+#include <stdlib.h>
+#include <string.h>
+
+typedef struct Entry {
+    char *key;
+    int value;
+    struct Entry *next;
+} Entry;
+
+typedef struct {
+    Entry **buckets;
+    size_t nbuckets;
+    size_t count;
+} Map;
+
+static size_t hash_str(const char *s) {
+    size_t h = 1469598103934665603u;
+    for (; *s; s++) {
+        h ^= (unsigned char)*s;
+        h *= 1099511628211u;
+    }
+    return h;
+}
+
+static char *copy_str(const char *s) {
+    size_t n = strlen(s) + 1;
+    char *p = malloc(n);
+    if (!p) abort();
+    memcpy(p, s, n);
+    return p;
+}
+
+Map *map_new(void) {
+    Map *m = malloc(sizeof *m);
+    if (!m) abort();
+    m->nbuckets = 8;
+    m->count = 0;
+    m->buckets = calloc(m->nbuckets, sizeof *m->buckets);
+    if (!m->buckets) abort();
+    return m;
+}
+
+static Entry **find_link(const Map *m, const char *key) {
+    Entry **link = &m->buckets[hash_str(key) % m->nbuckets];
+    while (*link && strcmp((*link)->key, key) != 0) link = &(*link)->next;
+    return link;
+}
+
+static void grow(Map *m) {
+    size_t nb = m->nbuckets * 2;
+    Entry **nbk = calloc(nb, sizeof *nbk);
+    if (!nbk) abort();
+    for (size_t i = 0; i < m->nbuckets; i++) {
+        Entry *e = m->buckets[i];
+        while (e) {
+            Entry *next = e->next;
+            size_t b = hash_str(e->key) % nb;
+            e->next = nbk[b];
+            nbk[b] = e;
+            e = next;
+        }
+    }
+    free(m->buckets);
+    m->buckets = nbk;
+    m->nbuckets = nb;
+}
+
+void map_put(Map *m, const char *key, int value) {
+    Entry **link = find_link(m, key);
+    if (*link) { (*link)->value = value; return; }
+    Entry *e = malloc(sizeof *e);
+    if (!e) abort();
+    e->key = copy_str(key);
+    e->value = value;
+    e->next = NULL;
+    *link = e;
+    if (++m->count > m->nbuckets) grow(m);
+}
+
+int map_get(const Map *m, const char *key, int *out) {
+    Entry *e = *find_link(m, key);
+    if (!e) return 0;
+    *out = e->value;
+    return 1;
+}
+
+int map_remove(Map *m, const char *key) {
+    Entry **link = find_link(m, key);
+    Entry *e = *link;
+    if (!e) return 0;
+    *link = e->next;
+    free(e->key);
+    free(e);
+    m->count--;
+    return 1;
+}
+
+size_t map_count(const Map *m) {
+    return m->count;
+}
+
+void map_free(Map *m) {
+    if (!m) return;
+    for (size_t i = 0; i < m->nbuckets; i++) {
+        Entry *e = m->buckets[i];
+        while (e) {
+            Entry *next = e->next;
+            free(e->key);
+            free(e);
+            e = next;
+        }
+    }
+    free(m->buckets);
+    free(m);
+}
+--- hint
+Write one helper that returns `Entry **`: the link (bucket head or some entry's `next`) where `key` is, or the `NULL` link at the end of its chain where it would go. `put`, `get` and `remove` all become a few lines on top of it.
+--- hint
+Hash with FNV-1a or djb2 (`h = h * 33 + c`) over `unsigned char`s, using an unsigned type so overflow wraps legally. Pick the bucket with `h % nbuckets`.
+--- hint
+To grow: allocate a new zeroed bucket array (`calloc`), move each entry onto the chain `hash % new_count` of the new array (relink, don't copy), free the old array.
+--- harness
+int main(void) {
+    Map *m = map_new();
+    int v = -1;
+    CHECK_INT(map_count(m), 0);
+    CHECK_INT(map_get(m, "apple", &v), 0);
+    CHECK_INT(v, -1);
+
+    map_put(m, "apple", 1);
+    map_put(m, "banana", 2);
+    map_put(m, "", 3);                         /* the empty string is a valid key */
+    CHECK_INT(map_count(m), 3);
+    CHECK_INT(map_get(m, "apple", &v), 1); CHECK_INT(v, 1);
+    CHECK_INT(map_get(m, "banana", &v), 1); CHECK_INT(v, 2);
+    CHECK_INT(map_get(m, "", &v), 1); CHECK_INT(v, 3);
+    map_put(m, "apple", 10);                   /* overwrite, not duplicate */
+    CHECK_INT(map_count(m), 3);
+    CHECK_INT(map_get(m, "apple", &v), 1); CHECK_INT(v, 10);
+    CHECK_INT(map_get(m, "appl", &v), 0);
+    CHECK_INT(map_get(m, "apples", &v), 0);
+
+    char buf[32];
+    strcpy(buf, "temp");
+    map_put(m, buf, 5);
+    strcpy(buf, "XXXX");                       /* caller reuses its buffer */
+    CHECK_INT(map_get(m, "temp", &v), 1); CHECK_INT(v, 5);
+    CHECK_INT(map_get(m, "XXXX", &v), 0);
+
+    CHECK_INT(map_remove(m, "banana"), 1);
+    CHECK_INT(map_remove(m, "banana"), 0);
+    CHECK_INT(map_get(m, "banana", &v), 0);
+    CHECK_INT(map_count(m), 3);
+
+    int ok = 1;
+    for (int i = 0; i < 20000; i++) { sprintf(buf, "key%d", i); map_put(m, buf, i * 3); }
+    CHECK_INT(map_count(m), 20003);
+    for (int i = 0; i < 20000; i++) {
+        sprintf(buf, "key%d", i);
+        if (!map_get(m, buf, &v) || v != i * 3) ok = 0;
+    }
+    CHECK(ok);
+    for (int i = 0; i < 20000; i += 2) { sprintf(buf, "key%d", i); if (!map_remove(m, buf)) ok = 0; }
+    CHECK(ok);
+    CHECK_INT(map_count(m), 10003);
+    for (int i = 0; i < 20000; i++) {
+        sprintf(buf, "key%d", i);
+        int found = map_get(m, buf, &v);
+        if (found != (i % 2) || (found && v != i * 3)) ok = 0;
+    }
+    CHECK(ok);
+    CHECK_INT(map_get(m, "apple", &v), 1); CHECK_INT(v, 10);
+    map_free(m);
+    return TEST_END();
+}
+
+=== exercise bst
+title: Binary search tree with delete
+--- prompt
+Write a BST of distinct `int` keys:
+
+- `Tree *bst_insert(Tree *root, int key)`: insert and return the root. Inserting an existing key does nothing.
+- `int bst_contains(const Tree *root, int key)`: 1 or 0.
+- `int bst_height(const Tree *root)`: number of nodes on the longest root-to-leaf path (empty tree: 0, single node: 1).
+- `size_t bst_to_array(const Tree *root, int *out)`: write the keys in ascending order into `out` (an in-order traversal) and return how many were written.
+- `Tree *bst_remove(Tree *root, int key)`: remove the key if present and return the new root. The hard case is a node with two children: replace its key with the smallest key in its right subtree, then remove that key from the right subtree.
+- `void bst_free(Tree *root)`.
+--- starter
+#include <stdlib.h>
+
+typedef struct Tree {
+    int key;
+    struct Tree *left, *right;
+} Tree;
+
+Tree *bst_insert(Tree *root, int key) {
+    (void)key;
+    return root;
+}
+
+int bst_contains(const Tree *root, int key) {
+    (void)root; (void)key;
+    return 0;
+}
+
+int bst_height(const Tree *root) {
+    (void)root;
+    return 0;
+}
+
+size_t bst_to_array(const Tree *root, int *out) {
+    (void)root; (void)out;
+    return 0;
+}
+
+Tree *bst_remove(Tree *root, int key) {
+    (void)key;
+    return root;
+}
+
+void bst_free(Tree *root) {
+    (void)root;
+}
+--- solution
+#include <stdlib.h>
+
+typedef struct Tree {
+    int key;
+    struct Tree *left, *right;
+} Tree;
+
+Tree *bst_insert(Tree *root, int key) {
+    Tree **link = &root;
+    while (*link) {
+        if (key == (*link)->key) return root;
+        link = key < (*link)->key ? &(*link)->left : &(*link)->right;
+    }
+    Tree *n = malloc(sizeof *n);
+    if (!n) abort();
+    n->key = key;
+    n->left = n->right = NULL;
+    *link = n;
+    return root;
+}
+
+int bst_contains(const Tree *root, int key) {
+    while (root && root->key != key) root = key < root->key ? root->left : root->right;
+    return root != NULL;
+}
+
+int bst_height(const Tree *root) {
+    if (!root) return 0;
+    int l = bst_height(root->left), r = bst_height(root->right);
+    return 1 + (l > r ? l : r);
+}
+
+size_t bst_to_array(const Tree *root, int *out) {
+    if (!root) return 0;
+    size_t n = bst_to_array(root->left, out);
+    out[n++] = root->key;
+    return n + bst_to_array(root->right, out + n);
+}
+
+Tree *bst_remove(Tree *root, int key) {
+    if (!root) return NULL;
+    if (key < root->key) {
+        root->left = bst_remove(root->left, key);
+    } else if (key > root->key) {
+        root->right = bst_remove(root->right, key);
+    } else if (!root->left || !root->right) {
+        Tree *child = root->left ? root->left : root->right;
+        free(root);
+        return child;
+    } else {
+        Tree *m = root->right;
+        while (m->left) m = m->left;
+        root->key = m->key;
+        root->right = bst_remove(root->right, m->key);
+    }
+    return root;
+}
+
+void bst_free(Tree *root) {
+    if (!root) return;
+    bst_free(root->left);
+    bst_free(root->right);
+    free(root);
+}
+--- hint
+`bst_to_array` can return a count: fill the left subtree into `out`, getting `n`; put the root at `out[n]`; then fill the right subtree starting at `out + n + 1`.
+--- hint
+`bst_remove` is easiest recursively, returning the new subtree root: `root->left = bst_remove(root->left, key)`. A node with zero or one child is replaced by that child (or `NULL`) after freeing it.
+--- hint
+Two children: find the leftmost node of the right subtree (its minimum), copy its key into this node, then `root->right = bst_remove(root->right, that_key)`. That removal hits the easy case because the minimum has no left child.
+--- harness
+static int t_sorted_is(const Tree *t, const int *want, size_t n) {
+    int buf[2100];
+    size_t got = bst_to_array(t, buf);
+    if (got != n) return 0;
+    for (size_t i = 0; i < n; i++) if (buf[i] != want[i]) return 0;
+    return 1;
+}
+
+int main(void) {
+    Tree *t = NULL;
+    CHECK_INT(bst_height(t), 0);
+    CHECK_INT(bst_contains(t, 1), 0);
+    int keys[] = {50, 30, 70, 20, 40, 60, 80, 35, 45, 65, 30, 50};
+    for (int i = 0; i < 12; i++) t = bst_insert(t, keys[i]);
+    CHECK(t != NULL);
+    CHECK(t_sorted_is(t, (int[]){20, 30, 35, 40, 45, 50, 60, 65, 70, 80}, 10));
+    CHECK_INT(bst_height(t), 4);
+    CHECK_INT(bst_contains(t, 45), 1);
+    CHECK_INT(bst_contains(t, 46), 0);
+    CHECK_INT(t->key, 50);
+
+    t = bst_remove(t, 20);                 /* leaf */
+    CHECK(t_sorted_is(t, (int[]){30, 35, 40, 45, 50, 60, 65, 70, 80}, 9));
+    t = bst_remove(t, 60);                 /* one child */
+    CHECK(t_sorted_is(t, (int[]){30, 35, 40, 45, 50, 65, 70, 80}, 8));
+    t = bst_remove(t, 30);                 /* one child (right) after 20 went */
+    CHECK(t_sorted_is(t, (int[]){35, 40, 45, 50, 65, 70, 80}, 7));
+    t = bst_remove(t, 50);                 /* root with two children */
+    CHECK(t_sorted_is(t, (int[]){35, 40, 45, 65, 70, 80}, 6));
+    CHECK_INT(bst_contains(t, 50), 0);
+    CHECK_INT(bst_contains(t, 65), 1);
+    t = bst_remove(t, 999);                /* missing */
+    CHECK(t_sorted_is(t, (int[]){35, 40, 45, 65, 70, 80}, 6));
+    int all[] = {35, 40, 45, 65, 70, 80};
+    for (int i = 0; i < 6; i++) t = bst_remove(t, all[i]);
+    CHECK(t == NULL);
+
+    for (int i = 1; i <= 2000; i++) t = bst_insert(t, i);    /* degenerate: a list */
+    CHECK_INT(bst_height(t), 2000);
+    for (int i = 1; i <= 2000; i += 2) t = bst_remove(t, i);
+    int ok = 1, buf[2100];
+    size_t n = bst_to_array(t, buf);
+    CHECK_INT(n, 1000);
+    for (size_t i = 0; i < n; i++) if (buf[i] != (int)(2 * i + 2)) ok = 0;
+    CHECK(ok);
+    bst_free(t);
+
+    t = NULL;
+    unsigned x = 12345;
+    for (int i = 0; i < 2000; i++) { x = x * 1103515245u + 12345u; t = bst_insert(t, (int)(x >> 8) % 5000); }
+    n = bst_to_array(t, buf);
+    for (size_t i = 1; i < n; i++) if (buf[i - 1] >= buf[i]) ok = 0;
+    CHECK(ok);
+    CHECK(bst_height(t) < 40);
+    bst_free(t);
+    return TEST_END();
+}
+
+=== exercise wordfreq
+title: Word frequencies in a tree
+--- prompt
+Read words from stdin (a word is a run of non-whitespace characters, at most 63 long). Convert each to lowercase and count it. Then print every distinct word in alphabetical order (`strcmp` order) with its count, one per line: `word count`.
+
+Store the words in a binary search tree keyed by string, with each node owning a malloc'd copy of its word. Free the whole tree before exiting: leaks fail the test.
+
+Input:
+
+```text
+The cat and the hat
+and THE bat
+```
+
+Output:
+
+```text
+and 2
+bat 1
+cat 1
+hat 1
+the 3
+```
+
+Print nothing for empty input.
+--- starter
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <ctype.h>
+
+typedef struct WNode {
+    char *word;
+    int count;
+    struct WNode *left, *right;
+} WNode;
+
+int main(void) {
+    char buf[64];
+    while (scanf("%63s", buf) == 1) {
+        // lowercase buf, then count it in the tree
+    }
+    // print in order, then free
+    return 0;
+}
+--- solution
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <ctype.h>
+
+typedef struct WNode {
+    char *word;
+    int count;
+    struct WNode *left, *right;
+} WNode;
+
+static WNode *add(WNode *t, const char *w) {
+    if (!t) {
+        t = malloc(sizeof *t);
+        size_t n = strlen(w) + 1;
+        t->word = malloc(n);
+        memcpy(t->word, w, n);
+        t->count = 1;
+        t->left = t->right = NULL;
+        return t;
+    }
+    int c = strcmp(w, t->word);
+    if (c < 0) t->left = add(t->left, w);
+    else if (c > 0) t->right = add(t->right, w);
+    else t->count++;
+    return t;
+}
+
+static void print_tree(const WNode *t) {
+    if (!t) return;
+    print_tree(t->left);
+    printf("%s %d\n", t->word, t->count);
+    print_tree(t->right);
+}
+
+static void free_tree(WNode *t) {
+    if (!t) return;
+    free_tree(t->left);
+    free_tree(t->right);
+    free(t->word);
+    free(t);
+}
+
+int main(void) {
+    char buf[64];
+    WNode *root = NULL;
+    while (scanf("%63s", buf) == 1) {
+        for (char *p = buf; *p; p++) *p = (char)tolower((unsigned char)*p);
+        root = add(root, buf);
+    }
+    print_tree(root);
+    free_tree(root);
+    return 0;
+}
+--- hint
+`tolower` takes an `int` that must be an `unsigned char` value or `EOF`, so call it as `tolower((unsigned char)c)`.
+--- hint
+Compare keys with `strcmp`, and copy the word into the node (`buf` is reused for every word). Free the word before the node.
+--- test
+The cat and the hat
+and THE bat
+--- out
+and 2
+bat 1
+cat 1
+hat 1
+the 3
+--- test
+--- out
+--- test
+zeta Alpha alpha MIKE mike Mike beta zeta zeta
+--- out
+alpha 2
+beta 1
+mike 3
+zeta 3
+--- test
+to be or not to be: that is the question
+  whether 'tis nobler in the mind to suffer
+--- out
+'tis 1
+be 1
+be: 1
+in 1
+is 1
+mind 1
+nobler 1
+not 1
+or 1
+question 1
+suffer 1
+that 1
+the 2
+to 3
+whether 1
+--- test
+a b c d e f g h i j k l m n o p
+--- out
+a 1
+b 1
+c 1
+d 1
+e 1
+f 1
+g 1
+h 1
+i 1
+j 1
+k 1
+l 1
+m 1
+n 1
+o 1
+p 1
+
+=== quiz
+run: yes
+--- q
+What does this print?
+--- code
+#include <stdio.h>
+#include <stdlib.h>
+
+typedef struct Node { int value; struct Node *next; } Node;
+
+Node *push(Node *head, int v) {
+    Node *n = malloc(sizeof *n);
+    n->value = v;
+    n->next = head;
+    return n;
+}
+
+int main(void) {
+    Node *list = NULL;
+    for (int i = 1; i <= 4; i++) list = push(list, i * 10);
+    for (Node *n = list; n; ) {
+        Node *next = n->next;
+        printf("%d ", n->value);
+        free(n);
+        n = next;
+    }
+    printf("\n");
+    return 0;
+}
+--- choice
+10 20 30 40
+--- answer
+40 30 20 10
+--- choice
+40
+--- choice
+10
+--- explain
+Pushing at the front reverses the insertion order: the last value pushed becomes the head. That's a stack (LIFO).
+
+=== quiz
+run: yes
+--- q
+What does this print?
+--- code
+#include <stdio.h>
+
+typedef struct Node { int value; struct Node *next; } Node;
+
+void set_head(Node *head, Node *n) {
+    n->next = head;
+    head = n;
+}
+
+int main(void) {
+    Node a = {1, NULL};
+    Node *list = NULL;
+    set_head(list, &a);
+    printf("%s\n", list ? "has a node" : "empty");
+    return 0;
+}
+--- choice
+has a node
+--- answer
+empty
+--- choice
+It does not compile
+--- explain
+`head` is a copy of `list`. Assigning to the copy doesn't touch the caller's variable. To change the caller's pointer, take a `Node **` (and write `*head = n`) or return the new head.
+
+=== quiz
+run: yes
+--- q
+Using the pointer-to-pointer removal loop, what does this print?
+--- code
+#include <stdio.h>
+
+typedef struct Node { int value; struct Node *next; } Node;
+
+int main(void) {
+    Node d = {4, NULL}, c = {3, &d}, b = {2, &c}, a = {1, &b};
+    Node *head = &a;
+    for (Node **link = &head; *link; ) {
+        if ((*link)->value % 2 == 1) *link = (*link)->next;
+        else link = &(*link)->next;
+    }
+    for (Node *n = head; n; n = n->next) printf("%d ", n->value);
+    printf("\n");
+    return 0;
+}
+--- choice
+1 3
+--- answer
+2 4
+--- choice
+1 2 3 4
+--- choice
+2 3 4
+--- explain
+Odd nodes are unlinked by rewriting whichever link points at them, including `head` itself for node 1. The loop only advances `link` when it keeps a node. (The nodes are on the stack here, so nothing needs freeing.)
+
+=== quiz
+run: yes
+--- q
+A ring buffer with capacity 8 has `head = 6` and `len = 4`. At which indices are the four elements, front to back?
+--- code
+#include <stdio.h>
+
+int main(void) {
+    unsigned cap = 8, head = 6, len = 4;
+    for (unsigned i = 0; i < len; i++) printf("%u ", (head + i) % cap);
+    printf("\n");
+    return 0;
+}
+--- choice
+6 7 8 9
+--- answer
+6 7 0 1
+--- choice
+2 3 4 5
+--- choice
+6 5 4 3
+--- explain
+Indices wrap at the capacity. This is also why growing a ring buffer with a plain `realloc` is wrong: elements at 0 and 1 belong *after* 6 and 7.
+
+=== quiz
+run: yes
+--- q
+Keys are inserted into an empty BST in the order 5, 3, 8, 1, 4, 9. What does a **pre-order** traversal (node, then left, then right) print?
+--- code
+#include <stdio.h>
+#include <stdlib.h>
+
+typedef struct T { int k; struct T *l, *r; } T;
+
+T *ins(T *t, int k) {
+    if (!t) { t = calloc(1, sizeof *t); t->k = k; }
+    else if (k < t->k) t->l = ins(t->l, k);
+    else t->r = ins(t->r, k);
+    return t;
+}
+
+void pre(T *t) {
+    if (!t) return;
+    printf("%d ", t->k);
+    pre(t->l);
+    pre(t->r);
+}
+
+void del(T *t) { if (t) { del(t->l); del(t->r); free(t); } }
+
+int main(void) {
+    T *root = NULL;
+    int ks[] = {5, 3, 8, 1, 4, 9};
+    for (int i = 0; i < 6; i++) root = ins(root, ks[i]);
+    pre(root);
+    printf("\n");
+    del(root);
+    return 0;
+}
+--- choice
+1 3 4 5 8 9
+--- answer
+5 3 1 4 8 9
+--- choice
+1 4 3 9 8 5
+--- choice
+5 3 8 1 4 9
+--- explain
+Pre-order visits a node before its subtrees: 5, then the whole left subtree (3, 1, 4), then the right (8, 9). In-order would give the sorted order; post-order (1 4 3 9 8 5) is the order you free in.
+
+=== quiz
+--- q
+What is wrong with this list free?
+
+```c
+for (Node *n = head; n != NULL; n = n->next)
+    free(n);
+```
+--- choice
+Nothing; it frees every node
+--- choice
+It skips the last node
+--- answer
+After `free(n)`, the loop step reads `n->next` from freed memory
+--- choice
+It should free `head` separately first
+--- explain
+The increment expression runs *after* the body, so it dereferences a freed node: a use-after-free. It often "works" because the memory hasn't been reused yet, which is exactly what makes it dangerous. Save `next` before freeing.
+
+=== quiz
+--- q
+You insert the keys 1, 2, 3, ..., 100000 into a plain (unbalanced) BST in that order. What is the cost of looking up 100000 afterwards?
+--- choice
+O(1)
+--- choice
+O(log n), about 17 comparisons
+--- answer
+O(n), about 100000 comparisons
+--- choice
+It depends on the hash function
+--- explain
+Sorted insertion sends every key right, so the "tree" is a linked list of height n. That's why `SortedDictionary` uses a red-black tree, which rebalances to keep the height O(log n). A recursive free of that degenerate tree also recurses 100000 deep.

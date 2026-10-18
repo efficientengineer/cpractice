@@ -1,0 +1,39 @@
+=== chapter start
+title: Smoke
+blurb: x
+--- body
+```js
+console.log([1, 'a', { b: 2 }], new Map([[1, 2]]));
+```
+=== exercise sum
+title: Sum
+--- prompt
+Write `sum(arr)`.
+--- starter
+function sum(arr) {}
+--- solution
+const sum = arr => arr.reduce((a, b) => a + b, 0);
+--- harness
+eq(sum([1, 2, 3]), 6);
+eq(sum([]), 0);
+=== exercise hello
+title: Hello
+--- prompt
+Log hi
+--- starter
+// log
+--- solution
+console.log('hi', [1, 'x']);
+--- test
+--- out
+hi [ 1, 'x' ]
+=== quiz
+run: yes
+--- q
+?
+--- code
+console.log(0.1 + 0.2 === 0.3, typeof null);
+--- answer
+false object
+--- choice
+true object

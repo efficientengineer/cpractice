@@ -1,0 +1,1533 @@
+=== chapter funcptrs
+title: Function pointers
+blurb: Delegates without the runtime: function pointer syntax, callbacks, qsort and bsearch, void * generics, dispatch tables, hand-built vtables, and passing context instead of closures.
+--- body
+## Functions have addresses
+
+Compiled code lives in memory like everything else, so a function has an address and you can store it in a variable. A function pointer is C's `Func<>`/`Action<>`, minus everything a delegate carries besides the method: no captured target object, no multicast, no lambdas.
+
+```c
+#include <stdio.h>
+
+int add(int a, int b) { return a + b; }
+int mul(int a, int b) { return a * b; }
+
+int main(void) {
+    int (*op)(int, int);         // op: pointer to function taking (int, int) returning int
+    op = add;                    // a function name decays to its address (&add also works)
+    printf("%d\n", op(3, 4));    // call through it: 7. (*op)(3, 4) is the same thing
+    op = mul;
+    printf("%d\n", op(3, 4));    // 12
+    return 0;
+}
+```
+
+The parentheses in `int (*op)(int, int)` matter: `int *op(int, int)` declares a *function* returning `int *`. Read declarations from the name outward: "`op` is a pointer (`*op`) to a function taking `(int, int)` returning `int`".
+
+### typedef it
+
+Raw function pointer types get unreadable fast, especially as parameters and return types. Name them:
+
+```c
+typedef int (*BinOp)(int, int);     // BinOp is "pointer to int(int, int)"
+
+int apply(BinOp f, int a, int b) { return f(a, b); }
+
+// Without the typedef, a function returning a BinOp looks like this:
+int (*pick_raw(char c))(int, int);
+// With it:
+BinOp pick(char c);
+```
+
+Some codebases typedef the *function type* instead and write the star at use sites: `typedef int BinOpFn(int, int); BinOpFn *f;`. Both are fine; be consistent. The standard library's own `signal` is the classic monster: `void (*signal(int sig, void (*handler)(int)))(int);`
+
+| C# | C |
+|---|---|
+| `Func<int, int, int> f = Add;` | `int (*f)(int, int) = add;` |
+| `delegate int BinOp(int a, int b);` | `typedef int (*BinOp)(int, int);` |
+| `f(1, 2)` / `f.Invoke(1, 2)` | `f(1, 2)` / `(*f)(1, 2)` |
+| `f == null` | `f == NULL` (calling a NULL function pointer crashes) |
+| lambda capturing locals | not possible: pass a `void *ctx` instead (below) |
+
+A function pointer and a data pointer (`void *`) are not interchangeable in standard C. Don't store functions in `void *`; use a function pointer type (any one, cast back before calling) if you need a generic slot.
+
+## Callbacks
+
+Passing a function into another function is how C does strategy, events and iteration:
+
+```c
+#include <stdio.h>
+
+typedef void (*IntVisitor)(int value, size_t index);
+
+void for_each(const int *a, size_t n, IntVisitor visit) {
+    for (size_t i = 0; i < n; i++) visit(a[i], i);
+}
+
+void print_item(int value, size_t index) {
+    printf("[%zu] = %d\n", index, value);
+}
+
+int main(void) {
+    int xs[] = {7, 1, 9};
+    for_each(xs, 3, print_item);
+    return 0;
+}
+```
+
+## qsort: the standard library's callback showcase
+
+```c
+void qsort(void *base, size_t count, size_t size,
+           int (*compar)(const void *, const void *));
+```
+
+`qsort` sorts *any* array: it only knows the start address, the element count, and the element size in bytes. To order two elements it calls your comparator with pointers to them, typed as `const void *` because it doesn't know their type. Your comparator casts back and returns negative, zero or positive, like `IComparer<T>.Compare`.
+
+```c
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+int cmp_int(const void *pa, const void *pb) {
+    int a = *(const int *)pa, b = *(const int *)pb;
+    return (a > b) - (a < b);          // -1, 0 or 1, never overflows
+}
+
+typedef struct { char name[16]; int age; } Person;
+
+int cmp_person(const void *pa, const void *pb) {
+    const Person *a = pa, *b = pb;     // void * converts implicitly in C (not in C++)
+    if (a->age != b->age) return (a->age > b->age) - (a->age < b->age);
+    return strcmp(a->name, b->name);   // tie-break: then by name
+}
+
+// Array of char *: each ELEMENT is a char *, so qsort hands us char **.
+int cmp_str(const void *pa, const void *pb) {
+    const char *a = *(const char *const *)pa;
+    const char *b = *(const char *const *)pb;
+    return strcmp(a, b);
+}
+
+int main(void) {
+    int xs[] = {5, -2, 9, 0, -2};
+    qsort(xs, 5, sizeof xs[0], cmp_int);
+    for (int i = 0; i < 5; i++) printf("%d ", xs[i]);
+    printf("\n");
+
+    Person ps[] = {{"cy", 30}, {"al", 25}, {"bo", 30}};
+    qsort(ps, 3, sizeof ps[0], cmp_person);
+    for (int i = 0; i < 3; i++) printf("%s:%d ", ps[i].name, ps[i].age);
+    printf("\n");
+
+    const char *words[] = {"pear", "apple", "fig"};
+    qsort(words, 3, sizeof words[0], cmp_str);
+    for (int i = 0; i < 3; i++) printf("%s ", words[i]);
+    printf("\n");
+    return 0;
+}
+```
+
+Three classic bugs:
+
+1. **`return a - b;`** It's in a thousand tutorials and it's wrong. If `a = INT_MIN` and `b = 1`, the subtraction overflows `int`: undefined behavior, and in practice it wraps to `INT_MAX`, a *positive* answer for a < b. The sort silently comes out wrong for inputs near the extremes. Use `(a > b) - (a < b)`: each comparison is 0 or 1, so the result is -1, 0 or 1.
+2. **Sorting `char *` with `strcmp` directly.** For an array of strings the elements are `char *`, so the comparator receives `char **` disguised as `const void *`. Passing those straight to `strcmp` compares the bytes of the pointers themselves. Dereference once first, as `cmp_str` does. (For `char names[10][32]`, the elements *are* the char arrays, so there you pass the pointers straight to `strcmp`.)
+3. **Casting a comparator for doubles to `int`.** `return (int)(a - b);` makes 0.3 and 0.1 "equal". Use the comparison idiom again.
+
+`qsort` is not guaranteed stable (equal elements may be reordered); `List<T>.Sort` isn't either, but LINQ's `OrderBy` is. If you need stability, tie-break on a secondary key or the original index.
+
+## bsearch
+
+```c
+void *bsearch(const void *key, const void *base, size_t count, size_t size,
+              int (*compar)(const void *key, const void *elem));
+```
+
+Binary search over a sorted array. It returns a pointer to *a* matching element (not necessarily the first of several equal ones) or `NULL`. The comparator's first argument is always the key you passed, which need not have the element type: look up a struct by its name by passing the name as the key.
+
+```c
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+typedef struct { const char *sym; int number; } Element;
+
+// key is a const char *, element is an Element
+int cmp_key_elem(const void *key, const void *elem) {
+    return strcmp(key, ((const Element *)elem)->sym);
+}
+
+int main(void) {
+    static const Element table[] = {      // must be sorted by the same order
+        {"C", 6}, {"Fe", 26}, {"H", 1}, {"He", 2}, {"O", 8}, {"U", 92},
+    };
+    size_t n = sizeof table / sizeof table[0];
+    const char *queries[] = {"Fe", "U", "Xx"};
+    for (int i = 0; i < 3; i++) {
+        const Element *e = bsearch(queries[i], table, n, sizeof table[0], cmp_key_elem);
+        if (e) printf("%s = %d (index %td)\n", e->sym, e->number, e - table);
+        else   printf("%s not found\n", queries[i]);
+    }
+    return 0;
+}
+```
+
+`e - table` is pointer subtraction: the index. Its type is `ptrdiff_t`, printed with `%td`.
+
+## void * generics
+
+`qsort` shows the pattern for generic code in C: pass `void *` plus an element size, move bytes with `memcpy`, and let a callback interpret them. Here is a type-agnostic swap and a generic "find the max" that works for any element type:
+
+```c
+#include <stdio.h>
+#include <string.h>
+
+void swap_bytes(void *a, void *b, size_t size) {
+    unsigned char tmp[64];                    // fine for small elements
+    memcpy(tmp, a, size);
+    memcpy(a, b, size);
+    memcpy(b, tmp, size);
+}
+
+const void *max_elem(const void *base, size_t n, size_t size,
+                     int (*cmp)(const void *, const void *)) {
+    const unsigned char *p = base, *best = n ? p : NULL;   // char * so we can step by bytes
+    for (size_t i = 1; i < n; i++)
+        if (cmp(p + i * size, best) > 0) best = p + i * size;
+    return best;
+}
+
+int cmp_double(const void *a, const void *b) {
+    double x = *(const double *)a, y = *(const double *)b;
+    return (x > y) - (x < y);
+}
+
+int main(void) {
+    double ds[] = {2.5, 9.75, -1.0};
+    const double *m = max_elem(ds, 3, sizeof ds[0], cmp_double);
+    printf("max %.2f\n", *m);
+    swap_bytes(&ds[0], &ds[2], sizeof ds[0]);
+    printf("%.1f %.1f\n", ds[0], ds[2]);
+    return 0;
+}
+```
+
+You can't do arithmetic on `void *` in standard C (gcc allows it as an extension); convert to `unsigned char *` and multiply indices by the element size. What you lose compared to C# generics is type checking: nothing stops you passing an `int` array with a double comparator. `List<T>` knows `T`; your `Vec` only knows "8 bytes".
+
+## map, filter, reduce
+
+LINQ's `Select`, `Where` and `Aggregate` are three loops with a callback. In C they take the output buffer from the caller, since there's no GC to hand back a new sequence:
+
+```c
+#include <stdio.h>
+
+typedef int  (*MapFn)(int);
+typedef int  (*PredFn)(int);
+typedef long (*ReduceFn)(long acc, int x);
+
+void map(int *a, size_t n, MapFn f)             { for (size_t i = 0; i < n; i++) a[i] = f(a[i]); }
+
+size_t filter(const int *in, size_t n, int *out, PredFn keep) {
+    size_t k = 0;
+    for (size_t i = 0; i < n; i++) if (keep(in[i])) out[k++] = in[i];
+    return k;                                    // how many were kept
+}
+
+long reduce(const int *a, size_t n, long init, ReduceFn f) {
+    for (size_t i = 0; i < n; i++) init = f(init, a[i]);
+    return init;
+}
+
+int square(int x)        { return x * x; }
+int is_odd(int x)        { return x % 2 != 0; }
+long sum(long acc, int x) { return acc + x; }
+
+int main(void) {
+    int xs[] = {1, 2, 3, 4, 5, 6};
+    int odd[6];
+    size_t k = filter(xs, 6, odd, is_odd);       // 1 3 5
+    map(odd, k, square);                         // 1 9 25
+    printf("%ld\n", reduce(odd, k, 0, sum));     // 35
+    return 0;
+}
+```
+
+## Closures don't exist: pass a context pointer
+
+In C# you'd write `xs.Where(x => x > threshold)`. The lambda *captures* `threshold`: the compiler generates a hidden class holding it, and the delegate stores both a method pointer and a reference to that object. C function pointers are just the method pointer, so there's nowhere to put `threshold`.
+
+The C idiom does what the C# compiler does by hand: the callback takes an extra `void *ctx` argument, and whoever registers the callback passes a pointer to whatever state it needs. The library just carries the pointer through without looking at it.
+
+```c
+#include <stdio.h>
+
+typedef int (*Pred)(int x, void *ctx);
+
+size_t count_if(const int *a, size_t n, Pred p, void *ctx) {
+    size_t c = 0;
+    for (size_t i = 0; i < n; i++) if (p(a[i], ctx)) c++;
+    return c;
+}
+
+int greater_than(int x, void *ctx) {
+    int threshold = *(int *)ctx;
+    return x > threshold;
+}
+
+typedef struct { int lo, hi; long calls; } Range;   // several captured values: use a struct
+
+int in_range(int x, void *ctx) {
+    Range *r = ctx;
+    r->calls++;                    // the callback can also mutate captured state
+    return x >= r->lo && x <= r->hi;
+}
+
+int main(void) {
+    int xs[] = {4, 8, 15, 16, 23, 42};
+    int t = 15;
+    printf("%zu\n", count_if(xs, 6, greater_than, &t));         // 3
+    Range r = {5, 20, 0};
+    size_t n = count_if(xs, 6, in_range, &r);   // call first: argument order is unspecified
+    printf("%zu (calls=%ld)\n", n, r.calls);    // 3 (calls=6)
+    return 0;
+}
+```
+
+Every serious C callback API has this parameter: `pthread_create`'s `void *arg`, GLib's `gpointer user_data`, the `void *` in event libraries. `qsort` notably lacks it, which is why sorting by a runtime-chosen key forces a global variable (or the non-portable `qsort_r`). When you design an API that takes a callback, always add the `void *ctx`.
+
+Watch the lifetime: `ctx` usually points at a local. That's fine while the call is running, but if the callback is *stored* and called later (an event handler), the local may be gone. C# closures keep captured variables alive; C doesn't.
+
+## Dispatch tables
+
+A `switch` on a command name becomes a table of `{name, function}` pairs. Adding a command is adding a row:
+
+```c
+#include <stdio.h>
+#include <string.h>
+
+typedef double (*UnaryFn)(double);
+
+static double twice(double x)  { return 2 * x; }
+static double halve(double x)  { return x / 2; }
+static double negate(double x) { return -x; }
+
+static const struct { const char *name; UnaryFn fn; } COMMANDS[] = {
+    {"twice", twice}, {"halve", halve}, {"negate", negate},
+};
+
+static UnaryFn lookup(const char *name) {
+    for (size_t i = 0; i < sizeof COMMANDS / sizeof COMMANDS[0]; i++)
+        if (strcmp(COMMANDS[i].name, name) == 0) return COMMANDS[i].fn;
+    return NULL;
+}
+
+int main(void) {
+    const char *prog[] = {"twice", "twice", "negate", "halve", "explode"};
+    double x = 5;
+    for (int i = 0; i < 5; i++) {
+        UnaryFn f = lookup(prog[i]);
+        if (!f) { printf("unknown: %s\n", prog[i]); continue; }
+        x = f(x);
+        printf("%s -> %g\n", prog[i], x);
+    }
+    return 0;
+}
+```
+
+When the keys are small integers (opcodes, enum values, states in a state machine) skip the search and index directly: `handlers[opcode](vm)`. That's the core loop of many interpreters and emulators.
+
+## Interfaces and virtual methods: the vtable
+
+A C# interface call `shape.Area()` works like this under the hood: each object starts with a pointer to its type's method table, and the call loads the function pointer from that table. You can build exactly that:
+
+```c
+#include <stdio.h>
+#include <stdlib.h>
+
+typedef struct Shape Shape;
+
+typedef struct {                                 // the "interface": one per type, shared
+    const char *name;
+    double (*area)(const Shape *self);
+    void (*destroy)(Shape *self);
+} ShapeVtbl;
+
+struct Shape { const ShapeVtbl *vt; };           // the "base class": just the vtable pointer
+
+typedef struct { Shape base; double r; } Circle;     // base FIRST, so Circle * -> Shape * is valid
+typedef struct { Shape base; double w, h; } Rect;
+
+static double circle_area(const Shape *s) {
+    const Circle *c = (const Circle *)s;         // the "downcast"
+    return 3.14159265358979 * c->r * c->r;
+}
+static double rect_area(const Shape *s) {
+    const Rect *r = (const Rect *)s;
+    return r->w * r->h;
+}
+static void shape_free(Shape *s) { free(s); }
+
+static const ShapeVtbl CIRCLE_VT = {"circle", circle_area, shape_free};
+static const ShapeVtbl RECT_VT   = {"rect",   rect_area,   shape_free};
+
+Shape *circle_new(double r) {
+    Circle *c = malloc(sizeof *c);
+    c->base.vt = &CIRCLE_VT;
+    c->r = r;
+    return &c->base;
+}
+
+Shape *rect_new(double w, double h) {
+    Rect *r = malloc(sizeof *r);
+    r->base.vt = &RECT_VT;
+    r->w = w;
+    r->h = h;
+    return &r->base;
+}
+
+int main(void) {
+    Shape *shapes[] = {circle_new(1), rect_new(2, 3), circle_new(0.5)};
+    for (int i = 0; i < 3; i++) {
+        Shape *s = shapes[i];
+        printf("%-6s %.3f\n", s->vt->name, s->vt->area(s));   // virtual call
+        s->vt->destroy(s);
+    }
+    return 0;
+}
+```
+
+Key points:
+
+- The vtable is `static const`, one per type, shared by all instances (like the CLR's method table). Each object pays one pointer.
+- Putting `Shape base` as the **first member** means a `Circle *` and its `&c->base` have the same address, so converting between them with a cast is valid C. That's single inheritance.
+- `self` is explicit. C#'s `this` is the same hidden first argument.
+- `destroy` in the vtable is the virtual destructor: callers free shapes without knowing their concrete type.
+- The Linux kernel (`struct file_operations`), SQLite (`sqlite3_vfs`) and COM all use this pattern.
+
+=== exercise comparators
+title: Comparators that don't overflow
+--- prompt
+Write three `qsort` comparators for `int` arrays:
+
+- `int cmp_int_asc(const void *a, const void *b)`: ascending.
+- `int cmp_int_desc(const void *a, const void *b)`: descending.
+- `int cmp_abs(const void *a, const void *b)`: by absolute value ascending; when the absolute values are equal, the negative number first. Note that `abs(INT_MIN)` overflows.
+
+They must work for the full `int` range, including `INT_MIN` and `INT_MAX`. The starter uses the subtraction trick, which doesn't.
+--- starter
+#include <stdlib.h>
+#include <limits.h>
+
+int cmp_int_asc(const void *a, const void *b) {
+    return *(const int *)a - *(const int *)b;
+}
+
+int cmp_int_desc(const void *a, const void *b) {
+    return *(const int *)b - *(const int *)a;
+}
+
+int cmp_abs(const void *a, const void *b) {
+    return abs(*(const int *)a) - abs(*(const int *)b);
+}
+--- solution
+#include <stdlib.h>
+#include <limits.h>
+
+int cmp_int_asc(const void *a, const void *b) {
+    int x = *(const int *)a, y = *(const int *)b;
+    return (x > y) - (x < y);
+}
+
+int cmp_int_desc(const void *a, const void *b) {
+    return cmp_int_asc(b, a);
+}
+
+int cmp_abs(const void *a, const void *b) {
+    long long x = *(const int *)a, y = *(const int *)b;
+    long long ax = x < 0 ? -x : x, ay = y < 0 ? -y : y;
+    if (ax != ay) return (ax > ay) - (ax < ay);
+    return (x > y) - (x < y);
+}
+--- hint
+`(x > y) - (x < y)` is -1, 0 or 1 and can't overflow.
+--- hint
+Descending is ascending with the arguments swapped.
+--- hint
+For `cmp_abs`, widen to `long long` before negating so `-INT_MIN` is representable.
+--- harness
+#include <limits.h>
+static int t_is(const int *a, const int *b, size_t n) {
+    for (size_t i = 0; i < n; i++) if (a[i] != b[i]) return 0;
+    return 1;
+}
+static int t_sign(int x) { return (x > 0) - (x < 0); }
+
+int main(void) {
+    int one = 1, mn = INT_MIN, mx = INT_MAX, neg = -1, z = 0;
+    CHECK_INT(t_sign(cmp_int_asc(&mn, &one)), -1);
+    CHECK_INT(t_sign(cmp_int_asc(&mx, &neg)), 1);
+    CHECK_INT(t_sign(cmp_int_asc(&z, &z)), 0);
+    CHECK_INT(t_sign(cmp_int_desc(&mn, &mx)), 1);
+    CHECK_INT(t_sign(cmp_int_desc(&one, &z)), -1);
+
+    int a[] = {3, INT_MIN, 0, INT_MAX, -7, 3, -1, INT_MAX - 1, INT_MIN + 1};
+    int asc[] = {INT_MIN, INT_MIN + 1, -7, -1, 0, 3, 3, INT_MAX - 1, INT_MAX};
+    int desc[] = {INT_MAX, INT_MAX - 1, 3, 3, 0, -1, -7, INT_MIN + 1, INT_MIN};
+    qsort(a, 9, sizeof a[0], cmp_int_asc);
+    CHECK(t_is(a, asc, 9));
+    qsort(a, 9, sizeof a[0], cmp_int_desc);
+    CHECK(t_is(a, desc, 9));
+
+    int b[] = {5, -3, 3, INT_MIN, -5, 0, INT_MAX, 1, -INT_MAX};
+    int babs[] = {0, 1, -3, 3, -5, 5, -INT_MAX, INT_MAX, INT_MIN};
+    qsort(b, 9, sizeof b[0], cmp_abs);
+    CHECK(t_is(b, babs, 9));
+    CHECK_INT(t_sign(cmp_abs(&mn, &mx)), 1);
+    CHECK_INT(t_sign(cmp_abs(&neg, &one)), -1);
+    CHECK_INT(t_sign(cmp_abs(&one, &one)), 0);
+    return TEST_END();
+}
+
+=== exercise sortrecords
+title: Sorting records and strings
+--- prompt
+Use `qsort` with your own comparators to write:
+
+- `void sort_people(Person *p, size_t n)`: by `age` ascending, then by `name` ascending (`strcmp` order) for equal ages.
+- `void sort_by_score_desc(Person *p, size_t n)`: by `score` (a `double`) descending; equal scores keep no particular order. Scores differ by less than 1, so casting a difference to `int` won't do.
+- `void sort_words(const char **words, size_t n)`: an array of string pointers, alphabetically. Remember what the comparator actually receives.
+
+The comparators themselves can be `static` helpers; only these three functions are tested.
+--- starter
+#include <stdlib.h>
+#include <string.h>
+
+typedef struct {
+    char name[32];
+    int age;
+    double score;
+} Person;
+
+void sort_people(Person *p, size_t n) {
+    (void)p; (void)n;
+}
+
+void sort_by_score_desc(Person *p, size_t n) {
+    (void)p; (void)n;
+}
+
+void sort_words(const char **words, size_t n) {
+    (void)words; (void)n;
+}
+--- solution
+#include <stdlib.h>
+#include <string.h>
+
+typedef struct {
+    char name[32];
+    int age;
+    double score;
+} Person;
+
+static int cmp_age_name(const void *pa, const void *pb) {
+    const Person *a = pa, *b = pb;
+    if (a->age != b->age) return (a->age > b->age) - (a->age < b->age);
+    return strcmp(a->name, b->name);
+}
+
+static int cmp_score_desc(const void *pa, const void *pb) {
+    const Person *a = pa, *b = pb;
+    return (a->score < b->score) - (a->score > b->score);
+}
+
+static int cmp_word(const void *pa, const void *pb) {
+    return strcmp(*(const char *const *)pa, *(const char *const *)pb);
+}
+
+void sort_people(Person *p, size_t n) {
+    qsort(p, n, sizeof *p, cmp_age_name);
+}
+
+void sort_by_score_desc(Person *p, size_t n) {
+    qsort(p, n, sizeof *p, cmp_score_desc);
+}
+
+void sort_words(const char **words, size_t n) {
+    qsort(words, n, sizeof *words, cmp_word);
+}
+--- hint
+Inside a `Person` comparator, `const Person *a = pa;` converts from `const void *` without a cast.
+--- hint
+For the words, each element is a `const char *`, so the comparator gets a pointer to one: `*(const char *const *)pa` is the string.
+--- harness
+int main(void) {
+    Person ps[] = {
+        {"mia", 30, 0.75}, {"ann", 25, 0.5}, {"zed", 30, 0.25},
+        {"bob", 25, 0.875}, {"amy", 30, 0.125}, {"kim", 19, 0.625},
+    };
+    sort_people(ps, 6);
+    CHECK_STR(ps[0].name, "kim");
+    CHECK_STR(ps[1].name, "ann");
+    CHECK_STR(ps[2].name, "bob");
+    CHECK_STR(ps[3].name, "amy");
+    CHECK_STR(ps[4].name, "mia");
+    CHECK_STR(ps[5].name, "zed");
+    CHECK_INT(ps[5].age, 30);
+
+    sort_by_score_desc(ps, 6);
+    const char *by_score[] = {"bob", "mia", "kim", "ann", "zed", "amy"};
+    for (int i = 0; i < 6; i++) CHECK_STR(ps[i].name, by_score[i]);
+    CHECK_DBL(ps[0].score, 0.875);
+
+    const char *w[] = {"pear", "apple", "fig", "Banana", "apples", "app", "fig"};
+    sort_words(w, 7);
+    const char *ws[] = {"Banana", "app", "apple", "apples", "fig", "fig", "pear"};
+    for (int i = 0; i < 7; i++) CHECK_STR(w[i], ws[i]);
+
+    sort_people(ps, 0);
+    sort_words(w, 1);
+    CHECK_STR(w[0], "Banana");
+    return TEST_END();
+}
+
+=== exercise mapfilterreduce
+title: map, filter, reduce with context
+--- prompt
+Write LINQ-style helpers for `int` arrays where every callback receives a `void *ctx` that the caller passes through (C's substitute for a capturing lambda):
+
+```c
+typedef int  (*MapFn)(int x, void *ctx);
+typedef int  (*PredFn)(int x, void *ctx);
+typedef long (*FoldFn)(long acc, int x, void *ctx);
+```
+
+- `void map_ints(int *a, size_t n, MapFn f, void *ctx)`: replace each element with `f(element, ctx)`, in order from index 0.
+- `size_t filter_ints(const int *in, size_t n, int *out, PredFn keep, void *ctx)`: copy the elements for which `keep` returns nonzero into `out`, in order; return how many.
+- `long fold_ints(const int *a, size_t n, long init, FoldFn f, void *ctx)`: left fold, like `Aggregate(init, f)`.
+- `int any_ints(const int *a, size_t n, PredFn p, void *ctx)`: 1 if `p` holds for some element. Stop calling `p` at the first match (the tests count calls).
+
+The tests' callbacks use `ctx` for thresholds, multipliers and call counters.
+--- starter
+#include <stddef.h>
+
+typedef int  (*MapFn)(int x, void *ctx);
+typedef int  (*PredFn)(int x, void *ctx);
+typedef long (*FoldFn)(long acc, int x, void *ctx);
+
+void map_ints(int *a, size_t n, MapFn f, void *ctx) {
+    (void)a; (void)n; (void)f; (void)ctx;
+}
+
+size_t filter_ints(const int *in, size_t n, int *out, PredFn keep, void *ctx) {
+    (void)in; (void)n; (void)out; (void)keep; (void)ctx;
+    return 0;
+}
+
+long fold_ints(const int *a, size_t n, long init, FoldFn f, void *ctx) {
+    (void)a; (void)n; (void)f; (void)ctx;
+    return init;
+}
+
+int any_ints(const int *a, size_t n, PredFn p, void *ctx) {
+    (void)a; (void)n; (void)p; (void)ctx;
+    return 0;
+}
+--- solution
+#include <stddef.h>
+
+typedef int  (*MapFn)(int x, void *ctx);
+typedef int  (*PredFn)(int x, void *ctx);
+typedef long (*FoldFn)(long acc, int x, void *ctx);
+
+void map_ints(int *a, size_t n, MapFn f, void *ctx) {
+    for (size_t i = 0; i < n; i++) a[i] = f(a[i], ctx);
+}
+
+size_t filter_ints(const int *in, size_t n, int *out, PredFn keep, void *ctx) {
+    size_t k = 0;
+    for (size_t i = 0; i < n; i++)
+        if (keep(in[i], ctx)) out[k++] = in[i];
+    return k;
+}
+
+long fold_ints(const int *a, size_t n, long init, FoldFn f, void *ctx) {
+    for (size_t i = 0; i < n; i++) init = f(init, a[i], ctx);
+    return init;
+}
+
+int any_ints(const int *a, size_t n, PredFn p, void *ctx) {
+    for (size_t i = 0; i < n; i++)
+        if (p(a[i], ctx)) return 1;
+    return 0;
+}
+--- hint
+Each function is one loop. Pass `ctx` through to the callback untouched: your code never looks inside it.
+--- harness
+static int t_scale(int x, void *ctx) { return x * *(int *)ctx; }
+static int t_counter_add(int x, void *ctx) { int *c = ctx; return x + (*c)++; }
+static int t_above(int x, void *ctx) { return x > *(int *)ctx; }
+typedef struct { int lo, hi, calls; } TRange;
+static int t_in(int x, void *ctx) { TRange *r = ctx; r->calls++; return x >= r->lo && x <= r->hi; }
+static long t_sum(long acc, int x, void *ctx) { (void)ctx; return acc + x; }
+static long t_digits(long acc, int x, void *ctx) { return acc * *(int *)ctx + x; }
+static long t_max(long acc, int x, void *ctx) { (void)ctx; return x > acc ? x : acc; }
+
+int main(void) {
+    int a[] = {1, 2, 3, 4, 5};
+    int k = 3;
+    map_ints(a, 5, t_scale, &k);
+    CHECK(a[0] == 3 && a[1] == 6 && a[2] == 9 && a[3] == 12 && a[4] == 15);
+    int counter = 100;
+    map_ints(a, 5, t_counter_add, &counter);      /* order matters: 100, 101, ... */
+    CHECK(a[0] == 103 && a[1] == 107 && a[2] == 111 && a[3] == 115 && a[4] == 119);
+    CHECK_INT(counter, 105);
+
+    int in[] = {5, 12, -3, 40, 7, 12, 0};
+    int out[7];
+    int t = 6;
+    CHECK_INT(filter_ints(in, 7, out, t_above, &t), 4);
+    CHECK(out[0] == 12 && out[1] == 40 && out[2] == 7 && out[3] == 12);
+    TRange r = {0, 10, 0};
+    size_t n = filter_ints(in, 7, out, t_in, &r);
+    CHECK_INT(n, 3);
+    CHECK(out[0] == 5 && out[1] == 7 && out[2] == 0);
+    CHECK_INT(r.calls, 7);
+    CHECK_INT(filter_ints(in, 0, out, t_above, &t), 0);
+
+    CHECK_INT(fold_ints(in, 7, 0, t_sum, NULL), 73);
+    int base = 10;
+    int digits[] = {4, 0, 9, 6};
+    CHECK_INT(fold_ints(digits, 4, 0, t_digits, &base), 4096);
+    base = 2;
+    int bits[] = {1, 0, 1, 1};
+    CHECK_INT(fold_ints(bits, 4, 1, t_digits, &base), 27);    /* init participates */
+    CHECK_INT(fold_ints(in, 7, -1000, t_max, NULL), 40);
+    CHECK_INT(fold_ints(in, 0, 77, t_sum, NULL), 77);
+
+    TRange q = {10, 20, 0};
+    CHECK_INT(any_ints(in, 7, t_in, &q), 1);
+    CHECK_INT(q.calls, 2);                         /* stopped at 12 */
+    TRange q2 = {100, 200, 0};
+    CHECK_INT(any_ints(in, 7, t_in, &q2), 0);
+    CHECK_INT(q2.calls, 7);
+    return TEST_END();
+}
+
+=== exercise genericvec
+title: A generic vector with void *
+--- prompt
+Write a growable array that stores elements of any type, given the element size at runtime: the C version of `List<T>`.
+
+```c
+typedef struct {
+    unsigned char *data;   // bytes; element i starts at data + i * elem_size
+    size_t elem_size, len, cap;
+} Vec;
+```
+
+- `void vec_init(Vec *v, size_t elem_size)`: empty vector, nothing allocated yet.
+- `void *vec_push(Vec *v, const void *elem)`: copy `elem_size` bytes from `elem` onto the end (grow by doubling) and return a pointer to the stored copy.
+- `void *vec_at(const Vec *v, size_t i)`: pointer to element `i`, or `NULL` if out of range.
+- `void vec_remove(Vec *v, size_t i)`: remove element `i`, shifting later ones down (`memmove`). Ignore out-of-range `i`.
+- `void *vec_find(const Vec *v, const void *key, int (*eq)(const void *key, const void *elem))`: first element for which `eq` returns nonzero, or `NULL`.
+- `void vec_free(Vec *v)`: release the memory and leave `v` empty and reusable.
+
+The tests store `int`s, `double`s and structs.
+--- starter
+#include <stdlib.h>
+#include <string.h>
+
+typedef struct {
+    unsigned char *data;
+    size_t elem_size, len, cap;
+} Vec;
+
+void vec_init(Vec *v, size_t elem_size) {
+    v->data = NULL;
+    v->elem_size = elem_size;
+    v->len = v->cap = 0;
+}
+
+void *vec_push(Vec *v, const void *elem) {
+    (void)v; (void)elem;
+    return NULL;
+}
+
+void *vec_at(const Vec *v, size_t i) {
+    (void)v; (void)i;
+    return NULL;
+}
+
+void vec_remove(Vec *v, size_t i) {
+    (void)v; (void)i;
+}
+
+void *vec_find(const Vec *v, const void *key, int (*eq)(const void *key, const void *elem)) {
+    (void)v; (void)key; (void)eq;
+    return NULL;
+}
+
+void vec_free(Vec *v) {
+    (void)v;
+}
+--- solution
+#include <stdlib.h>
+#include <string.h>
+
+typedef struct {
+    unsigned char *data;
+    size_t elem_size, len, cap;
+} Vec;
+
+void vec_init(Vec *v, size_t elem_size) {
+    v->data = NULL;
+    v->elem_size = elem_size;
+    v->len = v->cap = 0;
+}
+
+void *vec_push(Vec *v, const void *elem) {
+    if (v->len == v->cap) {
+        size_t ncap = v->cap ? v->cap * 2 : 4;
+        unsigned char *p = realloc(v->data, ncap * v->elem_size);
+        if (!p) return NULL;
+        v->data = p;
+        v->cap = ncap;
+    }
+    unsigned char *slot = v->data + v->len * v->elem_size;
+    memcpy(slot, elem, v->elem_size);
+    v->len++;
+    return slot;
+}
+
+void *vec_at(const Vec *v, size_t i) {
+    return i < v->len ? v->data + i * v->elem_size : NULL;
+}
+
+void vec_remove(Vec *v, size_t i) {
+    if (i >= v->len) return;
+    unsigned char *p = v->data + i * v->elem_size;
+    memmove(p, p + v->elem_size, (v->len - i - 1) * v->elem_size);
+    v->len--;
+}
+
+void *vec_find(const Vec *v, const void *key, int (*eq)(const void *key, const void *elem)) {
+    for (size_t i = 0; i < v->len; i++) {
+        unsigned char *p = v->data + i * v->elem_size;
+        if (eq(key, p)) return p;
+    }
+    return NULL;
+}
+
+void vec_free(Vec *v) {
+    free(v->data);
+    v->data = NULL;
+    v->len = v->cap = 0;
+}
+--- hint
+All addressing is `v->data + i * v->elem_size` on an `unsigned char *`.
+--- hint
+`memmove` (not `memcpy`) for removal, because source and destination overlap. The number of bytes to move is `(len - i - 1) * elem_size`.
+--- harness
+typedef struct { char name[12]; int hp; } TMonster;
+static int t_eq_int(const void *k, const void *e) { return *(const int *)k == *(const int *)e; }
+static int t_name_is(const void *k, const void *e) { return strcmp(k, ((const TMonster *)e)->name) == 0; }
+
+int main(void) {
+    Vec v;
+    vec_init(&v, sizeof(int));
+    CHECK(vec_at(&v, 0) == NULL);
+    for (int i = 0; i < 1000; i++) {
+        int *p = vec_push(&v, &i);
+        if (!p || *p != i) { CHECK(0); break; }
+    }
+    CHECK_INT(v.len, 1000);
+    int ok = 1;
+    for (int i = 0; i < 1000; i++) { int *p = vec_at(&v, i); if (!p || *p != i) ok = 0; }
+    CHECK(ok);
+    CHECK(vec_at(&v, 1000) == NULL);
+    vec_remove(&v, 0);
+    vec_remove(&v, 500);           /* removes value 501 */
+    vec_remove(&v, 997);           /* last: value 999 */
+    vec_remove(&v, 5000);          /* ignored */
+    CHECK_INT(v.len, 997);
+    CHECK_INT(*(int *)vec_at(&v, 0), 1);
+    CHECK_INT(*(int *)vec_at(&v, 499), 500);
+    CHECK_INT(*(int *)vec_at(&v, 500), 502);
+    CHECK_INT(*(int *)vec_at(&v, 996), 998);
+    int key = 777;
+    int *f = vec_find(&v, &key, t_eq_int);
+    CHECK(f != NULL && *f == 777);
+    key = 501;
+    CHECK(vec_find(&v, &key, t_eq_int) == NULL);
+    vec_free(&v);
+    CHECK_INT(v.len, 0);
+
+    vec_init(&v, sizeof(double));
+    double d = 0.5;
+    vec_push(&v, &d); d = -2.25; vec_push(&v, &d);
+    CHECK_DBL(*(double *)vec_at(&v, 1), -2.25);
+    vec_free(&v);
+    d = 9.0;
+    vec_push(&v, &d);              /* reusable after free */
+    CHECK_DBL(*(double *)vec_at(&v, 0), 9.0);
+    vec_free(&v);
+
+    vec_init(&v, sizeof(TMonster));
+    TMonster ms[] = {{"orc", 30}, {"slime", 5}, {"dragon", 900}, {"bat", 3}};
+    for (int i = 0; i < 4; i++) vec_push(&v, &ms[i]);
+    ms[0].hp = -1;                 /* the vector holds copies */
+    CHECK_INT(((TMonster *)vec_at(&v, 0))->hp, 30);
+    TMonster *dr = vec_find(&v, "dragon", t_name_is);
+    CHECK(dr != NULL && dr->hp == 900);
+    vec_remove(&v, 1);
+    CHECK_STR(((TMonster *)vec_at(&v, 1))->name, "dragon");
+    CHECK(vec_find(&v, "slime", t_name_is) == NULL);
+    CHECK_STR(((TMonster *)vec_at(&v, 2))->name, "bat");
+    vec_free(&v);
+    return TEST_END();
+}
+
+=== exercise dispatch
+title: Command dispatch table
+--- prompt
+Write a calculator that reads commands from stdin, one per line, and prints one result line per command. Implement it with a **table** of `{name, arity, function}` entries, not a chain of `if`/`strcmp`.
+
+| Command | Result |
+|---|---|
+| `add a b` | a + b |
+| `sub a b` | a - b |
+| `mul a b` | a * b |
+| `div a b` | a / b (C division) |
+| `mod a b` | a % b |
+| `neg a` | -a |
+| `sq a` | a * a |
+
+All numbers are integers that fit in `long`, and results fit too.
+
+- Blank lines produce no output.
+- An unknown command prints `error: unknown command NAME`.
+- A wrong number of arguments prints `error: NAME takes N argument(s)` with `N` the expected count, e.g. `error: neg takes 1 argument(s)`.
+- `div` or `mod` by zero prints `error: division by zero`.
+
+A clean way: each function has the signature `int fn(const long *args, long *result)` and returns 0 on success or nonzero for an error.
+--- starter
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+int main(void) {
+    char line[256];
+    while (fgets(line, sizeof line, stdin)) {
+        // split into a name and up to a few numbers, look the name up, call it
+    }
+    return 0;
+}
+--- solution
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+typedef int (*CmdFn)(const long *args, long *result);
+
+static int c_add(const long *a, long *r) { *r = a[0] + a[1]; return 0; }
+static int c_sub(const long *a, long *r) { *r = a[0] - a[1]; return 0; }
+static int c_mul(const long *a, long *r) { *r = a[0] * a[1]; return 0; }
+static int c_div(const long *a, long *r) { if (a[1] == 0) return 1; *r = a[0] / a[1]; return 0; }
+static int c_mod(const long *a, long *r) { if (a[1] == 0) return 1; *r = a[0] % a[1]; return 0; }
+static int c_neg(const long *a, long *r) { *r = -a[0]; return 0; }
+static int c_sq(const long *a, long *r)  { *r = a[0] * a[0]; return 0; }
+
+static const struct { const char *name; int arity; CmdFn fn; } CMDS[] = {
+    {"add", 2, c_add}, {"sub", 2, c_sub}, {"mul", 2, c_mul}, {"div", 2, c_div},
+    {"mod", 2, c_mod}, {"neg", 1, c_neg}, {"sq", 1, c_sq},
+};
+
+int main(void) {
+    char line[256];
+    while (fgets(line, sizeof line, stdin)) {
+        char name[32];
+        int used;
+        if (sscanf(line, "%31s%n", name, &used) != 1) continue;
+        long args[8];
+        int nargs = 0;
+        char *p = line + used, *end;
+        for (;;) {
+            long v = strtol(p, &end, 10);
+            if (end == p) break;
+            if (nargs < 8) args[nargs] = v;
+            nargs++;
+            p = end;
+        }
+        int found = 0;
+        for (size_t i = 0; i < sizeof CMDS / sizeof CMDS[0]; i++) {
+            if (strcmp(CMDS[i].name, name) != 0) continue;
+            found = 1;
+            long r;
+            if (nargs != CMDS[i].arity)
+                printf("error: %s takes %d argument(s)\n", name, CMDS[i].arity);
+            else if (CMDS[i].fn(args, &r) != 0)
+                printf("error: division by zero\n");
+            else
+                printf("%ld\n", r);
+            break;
+        }
+        if (!found) printf("error: unknown command %s\n", name);
+    }
+    return 0;
+}
+--- hint
+`sscanf(line, "%31s%n", name, &used)` reads the name and stores in `used` how many characters were consumed, so the numbers start at `line + used`. A blank line makes `sscanf` return `EOF` (or 0).
+--- hint
+Count the numbers with a `strtol` loop: when `end == p`, there was no number left.
+--- hint
+The table can be `static const struct { const char *name; int arity; CmdFn fn; } CMDS[] = {...};` and a loop over `sizeof CMDS / sizeof CMDS[0]` entries.
+--- test
+add 2 3
+mul -4 6
+neg 9
+sq 12
+sub 10 25
+--- out
+5
+-24
+-9
+144
+-15
+--- test
+div 7 2
+div -7 2
+mod -7 2
+div 1 0
+mod 5 0
+--- out
+3
+-3
+-1
+error: division by zero
+error: division by zero
+--- test
+add 1
+neg 1 2
+
+pow 2 8
+sq
+add 1000000000000 2000000000000
+--- out
+error: add takes 2 argument(s)
+error: neg takes 1 argument(s)
+error: unknown command pow
+error: sq takes 1 argument(s)
+3000000000000
+--- test
+   mul    3     -3
+ADD 1 1
+neg -5
+--- out
+-9
+error: unknown command ADD
+5
+
+=== exercise shapes
+title: Interfaces with a vtable
+--- prompt
+Implement two "classes" behind the `Shape` interface from the starter. Every shape starts with a `const ShapeVtbl *vt`, and callers only ever use the vtable:
+
+- `Shape *circle_new(double r)` and `Shape *rect_new(double w, double h)`: allocate, set the vtable pointer and fields.
+- Each type needs a `static const ShapeVtbl` with its `name` (`"circle"` / `"rect"`) and implementations of `area`, `perimeter`, `scale` (multiply every dimension by `k`) and `destroy` (free the object).
+- `double total_area(Shape *const *shapes, size_t n)`: sum through the vtable.
+- `Shape *largest(Shape *const *shapes, size_t n)`: the shape with the largest area (the first one on ties), or `NULL` if `n` is 0.
+
+`M_PI` is not defined under strict `-std=c17`; use `acos(-1.0)` or write the constant out.
+--- starter
+#include <stdlib.h>
+#include <math.h>
+
+typedef struct Shape Shape;
+
+typedef struct {
+    const char *name;
+    double (*area)(const Shape *self);
+    double (*perimeter)(const Shape *self);
+    void (*scale)(Shape *self, double k);
+    void (*destroy)(Shape *self);
+} ShapeVtbl;
+
+struct Shape { const ShapeVtbl *vt; };
+
+typedef struct { Shape base; double r; } Circle;
+typedef struct { Shape base; double w, h; } Rect;
+
+Shape *circle_new(double r) {
+    (void)r;
+    return NULL;
+}
+
+Shape *rect_new(double w, double h) {
+    (void)w; (void)h;
+    return NULL;
+}
+
+double total_area(Shape *const *shapes, size_t n) {
+    (void)shapes; (void)n;
+    return 0;
+}
+
+Shape *largest(Shape *const *shapes, size_t n) {
+    (void)shapes; (void)n;
+    return NULL;
+}
+--- solution
+#include <stdlib.h>
+#include <math.h>
+
+typedef struct Shape Shape;
+
+typedef struct {
+    const char *name;
+    double (*area)(const Shape *self);
+    double (*perimeter)(const Shape *self);
+    void (*scale)(Shape *self, double k);
+    void (*destroy)(Shape *self);
+} ShapeVtbl;
+
+struct Shape { const ShapeVtbl *vt; };
+
+typedef struct { Shape base; double r; } Circle;
+typedef struct { Shape base; double w, h; } Rect;
+
+static const double PI = 3.14159265358979323846;
+
+static double circle_area(const Shape *s) { const Circle *c = (const Circle *)s; return PI * c->r * c->r; }
+static double circle_perim(const Shape *s) { const Circle *c = (const Circle *)s; return 2 * PI * c->r; }
+static void circle_scale(Shape *s, double k) { ((Circle *)s)->r *= k; }
+
+static double rect_area(const Shape *s) { const Rect *r = (const Rect *)s; return r->w * r->h; }
+static double rect_perim(const Shape *s) { const Rect *r = (const Rect *)s; return 2 * (r->w + r->h); }
+static void rect_scale(Shape *s, double k) { Rect *r = (Rect *)s; r->w *= k; r->h *= k; }
+
+static void shape_destroy(Shape *s) { free(s); }
+
+static const ShapeVtbl CIRCLE_VT = {"circle", circle_area, circle_perim, circle_scale, shape_destroy};
+static const ShapeVtbl RECT_VT = {"rect", rect_area, rect_perim, rect_scale, shape_destroy};
+
+Shape *circle_new(double r) {
+    Circle *c = malloc(sizeof *c);
+    if (!c) return NULL;
+    c->base.vt = &CIRCLE_VT;
+    c->r = r;
+    return &c->base;
+}
+
+Shape *rect_new(double w, double h) {
+    Rect *r = malloc(sizeof *r);
+    if (!r) return NULL;
+    r->base.vt = &RECT_VT;
+    r->w = w;
+    r->h = h;
+    return &r->base;
+}
+
+double total_area(Shape *const *shapes, size_t n) {
+    double sum = 0;
+    for (size_t i = 0; i < n; i++) sum += shapes[i]->vt->area(shapes[i]);
+    return sum;
+}
+
+Shape *largest(Shape *const *shapes, size_t n) {
+    Shape *best = NULL;
+    double best_area = 0;
+    for (size_t i = 0; i < n; i++) {
+        double a = shapes[i]->vt->area(shapes[i]);
+        if (!best || a > best_area) { best = shapes[i]; best_area = a; }
+    }
+    return best;
+}
+--- hint
+Because `base` is the first member, `(Circle *)s` is valid inside the circle's functions, and `&c->base` (or `(Shape *)c`) is what the constructor returns.
+--- hint
+Declare the vtables as `static const ShapeVtbl CIRCLE_VT = {"circle", circle_area, ...};` after the functions they point to, and point every new object's `base.vt` at it.
+--- harness
+int main(void) {
+    double pi = acos(-1.0);
+    Shape *c = circle_new(2);
+    Shape *r = rect_new(3, 4);
+    CHECK(c != NULL && r != NULL);
+    if (!c || !r) return TEST_END();
+    CHECK(c->vt != r->vt);
+    CHECK_STR(c->vt->name, "circle");
+    CHECK_STR(r->vt->name, "rect");
+    CHECK_DBL(c->vt->area(c), 4 * pi);
+    CHECK_DBL(c->vt->perimeter(c), 4 * pi);
+    CHECK_DBL(r->vt->area(r), 12);
+    CHECK_DBL(r->vt->perimeter(r), 14);
+
+    Shape *c2 = circle_new(1);
+    CHECK(c2->vt == c->vt);                /* one shared vtable per type */
+    r->vt->scale(r, 0.5);
+    CHECK_DBL(r->vt->area(r), 3);
+    CHECK_DBL(r->vt->perimeter(r), 7);
+    c2->vt->scale(c2, 3);
+    CHECK_DBL(c2->vt->area(c2), 9 * pi);
+
+    Shape *all[] = {r, c, c2};
+    CHECK_DBL(total_area(all, 3), 3 + 13 * pi);
+    CHECK(largest(all, 3) == c2);
+    CHECK(largest(all, 1) == r);
+    CHECK(largest(all, 0) == NULL);
+    CHECK_DBL(total_area(all, 0), 0);
+    Shape *sq1 = rect_new(2, 2), *sq2 = rect_new(1, 4);
+    Shape *tie[] = {sq1, sq2};
+    CHECK(largest(tie, 2) == sq1);
+
+    Shape *to_free[] = {c, r, c2, sq1, sq2};
+    for (int i = 0; i < 5; i++) to_free[i]->vt->destroy(to_free[i]);
+    return TEST_END();
+}
+
+=== exercise lowerbound
+title: Generic lower_bound and bsearch lookups
+--- prompt
+Two parts.
+
+**1.** `bsearch` returns *some* matching element, not the first. Write a generic binary search in the same style that returns the **first** element not less than the key:
+
+```c
+void *lower_bound(const void *key, const void *base, size_t n, size_t size,
+                  int (*cmp)(const void *key, const void *elem));
+```
+
+`base` is sorted by `cmp`. Return a pointer to the first element `e` with `cmp(key, e) <= 0`, or to one past the end (`base + n * size`) if there is none. Use O(log n) comparisons (the tests count them).
+
+**2.** Using the standard `qsort` and `bsearch`:
+
+- `void sort_codes(Country *c, size_t n)`: sort by `code` (`strcmp`).
+- `const Country *find_code(const Country *c, size_t n, const char *code)`: `bsearch` with the code string itself as the key; `NULL` if absent.
+--- starter
+#include <stdlib.h>
+#include <string.h>
+
+typedef struct { char code[4]; const char *name; } Country;
+
+void *lower_bound(const void *key, const void *base, size_t n, size_t size,
+                  int (*cmp)(const void *key, const void *elem)) {
+    (void)key; (void)cmp; (void)size; (void)n;
+    return (void *)base;
+}
+
+void sort_codes(Country *c, size_t n) {
+    (void)c; (void)n;
+}
+
+const Country *find_code(const Country *c, size_t n, const char *code) {
+    (void)c; (void)n; (void)code;
+    return NULL;
+}
+--- solution
+#include <stdlib.h>
+#include <string.h>
+
+typedef struct { char code[4]; const char *name; } Country;
+
+void *lower_bound(const void *key, const void *base, size_t n, size_t size,
+                  int (*cmp)(const void *key, const void *elem)) {
+    const unsigned char *p = base;
+    size_t lo = 0, hi = n;                 // answer is in [lo, hi]
+    while (lo < hi) {
+        size_t mid = lo + (hi - lo) / 2;
+        if (cmp(key, p + mid * size) > 0) lo = mid + 1;
+        else hi = mid;
+    }
+    return (void *)(p + lo * size);
+}
+
+static int cmp_country(const void *a, const void *b) {
+    return strcmp(((const Country *)a)->code, ((const Country *)b)->code);
+}
+
+static int cmp_code_key(const void *key, const void *elem) {
+    return strcmp(key, ((const Country *)elem)->code);
+}
+
+void sort_codes(Country *c, size_t n) {
+    qsort(c, n, sizeof *c, cmp_country);
+}
+
+const Country *find_code(const Country *c, size_t n, const char *code) {
+    return bsearch(code, c, n, sizeof *c, cmp_code_key);
+}
+--- hint
+Keep a half-open range `[lo, hi)` of candidate indices. If the middle element is less than the key (`cmp(key, mid) > 0`), the answer is after it: `lo = mid + 1`. Otherwise it's at `mid` or before: `hi = mid`. Stop when `lo == hi`.
+--- hint
+Compute `mid` as `lo + (hi - lo) / 2`, and address elements as `(const unsigned char *)base + mid * size`.
+--- hint
+For `find_code`, the `bsearch` comparator's first argument is the key you passed (a `const char *`), the second is a `Country`. They are different types.
+--- harness
+static int t_calls = 0;
+static int t_cmp_int(const void *k, const void *e) {
+    t_calls++;
+    int a = *(const int *)k, b = *(const int *)e;
+    return (a > b) - (a < b);
+}
+
+int main(void) {
+    int a[] = {1, 3, 3, 3, 5, 8, 8, 13};
+    int k;
+    k = 3;  CHECK_INT((int *)lower_bound(&k, a, 8, sizeof(int), t_cmp_int) - a, 1);
+    k = 4;  CHECK_INT((int *)lower_bound(&k, a, 8, sizeof(int), t_cmp_int) - a, 4);
+    k = 0;  CHECK_INT((int *)lower_bound(&k, a, 8, sizeof(int), t_cmp_int) - a, 0);
+    k = 1;  CHECK_INT((int *)lower_bound(&k, a, 8, sizeof(int), t_cmp_int) - a, 0);
+    k = 8;  CHECK_INT((int *)lower_bound(&k, a, 8, sizeof(int), t_cmp_int) - a, 5);
+    k = 13; CHECK_INT((int *)lower_bound(&k, a, 8, sizeof(int), t_cmp_int) - a, 7);
+    k = 14; CHECK_INT((int *)lower_bound(&k, a, 8, sizeof(int), t_cmp_int) - a, 8);
+    CHECK((int *)lower_bound(&k, a, 0, sizeof(int), t_cmp_int) == a);
+
+    static int big[100000];
+    for (int i = 0; i < 100000; i++) big[i] = i / 3;      /* each value three times */
+    int ok = 1;
+    t_calls = 0;
+    for (int v = -1; v <= 33334; v += 7) {
+        int *p = lower_bound(&v, big, 100000, sizeof(int), t_cmp_int);
+        long want = v < 0 ? 0 : (long)v * 3 > 100000 ? 100000 : (long)v * 3;
+        if (p - big != want) ok = 0;
+    }
+    CHECK(ok);
+    CHECK(t_calls < 4763 * 20);                            /* about 17 per search */
+
+    Country cs[] = {
+        {"NOR", "Norway"}, {"BRA", "Brazil"}, {"JPN", "Japan"}, {"AUS", "Australia"},
+        {"KEN", "Kenya"}, {"CAN", "Canada"}, {"BEL", "Belgium"},
+    };
+    sort_codes(cs, 7);
+    const char *order[] = {"AUS", "BEL", "BRA", "CAN", "JPN", "KEN", "NOR"};
+    for (int i = 0; i < 7; i++) CHECK_STR(cs[i].code, order[i]);
+    const Country *c = find_code(cs, 7, "KEN");
+    CHECK(c != NULL && c == &cs[5]);
+    if (c) CHECK_STR(c->name, "Kenya");
+    c = find_code(cs, 7, "AUS");
+    CHECK(c == &cs[0]);
+    c = find_code(cs, 7, "NOR");
+    CHECK(c == &cs[6]);
+    CHECK(find_code(cs, 7, "FRA") == NULL);
+    CHECK(find_code(cs, 7, "") == NULL);
+    CHECK(find_code(cs, 0, "AUS") == NULL);
+    return TEST_END();
+}
+
+=== quiz
+run: yes
+--- q
+What does this print?
+--- code
+#include <stdio.h>
+
+int inc(int x) { return x + 1; }
+int dbl(int x) { return x * 2; }
+int sq(int x)  { return x * x; }
+
+int main(void) {
+    int (*steps[])(int) = {dbl, inc, sq, inc};
+    int x = 3;
+    for (int i = 0; i < 4; i++) x = steps[i](x);
+    printf("%d\n", x);
+    return 0;
+}
+--- choice
+37
+--- answer
+50
+--- choice
+65
+--- choice
+17
+--- explain
+An array of function pointers applied in order: dbl(3) = 6, inc = 7, sq = 49, inc = 50.
+
+=== quiz
+run: yes
+--- q
+What does this print?
+--- code
+#include <stdio.h>
+#include <stdlib.h>
+
+int cmp(const void *a, const void *b) {
+    int x = *(const int *)a, y = *(const int *)b;
+    return (x % 10 > y % 10) - (x % 10 < y % 10);
+}
+
+int main(void) {
+    int xs[] = {31, 17, 42, 9, 55};
+    qsort(xs, 5, sizeof xs[0], cmp);
+    for (int i = 0; i < 5; i++) printf("%d ", xs[i]);
+    printf("\n");
+    return 0;
+}
+--- choice
+9 17 31 42 55
+--- answer
+31 42 55 17 9
+--- choice
+55 42 31 17 9
+--- choice
+9 17 55 42 31
+--- explain
+The comparator orders by last digit only: 1, 2, 5, 7, 9. All last digits differ here, so the result is fully determined despite `qsort` not being stable.
+
+=== quiz
+--- q
+Why is `return *(const int *)a - *(const int *)b;` a broken comparator?
+--- choice
+`qsort` requires the result to be exactly -1, 0 or 1
+--- answer
+For values far apart, like `INT_MIN` and `1`, the subtraction overflows, which is undefined behavior and in practice gives the wrong sign
+--- choice
+It compares the pointers rather than the values
+--- choice
+It is fine; it is the idiomatic C comparator
+--- explain
+Any negative/zero/positive result is allowed, so the shape is fine; the overflow is the problem. `INT_MIN - 1` wraps to `INT_MAX` on real hardware, telling `qsort` that the smallest int is larger than 1. Use `(x > y) - (x < y)`.
+
+=== quiz
+--- q
+What is `p` in this declaration?
+
+```c
+char *(*p)(const char *, int);
+```
+--- choice
+A function taking `(const char *, int)` that returns a pointer to a `char *`
+--- answer
+A pointer to a function taking `(const char *, int)` that returns `char *`
+--- choice
+A pointer to a `char *` array
+--- choice
+A function returning a function pointer
+--- explain
+Start at the name: `(*p)` says `p` is a pointer; the `( const char *, int )` after it says to a function; the `char *` on the left is the return type. Something like `strchr`'s shape fits.
+
+=== quiz
+--- q
+You sort `const char *words[] = {"pear", "fig", "apple"};` with this comparator. What happens?
+
+```c
+int cmp(const void *a, const void *b) {
+    return strcmp(a, b);
+}
+qsort(words, 3, sizeof words[0], cmp);
+```
+--- choice
+The words end up sorted correctly
+--- answer
+It compares the bytes of the pointer values themselves, so the order is meaningless (and it may read past them)
+--- choice
+It sorts in reverse order
+--- choice
+It doesn't compile because `strcmp` needs `const char *`
+--- explain
+`qsort` passes pointers to the *elements*. The elements are `const char *`, so `a` really is a `const char **`. `strcmp(a, b)` treats the 8 bytes of each stored pointer as characters. It compiles because `const void *` converts implicitly to `const char *`. Write `strcmp(*(const char *const *)a, *(const char *const *)b)`.
+
+=== quiz
+run: yes
+--- q
+What does this print?
+--- code
+#include <stdio.h>
+
+typedef void (*Visit)(int x, void *ctx);
+
+void each(const int *a, int n, Visit f, void *ctx) {
+    for (int i = 0; i < n; i++) f(a[i], ctx);
+}
+
+typedef struct { int sum, count; } Acc;
+
+void tally(int x, void *ctx) {
+    Acc *acc = ctx;
+    if (x > 2) { acc->sum += x; acc->count++; }
+}
+
+int main(void) {
+    int xs[] = {1, 5, 2, 7, 3};
+    Acc acc = {0, 0};
+    each(xs, 5, tally, &acc);
+    printf("%d %d\n", acc.sum, acc.count);
+    return 0;
+}
+--- choice
+18 5
+--- answer
+15 3
+--- choice
+0 0
+--- choice
+12 2
+--- explain
+The callback has no closure; its "captured" state is the `Acc` the caller passes through `ctx`. Values above 2 are 5, 7 and 3: sum 15, count 3.
+
+=== quiz
+run: yes
+--- q
+What does this print?
+--- code
+#include <stdio.h>
+
+typedef struct Animal Animal;
+typedef struct { const char *(*speak)(const Animal *); } AnimalVt;
+struct Animal { const AnimalVt *vt; int loud; };
+
+const char *dog(const Animal *a) { return a->loud ? "WOOF" : "woof"; }
+const char *cat(const Animal *a) { (void)a; return "meow"; }
+
+int main(void) {
+    static const AnimalVt DOG = {dog}, CAT = {cat};
+    Animal zoo[] = {{&DOG, 0}, {&CAT, 1}, {&DOG, 1}};
+    zoo[1].vt = &DOG;
+    for (int i = 0; i < 3; i++) printf("%s ", zoo[i].vt->speak(&zoo[i]));
+    printf("\n");
+    return 0;
+}
+--- choice
+woof meow WOOF
+--- answer
+woof WOOF WOOF
+--- choice
+woof woof WOOF
+--- choice
+WOOF meow woof
+--- explain
+Dispatch follows the vtable pointer stored in each object, so reassigning `zoo[1].vt` turns the cat into a dog at runtime. Its `loud` field is 1, so it prints `WOOF`.
+
+=== quiz
+run: yes
+--- q
+What does this print?
+--- code
+#include <stdio.h>
+#include <stdlib.h>
+
+int cmp(const void *k, const void *e) {
+    int a = *(const int *)k, b = *(const int *)e;
+    return (a > b) - (a < b);
+}
+
+int main(void) {
+    int xs[] = {2, 4, 6, 8, 10, 12};
+    int keys[] = {8, 5};
+    for (int i = 0; i < 2; i++) {
+        int *p = bsearch(&keys[i], xs, 6, sizeof xs[0], cmp);
+        if (p) printf("%td ", p - xs);
+        else printf("none ");
+    }
+    printf("\n");
+    return 0;
+}
+--- choice
+4 none
+--- answer
+3 none
+--- choice
+3 2
+--- choice
+8 none
+--- explain
+`bsearch` returns a pointer to the element; subtracting the array start gives the index (8 is at index 3). A missing key gives `NULL`, not an insertion point.
